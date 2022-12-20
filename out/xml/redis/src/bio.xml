@@ -1,0 +1,293 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<unit xmlns="http://www.srcML.org/srcML/src" xmlns:cpp="http://www.srcML.org/srcML/cpp" revision="1.0.0" language="C" filename="/cloned_projects/redis/src/bio.c"><comment type="block">/* Background I/O service for Redis.
+ *
+ * This file implements operations that we need to perform in the background.
+ * Currently there is only a single operation, that is a background close(2)
+ * system call. This is needed as when the process is the last owner of a
+ * reference to a file closing it means unlinking it, and the deletion of the
+ * file is slow, blocking the server.
+ *
+ * In the future we'll either continue implementing new things we need or
+ * we'll switch to libeio. However there are probably long term uses for this
+ * file as we may want to put here Redis specific background tasks (for instance
+ * it is not impossible that we'll need a non blocking FLUSHDB/FLUSHALL
+ * implementation).
+ *
+ * DESIGN
+ * ------
+ *
+ * The design is trivial, we have a structure representing a job to perform
+ * and a different thread and job queue for every job type.
+ * Every thread waits for new jobs in its queue, and process every job
+ * sequentially.
+ *
+ * Jobs of the same type are guaranteed to be processed from the least
+ * recently inserted to the most recently inserted (older jobs processed
+ * first).
+ *
+ * Currently there is no way for the creator of the job to be notified about
+ * the completion of the operation, this will only be added when/if needed.
+ *
+ * ----------------------------------------------------------------------------
+ *
+ * Copyright (c) 2009-2012, Salvatore Sanfilippo &lt;antirez at gmail dot com&gt;
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ *   * Redistributions of source code must retain the above copyright notice,
+ *     this list of conditions and the following disclaimer.
+ *   * Redistributions in binary form must reproduce the above copyright
+ *     notice, this list of conditions and the following disclaimer in the
+ *     documentation and/or other materials provided with the distribution.
+ *   * Neither the name of Redis nor the names of its contributors may be used
+ *     to endorse or promote products derived from this software without
+ *     specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */</comment>
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>_WIN32</name></cpp:ifdef>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"Win32_Interop/Win32_Portability.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"Win32_Interop/win32fixes.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"Win32_Interop/Win32_PThread.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"Win32_Interop/Win32_ThreadControl.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"Win32_Interop/Win32_Error.h"</cpp:file></cpp:include>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"server.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"bio.h"</cpp:file></cpp:include>
+
+<decl_stmt><decl><type><specifier>static</specifier> <name>pthread_t</name></type> <name><name>bio_threads</name><index>[<expr><name>BIO_NUM_OPS</name></expr>]</index></name></decl>;</decl_stmt>
+<decl_stmt><decl><type><specifier>static</specifier> <name>pthread_mutex_t</name></type> <name><name>bio_mutex</name><index>[<expr><name>BIO_NUM_OPS</name></expr>]</index></name></decl>;</decl_stmt>
+<decl_stmt><decl><type><specifier>static</specifier> <name>pthread_cond_t</name></type> <name><name>bio_newjob_cond</name><index>[<expr><name>BIO_NUM_OPS</name></expr>]</index></name></decl>;</decl_stmt>
+<decl_stmt><decl><type><specifier>static</specifier> <name>pthread_cond_t</name></type> <name><name>bio_step_cond</name><index>[<expr><name>BIO_NUM_OPS</name></expr>]</index></name></decl>;</decl_stmt>
+<decl_stmt><decl><type><specifier>static</specifier> <name>list</name> <modifier>*</modifier></type><name><name>bio_jobs</name><index>[<expr><name>BIO_NUM_OPS</name></expr>]</index></name></decl>;</decl_stmt>
+<comment type="block">/* The following array is used to hold the number of pending jobs for every
+ * OP type. This allows us to export the bioPendingJobsOfType() API that is
+ * useful when the main thread wants to perform some operation that may involve
+ * objects shared with the background thread. The main thread will just wait
+ * that there are no longer jobs of this type to be executed before performing
+ * the sensible operation. This data is also useful for reporting. */</comment>
+<decl_stmt><decl><type><specifier>static</specifier> <name>PORT_ULONGLONG</name></type> <name><name>bio_pending</name><index>[<expr><name>BIO_NUM_OPS</name></expr>]</index></name></decl>;</decl_stmt>
+
+<comment type="block">/* This structure represents a background Job. It is only used locally to this
+ * file as the API does not expose the internals at all. */</comment>
+<struct>struct <name>bio_job</name> <block>{
+    <decl_stmt><decl><type><name>time_t</name></type> <name>time</name></decl>;</decl_stmt> <comment type="block">/* Time at which the job was created. */</comment>
+    <comment type="block">/* Job specific arguments pointers. If we need to pass more than three
+     * arguments we can just pass a pointer to a structure or alike. */</comment>
+    <decl_stmt><decl><type><name>void</name> <modifier>*</modifier></type><name>arg1</name></decl>, <decl><type ref="prev"><modifier>*</modifier></type><name>arg2</name></decl>, <decl><type ref="prev"><modifier>*</modifier></type><name>arg3</name></decl>;</decl_stmt>
+}</block>;</struct>
+
+<function_decl><type><name>void</name> <modifier>*</modifier></type><name>bioProcessBackgroundJobs</name><parameter_list>(<parameter><decl><type><name>void</name> <modifier>*</modifier></type><name>arg</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><name>void</name></type> <name>lazyfreeFreeObjectFromBioThread</name><parameter_list>(<parameter><decl><type><name>robj</name> <modifier>*</modifier></type><name>o</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><name>void</name></type> <name>lazyfreeFreeDatabaseFromBioThread</name><parameter_list>(<parameter><decl><type><name>dict</name> <modifier>*</modifier></type><name>ht1</name></decl></parameter>, <parameter><decl><type><name>dict</name> <modifier>*</modifier></type><name>ht2</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><name>void</name></type> <name>lazyfreeFreeSlotsMapFromBioThread</name><parameter_list>(<parameter><decl><type><name>zskiplist</name> <modifier>*</modifier></type><name>sl</name></decl></parameter>)</parameter_list>;</function_decl>
+
+<comment type="block">/* Make sure we have enough stack to perform all the things we do in the
+ * main thread. */</comment>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>REDIS_THREAD_STACK_SIZE</name></cpp:macro> <cpp:value>(1024*1024*4)</cpp:value></cpp:define>
+
+<comment type="block">/* Initialize the background system, spawning the thread. */</comment>
+<function><type><name>void</name></type> <name>bioInit</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list> <block>{<block_content>
+    <decl_stmt><decl><type><name>pthread_attr_t</name></type> <name>attr</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>pthread_t</name></type> <name>thread</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>size_t</name></type> <name>stacksize</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>int</name></type> <name>j</name></decl>;</decl_stmt>
+
+    <comment type="block">/* Initialization of state vars and objects */</comment>
+    <for>for <control>(<init><expr><name>j</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>j</name> <operator>&lt;</operator> <name>BIO_NUM_OPS</name></expr>;</condition> <incr><expr><name>j</name><operator>++</operator></expr></incr>)</control> <block>{<block_content>
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>_WIN32</name></cpp:ifdef>
+<cpp:pragma>#<cpp:directive>pragma</cpp:directive> <name>warning</name><name>(</name> <name>suppress</name> <name>:</name> <name>6031</name> <name>)</name></cpp:pragma>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+        <expr_stmt><expr><call><name>pthread_mutex_init</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>bio_mutex</name><index>[<expr><name>j</name></expr>]</index></name></expr></argument>,<argument><expr><name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <expr_stmt><expr><call><name>pthread_cond_init</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>bio_newjob_cond</name><index>[<expr><name>j</name></expr>]</index></name></expr></argument>,<argument><expr><name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <expr_stmt><expr><call><name>pthread_cond_init</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>bio_step_cond</name><index>[<expr><name>j</name></expr>]</index></name></expr></argument>,<argument><expr><name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <expr_stmt><expr><name><name>bio_jobs</name><index>[<expr><name>j</name></expr>]</index></name> <operator>=</operator> <call><name>listCreate</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+        <expr_stmt><expr><name><name>bio_pending</name><index>[<expr><name>j</name></expr>]</index></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+    </block_content>}</block></for>
+
+    <comment type="block">/* Set the stack size as by default it may be small in some system */</comment>
+    <expr_stmt><expr><call><name>pthread_attr_init</name><argument_list>(<argument><expr><operator>&amp;</operator><name>attr</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><call><name>pthread_attr_getstacksize</name><argument_list>(<argument><expr><operator>&amp;</operator><name>attr</name></expr></argument>,<argument><expr><operator>&amp;</operator><name>stacksize</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <if_stmt><if>if <condition>(<expr><operator>!</operator><name>stacksize</name></expr>)</condition><block type="pseudo"><block_content> <expr_stmt><expr><name>stacksize</name> <operator>=</operator> <literal type="number">1</literal></expr>;</expr_stmt></block_content></block></if></if_stmt> <comment type="block">/* The world is full of Solaris Fixes */</comment>
+    <while>while <condition>(<expr><name>stacksize</name> <operator>&lt;</operator> <name>REDIS_THREAD_STACK_SIZE</name></expr>)</condition><block type="pseudo"><block_content> <expr_stmt><expr><name>stacksize</name> <operator>*=</operator> <literal type="number">2</literal></expr>;</expr_stmt></block_content></block></while>
+    <expr_stmt><expr><call><name>pthread_attr_setstacksize</name><argument_list>(<argument><expr><operator>&amp;</operator><name>attr</name></expr></argument>, <argument><expr><operator>(</operator><operator>(</operator><name>ssize_t</name><operator>)</operator><name>stacksize</name><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>                     <macro><name>WIN_PORT_FIX</name></macro> <comment type="block">/* cast (ssize_t) */</comment>
+
+    <comment type="block">/* Ready to spawn our threads. We use the single argument the thread
+     * function accepts in order to pass the job ID the thread is
+     * responsible of. */</comment>
+    <for>for <control>(<init><expr><name>j</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>j</name> <operator>&lt;</operator> <name>BIO_NUM_OPS</name></expr>;</condition> <incr><expr><name>j</name><operator>++</operator></expr></incr>)</control> <block>{<block_content>
+        <decl_stmt><decl><type><name>void</name> <modifier>*</modifier></type><name>arg</name> <init>= <expr><operator>(</operator><name>void</name><operator>*</operator><operator>)</operator><operator>(</operator><name>PORT_ULONG</name><operator>)</operator> <name>j</name></expr></init></decl>;</decl_stmt>
+        <if_stmt><if>if <condition>(<expr><call><name>pthread_create</name><argument_list>(<argument><expr><operator>&amp;</operator><name>thread</name></expr></argument>,<argument><expr><operator>&amp;</operator><name>attr</name></expr></argument>,<argument><expr><name>bioProcessBackgroundJobs</name></expr></argument>,<argument><expr><name>arg</name></expr></argument>)</argument_list></call> <operator>!=</operator> <literal type="number">0</literal></expr>)</condition> <block>{<block_content>
+            <expr_stmt><expr><call><name>serverLog</name><argument_list>(<argument><expr><name>LL_WARNING</name></expr></argument>,<argument><expr><literal type="string">"Fatal: Can't initialize Background Jobs."</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+            <expr_stmt><expr><call><name>exit</name><argument_list>(<argument><expr><literal type="number">1</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        </block_content>}</block></if></if_stmt>
+        <expr_stmt><expr><name><name>bio_threads</name><index>[<expr><name>j</name></expr>]</index></name> <operator>=</operator> <name>thread</name></expr>;</expr_stmt>
+    </block_content>}</block></for>
+</block_content>}</block></function>
+
+<function><type><name>void</name></type> <name>bioCreateBackgroundJob</name><parameter_list>(<parameter><decl><type><name>int</name></type> <name>type</name></decl></parameter>, <parameter><decl><type><name>void</name> <modifier>*</modifier></type><name>arg1</name></decl></parameter>, <parameter><decl><type><name>void</name> <modifier>*</modifier></type><name>arg2</name></decl></parameter>, <parameter><decl><type><name>void</name> <modifier>*</modifier></type><name>arg3</name></decl></parameter>)</parameter_list> <block>{<block_content>
+    <decl_stmt><decl><type><name><name>struct</name> <name>bio_job</name></name> <modifier>*</modifier></type><name>job</name> <init>= <expr><call><name>zmalloc</name><argument_list>(<argument><expr><sizeof>sizeof<argument_list>(<argument><expr><operator>*</operator><name>job</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+    <expr_stmt><expr><name><name>job</name><operator>-&gt;</operator><name>time</name></name> <operator>=</operator> <call><name>time</name><argument_list>(<argument><expr><name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>job</name><operator>-&gt;</operator><name>arg1</name></name> <operator>=</operator> <name>arg1</name></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>job</name><operator>-&gt;</operator><name>arg2</name></name> <operator>=</operator> <name>arg2</name></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>job</name><operator>-&gt;</operator><name>arg3</name></name> <operator>=</operator> <name>arg3</name></expr>;</expr_stmt>
+    <expr_stmt><expr><call><name>pthread_mutex_lock</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>bio_mutex</name><index>[<expr><name>type</name></expr>]</index></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><call><name>listAddNodeTail</name><argument_list>(<argument><expr><name><name>bio_jobs</name><index>[<expr><name>type</name></expr>]</index></name></expr></argument>,<argument><expr><name>job</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>bio_pending</name><index>[<expr><name>type</name></expr>]</index></name><operator>++</operator></expr>;</expr_stmt>
+    <expr_stmt><expr><call><name>pthread_cond_signal</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>bio_newjob_cond</name><index>[<expr><name>type</name></expr>]</index></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><call><name>pthread_mutex_unlock</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>bio_mutex</name><index>[<expr><name>type</name></expr>]</index></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<function><type><name>void</name> <modifier>*</modifier></type><name>bioProcessBackgroundJobs</name><parameter_list>(<parameter><decl><type><name>void</name> <modifier>*</modifier></type><name>arg</name></decl></parameter>)</parameter_list> <block>{<block_content>
+    <decl_stmt><decl><type><name><name>struct</name> <name>bio_job</name></name> <modifier>*</modifier></type><name>job</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>PORT_ULONG</name></type> <name>type</name> <init>= <expr><operator>(</operator><name>PORT_ULONG</name><operator>)</operator> <name>arg</name></expr></init></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>sigset_t</name></type> <name>sigset</name></decl>;</decl_stmt>
+
+    <comment type="block">/* Check that the type is within the right interval. */</comment>
+    <if_stmt><if>if <condition>(<expr><name>type</name> <operator>&gt;=</operator> <name>BIO_NUM_OPS</name></expr>)</condition> <block>{<block_content>
+        <expr_stmt><expr><call><name>serverLog</name><argument_list>(<argument><expr><name>LL_WARNING</name></expr></argument>,
+            <argument><expr><literal type="string">"Warning: bio thread started with wrong type %Iu"</literal></expr></argument>,<argument><expr><name>type</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>                <macro><name>WIN_PORT_FIX</name></macro> <comment type="block">/* %lu -&gt; %Iu */</comment>
+        <return>return <expr><name>NULL</name></expr>;</return>
+    </block_content>}</block></if></if_stmt>
+
+    <comment type="block">/* Make the thread killable at any time, so that bioKillThreads()
+     * can work reliably. */</comment>
+<cpp:ifndef>#<cpp:directive>ifndef</cpp:directive> <name>_WIN32</name></cpp:ifndef>
+    <expr_stmt><expr><call><name>pthread_setcancelstate</name><argument_list>(<argument><expr><name>PTHREAD_CANCEL_ENABLE</name></expr></argument>, <argument><expr><name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><call><name>pthread_setcanceltype</name><argument_list>(<argument><expr><name>PTHREAD_CANCEL_ASYNCHRONOUS</name></expr></argument>, <argument><expr><name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+<cpp:else>#<cpp:directive>else</cpp:directive></cpp:else>
+    <comment type="line">// TODO: if the ptherad support is important, then the current implementation </comment>
+    <comment type="line">// in win32fixes.h needs much rework. Cancellability requires a shared event.</comment>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+    <expr_stmt><expr><call><name>pthread_mutex_lock</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>bio_mutex</name><index>[<expr><name>type</name></expr>]</index></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <comment type="block">/* Block SIGALRM so we are sure that only the main thread will
+     * receive the watchdog signal. */</comment>
+    <expr_stmt><expr><call><name>sigemptyset</name><argument_list>(<argument><expr><operator>&amp;</operator><name>sigset</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><call><name>sigaddset</name><argument_list>(<argument><expr><operator>&amp;</operator><name>sigset</name></expr></argument>, <argument><expr><name>SIGALRM</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <if_stmt><if>if <condition>(<expr><call><name>pthread_sigmask</name><argument_list>(<argument><expr><name>SIG_BLOCK</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>sigset</name></expr></argument>, <argument><expr><name>NULL</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+        <expr_stmt><expr><call><name>serverLog</name><argument_list>(<argument><expr><name>LL_WARNING</name></expr></argument>,
+            <argument><expr><literal type="string">"Warning: can't mask SIGALRM in bio.c thread: %s"</literal></expr></argument>, <argument><expr><call><name>IF_WIN32</name><argument_list>(<argument><expr><call><name>wsa_strerror</name><argument_list>(<argument><expr><name>errno</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><call><name>strerror</name><argument_list>(<argument><expr><name>errno</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+    <while>while<condition>(<expr><literal type="number">1</literal></expr>)</condition> <block>{<block_content>
+        <decl_stmt><decl><type><name>listNode</name> <modifier>*</modifier></type><name>ln</name></decl>;</decl_stmt>
+
+        <comment type="block">/* The loop always starts with the lock hold. */</comment>
+        <if_stmt><if>if <condition>(<expr><call><name>listLength</name><argument_list>(<argument><expr><name><name>bio_jobs</name><index>[<expr><name>type</name></expr>]</index></name></expr></argument>)</argument_list></call> <operator>==</operator> <literal type="number">0</literal></expr>)</condition> <block>{<block_content>
+            <expr_stmt><expr><call><name>WIN32_ONLY</name><argument_list>(<argument><expr><call><name>WorkerThread_EnterSafeMode</name><argument_list>()</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+            <expr_stmt><expr><call><name>pthread_cond_wait</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>bio_newjob_cond</name><index>[<expr><name>type</name></expr>]</index></name></expr></argument>,<argument><expr><operator>&amp;</operator><name><name>bio_mutex</name><index>[<expr><name>type</name></expr>]</index></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+            <expr_stmt><expr><call><name>WIN32_ONLY</name><argument_list>(<argument><expr><call><name>pthread_mutex_unlock</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>bio_mutex</name><index>[<expr><name>type</name></expr>]</index></name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+            <expr_stmt><expr><call><name>WIN32_ONLY</name><argument_list>(<argument><expr><call><name>WorkerThread_ExitSafeMode</name><argument_list>()</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+            <expr_stmt><expr><call><name>WIN32_ONLY</name><argument_list>(<argument><expr><call><name>pthread_mutex_lock</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>bio_mutex</name><index>[<expr><name>type</name></expr>]</index></name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+            <continue>continue;</continue>
+        </block_content>}</block></if></if_stmt>
+        <comment type="block">/* Pop the job from the queue. */</comment>
+        <expr_stmt><expr><name>ln</name> <operator>=</operator> <call><name>listFirst</name><argument_list>(<argument><expr><name><name>bio_jobs</name><index>[<expr><name>type</name></expr>]</index></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <expr_stmt><expr><name>job</name> <operator>=</operator> <name><name>ln</name><operator>-&gt;</operator><name>value</name></name></expr>;</expr_stmt>
+        <comment type="block">/* It is now possible to unlock the background system as we know have
+         * a stand alone job structure to process.*/</comment>
+        <expr_stmt><expr><call><name>pthread_mutex_unlock</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>bio_mutex</name><index>[<expr><name>type</name></expr>]</index></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+        <comment type="block">/* Process the job accordingly to its type. */</comment>
+        <if_stmt><if>if <condition>(<expr><name>type</name> <operator>==</operator> <name>BIO_CLOSE_FILE</name></expr>)</condition> <block>{<block_content>
+            <expr_stmt><expr><call><name>close</name><argument_list>(<argument><expr><operator>(</operator><name>int</name><operator>)</operator><operator>(</operator><name>PORT_LONG</name><operator>)</operator><name><name>job</name><operator>-&gt;</operator><name>arg1</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>  <expr_stmt><expr><name>WIN_PORT_FIX</name></expr></expr_stmt> <comment type="block">/* cast (int) */</comment>
+        </block_content>}</block></if> <if type="elseif">else if <condition>(<expr><name>type</name> <operator>==</operator> <name>BIO_AOF_FSYNC</name></expr>)</condition> <block>{<block_content>
+            <expr_stmt><expr><call><name>redis_fsync</name><argument_list>(<argument><expr><operator>(</operator><name>int</name><operator>)</operator><operator>(</operator><name>PORT_LONG</name><operator>)</operator><name><name>job</name><operator>-&gt;</operator><name>arg1</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>  <expr_stmt><expr><name>WIN_PORT_FIX</name></expr></expr_stmt> <comment type="block">/* cast (int) */</comment>
+        </block_content>}</block></if> <if type="elseif">else if <condition>(<expr><name>type</name> <operator>==</operator> <name>BIO_LAZY_FREE</name></expr>)</condition> <block>{<block_content>
+            <comment type="block">/* What we free changes depending on what arguments are set:
+             * arg1 -&gt; free the object at pointer.
+             * arg2 &amp; arg3 -&gt; free two dictionaries (a Redis DB).
+             * only arg3 -&gt; free the skiplist. */</comment>
+            <if_stmt><if>if <condition>(<expr><name><name>job</name><operator>-&gt;</operator><name>arg1</name></name></expr>)</condition><block type="pseudo"><block_content>
+                <expr_stmt><expr><call><name>lazyfreeFreeObjectFromBioThread</name><argument_list>(<argument><expr><name><name>job</name><operator>-&gt;</operator><name>arg1</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if>
+            <if type="elseif">else if <condition>(<expr><name><name>job</name><operator>-&gt;</operator><name>arg2</name></name> <operator>&amp;&amp;</operator> <name><name>job</name><operator>-&gt;</operator><name>arg3</name></name></expr>)</condition><block type="pseudo"><block_content>
+                <expr_stmt><expr><call><name>lazyfreeFreeDatabaseFromBioThread</name><argument_list>(<argument><expr><name><name>job</name><operator>-&gt;</operator><name>arg2</name></name></expr></argument>,<argument><expr><name><name>job</name><operator>-&gt;</operator><name>arg3</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if>
+            <if type="elseif">else if <condition>(<expr><name><name>job</name><operator>-&gt;</operator><name>arg3</name></name></expr>)</condition><block type="pseudo"><block_content>
+                <expr_stmt><expr><call><name>lazyfreeFreeSlotsMapFromBioThread</name><argument_list>(<argument><expr><name><name>job</name><operator>-&gt;</operator><name>arg3</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+        </block_content>}</block></if> <else>else <block>{<block_content>
+            <expr_stmt><expr><call><name>serverPanic</name><argument_list>(<argument><expr><literal type="string">"Wrong job type in bioProcessBackgroundJobs()."</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        </block_content>}</block></else></if_stmt>
+        <expr_stmt><expr><call><name>zfree</name><argument_list>(<argument><expr><name>job</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+        <comment type="block">/* Lock again before reiterating the loop, if there are no longer
+         * jobs to process we'll block again in pthread_cond_wait(). */</comment>
+        <expr_stmt><expr><call><name>pthread_mutex_lock</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>bio_mutex</name><index>[<expr><name>type</name></expr>]</index></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <expr_stmt><expr><call><name>listDelNode</name><argument_list>(<argument><expr><name><name>bio_jobs</name><index>[<expr><name>type</name></expr>]</index></name></expr></argument>,<argument><expr><name>ln</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <expr_stmt><expr><name><name>bio_pending</name><index>[<expr><name>type</name></expr>]</index></name><operator>--</operator></expr>;</expr_stmt>
+
+        <comment type="block">/* Unblock threads blocked on bioWaitStepOfType() if any. */</comment>
+        <expr_stmt><expr><call><name>pthread_cond_broadcast</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>bio_step_cond</name><index>[<expr><name>type</name></expr>]</index></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    </block_content>}</block></while>
+</block_content>}</block></function>
+
+<comment type="block">/* Return the number of pending jobs of the specified type. */</comment>
+<function><type><name>PORT_ULONGLONG</name></type> <name>bioPendingJobsOfType</name><parameter_list>(<parameter><decl><type><name>int</name></type> <name>type</name></decl></parameter>)</parameter_list> <block>{<block_content>
+    <decl_stmt><decl><type><name>PORT_ULONGLONG</name></type> <name>val</name></decl>;</decl_stmt>
+    <expr_stmt><expr><call><name>pthread_mutex_lock</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>bio_mutex</name><index>[<expr><name>type</name></expr>]</index></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><name>val</name> <operator>=</operator> <name><name>bio_pending</name><index>[<expr><name>type</name></expr>]</index></name></expr>;</expr_stmt>
+    <expr_stmt><expr><call><name>pthread_mutex_unlock</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>bio_mutex</name><index>[<expr><name>type</name></expr>]</index></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <return>return <expr><name>val</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/* If there are pending jobs for the specified type, the function blocks
+ * and waits that the next job was processed. Otherwise the function
+ * does not block and returns ASAP.
+ *
+ * The function returns the number of jobs still to process of the
+ * requested type.
+ *
+ * This function is useful when from another thread, we want to wait
+ * a bio.c thread to do more work in a blocking way.
+ */</comment>
+<function><type><name>PORT_ULONGLONG</name></type> <name>bioWaitStepOfType</name><parameter_list>(<parameter><decl><type><name>int</name></type> <name>type</name></decl></parameter>)</parameter_list> <block>{<block_content>
+    <decl_stmt><decl><type><name>PORT_ULONGLONG</name></type> <name>val</name></decl>;</decl_stmt>
+    <expr_stmt><expr><call><name>pthread_mutex_lock</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>bio_mutex</name><index>[<expr><name>type</name></expr>]</index></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><name>val</name> <operator>=</operator> <name><name>bio_pending</name><index>[<expr><name>type</name></expr>]</index></name></expr>;</expr_stmt>
+    <if_stmt><if>if <condition>(<expr><name>val</name> <operator>!=</operator> <literal type="number">0</literal></expr>)</condition> <block>{<block_content>
+        <expr_stmt><expr><call><name>pthread_cond_wait</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>bio_step_cond</name><index>[<expr><name>type</name></expr>]</index></name></expr></argument>,<argument><expr><operator>&amp;</operator><name><name>bio_mutex</name><index>[<expr><name>type</name></expr>]</index></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <expr_stmt><expr><name>val</name> <operator>=</operator> <name><name>bio_pending</name><index>[<expr><name>type</name></expr>]</index></name></expr>;</expr_stmt>
+    </block_content>}</block></if></if_stmt>
+    <expr_stmt><expr><call><name>pthread_mutex_unlock</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>bio_mutex</name><index>[<expr><name>type</name></expr>]</index></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <return>return <expr><name>val</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/* Kill the running bio threads in an unclean way. This function should be
+ * used only when it's critical to stop the threads for some reason.
+ * Currently Redis does this only on crash (for instance on SIGSEGV) in order
+ * to perform a fast memory check without other threads messing with memory. */</comment>
+<function><type><name>void</name></type> <name>bioKillThreads</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list> <block>{<block_content>
+<cpp:ifndef>#<cpp:directive>ifndef</cpp:directive> <name>_WIN32</name></cpp:ifndef>
+    <decl_stmt><decl><type><name>int</name></type> <name>err</name></decl>, <decl><type ref="prev"/><name>j</name></decl>;</decl_stmt>
+
+    <for>for <control>(<init><expr><name>j</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>j</name> <operator>&lt;</operator> <name>BIO_NUM_OPS</name></expr>;</condition> <incr><expr><name>j</name><operator>++</operator></expr></incr>)</control> <block>{<block_content>
+        <if_stmt><if>if <condition>(<expr><call><name>pthread_cancel</name><argument_list>(<argument><expr><name><name>bio_threads</name><index>[<expr><name>j</name></expr>]</index></name></expr></argument>)</argument_list></call> <operator>==</operator> <literal type="number">0</literal></expr>)</condition> <block>{<block_content>
+            <if_stmt><if>if <condition>(<expr><operator>(</operator><name>err</name> <operator>=</operator> <call><name>pthread_join</name><argument_list>(<argument><expr><name><name>bio_threads</name><index>[<expr><name>j</name></expr>]</index></name></expr></argument>,<argument><expr><name>NULL</name></expr></argument>)</argument_list></call><operator>)</operator> <operator>!=</operator> <literal type="number">0</literal></expr>)</condition> <block>{<block_content>
+                <expr_stmt><expr><call><name>serverLog</name><argument_list>(<argument><expr><name>LL_WARNING</name></expr></argument>,
+                    <argument><expr><literal type="string">"Bio thread for job type #%d can be joined: %s"</literal></expr></argument>,
+                        <argument><expr><name>j</name></expr></argument>, <argument><expr><call><name>strerror</name><argument_list>(<argument><expr><name>err</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+            </block_content>}</block></if> <else>else <block>{<block_content>
+                <expr_stmt><expr><call><name>serverLog</name><argument_list>(<argument><expr><name>LL_WARNING</name></expr></argument>,
+                    <argument><expr><literal type="string">"Bio thread for job type #%d terminated"</literal></expr></argument>,<argument><expr><name>j</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+            </block_content>}</block></else></if_stmt>
+        </block_content>}</block></if></if_stmt>
+    </block_content>}</block></for>
+<cpp:else>#<cpp:directive>else</cpp:directive></cpp:else>
+    <comment type="line">// TODO: pthreads routines in win32fixes needs rework for this to work properly. </comment>
+    <comment type="line">// utility of this is questionable on windows.</comment>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+</block_content>}</block></function>
+</unit>

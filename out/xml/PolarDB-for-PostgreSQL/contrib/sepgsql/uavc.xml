@@ -1,0 +1,531 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<unit xmlns="http://www.srcML.org/srcML/src" xmlns:cpp="http://www.srcML.org/srcML/cpp" revision="1.0.0" language="C" filename="/cloned_projects/PolarDB-for-PostgreSQL/contrib/sepgsql/uavc.c"><comment type="block">/* -------------------------------------------------------------------------
+ *
+ * contrib/sepgsql/uavc.c
+ *
+ * Implementation of userspace access vector cache; that enables to cache
+ * access control decisions recently used, and reduce number of kernel
+ * invocations to avoid unnecessary performance hit.
+ *
+ * Copyright (c) 2011-2018, PostgreSQL Global Development Group
+ *
+ * -------------------------------------------------------------------------
+ */</comment>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"postgres.h"</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/hash.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/pg_proc.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"commands/seclabel.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/ipc.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/guc.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/memutils.h"</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"sepgsql.h"</cpp:file></cpp:include>
+
+<comment type="block">/*
+ * avc_cache
+ *
+ * It enables to cache access control decision (and behavior on execution of
+ * trusted procedure, db_procedure class only) for a particular pair of
+ * security labels and object class in userspace.
+ */</comment>
+<typedef>typedef <type><struct>struct
+<block>{
+	<decl_stmt><decl><type><name>uint32</name></type>		<name>hash</name></decl>;</decl_stmt>			<comment type="block">/* hash value of this cache entry */</comment>
+	<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>scontext</name></decl>;</decl_stmt>		<comment type="block">/* security context of the subject */</comment>
+	<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>tcontext</name></decl>;</decl_stmt>		<comment type="block">/* security context of the target */</comment>
+	<decl_stmt><decl><type><name>uint16</name></type>		<name>tclass</name></decl>;</decl_stmt>			<comment type="block">/* object class of the target */</comment>
+
+	<decl_stmt><decl><type><name>uint32</name></type>		<name>allowed</name></decl>;</decl_stmt>		<comment type="block">/* permissions to be allowed */</comment>
+	<decl_stmt><decl><type><name>uint32</name></type>		<name>auditallow</name></decl>;</decl_stmt>		<comment type="block">/* permissions to be audited on allowed */</comment>
+	<decl_stmt><decl><type><name>uint32</name></type>		<name>auditdeny</name></decl>;</decl_stmt>		<comment type="block">/* permissions to be audited on denied */</comment>
+
+	<decl_stmt><decl><type><name>bool</name></type>		<name>permissive</name></decl>;</decl_stmt>		<comment type="block">/* true, if permissive rule */</comment>
+	<decl_stmt><decl><type><name>bool</name></type>		<name>hot_cache</name></decl>;</decl_stmt>		<comment type="block">/* true, if recently referenced */</comment>
+	<decl_stmt><decl><type><name>bool</name></type>		<name>tcontext_is_valid</name></decl>;</decl_stmt>
+	<comment type="block">/* true, if tcontext is valid */</comment>
+	<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>ncontext</name></decl>;</decl_stmt>		<comment type="block">/* temporary scontext on execution of trusted
+								 * procedure, or NULL elsewhere */</comment>
+}</block></struct></type>			<name>avc_cache</name>;</typedef>
+
+<comment type="block">/*
+ * Declaration of static variables
+ */</comment>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>AVC_NUM_SLOTS</name></cpp:macro>		<cpp:value>512</cpp:value></cpp:define>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>AVC_NUM_RECLAIM</name></cpp:macro>		<cpp:value>16</cpp:value></cpp:define>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>AVC_DEF_THRESHOLD</name></cpp:macro>	<cpp:value>384</cpp:value></cpp:define>
+
+<decl_stmt><decl><type><specifier>static</specifier> <name>MemoryContext</name></type> <name>avc_mem_cxt</name></decl>;</decl_stmt>
+<decl_stmt><decl><type><specifier>static</specifier> <name>List</name> <modifier>*</modifier></type><name><name>avc_slots</name><index>[<expr><name>AVC_NUM_SLOTS</name></expr>]</index></name></decl>;</decl_stmt>	<comment type="block">/* avc's hash buckets */</comment>
+<decl_stmt><decl><type><specifier>static</specifier> <name>int</name></type>	<name>avc_num_caches</name></decl>;</decl_stmt>		<comment type="block">/* number of caches currently used */</comment>
+<decl_stmt><decl><type><specifier>static</specifier> <name>int</name></type>	<name>avc_lru_hint</name></decl>;</decl_stmt>		<comment type="block">/* index of the buckets to be reclaimed next */</comment>
+<decl_stmt><decl><type><specifier>static</specifier> <name>int</name></type>	<name>avc_threshold</name></decl>;</decl_stmt>		<comment type="block">/* threshold to launch cache-reclaiming  */</comment>
+<decl_stmt><decl><type><specifier>static</specifier> <name>char</name> <modifier>*</modifier></type><name>avc_unlabeled</name></decl>;</decl_stmt>		<comment type="block">/* system 'unlabeled' label */</comment>
+
+<comment type="block">/*
+ * Hash function
+ */</comment>
+<function><type><specifier>static</specifier> <name>uint32</name></type>
+<name>sepgsql_avc_hash</name><parameter_list>(<parameter><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>scontext</name></decl></parameter>, <parameter><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>tcontext</name></decl></parameter>, <parameter><decl><type><name>uint16</name></type> <name>tclass</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<return>return <expr><call><name>hash_any</name><argument_list>(<argument><expr><operator>(</operator><specifier>const</specifier> <name>unsigned</name> <name>char</name> <operator>*</operator><operator>)</operator> <name>scontext</name></expr></argument>, <argument><expr><call><name>strlen</name><argument_list>(<argument><expr><name>scontext</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call>
+		<operator>^</operator> <call><name>hash_any</name><argument_list>(<argument><expr><operator>(</operator><specifier>const</specifier> <name>unsigned</name> <name>char</name> <operator>*</operator><operator>)</operator> <name>tcontext</name></expr></argument>, <argument><expr><call><name>strlen</name><argument_list>(<argument><expr><name>tcontext</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call>
+		<operator>^</operator> <name>tclass</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Reset all the avc caches
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>sepgsql_avc_reset</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>MemoryContextReset</name><argument_list>(<argument><expr><name>avc_mem_cxt</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><name>avc_slots</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>List</name> <operator>*</operator></expr></argument>)</argument_list></sizeof> <operator>*</operator> <name>AVC_NUM_SLOTS</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>avc_num_caches</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+	<expr_stmt><expr><name>avc_lru_hint</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+	<expr_stmt><expr><name>avc_unlabeled</name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Reclaim caches recently unreferenced
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>sepgsql_avc_reclaim</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>ListCell</name>   <modifier>*</modifier></type><name>cell</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>ListCell</name>   <modifier>*</modifier></type><name>next</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>ListCell</name>   <modifier>*</modifier></type><name>prev</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>index</name></decl>;</decl_stmt>
+
+	<while>while <condition>(<expr><name>avc_num_caches</name> <operator>&gt;=</operator> <name>avc_threshold</name> <operator>-</operator> <name>AVC_NUM_RECLAIM</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name>index</name> <operator>=</operator> <name>avc_lru_hint</name></expr>;</expr_stmt>
+
+		<expr_stmt><expr><name>prev</name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+		<for>for <control>(<init><expr><name>cell</name> <operator>=</operator> <call><name>list_head</name><argument_list>(<argument><expr><name><name>avc_slots</name><index>[<expr><name>index</name></expr>]</index></name></expr></argument>)</argument_list></call></expr>;</init> <condition><expr><name>cell</name></expr>;</condition> <incr><expr><name>cell</name> <operator>=</operator> <name>next</name></expr></incr>)</control>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>avc_cache</name>  <modifier>*</modifier></type><name>cache</name> <init>= <expr><call><name>lfirst</name><argument_list>(<argument><expr><name>cell</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+			<expr_stmt><expr><name>next</name> <operator>=</operator> <call><name>lnext</name><argument_list>(<argument><expr><name>cell</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<if_stmt><if>if <condition>(<expr><operator>!</operator><name><name>cache</name><operator>-&gt;</operator><name>hot_cache</name></name></expr>)</condition>
+			<block>{<block_content>
+				<expr_stmt><expr><name><name>avc_slots</name><index>[<expr><name>index</name></expr>]</index></name>
+					<operator>=</operator> <call><name>list_delete_cell</name><argument_list>(<argument><expr><name><name>avc_slots</name><index>[<expr><name>index</name></expr>]</index></name></expr></argument>, <argument><expr><name>cell</name></expr></argument>, <argument><expr><name>prev</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+				<expr_stmt><expr><call><name>pfree</name><argument_list>(<argument><expr><name><name>cache</name><operator>-&gt;</operator><name>scontext</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<expr_stmt><expr><call><name>pfree</name><argument_list>(<argument><expr><name><name>cache</name><operator>-&gt;</operator><name>tcontext</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<if_stmt><if>if <condition>(<expr><name><name>cache</name><operator>-&gt;</operator><name>ncontext</name></name></expr>)</condition><block type="pseudo"><block_content>
+					<expr_stmt><expr><call><name>pfree</name><argument_list>(<argument><expr><name><name>cache</name><operator>-&gt;</operator><name>ncontext</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+				<expr_stmt><expr><call><name>pfree</name><argument_list>(<argument><expr><name>cache</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+				<expr_stmt><expr><name>avc_num_caches</name><operator>--</operator></expr>;</expr_stmt>
+			</block_content>}</block></if>
+			<else>else
+			<block>{<block_content>
+				<expr_stmt><expr><name><name>cache</name><operator>-&gt;</operator><name>hot_cache</name></name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+				<expr_stmt><expr><name>prev</name> <operator>=</operator> <name>cell</name></expr>;</expr_stmt>
+			</block_content>}</block></else></if_stmt>
+		</block_content>}</block></for>
+		<expr_stmt><expr><name>avc_lru_hint</name> <operator>=</operator> <operator>(</operator><name>avc_lru_hint</name> <operator>+</operator> <literal type="number">1</literal><operator>)</operator> <operator>%</operator> <name>AVC_NUM_SLOTS</name></expr>;</expr_stmt>
+	</block_content>}</block></while>
+</block_content>}</block></function>
+
+<comment type="block">/* -------------------------------------------------------------------------
+ *
+ * sepgsql_avc_check_valid
+ *
+ * This function checks whether the cached entries are still valid.  If
+ * the security policy has been reloaded (or any other events that requires
+ * resetting userspace caches has occurred) since the last reference to
+ * the access vector cache, we must flush the cache.
+ *
+ * Access control decisions must be atomic, but multiple system calls may
+ * be required to make a decision; thus, when referencing the access vector
+ * cache, we must loop until we complete without an intervening cache flush
+ * event.  In practice, looping even once should be very rare.  Callers should
+ * do something like this:
+ *
+ *	 sepgsql_avc_check_valid();
+ *	 do {
+ *			 :
+ *		 &lt;reference to uavc&gt;
+ *			 :
+ *	 } while (!sepgsql_avc_check_valid())
+ *
+ * -------------------------------------------------------------------------
+ */</comment>
+<function><type><specifier>static</specifier> <name>bool</name></type>
+<name>sepgsql_avc_check_valid</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<if_stmt><if>if <condition>(<expr><call><name>selinux_status_updated</name><argument_list>()</argument_list></call> <operator>&gt;</operator> <literal type="number">0</literal></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>sepgsql_avc_reset</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+		<return>return <expr><name>false</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+	<return>return <expr><name>true</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * sepgsql_avc_unlabeled
+ *
+ * Returns an alternative label to be applied when no label or an invalid
+ * label would otherwise be assigned.
+ */</comment>
+<function><type><specifier>static</specifier> <name>char</name> <modifier>*</modifier></type>
+<name>sepgsql_avc_unlabeled</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><name>avc_unlabeled</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>security_context_t</name></type> <name>unlabeled</name></decl>;</decl_stmt>
+
+		<if_stmt><if>if <condition>(<expr><call><name>security_get_initial_context_raw</name><argument_list>(<argument><expr><literal type="string">"unlabeled"</literal></expr></argument>, <argument><expr><operator>&amp;</operator><name>unlabeled</name></expr></argument>)</argument_list></call> <operator>&lt;</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+					<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_INTERNAL_ERROR</name></expr></argument>)</argument_list></call><operator>,</operator>
+					 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"SELinux: failed to get initial security label: %m"</literal></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+		<expr_stmt><expr><call><name>PG_TRY</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+		<block>{<block_content>
+			<expr_stmt><expr><name>avc_unlabeled</name> <operator>=</operator> <call><name>MemoryContextStrdup</name><argument_list>(<argument><expr><name>avc_mem_cxt</name></expr></argument>, <argument><expr><name>unlabeled</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block>
+		<expr_stmt><expr><call><name>PG_CATCH</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+		<block>{<block_content>
+			<expr_stmt><expr><call><name>freecon</name><argument_list>(<argument><expr><name>unlabeled</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>PG_RE_THROW</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block>
+		<expr_stmt><expr><call><name>PG_END_TRY</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><call><name>freecon</name><argument_list>(<argument><expr><name>unlabeled</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+	<return>return <expr><name>avc_unlabeled</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * sepgsql_avc_compute
+ *
+ * A fallback path, when cache mishit. It asks SELinux its access control
+ * decision for the supplied pair of security context and object class.
+ */</comment>
+<function><type><specifier>static</specifier> <name>avc_cache</name> <modifier>*</modifier></type>
+<name>sepgsql_avc_compute</name><parameter_list>(<parameter><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>scontext</name></decl></parameter>, <parameter><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>tcontext</name></decl></parameter>, <parameter><decl><type><name>uint16</name></type> <name>tclass</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>ucontext</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>ncontext</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>MemoryContext</name></type> <name>oldctx</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>avc_cache</name>  <modifier>*</modifier></type><name>cache</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>uint32</name></type>		<name>hash</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>index</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name><name>struct</name> <name>av_decision</name></name></type> <name>avd</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name>hash</name> <operator>=</operator> <call><name>sepgsql_avc_hash</name><argument_list>(<argument><expr><name>scontext</name></expr></argument>, <argument><expr><name>tcontext</name></expr></argument>, <argument><expr><name>tclass</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>index</name> <operator>=</operator> <name>hash</name> <operator>%</operator> <name>AVC_NUM_SLOTS</name></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Validation check of the supplied security context. Because it always
+	 * invoke system-call, frequent check should be avoided. Unless security
+	 * policy is reloaded, validation status shall be kept, so we also cache
+	 * whether the supplied security context was valid, or not.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><call><name>security_check_context_raw</name><argument_list>(<argument><expr><operator>(</operator><name>security_context_t</name><operator>)</operator> <name>tcontext</name></expr></argument>)</argument_list></call> <operator>!=</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name>ucontext</name> <operator>=</operator> <call><name>sepgsql_avc_unlabeled</name><argument_list>()</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<comment type="block">/*
+	 * Ask SELinux its access control decision
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><name>ucontext</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>sepgsql_compute_avd</name><argument_list>(<argument><expr><name>scontext</name></expr></argument>, <argument><expr><name>tcontext</name></expr></argument>, <argument><expr><name>tclass</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>avd</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if>
+	<else>else<block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>sepgsql_compute_avd</name><argument_list>(<argument><expr><name>scontext</name></expr></argument>, <argument><expr><name>ucontext</name></expr></argument>, <argument><expr><name>tclass</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>avd</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></else></if_stmt>
+
+	<comment type="block">/*
+	 * It also caches a security label to be switched when a client labeled as
+	 * 'scontext' executes a procedure labeled as 'tcontext', not only access
+	 * control decision on the procedure. The security label to be switched
+	 * shall be computed uniquely on a pair of 'scontext' and 'tcontext',
+	 * thus, it is reasonable to cache the new label on avc, and enables to
+	 * reduce unnecessary system calls. It shall be referenced at
+	 * sepgsql_needs_fmgr_hook to check whether the supplied function is a
+	 * trusted procedure, or not.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name>tclass</name> <operator>==</operator> <name>SEPG_CLASS_DB_PROCEDURE</name></expr>)</condition>
+	<block>{<block_content>
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><name>ucontext</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><name>ncontext</name> <operator>=</operator> <call><name>sepgsql_compute_create</name><argument_list>(<argument><expr><name>scontext</name></expr></argument>, <argument><expr><name>tcontext</name></expr></argument>,
+											  <argument><expr><name>SEPG_CLASS_PROCESS</name></expr></argument>, <argument><expr><name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if>
+		<else>else<block type="pseudo"><block_content>
+			<expr_stmt><expr><name>ncontext</name> <operator>=</operator> <call><name>sepgsql_compute_create</name><argument_list>(<argument><expr><name>scontext</name></expr></argument>, <argument><expr><name>ucontext</name></expr></argument>,
+											  <argument><expr><name>SEPG_CLASS_PROCESS</name></expr></argument>, <argument><expr><name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></else></if_stmt>
+		<if_stmt><if>if <condition>(<expr><call><name>strcmp</name><argument_list>(<argument><expr><name>scontext</name></expr></argument>, <argument><expr><name>ncontext</name></expr></argument>)</argument_list></call> <operator>==</operator> <literal type="number">0</literal></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><call><name>pfree</name><argument_list>(<argument><expr><name>ncontext</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><name>ncontext</name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/*
+	 * Set up an avc_cache object
+	 */</comment>
+	<expr_stmt><expr><name>oldctx</name> <operator>=</operator> <call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>avc_mem_cxt</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>cache</name> <operator>=</operator> <call><name>palloc0</name><argument_list>(<argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>avc_cache</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name><name>cache</name><operator>-&gt;</operator><name>hash</name></name> <operator>=</operator> <name>hash</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>cache</name><operator>-&gt;</operator><name>scontext</name></name> <operator>=</operator> <call><name>pstrdup</name><argument_list>(<argument><expr><name>scontext</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>cache</name><operator>-&gt;</operator><name>tcontext</name></name> <operator>=</operator> <call><name>pstrdup</name><argument_list>(<argument><expr><name>tcontext</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>cache</name><operator>-&gt;</operator><name>tclass</name></name> <operator>=</operator> <name>tclass</name></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name><name>cache</name><operator>-&gt;</operator><name>allowed</name></name> <operator>=</operator> <name><name>avd</name><operator>.</operator><name>allowed</name></name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>cache</name><operator>-&gt;</operator><name>auditallow</name></name> <operator>=</operator> <name><name>avd</name><operator>.</operator><name>auditallow</name></name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>cache</name><operator>-&gt;</operator><name>auditdeny</name></name> <operator>=</operator> <name><name>avd</name><operator>.</operator><name>auditdeny</name></name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>cache</name><operator>-&gt;</operator><name>hot_cache</name></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><name><name>avd</name><operator>.</operator><name>flags</name></name> <operator>&amp;</operator> <name>SELINUX_AVD_FLAGS_PERMISSIVE</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name><name>cache</name><operator>-&gt;</operator><name>permissive</name></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><name>ucontext</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name><name>cache</name><operator>-&gt;</operator><name>tcontext_is_valid</name></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	<if_stmt><if>if <condition>(<expr><name>ncontext</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name><name>cache</name><operator>-&gt;</operator><name>ncontext</name></name> <operator>=</operator> <call><name>pstrdup</name><argument_list>(<argument><expr><name>ncontext</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><name>avc_num_caches</name><operator>++</operator></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>avc_num_caches</name> <operator>&gt;</operator> <name>avc_threshold</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>sepgsql_avc_reclaim</name><argument_list>()</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><name><name>avc_slots</name><index>[<expr><name>index</name></expr>]</index></name> <operator>=</operator> <call><name>lcons</name><argument_list>(<argument><expr><name>cache</name></expr></argument>, <argument><expr><name><name>avc_slots</name><index>[<expr><name>index</name></expr>]</index></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>oldctx</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<return>return <expr><name>cache</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * sepgsql_avc_lookup
+ *
+ * Look up a cache entry that matches the supplied security contexts and
+ * object class.  If not found, create a new cache entry.
+ */</comment>
+<function><type><specifier>static</specifier> <name>avc_cache</name> <modifier>*</modifier></type>
+<name>sepgsql_avc_lookup</name><parameter_list>(<parameter><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>scontext</name></decl></parameter>, <parameter><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>tcontext</name></decl></parameter>, <parameter><decl><type><name>uint16</name></type> <name>tclass</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>avc_cache</name>  <modifier>*</modifier></type><name>cache</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>ListCell</name>   <modifier>*</modifier></type><name>cell</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>uint32</name></type>		<name>hash</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>index</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name>hash</name> <operator>=</operator> <call><name>sepgsql_avc_hash</name><argument_list>(<argument><expr><name>scontext</name></expr></argument>, <argument><expr><name>tcontext</name></expr></argument>, <argument><expr><name>tclass</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>index</name> <operator>=</operator> <name>hash</name> <operator>%</operator> <name>AVC_NUM_SLOTS</name></expr>;</expr_stmt>
+
+	<macro><name>foreach</name><argument_list>(<argument>cell</argument>, <argument>avc_slots[index]</argument>)</argument_list></macro>
+	<block>{<block_content>
+		<expr_stmt><expr><name>cache</name> <operator>=</operator> <call><name>lfirst</name><argument_list>(<argument><expr><name>cell</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name><name>cache</name><operator>-&gt;</operator><name>hash</name></name> <operator>==</operator> <name>hash</name> <operator>&amp;&amp;</operator>
+			<name><name>cache</name><operator>-&gt;</operator><name>tclass</name></name> <operator>==</operator> <name>tclass</name> <operator>&amp;&amp;</operator>
+			<call><name>strcmp</name><argument_list>(<argument><expr><name><name>cache</name><operator>-&gt;</operator><name>tcontext</name></name></expr></argument>, <argument><expr><name>tcontext</name></expr></argument>)</argument_list></call> <operator>==</operator> <literal type="number">0</literal> <operator>&amp;&amp;</operator>
+			<call><name>strcmp</name><argument_list>(<argument><expr><name><name>cache</name><operator>-&gt;</operator><name>scontext</name></name></expr></argument>, <argument><expr><name>scontext</name></expr></argument>)</argument_list></call> <operator>==</operator> <literal type="number">0</literal></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><name><name>cache</name><operator>-&gt;</operator><name>hot_cache</name></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+			<return>return <expr><name>cache</name></expr>;</return>
+		</block_content>}</block></if></if_stmt>
+	</block_content>}</block>
+	<comment type="block">/* not found, so insert a new cache */</comment>
+	<return>return <expr><call><name>sepgsql_avc_compute</name><argument_list>(<argument><expr><name>scontext</name></expr></argument>, <argument><expr><name>tcontext</name></expr></argument>, <argument><expr><name>tclass</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * sepgsql_avc_check_perms(_label)
+ *
+ * It returns 'true', if the security policy suggested to allow the required
+ * permissions. Otherwise, it returns 'false' or raises an error according
+ * to the 'abort_on_violation' argument.
+ * The 'tobject' and 'tclass' identify the target object being referenced,
+ * and 'required' is a bitmask of permissions (SEPG_*__*) defined for each
+ * object classes.
+ * The 'audit_name' is the object name (optional). If SEPGSQL_AVC_NOAUDIT
+ * was supplied, it means to skip all the audit messages.
+ */</comment>
+<function><type><name>bool</name></type>
+<name>sepgsql_avc_check_perms_label</name><parameter_list>(<parameter><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>tcontext</name></decl></parameter>,
+							  <parameter><decl><type><name>uint16</name></type> <name>tclass</name></decl></parameter>, <parameter><decl><type><name>uint32</name></type> <name>required</name></decl></parameter>,
+							  <parameter><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>audit_name</name></decl></parameter>,
+							  <parameter><decl><type><name>bool</name></type> <name>abort_on_violation</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>scontext</name> <init>= <expr><call><name>sepgsql_get_client_label</name><argument_list>()</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>avc_cache</name>  <modifier>*</modifier></type><name>cache</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>uint32</name></type>		<name>denied</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>uint32</name></type>		<name>audited</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type>		<name>result</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>sepgsql_avc_check_valid</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+	<do>do
+	<block>{<block_content>
+		<expr_stmt><expr><name>result</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+
+		<comment type="block">/*
+		 * If the target object is unlabeled, we perform the check using the
+		 * label supplied by sepgsql_avc_unlabeled().
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><name>tcontext</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><name>cache</name> <operator>=</operator> <call><name>sepgsql_avc_lookup</name><argument_list>(<argument><expr><name>scontext</name></expr></argument>, <argument><expr><name>tcontext</name></expr></argument>, <argument><expr><name>tclass</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if>
+		<else>else<block type="pseudo"><block_content>
+			<expr_stmt><expr><name>cache</name> <operator>=</operator> <call><name>sepgsql_avc_lookup</name><argument_list>(<argument><expr><name>scontext</name></expr></argument>,
+									   <argument><expr><call><name>sepgsql_avc_unlabeled</name><argument_list>()</argument_list></call></expr></argument>, <argument><expr><name>tclass</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></else></if_stmt>
+
+		<expr_stmt><expr><name>denied</name> <operator>=</operator> <name>required</name> <operator>&amp;</operator> <operator>~</operator><name><name>cache</name><operator>-&gt;</operator><name>allowed</name></name></expr>;</expr_stmt>
+
+		<comment type="block">/*
+		 * Compute permissions to be audited
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><call><name>sepgsql_get_debug_audit</name><argument_list>()</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><name>audited</name> <operator>=</operator> <operator>(</operator><ternary><condition><expr><name>denied</name></expr> ?</condition><then> <expr><operator>(</operator><name>denied</name> <operator>&amp;</operator> <operator>~</operator><literal type="number">0</literal><operator>)</operator></expr> </then><else>: <expr><operator>(</operator><name>required</name> <operator>&amp;</operator> <operator>~</operator><literal type="number">0</literal><operator>)</operator></expr></else></ternary><operator>)</operator></expr>;</expr_stmt></block_content></block></if>
+		<else>else<block type="pseudo"><block_content>
+			<expr_stmt><expr><name>audited</name> <operator>=</operator> <ternary><condition><expr><name>denied</name></expr> ?</condition><then> <expr><operator>(</operator><name>denied</name> <operator>&amp;</operator> <name><name>cache</name><operator>-&gt;</operator><name>auditdeny</name></name><operator>)</operator></expr>
+				</then><else>: <expr><operator>(</operator><name>required</name> <operator>&amp;</operator> <name><name>cache</name><operator>-&gt;</operator><name>auditallow</name></name><operator>)</operator></expr></else></ternary></expr>;</expr_stmt></block_content></block></else></if_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name>denied</name></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/*
+			 * In permissive mode or permissive domain, violated permissions
+			 * shall be audited to the log files at once, and then implicitly
+			 * allowed to avoid a flood of access denied logs, because the
+			 * purpose of permissive mode/domain is to collect a violation log
+			 * that will make it possible to fix up the security policy.
+			 */</comment>
+			<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>sepgsql_getenforce</name><argument_list>()</argument_list></call> <operator>||</operator> <name><name>cache</name><operator>-&gt;</operator><name>permissive</name></name></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><name><name>cache</name><operator>-&gt;</operator><name>allowed</name></name> <operator>|=</operator> <name>required</name></expr>;</expr_stmt></block_content></block></if>
+			<else>else<block type="pseudo"><block_content>
+				<expr_stmt><expr><name>result</name> <operator>=</operator> <name>false</name></expr>;</expr_stmt></block_content></block></else></if_stmt>
+		</block_content>}</block></if></if_stmt>
+	</block_content>}</block> while <condition>(<expr><operator>!</operator><call><name>sepgsql_avc_check_valid</name><argument_list>()</argument_list></call></expr>)</condition>;</do>
+
+	<comment type="block">/*
+	 * In the case when we have something auditable actions here,
+	 * sepgsql_audit_log shall be called with text representation of security
+	 * labels for both of subject and object. It records this access
+	 * violation, so DBA will be able to find out unexpected security problems
+	 * later.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name>audited</name> <operator>!=</operator> <literal type="number">0</literal> <operator>&amp;&amp;</operator>
+		<name>audit_name</name> <operator>!=</operator> <name>SEPGSQL_AVC_NOAUDIT</name> <operator>&amp;&amp;</operator>
+		<call><name>sepgsql_get_mode</name><argument_list>()</argument_list></call> <operator>!=</operator> <name>SEPGSQL_MODE_INTERNAL</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>sepgsql_audit_log</name><argument_list>(<argument><expr><name>denied</name> <operator>!=</operator> <literal type="number">0</literal></expr></argument>,
+						  <argument><expr><name><name>cache</name><operator>-&gt;</operator><name>scontext</name></name></expr></argument>,
+						  <argument><expr><ternary><condition><expr><name><name>cache</name><operator>-&gt;</operator><name>tcontext_is_valid</name></name></expr> ?</condition><then>
+						  <expr><name><name>cache</name><operator>-&gt;</operator><name>tcontext</name></name></expr> </then><else>: <expr><call><name>sepgsql_avc_unlabeled</name><argument_list>()</argument_list></call></expr></else></ternary></expr></argument>,
+						  <argument><expr><name><name>cache</name><operator>-&gt;</operator><name>tclass</name></name></expr></argument>,
+						  <argument><expr><name>audited</name></expr></argument>,
+						  <argument><expr><name>audit_name</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>abort_on_violation</name> <operator>&amp;&amp;</operator> <operator>!</operator><name>result</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_INSUFFICIENT_PRIVILEGE</name></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"SELinux: security policy violation"</literal></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<return>return <expr><name>result</name></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><name>bool</name></type>
+<name>sepgsql_avc_check_perms</name><parameter_list>(<parameter><decl><type><specifier>const</specifier> <name>ObjectAddress</name> <modifier>*</modifier></type><name>tobject</name></decl></parameter>,
+						<parameter><decl><type><name>uint16</name></type> <name>tclass</name></decl></parameter>, <parameter><decl><type><name>uint32</name></type> <name>required</name></decl></parameter>,
+						<parameter><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>audit_name</name></decl></parameter>,
+						<parameter><decl><type><name>bool</name></type> <name>abort_on_violation</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>tcontext</name> <init>= <expr><call><name>GetSecurityLabel</name><argument_list>(<argument><expr><name>tobject</name></expr></argument>, <argument><expr><name>SEPGSQL_LABEL_TAG</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type>		<name>rc</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name>rc</name> <operator>=</operator> <call><name>sepgsql_avc_check_perms_label</name><argument_list>(<argument><expr><name>tcontext</name></expr></argument>,
+									   <argument><expr><name>tclass</name></expr></argument>, <argument><expr><name>required</name></expr></argument>,
+									   <argument><expr><name>audit_name</name></expr></argument>, <argument><expr><name>abort_on_violation</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><name>tcontext</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>pfree</name><argument_list>(<argument><expr><name>tcontext</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<return>return <expr><name>rc</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * sepgsql_avc_trusted_proc
+ *
+ * If the supplied function OID is configured as a trusted procedure, this
+ * function will return a security label to be used during the execution of
+ * that function.  Otherwise, it returns NULL.
+ */</comment>
+<function><type><name>char</name> <modifier>*</modifier></type>
+<name>sepgsql_avc_trusted_proc</name><parameter_list>(<parameter><decl><type><name>Oid</name></type> <name>functionId</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>scontext</name> <init>= <expr><call><name>sepgsql_get_client_label</name><argument_list>()</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>tcontext</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>ObjectAddress</name></type> <name>tobject</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>avc_cache</name>  <modifier>*</modifier></type><name>cache</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name><name>tobject</name><operator>.</operator><name>classId</name></name> <operator>=</operator> <name>ProcedureRelationId</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>tobject</name><operator>.</operator><name>objectId</name></name> <operator>=</operator> <name>functionId</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>tobject</name><operator>.</operator><name>objectSubId</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+	<expr_stmt><expr><name>tcontext</name> <operator>=</operator> <call><name>GetSecurityLabel</name><argument_list>(<argument><expr><operator>&amp;</operator><name>tobject</name></expr></argument>, <argument><expr><name>SEPGSQL_LABEL_TAG</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>sepgsql_avc_check_valid</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+	<do>do
+	<block>{<block_content>
+		<if_stmt><if>if <condition>(<expr><name>tcontext</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><name>cache</name> <operator>=</operator> <call><name>sepgsql_avc_lookup</name><argument_list>(<argument><expr><name>scontext</name></expr></argument>, <argument><expr><name>tcontext</name></expr></argument>,
+									   <argument><expr><name>SEPG_CLASS_DB_PROCEDURE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if>
+		<else>else<block type="pseudo"><block_content>
+			<expr_stmt><expr><name>cache</name> <operator>=</operator> <call><name>sepgsql_avc_lookup</name><argument_list>(<argument><expr><name>scontext</name></expr></argument>, <argument><expr><call><name>sepgsql_avc_unlabeled</name><argument_list>()</argument_list></call></expr></argument>,
+									   <argument><expr><name>SEPG_CLASS_DB_PROCEDURE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></else></if_stmt>
+	</block_content>}</block> while <condition>(<expr><operator>!</operator><call><name>sepgsql_avc_check_valid</name><argument_list>()</argument_list></call></expr>)</condition>;</do>
+
+	<return>return <expr><name><name>cache</name><operator>-&gt;</operator><name>ncontext</name></name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * sepgsql_avc_exit
+ *
+ * Clean up userspace AVC on process exit.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>sepgsql_avc_exit</name><parameter_list>(<parameter><decl><type><name>int</name></type> <name>code</name></decl></parameter>, <parameter><decl><type><name>Datum</name></type> <name>arg</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>selinux_status_close</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * sepgsql_avc_init
+ *
+ * Initialize the userspace AVC.  This should be called from _PG_init.
+ */</comment>
+<function><type><name>void</name></type>
+<name>sepgsql_avc_init</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>int</name></type>			<name>rc</name></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * All the avc stuff shall be allocated in avc_mem_cxt
+	 */</comment>
+	<expr_stmt><expr><name>avc_mem_cxt</name> <operator>=</operator> <call><name>AllocSetContextCreate</name><argument_list>(<argument><expr><name>TopMemoryContext</name></expr></argument>,
+										<argument><expr><literal type="string">"userspace access vector cache"</literal></expr></argument>,
+										<argument><expr><name>ALLOCSET_DEFAULT_SIZES</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><name>avc_slots</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>avc_slots</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>avc_num_caches</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+	<expr_stmt><expr><name>avc_lru_hint</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+	<expr_stmt><expr><name>avc_threshold</name> <operator>=</operator> <name>AVC_DEF_THRESHOLD</name></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * SELinux allows to mmap(2) its kernel status page in read-only mode to
+	 * inform userspace applications its status updating (such as policy
+	 * reloading) without system-call invocations. This feature is only
+	 * supported in Linux-2.6.38 or later, however, libselinux provides a
+	 * fallback mode to know its status using netlink sockets.
+	 */</comment>
+	<expr_stmt><expr><name>rc</name> <operator>=</operator> <call><name>selinux_status_open</name><argument_list>(<argument><expr><literal type="number">1</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><name>rc</name> <operator>&lt;</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_INTERNAL_ERROR</name></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"SELinux: could not open selinux status : %m"</literal></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if>
+	<if type="elseif">else if <condition>(<expr><name>rc</name> <operator>&gt;</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>LOG</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"SELinux: kernel status page uses fallback mode"</literal></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<comment type="block">/* Arrange to close selinux status page on process exit. */</comment>
+	<expr_stmt><expr><call><name>on_proc_exit</name><argument_list>(<argument><expr><name>sepgsql_avc_exit</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+</unit>

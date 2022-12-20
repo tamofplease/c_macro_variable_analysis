@@ -1,0 +1,729 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<unit xmlns="http://www.srcML.org/srcML/src" xmlns:cpp="http://www.srcML.org/srcML/cpp" revision="1.0.0" language="C" filename="/cloned_projects/gpdb/src/backend/commands/vacuum_ao.c"><comment type="block">/*-------------------------------------------------------------------------
+ *
+ * vacuum_ao.c
+ *	  VACUUM support for append-only tables.
+ *
+ *
+ * Portions Copyright (c) 2016, VMware, Inc. or its affiliates
+ * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1994, Regents of the University of California
+ *
+ * Overview
+ * --------
+ *
+ * Vacuum of AO and AOCO tables happens in three phases:
+ *
+ * 1. Pre-cleanup phase
+ *
+ *   Truncate any old AWAITING_DROP segments to zero bytes. We would do this in
+ *   the post-cleanup phase, anyway, but reclaiming space as early as possible
+ *   is good. We might need the space to complete the compaction phase.
+ *
+ * 2. Compaction phase
+ *
+ *   Copy tuples from segments to new segmnents, leaving out dead tuples.
+ *
+ * 3. Post-cleanup phase.
+ *
+ *   Truncate any old AWAITING_DROP segments, making them insertable again. If there
+ *   are no other transactions running (TODO: or we're in "aggressive mode" and want
+ *   to risk "snapshot too old" errors), this can truncate the old segments left
+ *   behind in the compaction phase.
+ *
+ *   Vacuum indexes.
+ *
+ *   Vacuum auxiliary heap tables.
+ *
+ * The orchestration of the phases mostly happens in vacuum_rel() (vacuum.c).
+ * This file contains functions implementing the phases.
+ *
+ * The pre-cleanup and post-cleanup phases could run in a local transaction,
+ * but the compaction phase needs a distributed transaction.
+ * Currently, though, we run each phase in a distributed transaction; there's
+ * no harm in that.
+ *
+ * Both lazy and FULL vacuum work the same on AO tables.
+ *
+ *
+ * Why does compaction have to run in a distributed transaction?
+ * ---------------------------------------------------------------------
+ *
+ * To determine the visibility of AO segments, we rely on the auxiliary
+ * pg_aoseg_* heap table. The visiblity of the rows in the pg_aoseg table
+ * determines which segments are visible to a snapshot.
+ *
+ * That works great currently, but if we switch to updating pg_aoseg in a
+ * local transaction, some anomalies become possible. A distributed
+ * transaction might see an inconsistent view of the segments, because one
+ * row version in pg_aoseg is visible according to the distributed snapshot,
+ * while another version of the same row is visible to its local snapshot.
+ *
+ * In fact, you can observe this anomaly even without appendonly tables, if
+ * you modify a heap table in utility mode. Here's an example (as an
+ * isolationtest2 test schedule):
+ *
+ * --------------------
+ * DROP TABLE IF EXISTS utiltest;
+ * CREATE TABLE utiltest (a int, t text);
+ * INSERT INTO utiltest SELECT i as a, 'initial' FROM generate_series(1, 10) AS i;
+ *
+ * create or replace function myfunc() returns setof utiltest as $$ begin perform pg_sleep(10); return query select * from utiltest; end; $$ stable language plpgsql;
+ *
+ * -- Launch one backend to query the table with a delay. It will acquire
+ * -- snapshot first, but scan the table only later. (A serializable snapshot
+ * -- would achieve the same thing.)
+ * 1&amp;: select * from myfunc();
+ *
+ * -- Update normally via QD. The delayed query does not see this update, as
+ * -- it acquire the snapshot before this.
+ * 2: UPDATE utiltest SET t = 'updated' WHERE a &lt;= 3;
+ *
+ * -- Update again in utility mode. Does the delayed query see this or not?
+ * 0U: UPDATE utiltest  SET t = 'updated in utility mode' WHERE a &lt;= 5;
+ *
+ * -- Get the delayed query's results. It returns 12 rows. It sees the
+ * -- initial version of each row, but it *also* sees the new tuple
+ * -- versions of the utility-mode update. The utility-updated rows have
+ * -- an xmin that's visible to the local snapshot that the delayed query.
+ * 1&lt;:
+ * --------------------
+ *
+ * In summary, this test case creates a table with 10 rows, and updates
+ * some rows twice. One of the updates is made in utility mode. No rows are
+ * deleted or inserted after the initial load, so any query on the table
+ * should see 10 rows. But the query that's performed in the function sees
+ * 12 rows. It sees two versions of the rows that were updated twice.
+ *
+ * This is clearly not ideal, but we can perhaps shrug it off as "don't do
+ * that". If you update rows in utility mode, weird things can happen. But
+ * it poses a problem for the idea of using local transactions for AO
+ * vacuum. We can't let that anomaly to happen as a result of a normal VACUUM!
+ *
+ *
+ * XXX: How does index vacuum work? We never reuse TIDs, right? So we can
+ * vacuum indexes independently of dropping segments.
+ *
+ * XXX: We could relax the requirement for AccessExclusiveLock in Vacuum drop
+ * phase with a little more effort. Scan could grab a share lock on the segfile
+ * it's about to scan.
+ *
+ * IDENTIFICATION
+ *	  src/backend/commands/vacuum_ao.c
+ *
+ *-------------------------------------------------------------------------
+ */</comment>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"postgres.h"</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/table.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/aocs_compaction.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/appendonlywriter.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/appendonly_compaction.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/genam.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/multixact.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/visibilitymap.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/xact.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/pg_appendonly.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"cdb/cdbappendonlyam.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"cdb/cdbtm.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"cdb/cdbvars.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"commands/vacuum.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"pgstat.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"postmaster/autovacuum.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/freespace.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/proc.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/procarray.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"miscadmin.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"nodes/makefuncs.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/faultinjector.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/guc.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/rel.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/relcache.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/lsyscache.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/pg_rusage.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"cdb/cdbappendonlyblockdirectory.h"</cpp:file></cpp:include>
+
+
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>vacuum_appendonly_index</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>indexRelation</name></decl></parameter>,
+									<parameter><decl><type><name>Relation</name></type> <name>aoRelation</name></decl></parameter>,
+									<parameter><decl><type><name>Bitmapset</name> <modifier>*</modifier></type><name>dead_segs</name></decl></parameter>,
+									<parameter><decl><type><name>int</name></type> <name>elevel</name></decl></parameter>,
+									<parameter><decl><type><name>BufferAccessStrategy</name></type> <name>bstrategy</name></decl></parameter>)</parameter_list>;</function_decl>
+
+<function_decl><type><specifier>static</specifier> <name>bool</name></type> <name>appendonly_tid_reaped</name><parameter_list>(<parameter><decl><type><name>ItemPointer</name></type> <name>itemptr</name></decl></parameter>, <parameter><decl><type><name>void</name> <modifier>*</modifier></type><name>state</name></decl></parameter>)</parameter_list>;</function_decl>
+
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>vacuum_appendonly_fill_stats</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>aorel</name></decl></parameter>, <parameter><decl><type><name>Snapshot</name></type> <name>snapshot</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>elevel</name></decl></parameter>,
+										 <parameter><decl><type><name>BlockNumber</name> <modifier>*</modifier></type><name>rel_pages</name></decl></parameter>, <parameter><decl><type><name>double</name> <modifier>*</modifier></type><name>rel_tuples</name></decl></parameter>,
+										 <parameter><decl><type><name>bool</name> <modifier>*</modifier></type><name>relhasindex</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>int</name></type> <name>vacuum_appendonly_indexes</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>aoRelation</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>options</name></decl></parameter>, <parameter><decl><type><name>Bitmapset</name> <modifier>*</modifier></type><name>dead_segs</name></decl></parameter>,
+									 <parameter><decl><type><name>BufferAccessStrategy</name></type> <name>bstrategy</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>ao_vacuum_rel_recycle_dead_segments</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>onerel</name></decl></parameter>, <parameter><decl><type><name>VacuumParams</name> <modifier>*</modifier></type><name>params</name></decl></parameter>,
+												<parameter><decl><type><name>BufferAccessStrategy</name></type> <name>bstrategy</name></decl></parameter>)</parameter_list>;</function_decl>
+
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>ao_vacuum_rel_pre_cleanup</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>onerel</name></decl></parameter>, <parameter><decl><type><name>VacuumParams</name> <modifier>*</modifier></type><name>params</name></decl></parameter>, <parameter><decl><type><name>BufferAccessStrategy</name></type> <name>bstrategy</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>relname</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>elevel</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>options</name> <init>= <expr><name><name>params</name><operator>-&gt;</operator><name>options</name></name></expr></init></decl>;</decl_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>options</name> <operator>&amp;</operator> <name>VACOPT_VERBOSE</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name>elevel</name> <operator>=</operator> <name>INFO</name></expr>;</expr_stmt></block_content></block></if>
+	<else>else<block type="pseudo"><block_content>
+		<expr_stmt><expr><name>elevel</name> <operator>=</operator> <name>DEBUG2</name></expr>;</expr_stmt></block_content></block></else></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>Gp_role</name> <operator>==</operator> <name>GP_ROLE_DISPATCH</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name>elevel</name> <operator>=</operator> <name>DEBUG2</name></expr>;</expr_stmt></block_content></block></if></if_stmt> <comment type="block">/* vacuum and analyze messages aren't interesting from the QD */</comment>
+
+	<expr_stmt><expr><name>relname</name> <operator>=</operator> <call><name>RelationGetRelationName</name><argument_list>(<argument><expr><name>onerel</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>elevel</name></expr></argument>,
+			<argument><expr><operator>(</operator><call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"vacuuming \"%s.%s\""</literal></expr></argument>,
+					<argument><expr><call><name>get_namespace_name</name><argument_list>(<argument><expr><call><name>RelationGetNamespace</name><argument_list>(<argument><expr><name>onerel</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr></argument>,
+					<argument><expr><name>relname</name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* 
+	 * Recycle AWAITING_DROP segments that are no longer visible to anyone.
+	 *
+	 * This is optional. We'll drop old AWAITING_DROP segments in the
+	 * post-cleanup phase, too, but doing this first helps to reclaim some
+	 * space earlier. The compaction phase might need the space.
+	 *
+	 * This could run in a local transaction.
+	 */</comment>
+	<expr_stmt><expr><call><name>ao_vacuum_rel_recycle_dead_segments</name><argument_list>(<argument><expr><name>onerel</name></expr></argument>, <argument><expr><name>params</name></expr></argument>, <argument><expr><name>bstrategy</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Also truncate all live segments to the EOF values stored in pg_aoseg.
+	 * This releases space left behind by aborted inserts.
+	 */</comment>
+	<expr_stmt><expr><call><name>AppendOptimizedTruncateToEOF</name><argument_list>(<argument><expr><name>onerel</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>ao_vacuum_rel_post_cleanup</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>onerel</name></decl></parameter>, <parameter><decl><type><name>VacuumParams</name> <modifier>*</modifier></type><name>params</name></decl></parameter>, <parameter><decl><type><name>BufferAccessStrategy</name></type> <name>bstrategy</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>BlockNumber</name></type>	<name>relpages</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>double</name></type>		<name>reltuples</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type>		<name>relhasindex</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>elevel</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>options</name> <init>= <expr><name><name>params</name><operator>-&gt;</operator><name>options</name></name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>TransactionId</name></type> <name>OldestXmin</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>TransactionId</name></type> <name>FreezeLimit</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>MultiXactId</name></type> <name>MultiXactCutoff</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>TransactionId</name></type> <name>xidFullScanLimit</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>MultiXactId</name></type> <name>mxactFullScanLimit</name></decl>;</decl_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>options</name> <operator>&amp;</operator> <name>VACOPT_VERBOSE</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name>elevel</name> <operator>=</operator> <name>INFO</name></expr>;</expr_stmt></block_content></block></if>
+	<else>else<block type="pseudo"><block_content>
+		<expr_stmt><expr><name>elevel</name> <operator>=</operator> <name>DEBUG2</name></expr>;</expr_stmt></block_content></block></else></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>Gp_role</name> <operator>==</operator> <name>GP_ROLE_DISPATCH</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name>elevel</name> <operator>=</operator> <name>DEBUG2</name></expr>;</expr_stmt></block_content></block></if></if_stmt> <comment type="block">/* vacuum and analyze messages aren't interesting from the QD */</comment>
+
+	<comment type="block">/*
+	 * This could run in a *local* transaction:
+	 *
+	 * 1. Recycled any dead AWAITING_DROP segments, like in the
+	 *    pre-cleanup phase.
+	 *
+	 * 2. Vacuum indexes.
+	 * 
+	 * 3. Drop/Truncate dead segments.
+	 * 
+	 * 4. Update statistics.
+	 */</comment>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>RelationIsAoRows</name><argument_list>(<argument><expr><name>onerel</name></expr></argument>)</argument_list></call> <operator>||</operator> <call><name>RelationIsAoCols</name><argument_list>(<argument><expr><name>onerel</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>ao_vacuum_rel_recycle_dead_segments</name><argument_list>(<argument><expr><name>onerel</name></expr></argument>, <argument><expr><name>params</name></expr></argument>, <argument><expr><name>bstrategy</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Update statistics in pg_class */</comment>
+	<expr_stmt><expr><call><name>vacuum_appendonly_fill_stats</name><argument_list>(<argument><expr><name>onerel</name></expr></argument>, <argument><expr><call><name>GetActiveSnapshot</name><argument_list>()</argument_list></call></expr></argument>,
+								 <argument><expr><name>elevel</name></expr></argument>,
+								 <argument><expr><operator>&amp;</operator><name>relpages</name></expr></argument>,
+								 <argument><expr><operator>&amp;</operator><name>reltuples</name></expr></argument>,
+								 <argument><expr><operator>&amp;</operator><name>relhasindex</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>vacuum_set_xid_limits</name><argument_list>(<argument><expr><name>onerel</name></expr></argument>,
+						  <argument><expr><name><name>params</name><operator>-&gt;</operator><name>freeze_min_age</name></name></expr></argument>,
+						  <argument><expr><name><name>params</name><operator>-&gt;</operator><name>freeze_table_age</name></name></expr></argument>,
+						  <argument><expr><name><name>params</name><operator>-&gt;</operator><name>multixact_freeze_min_age</name></name></expr></argument>,
+						  <argument><expr><name><name>params</name><operator>-&gt;</operator><name>multixact_freeze_table_age</name></name></expr></argument>,
+						  <argument><expr><operator>&amp;</operator><name>OldestXmin</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>FreezeLimit</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>xidFullScanLimit</name></expr></argument>,
+						  <argument><expr><operator>&amp;</operator><name>MultiXactCutoff</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>mxactFullScanLimit</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>vac_update_relstats</name><argument_list>(<argument><expr><name>onerel</name></expr></argument>,
+						<argument><expr><name>relpages</name></expr></argument>,
+						<argument><expr><name>reltuples</name></expr></argument>,
+						<argument><expr><literal type="number">0</literal></expr></argument>, <comment type="block">/* AO does not currently have an equivalent to
+							  Heap's 'all visible pages' */</comment>
+						<argument><expr><name>relhasindex</name></expr></argument>,
+						<argument><expr><name>FreezeLimit</name></expr></argument>,
+						<argument><expr><name>MultiXactCutoff</name></expr></argument>,
+						<argument><expr><name>false</name></expr></argument>,
+						<argument><expr><name>true</name></expr></argument> <comment type="block">/* isvacuum */</comment>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>ao_vacuum_rel_compact</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>onerel</name></decl></parameter>, <parameter><decl><type><name>VacuumParams</name> <modifier>*</modifier></type><name>params</name></decl></parameter>, <parameter><decl><type><name>BufferAccessStrategy</name></type> <name>bstrategy</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>int</name></type>			<name>compaction_segno</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>insert_segno</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>List</name>	   <modifier>*</modifier></type><name>compacted_segments</name> <init>= <expr><name>NIL</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>List</name>	   <modifier>*</modifier></type><name>compacted_and_inserted_segments</name> <init>= <expr><name>NIL</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>relname</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>elevel</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>options</name> <init>= <expr><name><name>params</name><operator>-&gt;</operator><name>options</name></name></expr></init></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * This should run in a distributed transaction. But also allow utility
+	 * mode. This also runs in the QD, but it should have no work to do because
+	 * all data resides on QEs nodes.
+	 */</comment>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>Gp_role</name> <operator>==</operator> <name>GP_ROLE_DISPATCH</name> <operator>||</operator>
+		   <name>Gp_role</name> <operator>==</operator> <name>GP_ROLE_UTILITY</name> <operator>||</operator>
+		   <name>DistributedTransactionContext</name> <operator>==</operator> <name>DTX_CONTEXT_QE_TWO_PHASE_IMPLICIT_WRITER</name> <operator>||</operator>
+		   <name>DistributedTransactionContext</name> <operator>==</operator> <name>DTX_CONTEXT_QE_TWO_PHASE_EXPLICIT_WRITER</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>RelationIsAoRows</name><argument_list>(<argument><expr><name>onerel</name></expr></argument>)</argument_list></call> <operator>||</operator> <call><name>RelationIsAoCols</name><argument_list>(<argument><expr><name>onerel</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>options</name> <operator>&amp;</operator> <name>VACOPT_VERBOSE</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name>elevel</name> <operator>=</operator> <name>INFO</name></expr>;</expr_stmt></block_content></block></if>
+	<else>else<block type="pseudo"><block_content>
+		<expr_stmt><expr><name>elevel</name> <operator>=</operator> <name>DEBUG2</name></expr>;</expr_stmt></block_content></block></else></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>Gp_role</name> <operator>==</operator> <name>GP_ROLE_DISPATCH</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name>elevel</name> <operator>=</operator> <name>DEBUG2</name></expr>;</expr_stmt></block_content></block></if></if_stmt> <comment type="block">/* vacuum and analyze messages aren't interesting from the QD */</comment>
+
+	<expr_stmt><expr><name>relname</name> <operator>=</operator> <call><name>RelationGetRelationName</name><argument_list>(<argument><expr><name>onerel</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>elevel</name></expr></argument>,
+			<argument><expr><operator>(</operator><call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"compacting \"%s.%s\""</literal></expr></argument>,
+					<argument><expr><call><name>get_namespace_name</name><argument_list>(<argument><expr><call><name>RelationGetNamespace</name><argument_list>(<argument><expr><name>onerel</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr></argument>,
+					<argument><expr><name>relname</name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Compact all the segfiles. Repeat as many times as required.
+	 *
+	 * XXX: Because we compact all segfiles in one transaction, this can
+	 * require up 2x the disk space. Alternatively, we could split this into
+	 * multiple transactions. The problem with that is that the updates to
+	 * pg_aoseg needs to happen in a distributed transaction (Problem 3), so
+	 * we would need to coordinate the transactions from the QD.
+	 */</comment>
+	<expr_stmt><expr><name>insert_segno</name> <operator>=</operator> <operator>-</operator><literal type="number">1</literal></expr>;</expr_stmt>
+	<while>while <condition>(<expr><operator>(</operator><name>compaction_segno</name> <operator>=</operator> <call><name>ChooseSegnoForCompaction</name><argument_list>(<argument><expr><name>onerel</name></expr></argument>, <argument><expr><name>compacted_and_inserted_segments</name></expr></argument>)</argument_list></call><operator>)</operator> <operator>!=</operator> <operator>-</operator><literal type="number">1</literal></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/*
+		 * Compact this segment. (If the segment doesn't need compaction,
+		 * AppendOnlyCompact() will fall through quickly).
+		 */</comment>
+		<expr_stmt><expr><name>compacted_segments</name> <operator>=</operator> <call><name>lappend_int</name><argument_list>(<argument><expr><name>compacted_segments</name></expr></argument>, <argument><expr><name>compaction_segno</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name>compacted_and_inserted_segments</name> <operator>=</operator> <call><name>lappend_int</name><argument_list>(<argument><expr><name>compacted_and_inserted_segments</name></expr></argument>,
+													  <argument><expr><name>compaction_segno</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/* XXX: maybe print this deeper, only if there's work to be done? */</comment>
+		<if_stmt><if>if <condition>(<expr><name>Debug_appendonly_print_compaction</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>LOG</name></expr></argument>, <argument><expr><literal type="string">"compacting segno %d of %s"</literal></expr></argument>, <argument><expr><name>compaction_segno</name></expr></argument>, <argument><expr><name>relname</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+		<if_stmt><if>if <condition>(<expr><call><name>RelationIsAoRows</name><argument_list>(<argument><expr><name>onerel</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>AppendOnlyCompact</name><argument_list>(<argument><expr><name>onerel</name></expr></argument>,
+							  <argument><expr><name>compaction_segno</name></expr></argument>,
+							  <argument><expr><operator>&amp;</operator><name>insert_segno</name></expr></argument>,
+							  <argument><expr><operator>(</operator><name>options</name> <operator>&amp;</operator> <name>VACOPT_FULL</name><operator>)</operator> <operator>!=</operator> <literal type="number">0</literal></expr></argument>,
+							  <argument><expr><name>compacted_segments</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if>
+		<else>else
+		<block>{<block_content>
+			<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>RelationIsAoCols</name><argument_list>(<argument><expr><name>onerel</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>AOCSCompact</name><argument_list>(<argument><expr><name>onerel</name></expr></argument>,
+						<argument><expr><name>compaction_segno</name></expr></argument>,
+						<argument><expr><operator>&amp;</operator><name>insert_segno</name></expr></argument>,
+						<argument><expr><operator>(</operator><name>options</name> <operator>&amp;</operator> <name>VACOPT_FULL</name><operator>)</operator> <operator>!=</operator> <literal type="number">0</literal></expr></argument>,
+						<argument><expr><name>compacted_segments</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></else></if_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name>insert_segno</name> <operator>!=</operator> <operator>-</operator><literal type="number">1</literal></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><name>compacted_and_inserted_segments</name> <operator>=</operator> <call><name>list_append_unique_int</name><argument_list>(<argument><expr><name>compacted_and_inserted_segments</name></expr></argument>,
+																	 <argument><expr><name>insert_segno</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+		<comment type="block">/*
+		 * AppendOnlyCompact() updates pg_aoseg. Increment the command counter, so
+		 * that we can update the insertion target pg_aoseg row again.
+		 */</comment>
+		<expr_stmt><expr><call><name>CommandCounterIncrement</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></while>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * ao_vacuum_rel()
+ *
+ * Common interface for vacuuming Append-Optimized table.
+ */</comment>
+<function><type><name>void</name></type>
+<name>ao_vacuum_rel</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>rel</name></decl></parameter>, <parameter><decl><type><name>VacuumParams</name> <modifier>*</modifier></type><name>params</name></decl></parameter>, <parameter><decl><type><name>BufferAccessStrategy</name></type> <name>bstrategy</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>RelationIsAppendOptimized</name><argument_list>(<argument><expr><name>rel</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>params</name> <operator>!=</operator> <name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<decl_stmt><decl><type><name>int</name></type> <name>ao_vacuum_phase</name> <init>= <expr><operator>(</operator><name><name>params</name><operator>-&gt;</operator><name>options</name></name> <operator>&amp;</operator> <name>VACUUM_AO_PHASE_MASK</name><operator>)</operator></expr></init></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * Do the actual work --- either FULL or "lazy" vacuum
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name>ao_vacuum_phase</name> <operator>==</operator> <name>VACOPT_AO_PRE_CLEANUP_PHASE</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ao_vacuum_rel_pre_cleanup</name><argument_list>(<argument><expr><name>rel</name></expr></argument>, <argument><expr><name>params</name></expr></argument>, <argument><expr><name>bstrategy</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if>
+	<if type="elseif">else if <condition>(<expr><name>ao_vacuum_phase</name> <operator>==</operator> <name>VACOPT_AO_COMPACT_PHASE</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ao_vacuum_rel_compact</name><argument_list>(<argument><expr><name>rel</name></expr></argument>, <argument><expr><name>params</name></expr></argument>, <argument><expr><name>bstrategy</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if>
+	<if type="elseif">else if <condition>(<expr><name>ao_vacuum_phase</name> <operator>==</operator> <name>VACOPT_AO_POST_CLEANUP_PHASE</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ao_vacuum_rel_post_cleanup</name><argument_list>(<argument><expr><name>rel</name></expr></argument>, <argument><expr><name>params</name></expr></argument>, <argument><expr><name>bstrategy</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if>
+	<else>else<block type="pseudo"><block_content>
+		<comment type="block">/* Do nothing here, we will launch the stages later */</comment>
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>ao_vacuum_phase</name> <operator>==</operator> <literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></else></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Recycling AWAITING_DROP segments.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>ao_vacuum_rel_recycle_dead_segments</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>onerel</name></decl></parameter>, <parameter><decl><type><name>VacuumParams</name> <modifier>*</modifier></type><name>params</name></decl></parameter>, <parameter><decl><type><name>BufferAccessStrategy</name></type> <name>bstrategy</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>Bitmapset</name>	<modifier>*</modifier></type><name>dead_segs</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>options</name> <init>= <expr><name><name>params</name><operator>-&gt;</operator><name>options</name></name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type>		<name>need_drop</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name>dead_segs</name> <operator>=</operator> <call><name>AppendOptimizedCollectDeadSegments</name><argument_list>(<argument><expr><name>onerel</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>need_drop</name> <operator>=</operator> <operator>!</operator><call><name>bms_is_empty</name><argument_list>(<argument><expr><name>dead_segs</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><name>need_drop</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/*
+		 * Vacuum indexes only when we do find AWAITING_DROP segments.
+		 *
+		 * Do index vacuuming before dropping dead segments for data
+		 * consistency and crash safety. If dropping dead segments before
+		 * cleaning up index tuples, the following issues may occur:
+		 * 
+		 * a) The dead segment file becomes available as soon as dropping
+		 * complete. Concurrent inserts may fill it with new tuples hence
+		 * might be deleted soon in the following index vacuuming;
+		 * 
+		 * b) Crash happens in-between ao_vacuum_rel_recycle_dead_segments()
+		 * and vacuum_appendonly_indexes() result in losing the opportunity
+		 * to clean index entries fully as a state for which index tuples
+		 * to delete will be lost in this case.
+		 * 
+		 * So make sure to vacuum indexs to be based on persistent information
+		 * (AWAITING_DROP state in pg_aoseg) to cleanup dead index tuples
+		 * effectively.
+		 */</comment>
+		<expr_stmt><expr><call><name>vacuum_appendonly_indexes</name><argument_list>(<argument><expr><name>onerel</name></expr></argument>, <argument><expr><name>options</name></expr></argument>, <argument><expr><name>dead_segs</name></expr></argument>, <argument><expr><name>bstrategy</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<comment type="block">/*
+		 * Truncate above collected AWAITING_DROP segments to 0 byte.
+		 * AppendOptimizedCollectDeadSegments() should guarantee that
+		 * no transaction is able to access the dead segments for being
+		 * marked as AWAITING_DROP as well as cutoff xid screening.
+		 * ExclusiveLock will be held in case of concurrent VACUUM being
+		 * on the same file.
+		 */</comment>
+		<expr_stmt><expr><call><name>AppendOptimizedDropDeadSegments</name><argument_list>(<argument><expr><name>onerel</name></expr></argument>, <argument><expr><name>dead_segs</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<else>else
+	<block>{<block_content>
+		<comment type="block">/*
+		 * If no AWAITING_DROP segments were found, we called
+		 * vacuum_appendonly_indexes() in post_cleanup phase
+		 * for updating statistics.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><operator>(</operator><name>options</name> <operator>&amp;</operator> <name>VACUUM_AO_PHASE_MASK</name><operator>)</operator> <operator>==</operator> <name>VACOPT_AO_POST_CLEANUP_PHASE</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>vacuum_appendonly_indexes</name><argument_list>(<argument><expr><name>onerel</name></expr></argument>, <argument><expr><name>options</name></expr></argument>, <argument><expr><name>dead_segs</name></expr></argument>, <argument><expr><name>bstrategy</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	</block_content>}</block></else></if_stmt>
+
+	<expr_stmt><expr><call><name>bms_free</name><argument_list>(<argument><expr><name>dead_segs</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * vacuum_appendonly_indexes()
+ *
+ * Perform a vacuum on all indexes of an append-only relation.
+ *
+ * It returns the number of indexes on the relation.
+ */</comment>
+<function><type><specifier>static</specifier> <name>int</name></type>
+<name>vacuum_appendonly_indexes</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>aoRelation</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>options</name></decl></parameter>, <parameter><decl><type><name>Bitmapset</name> <modifier>*</modifier></type><name>dead_segs</name></decl></parameter>,
+						  <parameter><decl><type><name>BufferAccessStrategy</name></type> <name>bstrategy</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>int</name></type>			<name>i</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Relation</name>   <modifier>*</modifier></type><name>Irel</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>nindexes</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>RelationIsAppendOptimized</name><argument_list>(<argument><expr><name>aoRelation</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>Debug_appendonly_print_compaction</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>LOG</name></expr></argument>, <argument><expr><literal type="string">"Vacuum indexes for append-only relation %s"</literal></expr></argument>,
+			 <argument><expr><call><name>RelationGetRelationName</name><argument_list>(<argument><expr><name>aoRelation</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<comment type="block">/* Now open all indexes of the relation */</comment>
+	<if_stmt><if>if <condition>(<expr><operator>(</operator><name>options</name> <operator>&amp;</operator> <name>VACOPT_FULL</name><operator>)</operator></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>vac_open_indexes</name><argument_list>(<argument><expr><name>aoRelation</name></expr></argument>, <argument><expr><name>AccessExclusiveLock</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>nindexes</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>Irel</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if>
+	<else>else<block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>vac_open_indexes</name><argument_list>(<argument><expr><name>aoRelation</name></expr></argument>, <argument><expr><name>RowExclusiveLock</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>nindexes</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>Irel</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></else></if_stmt>
+
+	<comment type="block">/* Clean/scan index relation(s) */</comment>
+	<if_stmt><if>if <condition>(<expr><name>Irel</name> <operator>!=</operator> <name>NULL</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>int</name></type> <name>elevel</name></decl>;</decl_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name>options</name> <operator>&amp;</operator> <name>VACOPT_VERBOSE</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><name>elevel</name> <operator>=</operator> <name>INFO</name></expr>;</expr_stmt></block_content></block></if>
+		<else>else<block type="pseudo"><block_content>
+			<expr_stmt><expr><name>elevel</name> <operator>=</operator> <name>DEBUG2</name></expr>;</expr_stmt></block_content></block></else></if_stmt>
+
+		<comment type="block">/* just scan indexes to update statistic */</comment>
+		<if_stmt><if>if <condition>(<expr><name>Gp_role</name> <operator>==</operator> <name>GP_ROLE_DISPATCH</name> <operator>||</operator> <call><name>bms_is_empty</name><argument_list>(<argument><expr><name>dead_segs</name></expr></argument>)</argument_list></call></expr>)</condition>
+		<block>{<block_content>
+			<for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name>nindexes</name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control>
+			<block>{<block_content>
+				<expr_stmt><expr><call><name>scan_index</name><argument_list>(<argument><expr><name><name>Irel</name><index>[<expr><name>i</name></expr>]</index></name></expr></argument>,
+						   <argument><expr><name>aoRelation</name></expr></argument>,
+						   <argument><expr><name>elevel</name></expr></argument>,
+						   <argument><expr><name>bstrategy</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			</block_content>}</block></for>
+		</block_content>}</block></if>
+		<else>else
+		<block>{<block_content>
+			<for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name>nindexes</name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control>
+			<block>{<block_content>
+				<expr_stmt><expr><call><name>vacuum_appendonly_index</name><argument_list>(<argument><expr><name><name>Irel</name><index>[<expr><name>i</name></expr>]</index></name></expr></argument>,
+										<argument><expr><name>aoRelation</name></expr></argument>,
+										<argument><expr><name>dead_segs</name></expr></argument>,
+										<argument><expr><name>elevel</name></expr></argument>,
+										<argument><expr><name>bstrategy</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			</block_content>}</block></for>
+		</block_content>}</block></else></if_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>vac_close_indexes</name><argument_list>(<argument><expr><name>nindexes</name></expr></argument>, <argument><expr><name>Irel</name></expr></argument>, <argument><expr><name>NoLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<return>return <expr><name>nindexes</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Vacuums an index on an append-only table.
+ *
+ * This is called after an append-only segment file compaction to move
+ * all tuples from the compacted segment files.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>vacuum_appendonly_index</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>indexRelation</name></decl></parameter>,
+						<parameter><decl><type><name>Relation</name></type> <name>aoRelation</name></decl></parameter>,
+						<parameter><decl><type><name>Bitmapset</name> <modifier>*</modifier></type><name>dead_segs</name></decl></parameter>,
+						<parameter><decl><type><name>int</name></type> <name>elevel</name></decl></parameter>,
+						<parameter><decl><type><name>BufferAccessStrategy</name></type> <name>bstrategy</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>IndexBulkDeleteResult</name> <modifier>*</modifier></type><name>stats</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>IndexVacuumInfo</name></type> <name>ivinfo</name> <init>= <expr><block>{<expr><literal type="number">0</literal></expr>}</block></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>PGRUsage</name></type>	<name>ru0</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>RelationIsValid</name><argument_list>(<argument><expr><name>indexRelation</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>pg_rusage_init</name><argument_list>(<argument><expr><operator>&amp;</operator><name>ru0</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name><name>ivinfo</name><operator>.</operator><name>index</name></name> <operator>=</operator> <name>indexRelation</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>ivinfo</name><operator>.</operator><name>analyze_only</name></name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>ivinfo</name><operator>.</operator><name>message_level</name></name> <operator>=</operator> <name>elevel</name></expr>;</expr_stmt>
+	<comment type="block">/* 
+	 * We can only provide the AO rel's reltuples as an estimate
+	 * (similar to heapam. See: lazy_vacuum_index()).
+	 */</comment>
+	<expr_stmt><expr><name><name>ivinfo</name><operator>.</operator><name>num_heap_tuples</name></name> <operator>=</operator> <name><name>aoRelation</name><operator>-&gt;</operator><name>rd_rel</name><operator>-&gt;</operator><name>reltuples</name></name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>ivinfo</name><operator>.</operator><name>estimated_count</name></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>ivinfo</name><operator>.</operator><name>strategy</name></name> <operator>=</operator> <name>bstrategy</name></expr>;</expr_stmt>
+
+	<comment type="block">/* Do bulk deletion */</comment>
+	<expr_stmt><expr><name>stats</name> <operator>=</operator> <call><name>index_bulk_delete</name><argument_list>(<argument><expr><operator>&amp;</operator><name>ivinfo</name></expr></argument>, <argument><expr><name>NULL</name></expr></argument>, <argument><expr><name>appendonly_tid_reaped</name></expr></argument>,
+							  <argument><expr><operator>(</operator><name>void</name> <operator>*</operator><operator>)</operator> <name>dead_segs</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>SIMPLE_FAULT_INJECTOR</name><argument_list>(<argument><expr><literal type="string">"vacuum_ao_after_index_delete"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Do post-VACUUM cleanup */</comment>
+	<expr_stmt><expr><name>stats</name> <operator>=</operator> <call><name>index_vacuum_cleanup</name><argument_list>(<argument><expr><operator>&amp;</operator><name>ivinfo</name></expr></argument>, <argument><expr><name>stats</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><name>stats</name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return;</return></block_content></block></if></if_stmt>
+
+	<comment type="block">/*
+	 * Now update statistics in pg_class, but only if the index says the count
+	 * is accurate.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><name><name>stats</name><operator>-&gt;</operator><name>estimated_count</name></name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>vac_update_relstats</name><argument_list>(<argument><expr><name>indexRelation</name></expr></argument>,
+							<argument><expr><name><name>stats</name><operator>-&gt;</operator><name>num_pages</name></name></expr></argument>, <argument><expr><name><name>stats</name><operator>-&gt;</operator><name>num_index_tuples</name></name></expr></argument>,
+							<argument><expr><literal type="number">0</literal></expr></argument>, <comment type="block">/* relallvisible */</comment>
+							<argument><expr><name>false</name></expr></argument>,
+							<argument><expr><name>InvalidTransactionId</name></expr></argument>,
+							<argument><expr><name>InvalidMultiXactId</name></expr></argument>,
+							<argument><expr><name>false</name></expr></argument>,
+							<argument><expr><name>true</name></expr></argument> <comment type="block">/* isvacuum */</comment>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>elevel</name></expr></argument>,
+			<argument><expr><operator>(</operator><call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"index \"%s\" now contains %.0f row versions in %u pages"</literal></expr></argument>,
+					<argument><expr><call><name>RelationGetRelationName</name><argument_list>(<argument><expr><name>indexRelation</name></expr></argument>)</argument_list></call></expr></argument>,
+					<argument><expr><name><name>stats</name><operator>-&gt;</operator><name>num_index_tuples</name></name></expr></argument>,
+					<argument><expr><name><name>stats</name><operator>-&gt;</operator><name>num_pages</name></name></expr></argument>)</argument_list></call><operator>,</operator>
+			 <call><name>errdetail</name><argument_list>(<argument><expr><literal type="string">"%.0f index row versions were removed.\n"</literal>
+			 <literal type="string">"%u index pages have been deleted, %u are currently reusable.\n"</literal>
+					   <literal type="string">"%s."</literal></expr></argument>,
+					   <argument><expr><name><name>stats</name><operator>-&gt;</operator><name>tuples_removed</name></name></expr></argument>,
+					   <argument><expr><name><name>stats</name><operator>-&gt;</operator><name>pages_deleted</name></name></expr></argument>, <argument><expr><name><name>stats</name><operator>-&gt;</operator><name>pages_free</name></name></expr></argument>,
+					   <argument><expr><call><name>pg_rusage_show</name><argument_list>(<argument><expr><operator>&amp;</operator><name>ru0</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>pfree</name><argument_list>(<argument><expr><name>stats</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * appendonly_tid_reaped()
+ *
+ * Is a particular tid for an appendonly reaped? the inputed state
+ * is a bitmap of dropped segno. The index entry is reaped only
+ * because of the segment no is a member of dead_segs. In this
+ * way, no need to scan visibility map so the performance would be
+ * good.
+ *
+ * This has the right signature to be an IndexBulkDeleteCallback.
+ */</comment>
+<function><type><specifier>static</specifier> <name>bool</name></type>
+<name>appendonly_tid_reaped</name><parameter_list>(<parameter><decl><type><name>ItemPointer</name></type> <name>itemptr</name></decl></parameter>, <parameter><decl><type><name>void</name> <modifier>*</modifier></type><name>state</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>Bitmapset</name> <modifier>*</modifier></type><name>dead_segs</name> <init>= <expr><operator>(</operator><name>Bitmapset</name> <operator>*</operator><operator>)</operator> <name>state</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type> <name>segno</name> <init>= <expr><call><name>AOTupleIdGet_segmentFileNum</name><argument_list>(<argument><expr><operator>(</operator><name>AOTupleId</name> <operator>*</operator><operator>)</operator><name>itemptr</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<return>return <expr><call><name>bms_is_member</name><argument_list>(<argument><expr><name>segno</name></expr></argument>, <argument><expr><name>dead_segs</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Fills in the relation statistics for an append-only relation.
+ *
+ *	This information is used to update the reltuples and relpages information
+ *	in pg_class. reltuples is the same as "pg_aoseg_&lt;oid&gt;:tupcount"
+ *	column and we simulate relpages by subdividing the eof value
+ *	("pg_aoseg_&lt;oid&gt;:eof") over the defined page size.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>vacuum_appendonly_fill_stats</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>aorel</name></decl></parameter>, <parameter><decl><type><name>Snapshot</name></type> <name>snapshot</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>elevel</name></decl></parameter>,
+							 <parameter><decl><type><name>BlockNumber</name> <modifier>*</modifier></type><name>rel_pages</name></decl></parameter>, <parameter><decl><type><name>double</name> <modifier>*</modifier></type><name>rel_tuples</name></decl></parameter>,
+							 <parameter><decl><type><name>bool</name> <modifier>*</modifier></type><name>relhasindex</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>FileSegTotals</name> <modifier>*</modifier></type><name>fstotal</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>BlockNumber</name></type> <name>nblocks</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>relname</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>double</name></type>		<name>num_tuples</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int64</name></type>       <name>hidden_tupcount</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>AppendOnlyVisimap</name></type> <name>visimap</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Oid</name></type>			<name>visimaprelid</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Oid</name></type>			<name>visimapidxid</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>RelationIsAoRows</name><argument_list>(<argument><expr><name>aorel</name></expr></argument>)</argument_list></call> <operator>||</operator> <call><name>RelationIsAoCols</name><argument_list>(<argument><expr><name>aorel</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>relname</name> <operator>=</operator> <call><name>RelationGetRelationName</name><argument_list>(<argument><expr><name>aorel</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* get updated statistics from the pg_aoseg table */</comment>
+	<if_stmt><if>if <condition>(<expr><call><name>RelationIsAoRows</name><argument_list>(<argument><expr><name>aorel</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name>fstotal</name> <operator>=</operator> <call><name>GetSegFilesTotals</name><argument_list>(<argument><expr><name>aorel</name></expr></argument>, <argument><expr><name>snapshot</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<else>else
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>RelationIsAoCols</name><argument_list>(<argument><expr><name>aorel</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name>fstotal</name> <operator>=</operator> <call><name>GetAOCSSSegFilesTotals</name><argument_list>(<argument><expr><name>aorel</name></expr></argument>, <argument><expr><name>snapshot</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></else></if_stmt>
+
+	<comment type="block">/* calculate the values we care about */</comment>
+	<expr_stmt><expr><name>num_tuples</name> <operator>=</operator> <operator>(</operator><name>double</name><operator>)</operator><name><name>fstotal</name><operator>-&gt;</operator><name>totaltuples</name></name></expr>;</expr_stmt>
+	<expr_stmt><expr><name>nblocks</name> <operator>=</operator> <operator>(</operator><name>uint32</name><operator>)</operator><call><name>RelationGetNumberOfBlocks</name><argument_list>(<argument><expr><name>aorel</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>GetAppendOnlyEntryAuxOids</name><argument_list>(<argument><expr><name><name>aorel</name><operator>-&gt;</operator><name>rd_id</name></name></expr></argument>,
+							  <argument><expr><name>snapshot</name></expr></argument>, 
+							  <argument><expr><name>NULL</name></expr></argument>, <argument><expr><name>NULL</name></expr></argument>, <argument><expr><name>NULL</name></expr></argument>,
+							  <argument><expr><operator>&amp;</operator><name>visimaprelid</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>visimapidxid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>AppendOnlyVisimap_Init</name><argument_list>(<argument><expr><operator>&amp;</operator><name>visimap</name></expr></argument>,
+						   <argument><expr><name>visimaprelid</name></expr></argument>,
+						   <argument><expr><name>visimapidxid</name></expr></argument>,
+						   <argument><expr><name>AccessShareLock</name></expr></argument>,
+						   <argument><expr><name>snapshot</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>hidden_tupcount</name> <operator>=</operator> <call><name>AppendOnlyVisimap_GetRelationHiddenTupleCount</name><argument_list>(<argument><expr><operator>&amp;</operator><name>visimap</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>num_tuples</name> <operator>-=</operator> <name>hidden_tupcount</name></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>num_tuples</name> <operator>&gt;</operator> <operator>-</operator><literal type="number">1.0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>AppendOnlyVisimap_Finish</name><argument_list>(<argument><expr><operator>&amp;</operator><name>visimap</name></expr></argument>, <argument><expr><name>AccessShareLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>Debug_appendonly_print_compaction</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>LOG</name></expr></argument>,
+			 <argument><expr><literal type="string">"Gather statistics after vacuum for append-only relation %s: "</literal>
+			 <literal type="string">"page count %d, tuple count %f"</literal></expr></argument>,
+			 <argument><expr><name>relname</name></expr></argument>,
+			 <argument><expr><name>nblocks</name></expr></argument>, <argument><expr><name>num_tuples</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><operator>*</operator><name>rel_pages</name> <operator>=</operator> <name>nblocks</name></expr>;</expr_stmt>
+	<expr_stmt><expr><operator>*</operator><name>rel_tuples</name> <operator>=</operator> <name>num_tuples</name></expr>;</expr_stmt>
+	<expr_stmt><expr><operator>*</operator><name>relhasindex</name> <operator>=</operator> <name><name>aorel</name><operator>-&gt;</operator><name>rd_rel</name><operator>-&gt;</operator><name>relhasindex</name></name></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>elevel</name></expr></argument>,
+			<argument><expr><operator>(</operator><call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"\"%s\": found %.0f rows in %u pages."</literal></expr></argument>,
+					<argument><expr><name>relname</name></expr></argument>, <argument><expr><name>num_tuples</name></expr></argument>, <argument><expr><name>nblocks</name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>pfree</name><argument_list>(<argument><expr><name>fstotal</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ *	scan_index() -- scan one index relation to update pg_class statistics.
+ *
+ * We use this when we have no deletions to do.
+ */</comment>
+<function><type><name>void</name></type>
+<name>scan_index</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>indrel</name></decl></parameter>, <parameter><decl><type><name>Relation</name></type> <name>aorel</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>elevel</name></decl></parameter>, <parameter><decl><type><name>BufferAccessStrategy</name></type> <name>vac_strategy</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>IndexBulkDeleteResult</name> <modifier>*</modifier></type><name>stats</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>IndexVacuumInfo</name></type> <name>ivinfo</name> <init>= <expr><block>{<expr><literal type="number">0</literal></expr>}</block></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>PGRUsage</name></type>	<name>ru0</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>pg_rusage_init</name><argument_list>(<argument><expr><operator>&amp;</operator><name>ru0</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name><name>ivinfo</name><operator>.</operator><name>index</name></name> <operator>=</operator> <name>indrel</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>ivinfo</name><operator>.</operator><name>analyze_only</name></name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>ivinfo</name><operator>.</operator><name>message_level</name></name> <operator>=</operator> <name>elevel</name></expr>;</expr_stmt>
+	<comment type="block">/* 
+	 * We can only provide the AO rel's reltuples as an estimate
+	 * (similar to heapam. See: lazy_vacuum_index()).
+	 */</comment>
+	<expr_stmt><expr><name><name>ivinfo</name><operator>.</operator><name>num_heap_tuples</name></name> <operator>=</operator> <name><name>aorel</name><operator>-&gt;</operator><name>rd_rel</name><operator>-&gt;</operator><name>reltuples</name></name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>ivinfo</name><operator>.</operator><name>estimated_count</name></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>ivinfo</name><operator>.</operator><name>strategy</name></name> <operator>=</operator> <name>vac_strategy</name></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>stats</name> <operator>=</operator> <call><name>index_vacuum_cleanup</name><argument_list>(<argument><expr><operator>&amp;</operator><name>ivinfo</name></expr></argument>, <argument><expr><name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><name>stats</name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return;</return></block_content></block></if></if_stmt>
+
+	<comment type="block">/*
+	 * Now update statistics in pg_class, but only if the index says the count
+	 * is accurate.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><name><name>stats</name><operator>-&gt;</operator><name>estimated_count</name></name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>vac_update_relstats</name><argument_list>(<argument><expr><name>indrel</name></expr></argument>,
+							<argument><expr><name><name>stats</name><operator>-&gt;</operator><name>num_pages</name></name></expr></argument>, <argument><expr><name><name>stats</name><operator>-&gt;</operator><name>num_index_tuples</name></name></expr></argument>,
+							<argument><expr><literal type="number">0</literal></expr></argument>, <comment type="block">/* relallvisible, don't bother for indexes */</comment>
+							<argument><expr><name>false</name></expr></argument>,
+							<argument><expr><name>InvalidTransactionId</name></expr></argument>,
+							<argument><expr><name>InvalidMultiXactId</name></expr></argument>,
+							<argument><expr><name>false</name></expr></argument>,
+							<argument><expr><name>true</name></expr></argument> <comment type="block">/* isvacuum */</comment>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>elevel</name></expr></argument>,
+			<argument><expr><operator>(</operator><call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"index \"%s\" now contains %.0f row versions in %u pages"</literal></expr></argument>,
+					<argument><expr><call><name>RelationGetRelationName</name><argument_list>(<argument><expr><name>indrel</name></expr></argument>)</argument_list></call></expr></argument>,
+					<argument><expr><name><name>stats</name><operator>-&gt;</operator><name>num_index_tuples</name></name></expr></argument>,
+					<argument><expr><name><name>stats</name><operator>-&gt;</operator><name>num_pages</name></name></expr></argument>)</argument_list></call><operator>,</operator>
+	<call><name>errdetail</name><argument_list>(<argument><expr><literal type="string">"%u index pages have been deleted, %u are currently reusable.\n"</literal>
+			  <literal type="string">"%s."</literal></expr></argument>,
+			  <argument><expr><name><name>stats</name><operator>-&gt;</operator><name>pages_deleted</name></name></expr></argument>, <argument><expr><name><name>stats</name><operator>-&gt;</operator><name>pages_free</name></name></expr></argument>,
+			  <argument><expr><call><name>pg_rusage_show</name><argument_list>(<argument><expr><operator>&amp;</operator><name>ru0</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>pfree</name><argument_list>(<argument><expr><name>stats</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+</unit>

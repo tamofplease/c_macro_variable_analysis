@@ -1,0 +1,773 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<unit xmlns="http://www.srcML.org/srcML/src" xmlns:cpp="http://www.srcML.org/srcML/cpp" revision="1.0.0" language="C" filename="/cloned_projects/gpdb/src/backend/cdb/motion/tupleremap.c"><comment type="block">/*-------------------------------------------------------------------------
+ *
+ * tupleremap.c
+ *
+ * Derived from executor/tqueue.c in upstream PostgreSQL.
+ *
+ * Reused the remap logic on the motion receiver for record type remap,
+ * with some changes:
+ *
+ * - TupleQueueReader is renamed to TupleRemapper;
+ * - {Create,Destroy}TupleQueueReader() are renamed to
+ *   {Create,Destroy}TupleRemapper;
+ * - all TQ prefixes are renamed to TR;
+ * - typmodmap use array instead of hash table for faster lookup;
+ * - put range support in conditional compilation, only enabled if
+ *   TYPTYPE_RANGE is defined;
+ *
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1994, Regents of the University of California
+ *
+ * IDENTIFICATION
+ *	  src/backend/cdb/motion/tupleremap.c
+ *
+ *-------------------------------------------------------------------------
+ */</comment>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"postgres.h"</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/pg_type.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"cdb/tupleremap.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"funcapi.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"lib/stringinfo.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"miscadmin.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/array.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/lsyscache.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/memutils.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/rangetypes.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/syscache.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/typcache.h"</cpp:file></cpp:include>
+
+<comment type="block">/*
+ * When a tuple is received on the motion receiver, the typmod of RECORDOID
+ * represents the index of cache on the sender, which is meaningless on the
+ * receiver. So we build a typmod map of RECORDOID type on the motion receiver,
+ * and translate the typmod of tuple from remote to local.
+ *
+ * Motion receiver build a tree of TupleRemapInfo nodes to help them identify
+ * which (sub) fields of transmitted tuples are composite and may thus need
+ * remap processing.  We might need to look within arrays and ranges, not only
+ * composites, to find composite sub-fields.  A NULL TupleRemapInfo pointer
+ * indicates that it is known that the described field is not composite and
+ * has no composite substructure.
+ *
+ * Note that we currently have to look at each composite field at runtime,
+ * even if we believe it's of a named composite type (i.e., not RECORD).
+ * This is because we allow the actual value to be a compatible transient
+ * RECORD type.  That's grossly inefficient, and it would be good to get
+ * rid of the requirement, but it's not clear what would need to change.
+ *
+ * Also, we allow the top-level tuple structure, as well as the actual
+ * structure of composite subfields, to change from one tuple to the next
+ * at runtime.  This may well be entirely historical, but it's mostly free
+ * to support given the previous requirement; and other places in the system
+ * also permit this, so it's not entirely clear if we could drop it.
+ */</comment>
+
+<typedef>typedef <type><enum>enum
+<block>{
+	<decl><name>TUPLE_REMAP_ARRAY</name></decl>,			<comment type="block">/* array */</comment>
+	<decl><name>TUPLE_REMAP_RANGE</name></decl>,			<comment type="block">/* range */</comment>
+	<decl><name>TUPLE_REMAP_RECORD</name></decl>			<comment type="block">/* composite type, named or transient */</comment>
+}</block></enum></type> <name>TupleRemapClass</name>;</typedef>
+
+<typedef>typedef <type><name><name>struct</name> <name>TupleRemapInfo</name></name></type> <name>TupleRemapInfo</name>;</typedef>
+
+<typedef>typedef <type><struct>struct <name>ArrayRemapInfo</name>
+<block>{
+	<decl_stmt><decl><type><name>int16</name></type>		<name>typlen</name></decl>;</decl_stmt>			<comment type="block">/* array element type's storage properties */</comment>
+	<decl_stmt><decl><type><name>bool</name></type>		<name>typbyval</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>char</name></type>		<name>typalign</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>TupleRemapInfo</name> <modifier>*</modifier></type><name>element_remap</name></decl>;</decl_stmt>	<comment type="block">/* array element type's remap info */</comment>
+}</block></struct></type> <name>ArrayRemapInfo</name>;</typedef>
+
+<typedef>typedef <type><struct>struct <name>RangeRemapInfo</name>
+<block>{
+	<decl_stmt><decl><type><name>TypeCacheEntry</name> <modifier>*</modifier></type><name>typcache</name></decl>;</decl_stmt>	<comment type="block">/* range type's typcache entry */</comment>
+	<decl_stmt><decl><type><name>TupleRemapInfo</name> <modifier>*</modifier></type><name>bound_remap</name></decl>;</decl_stmt>	<comment type="block">/* range bound type's remap info */</comment>
+}</block></struct></type> <name>RangeRemapInfo</name>;</typedef>
+
+<typedef>typedef <type><struct>struct <name>RecordRemapInfo</name>
+<block>{
+	<comment type="block">/* Original (remote) type ID info last seen for this composite field */</comment>
+	<decl_stmt><decl><type><name>Oid</name></type>			<name>rectypid</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int32</name></type>		<name>rectypmod</name></decl>;</decl_stmt>
+	<comment type="block">/* Local RECORD typmod, or -1 if unset; not used on sender side */</comment>
+	<decl_stmt><decl><type><name>int32</name></type>		<name>localtypmod</name></decl>;</decl_stmt>
+	<comment type="block">/* If no fields of the record require remapping, these are NULL: */</comment>
+	<decl_stmt><decl><type><name>TupleDesc</name></type>	<name>tupledesc</name></decl>;</decl_stmt>		<comment type="block">/* copy of record's tupdesc */</comment>
+	<decl_stmt><decl><type><name>TupleRemapInfo</name> <modifier>*</modifier><modifier>*</modifier></type><name>field_remap</name></decl>;</decl_stmt>	<comment type="block">/* each field's remap info */</comment>
+}</block></struct></type> <name>RecordRemapInfo</name>;</typedef>
+
+<struct>struct <name>TupleRemapInfo</name>
+<block>{
+	<decl_stmt><decl><type><name>TupleRemapClass</name></type> <name>remapclass</name></decl>;</decl_stmt>
+	<union>union
+	<block>{
+		<decl_stmt><decl><type><name>ArrayRemapInfo</name></type> <name>arr</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>RangeRemapInfo</name></type> <name>rng</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>RecordRemapInfo</name></type> <name>rec</name></decl>;</decl_stmt>
+	}</block>			<decl><name>u</name></decl>;</union>
+}</block>;</struct>
+
+<comment type="block">/*
+ * TupleRemapper object's private contents
+ *
+ * tupledesc is a pointer to data supplied by remapper's caller.
+ * The typmodmap and remap info are owned by the TupleRemapper and
+ * are kept in mycontext.
+ *
+ * "typedef struct TupleRemapper TupleRemapper" is in tupleremap.h
+ */</comment>
+<struct>struct <name>TupleRemapper</name>
+<block>{
+	<decl_stmt><decl><type><name>MemoryContext</name></type> <name>mycontext</name></decl>;</decl_stmt>	<comment type="block">/* context containing TupleRemapper */</comment>
+	<decl_stmt><decl><type><name>int32</name>	   <modifier>*</modifier></type><name>typmodmap</name></decl>;</decl_stmt>		<comment type="block">/* typmod map from remote to local */</comment>
+	<decl_stmt><decl><type><name>int</name></type>			<name>typmodmapsize</name></decl>;</decl_stmt>	<comment type="block">/* size of typmodmap */</comment>
+	<decl_stmt><decl><type><name>TupleDesc</name></type>	<name>tupledesc</name></decl>;</decl_stmt>		<comment type="block">/* current top-level tuple descriptor */</comment>
+	<decl_stmt><decl><type><name>TupleRemapInfo</name> <modifier>*</modifier><modifier>*</modifier></type><name>field_remapinfo</name></decl>;</decl_stmt>	<comment type="block">/* current top-level remap info */</comment>
+	<decl_stmt><decl><type><name>bool</name></type>		<name>remap_needed</name></decl>;</decl_stmt>	<comment type="block">/* is remap needed */</comment>
+}</block>;</struct>
+
+<function_decl><type><specifier>static</specifier> <name>HeapTuple</name></type> <name>TRRemapTuple</name><parameter_list>(<parameter><decl><type><name>TupleRemapper</name> <modifier>*</modifier></type><name>remapper</name></decl></parameter>,
+							  <parameter><decl><type><name>TupleDesc</name></type> <name>tupledesc</name></decl></parameter>,
+							  <parameter><decl><type><name>TupleRemapInfo</name> <modifier>*</modifier><modifier>*</modifier></type><name>field_remapinfo</name></decl></parameter>,
+							  <parameter><decl><type><name>HeapTuple</name></type> <name>tuple</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>MinimalTuple</name></type> <name>TRRemapMinimalTuple</name><parameter_list>(<parameter><decl><type><name>TupleRemapper</name> <modifier>*</modifier></type><name>remapper</name></decl></parameter>,
+										<parameter><decl><type><name>TupleDesc</name></type> <name>tupledesc</name></decl></parameter>,
+										<parameter><decl><type><name>TupleRemapInfo</name> <modifier>*</modifier><modifier>*</modifier></type><name>field_remapinfo</name></decl></parameter>,
+										<parameter><decl><type><name>MinimalTuple</name></type> <name>tuple</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>Datum</name></type> <name>TRRemap</name><parameter_list>(<parameter><decl><type><name>TupleRemapper</name> <modifier>*</modifier></type><name>remapper</name></decl></parameter>, <parameter><decl><type><name>TupleRemapInfo</name> <modifier>*</modifier></type><name>remapinfo</name></decl></parameter>,
+					 <parameter><decl><type><name>Datum</name></type> <name>value</name></decl></parameter>, <parameter><decl><type><name>bool</name> <modifier>*</modifier></type><name>changed</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>Datum</name></type> <name>TRRemapArray</name><parameter_list>(<parameter><decl><type><name>TupleRemapper</name> <modifier>*</modifier></type><name>remapper</name></decl></parameter>, <parameter><decl><type><name>ArrayRemapInfo</name> <modifier>*</modifier></type><name>remapinfo</name></decl></parameter>,
+						  <parameter><decl><type><name>Datum</name></type> <name>value</name></decl></parameter>, <parameter><decl><type><name>bool</name> <modifier>*</modifier></type><name>changed</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>Datum</name></type> <name>TRRemapRange</name><parameter_list>(<parameter><decl><type><name>TupleRemapper</name> <modifier>*</modifier></type><name>remapper</name></decl></parameter>, <parameter><decl><type><name>RangeRemapInfo</name> <modifier>*</modifier></type><name>remapinfo</name></decl></parameter>,
+						  <parameter><decl><type><name>Datum</name></type> <name>value</name></decl></parameter>, <parameter><decl><type><name>bool</name> <modifier>*</modifier></type><name>changed</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>Datum</name></type> <name>TRRemapRecord</name><parameter_list>(<parameter><decl><type><name>TupleRemapper</name> <modifier>*</modifier></type><name>remapper</name></decl></parameter>, <parameter><decl><type><name>RecordRemapInfo</name> <modifier>*</modifier></type><name>remapinfo</name></decl></parameter>,
+						   <parameter><decl><type><name>Datum</name></type> <name>value</name></decl></parameter>, <parameter><decl><type><name>bool</name> <modifier>*</modifier></type><name>changed</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>TupleRemapInfo</name> <modifier>*</modifier></type><name>BuildTupleRemapInfo</name><parameter_list>(<parameter><decl><type><name>Oid</name></type> <name>typid</name></decl></parameter>, <parameter><decl><type><name>MemoryContext</name></type> <name>mycontext</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>TupleRemapInfo</name> <modifier>*</modifier></type><name>BuildArrayRemapInfo</name><parameter_list>(<parameter><decl><type><name>Oid</name></type> <name>elemtypid</name></decl></parameter>,
+										   <parameter><decl><type><name>MemoryContext</name></type> <name>mycontext</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>TupleRemapInfo</name> <modifier>*</modifier></type><name>BuildRangeRemapInfo</name><parameter_list>(<parameter><decl><type><name>Oid</name></type> <name>rngtypid</name></decl></parameter>,
+										   <parameter><decl><type><name>MemoryContext</name></type> <name>mycontext</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>TupleRemapInfo</name> <modifier>*</modifier><modifier>*</modifier></type><name>BuildFieldRemapInfo</name><parameter_list>(<parameter><decl><type><name>TupleDesc</name></type> <name>tupledesc</name></decl></parameter>,
+											<parameter><decl><type><name>MemoryContext</name></type> <name>mycontext</name></decl></parameter>)</parameter_list>;</function_decl>
+
+
+<comment type="block">/*
+ * Create a tuple remapper.
+ */</comment>
+<function><type><name>TupleRemapper</name> <modifier>*</modifier></type>
+<name>CreateTupleRemapper</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>TupleRemapper</name> <modifier>*</modifier></type><name>remapper</name> <init>= <expr><call><name>palloc0</name><argument_list>(<argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>TupleRemapper</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name><name>remapper</name><operator>-&gt;</operator><name>mycontext</name></name> <operator>=</operator> <name>CurrentMemoryContext</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>remapper</name><operator>-&gt;</operator><name>typmodmap</name></name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>remapper</name><operator>-&gt;</operator><name>typmodmapsize</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>remapper</name><operator>-&gt;</operator><name>tupledesc</name></name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>remapper</name><operator>-&gt;</operator><name>field_remapinfo</name></name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>remapper</name><operator>-&gt;</operator><name>remap_needed</name></name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+
+	<return>return <expr><name>remapper</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Destroy a tuple remapper.
+ */</comment>
+<function><type><name>void</name></type>
+<name>DestroyTupleRemapper</name><parameter_list>(<parameter><decl><type><name>TupleRemapper</name> <modifier>*</modifier></type><name>remapper</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<if_stmt><if>if <condition>(<expr><name><name>remapper</name><operator>-&gt;</operator><name>typmodmap</name></name> <operator>!=</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>pfree</name><argument_list>(<argument><expr><name><name>remapper</name><operator>-&gt;</operator><name>typmodmap</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	<comment type="block">/* Is it worth trying to free substructure of the remap tree? */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>remapper</name><operator>-&gt;</operator><name>field_remapinfo</name></name> <operator>!=</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>pfree</name><argument_list>(<argument><expr><name><name>remapper</name><operator>-&gt;</operator><name>field_remapinfo</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	<expr_stmt><expr><call><name>pfree</name><argument_list>(<argument><expr><name>remapper</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Remap a tuple if needed
+ *
+ * Form a new tuple with all the remote typmods remapped to local typmods.
+ */</comment>
+<function><type><name>MinimalTuple</name></type>
+<name>TRCheckAndRemap</name><parameter_list>(<parameter><decl><type><name>TupleRemapper</name> <modifier>*</modifier></type><name>remapper</name></decl></parameter>, <parameter><decl><type><name>TupleDesc</name></type> <name>tupledesc</name></decl></parameter>, <parameter><decl><type><name>MinimalTuple</name></type> <name>tuple</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><name><name>remapper</name><operator>-&gt;</operator><name>remap_needed</name></name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>tuple</name></expr>;</return></block_content></block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><name><name>remapper</name><operator>-&gt;</operator><name>field_remapinfo</name></name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>remapper</name><operator>-&gt;</operator><name>tupledesc</name></name> <operator>==</operator> <name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>remapper</name><operator>-&gt;</operator><name>field_remapinfo</name></name> <operator>=</operator> <call><name>BuildFieldRemapInfo</name><argument_list>(<argument><expr><name>tupledesc</name></expr></argument>,
+														<argument><expr><name><name>remapper</name><operator>-&gt;</operator><name>mycontext</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<if_stmt><if>if <condition>(<expr><name><name>remapper</name><operator>-&gt;</operator><name>field_remapinfo</name></name> <operator>!=</operator> <name>NULL</name></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/* Remapping is required. Save a copy of the tupledesc */</comment>
+			<expr_stmt><expr><name><name>remapper</name><operator>-&gt;</operator><name>tupledesc</name></name> <operator>=</operator> <name>tupledesc</name></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<return>return <expr><call><name>TRRemapMinimalTuple</name><argument_list>(<argument><expr><name>remapper</name></expr></argument>, <argument><expr><name>tupledesc</name></expr></argument>, <argument><expr><name><name>remapper</name><operator>-&gt;</operator><name>field_remapinfo</name></name></expr></argument>, <argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Handle the record type cache from motion sender.
+ *
+ * Add the record types to local cache, and build a map from remote to local.
+ */</comment>
+<function><type><name>void</name></type>
+<name>TRHandleTypeLists</name><parameter_list>(<parameter><decl><type><name>TupleRemapper</name> <modifier>*</modifier></type><name>remapper</name></decl></parameter>, <parameter><decl><type><name>List</name> <modifier>*</modifier></type><name>typelist</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>int</name></type>			<name>j</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>ListCell</name>   <modifier>*</modifier></type><name>cell</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>mapsize</name> <init>= <expr><name><name>remapper</name><operator>-&gt;</operator><name>typmodmapsize</name></name> <operator>+</operator> <call><name>list_length</name><argument_list>(<argument><expr><name>typelist</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name><name>remapper</name><operator>-&gt;</operator><name>typmodmap</name></name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name><name>remapper</name><operator>-&gt;</operator><name>typmodmap</name></name> <operator>=</operator> <call><name>repalloc</name><argument_list>(<argument><expr><name><name>remapper</name><operator>-&gt;</operator><name>typmodmap</name></name></expr></argument>, <argument><expr><name>mapsize</name> <operator>*</operator> <sizeof>sizeof<argument_list>(<argument><expr><name>int32</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if>
+	<else>else<block type="pseudo"><block_content>
+		<expr_stmt><expr><name><name>remapper</name><operator>-&gt;</operator><name>typmodmap</name></name> <operator>=</operator> <call><name>palloc</name><argument_list>(<argument><expr><name>mapsize</name> <operator>*</operator> <sizeof>sizeof<argument_list>(<argument><expr><name>int32</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></else></if_stmt>
+
+	<for>for <control>(<init><expr><name>j</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>j</name> <operator>&lt;</operator> <call><name>list_length</name><argument_list>(<argument><expr><name>typelist</name></expr></argument>)</argument_list></call></expr>;</condition> <incr><expr><name>j</name><operator>++</operator></expr></incr>)</control><block type="pseudo"><block_content>
+		<expr_stmt><expr><name><name>remapper</name><operator>-&gt;</operator><name>typmodmap</name><index>[<expr><name><name>remapper</name><operator>-&gt;</operator><name>typmodmapsize</name></name> <operator>+</operator> <name>j</name></expr>]</index></name> <operator>=</operator> <operator>-</operator><literal type="number">1</literal></expr>;</expr_stmt></block_content></block></for>
+
+	<expr_stmt><expr><name><name>remapper</name><operator>-&gt;</operator><name>typmodmapsize</name></name> <operator>=</operator> <name>mapsize</name></expr>;</expr_stmt>
+
+	<macro><name>foreach</name><argument_list>(<argument>cell</argument>, <argument>typelist</argument>)</argument_list></macro>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>int32</name></type>		<name>local_typmod</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>TupleDescNode</name> <modifier>*</modifier></type><name>descnode</name> <init>= <expr><operator>(</operator><name>TupleDescNode</name> <operator>*</operator><operator>)</operator> <call><name>lfirst</name><argument_list>(<argument><expr><name>cell</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>int32</name></type>		<name>remote_typmod</name> <init>= <expr><name><name>descnode</name><operator>-&gt;</operator><name>tuple</name><operator>-&gt;</operator><name>tdtypmod</name></name></expr></init></decl>;</decl_stmt>
+
+		<comment type="block">/*
+		 * assign_record_type_typmod() will update tdtypmod to the local
+		 * typmod
+		 */</comment>
+		<expr_stmt><expr><call><name>assign_record_type_typmod</name><argument_list>(<argument><expr><name><name>descnode</name><operator>-&gt;</operator><name>tuple</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><name>local_typmod</name> <operator>=</operator> <name><name>descnode</name><operator>-&gt;</operator><name>tuple</name><operator>-&gt;</operator><name>tdtypmod</name></name></expr>;</expr_stmt>
+
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>remote_typmod</name> <operator>&gt;=</operator> <literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>local_typmod</name> <operator>&gt;=</operator> <literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>remote_typmod</name> <operator>&lt;</operator> <name><name>remapper</name><operator>-&gt;</operator><name>typmodmapsize</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><name><name>remapper</name><operator>-&gt;</operator><name>typmodmap</name><index>[<expr><name>remote_typmod</name></expr>]</index></name> <operator>=</operator> <name>local_typmod</name></expr>;</expr_stmt>
+
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><name><name>remapper</name><operator>-&gt;</operator><name>remap_needed</name></name> <operator>&amp;&amp;</operator> <name>local_typmod</name> <operator>!=</operator> <name>remote_typmod</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><name><name>remapper</name><operator>-&gt;</operator><name>remap_needed</name></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	</block_content>}</block>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * Remap a single Datum, which can be a RECORD datum using the remote system's
+ * typmods.
+ */</comment>
+<function><type><name>Datum</name></type>
+<name>TRRemapDatum</name><parameter_list>(<parameter><decl><type><name>TupleRemapper</name> <modifier>*</modifier></type><name>remapper</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>typeid</name></decl></parameter>, <parameter><decl><type><name>Datum</name></type> <name>value</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>TupleRemapInfo</name> <modifier>*</modifier></type><name>remapinfo</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type>		<name>changed</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name>remapinfo</name> <operator>=</operator> <call><name>BuildTupleRemapInfo</name><argument_list>(<argument><expr><name>typeid</name></expr></argument>, <argument><expr><name><name>remapper</name><operator>-&gt;</operator><name>mycontext</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><name>remapinfo</name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>value</name></expr>;</return></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><name>value</name> <operator>=</operator> <call><name>TRRemap</name><argument_list>(<argument><expr><name>remapper</name></expr></argument>, <argument><expr><name>remapinfo</name></expr></argument>, <argument><expr><name>value</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>changed</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>pfree</name><argument_list>(<argument><expr><name>remapinfo</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<return>return <expr><name>value</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Copy the given tuple, remapping any transient typmods contained in it.
+ */</comment>
+<function><type><specifier>static</specifier> <name>HeapTuple</name></type>
+<name>TRRemapTuple</name><parameter_list>(<parameter><decl><type><name>TupleRemapper</name> <modifier>*</modifier></type><name>remapper</name></decl></parameter>,
+			 <parameter><decl><type><name>TupleDesc</name></type> <name>tupledesc</name></decl></parameter>,
+			 <parameter><decl><type><name>TupleRemapInfo</name> <modifier>*</modifier><modifier>*</modifier></type><name>field_remapinfo</name></decl></parameter>,
+			 <parameter><decl><type><name>HeapTuple</name></type> <name>tuple</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>Datum</name>	   <modifier>*</modifier></type><name>values</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name>	   <modifier>*</modifier></type><name>isnull</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type>		<name>changed</name> <init>= <expr><name>false</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>i</name></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * If no remapping is necessary, just copy the tuple into a single
+	 * palloc'd chunk, as caller will expect.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name>field_remapinfo</name> <operator>==</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>tuple</name></expr>;</return></block_content></block></if></if_stmt>
+
+	<comment type="block">/* Deform tuple so we can remap record typmods for individual attrs. */</comment>
+	<expr_stmt><expr><name>values</name> <operator>=</operator> <operator>(</operator><name>Datum</name> <operator>*</operator><operator>)</operator> <call><name>palloc</name><argument_list>(<argument><expr><name><name>tupledesc</name><operator>-&gt;</operator><name>natts</name></name> <operator>*</operator> <sizeof>sizeof<argument_list>(<argument><expr><name>Datum</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>isnull</name> <operator>=</operator> <operator>(</operator><name>bool</name> <operator>*</operator><operator>)</operator> <call><name>palloc</name><argument_list>(<argument><expr><name><name>tupledesc</name><operator>-&gt;</operator><name>natts</name></name> <operator>*</operator> <sizeof>sizeof<argument_list>(<argument><expr><name>bool</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>heap_deform_tuple</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>, <argument><expr><name>tupledesc</name></expr></argument>, <argument><expr><name>values</name></expr></argument>, <argument><expr><name>isnull</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Recursively process each interesting non-NULL attribute. */</comment>
+	<for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name><name>tupledesc</name><operator>-&gt;</operator><name>natts</name></name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control>
+	<block>{<block_content>
+		<if_stmt><if>if <condition>(<expr><name><name>isnull</name><index>[<expr><name>i</name></expr>]</index></name> <operator>||</operator> <name><name>field_remapinfo</name><index>[<expr><name>i</name></expr>]</index></name> <operator>==</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+			<continue>continue;</continue></block_content></block></if></if_stmt>
+		<expr_stmt><expr><name><name>values</name><index>[<expr><name>i</name></expr>]</index></name> <operator>=</operator> <call><name>TRRemap</name><argument_list>(<argument><expr><name>remapper</name></expr></argument>, <argument><expr><name><name>field_remapinfo</name><index>[<expr><name>i</name></expr>]</index></name></expr></argument>, <argument><expr><name><name>values</name><index>[<expr><name>i</name></expr>]</index></name></expr></argument>, <argument><expr><operator>&amp;</operator><name>changed</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></for>
+
+	<comment type="block">/* Reconstruct the modified tuple, if anything was modified. */</comment>
+	<if_stmt><if>if <condition>(<expr><name>changed</name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><call><name>heap_form_tuple</name><argument_list>(<argument><expr><name>tupledesc</name></expr></argument>, <argument><expr><name>values</name></expr></argument>, <argument><expr><name>isnull</name></expr></argument>)</argument_list></call></expr>;</return></block_content></block></if>
+	<else>else<block type="pseudo"><block_content>
+		<return>return <expr><name>tuple</name></expr>;</return></block_content></block></else></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Like TRRemapTuple(), but for a MinimalTuple
+ */</comment>
+<function><type><specifier>static</specifier> <name>MinimalTuple</name></type>
+<name>TRRemapMinimalTuple</name><parameter_list>(<parameter><decl><type><name>TupleRemapper</name> <modifier>*</modifier></type><name>remapper</name></decl></parameter>,
+					<parameter><decl><type><name>TupleDesc</name></type> <name>tupledesc</name></decl></parameter>,
+					<parameter><decl><type><name>TupleRemapInfo</name> <modifier>*</modifier><modifier>*</modifier></type><name>field_remapinfo</name></decl></parameter>,
+					<parameter><decl><type><name>MinimalTuple</name></type> <name>tuple</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>Datum</name>	   <modifier>*</modifier></type><name>values</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name>	   <modifier>*</modifier></type><name>isnull</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type>		<name>changed</name> <init>= <expr><name>false</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>i</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>HeapTupleData</name></type> <name>htup</name></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * If no remapping is necessary, just copy the tuple into a single
+	 * palloc'd chunk, as caller will expect.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name>field_remapinfo</name> <operator>==</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>tuple</name></expr>;</return></block_content></block></if></if_stmt>
+
+	<comment type="block">/* Deform tuple so we can remap record typmods for individual attrs. */</comment>
+	<expr_stmt><expr><name>values</name> <operator>=</operator> <operator>(</operator><name>Datum</name> <operator>*</operator><operator>)</operator> <call><name>palloc</name><argument_list>(<argument><expr><name><name>tupledesc</name><operator>-&gt;</operator><name>natts</name></name> <operator>*</operator> <sizeof>sizeof<argument_list>(<argument><expr><name>Datum</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>isnull</name> <operator>=</operator> <operator>(</operator><name>bool</name> <operator>*</operator><operator>)</operator> <call><name>palloc</name><argument_list>(<argument><expr><name><name>tupledesc</name><operator>-&gt;</operator><name>natts</name></name> <operator>*</operator> <sizeof>sizeof<argument_list>(<argument><expr><name>bool</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name><name>htup</name><operator>.</operator><name>t_len</name></name> <operator>=</operator> <name><name>tuple</name><operator>-&gt;</operator><name>t_len</name></name> <operator>+</operator> <name>MINIMAL_TUPLE_OFFSET</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>htup</name><operator>.</operator><name>t_data</name></name> <operator>=</operator> <operator>(</operator><name>HeapTupleHeader</name><operator>)</operator> <operator>(</operator><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <name>tuple</name> <operator>-</operator> <name>MINIMAL_TUPLE_OFFSET</name><operator>)</operator></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>heap_deform_tuple</name><argument_list>(<argument><expr><operator>&amp;</operator><name>htup</name></expr></argument>, <argument><expr><name>tupledesc</name></expr></argument>, <argument><expr><name>values</name></expr></argument>, <argument><expr><name>isnull</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Recursively process each interesting non-NULL attribute. */</comment>
+	<for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name><name>tupledesc</name><operator>-&gt;</operator><name>natts</name></name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control>
+	<block>{<block_content>
+		<if_stmt><if>if <condition>(<expr><name><name>isnull</name><index>[<expr><name>i</name></expr>]</index></name> <operator>||</operator> <name><name>field_remapinfo</name><index>[<expr><name>i</name></expr>]</index></name> <operator>==</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+			<continue>continue;</continue></block_content></block></if></if_stmt>
+		<expr_stmt><expr><name><name>values</name><index>[<expr><name>i</name></expr>]</index></name> <operator>=</operator> <call><name>TRRemap</name><argument_list>(<argument><expr><name>remapper</name></expr></argument>, <argument><expr><name><name>field_remapinfo</name><index>[<expr><name>i</name></expr>]</index></name></expr></argument>, <argument><expr><name><name>values</name><index>[<expr><name>i</name></expr>]</index></name></expr></argument>, <argument><expr><operator>&amp;</operator><name>changed</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></for>
+
+	<comment type="block">/* Reconstruct the modified tuple, if anything was modified. */</comment>
+	<if_stmt><if>if <condition>(<expr><name>changed</name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><call><name>heap_form_minimal_tuple</name><argument_list>(<argument><expr><name>tupledesc</name></expr></argument>, <argument><expr><name>values</name></expr></argument>, <argument><expr><name>isnull</name></expr></argument>)</argument_list></call></expr>;</return></block_content></block></if>
+	<else>else<block type="pseudo"><block_content>
+		<return>return <expr><name>tuple</name></expr>;</return></block_content></block></else></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Process the given datum and replace any transient record typmods
+ * contained in it.  Set *changed to TRUE if we actually changed the datum.
+ *
+ * remapinfo is previously-computed remapping info about the datum's type.
+ *
+ * This function just dispatches based on the remap class.
+ */</comment>
+<function><type><specifier>static</specifier> <name>Datum</name></type>
+<name>TRRemap</name><parameter_list>(<parameter><decl><type><name>TupleRemapper</name> <modifier>*</modifier></type><name>remapper</name></decl></parameter>, <parameter><decl><type><name>TupleRemapInfo</name> <modifier>*</modifier></type><name>remapinfo</name></decl></parameter>,
+		<parameter><decl><type><name>Datum</name></type> <name>value</name></decl></parameter>, <parameter><decl><type><name>bool</name> <modifier>*</modifier></type><name>changed</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<comment type="block">/* This is recursive, so it could be driven to stack overflow. */</comment>
+	<expr_stmt><expr><call><name>check_stack_depth</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+	<switch>switch <condition>(<expr><name><name>remapinfo</name><operator>-&gt;</operator><name>remapclass</name></name></expr>)</condition>
+	<block>{<block_content>
+		<case>case <expr><name>TUPLE_REMAP_ARRAY</name></expr>:</case>
+			<return>return <expr><call><name>TRRemapArray</name><argument_list>(<argument><expr><name>remapper</name></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>remapinfo</name><operator>-&gt;</operator><name>u</name><operator>.</operator><name>arr</name></name></expr></argument>, <argument><expr><name>value</name></expr></argument>, <argument><expr><name>changed</name></expr></argument>)</argument_list></call></expr>;</return>
+
+		<case>case <expr><name>TUPLE_REMAP_RANGE</name></expr>:</case>
+			<return>return <expr><call><name>TRRemapRange</name><argument_list>(<argument><expr><name>remapper</name></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>remapinfo</name><operator>-&gt;</operator><name>u</name><operator>.</operator><name>rng</name></name></expr></argument>, <argument><expr><name>value</name></expr></argument>, <argument><expr><name>changed</name></expr></argument>)</argument_list></call></expr>;</return>
+
+		<case>case <expr><name>TUPLE_REMAP_RECORD</name></expr>:</case>
+			<return>return <expr><call><name>TRRemapRecord</name><argument_list>(<argument><expr><name>remapper</name></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>remapinfo</name><operator>-&gt;</operator><name>u</name><operator>.</operator><name>rec</name></name></expr></argument>, <argument><expr><name>value</name></expr></argument>, <argument><expr><name>changed</name></expr></argument>)</argument_list></call></expr>;</return>
+	</block_content>}</block></switch>
+
+	<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"unrecognized remapper remap class: %d"</literal></expr></argument>,
+		 <argument><expr><operator>(</operator><name>int</name><operator>)</operator> <name><name>remapinfo</name><operator>-&gt;</operator><name>remapclass</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<return>return <expr><operator>(</operator><name>Datum</name><operator>)</operator> <literal type="number">0</literal></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Process the given array datum and replace any transient record typmods
+ * contained in it.  Set *changed to TRUE if we actually changed the datum.
+ */</comment>
+<function><type><specifier>static</specifier> <name>Datum</name></type>
+<name>TRRemapArray</name><parameter_list>(<parameter><decl><type><name>TupleRemapper</name> <modifier>*</modifier></type><name>remapper</name></decl></parameter>, <parameter><decl><type><name>ArrayRemapInfo</name> <modifier>*</modifier></type><name>remapinfo</name></decl></parameter>,
+			 <parameter><decl><type><name>Datum</name></type> <name>value</name></decl></parameter>, <parameter><decl><type><name>bool</name> <modifier>*</modifier></type><name>changed</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>ArrayType</name>  <modifier>*</modifier></type><name>arr</name> <init>= <expr><call><name>DatumGetArrayTypeP</name><argument_list>(<argument><expr><name>value</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Oid</name></type>			<name>typid</name> <init>= <expr><call><name>ARR_ELEMTYPE</name><argument_list>(<argument><expr><name>arr</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type>		<name>element_changed</name> <init>= <expr><name>false</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Datum</name>	   <modifier>*</modifier></type><name>elem_values</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name>	   <modifier>*</modifier></type><name>elem_nulls</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>num_elems</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>i</name></decl>;</decl_stmt>
+
+	<comment type="block">/* Deconstruct the array. */</comment>
+	<expr_stmt><expr><call><name>deconstruct_array</name><argument_list>(<argument><expr><name>arr</name></expr></argument>, <argument><expr><name>typid</name></expr></argument>, <argument><expr><name><name>remapinfo</name><operator>-&gt;</operator><name>typlen</name></name></expr></argument>,
+					  <argument><expr><name><name>remapinfo</name><operator>-&gt;</operator><name>typbyval</name></name></expr></argument>, <argument><expr><name><name>remapinfo</name><operator>-&gt;</operator><name>typalign</name></name></expr></argument>,
+					  <argument><expr><operator>&amp;</operator><name>elem_values</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>elem_nulls</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>num_elems</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Remap each element. */</comment>
+	<for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name>num_elems</name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control>
+	<block>{<block_content>
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><name><name>elem_nulls</name><index>[<expr><name>i</name></expr>]</index></name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><name><name>elem_values</name><index>[<expr><name>i</name></expr>]</index></name> <operator>=</operator> <call><name>TRRemap</name><argument_list>(<argument><expr><name>remapper</name></expr></argument>,
+									 <argument><expr><name><name>remapinfo</name><operator>-&gt;</operator><name>element_remap</name></name></expr></argument>,
+									 <argument><expr><name><name>elem_values</name><index>[<expr><name>i</name></expr>]</index></name></expr></argument>,
+									 <argument><expr><operator>&amp;</operator><name>element_changed</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	</block_content>}</block></for>
+
+	<if_stmt><if>if <condition>(<expr><name>element_changed</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* Reconstruct and return the array.  */</comment>
+		<expr_stmt><expr><operator>*</operator><name>changed</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name>arr</name> <operator>=</operator> <call><name>construct_md_array</name><argument_list>(<argument><expr><name>elem_values</name></expr></argument>, <argument><expr><name>elem_nulls</name></expr></argument>,
+								 <argument><expr><call><name>ARR_NDIM</name><argument_list>(<argument><expr><name>arr</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><call><name>ARR_DIMS</name><argument_list>(<argument><expr><name>arr</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><call><name>ARR_LBOUND</name><argument_list>(<argument><expr><name>arr</name></expr></argument>)</argument_list></call></expr></argument>,
+								 <argument><expr><name>typid</name></expr></argument>, <argument><expr><name><name>remapinfo</name><operator>-&gt;</operator><name>typlen</name></name></expr></argument>,
+								 <argument><expr><name><name>remapinfo</name><operator>-&gt;</operator><name>typbyval</name></name></expr></argument>, <argument><expr><name><name>remapinfo</name><operator>-&gt;</operator><name>typalign</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<return>return <expr><call><name>PointerGetDatum</name><argument_list>(<argument><expr><name>arr</name></expr></argument>)</argument_list></call></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/* Else just return the value as-is. */</comment>
+	<return>return <expr><name>value</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Process the given range datum and replace any transient record typmods
+ * contained in it.  Set *changed to TRUE if we actually changed the datum.
+ */</comment>
+<function><type><specifier>static</specifier> <name>Datum</name></type>
+<name>TRRemapRange</name><parameter_list>(<parameter><decl><type><name>TupleRemapper</name> <modifier>*</modifier></type><name>remapper</name></decl></parameter>, <parameter><decl><type><name>RangeRemapInfo</name> <modifier>*</modifier></type><name>remapinfo</name></decl></parameter>,
+			 <parameter><decl><type><name>Datum</name></type> <name>value</name></decl></parameter>, <parameter><decl><type><name>bool</name> <modifier>*</modifier></type><name>changed</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>RangeType</name>  <modifier>*</modifier></type><name>range</name> <init>= <expr><call><name>DatumGetRangeTypeP</name><argument_list>(<argument><expr><name>value</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type>		<name>bound_changed</name> <init>= <expr><name>false</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>RangeBound</name></type>	<name>lower</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>RangeBound</name></type>	<name>upper</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type>		<name>empty</name></decl>;</decl_stmt>
+
+	<comment type="block">/* Extract the lower and upper bounds. */</comment>
+	<expr_stmt><expr><call><name>range_deserialize</name><argument_list>(<argument><expr><name><name>remapinfo</name><operator>-&gt;</operator><name>typcache</name></name></expr></argument>, <argument><expr><name>range</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>lower</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>upper</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>empty</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Nothing to do for an empty range. */</comment>
+	<if_stmt><if>if <condition>(<expr><name>empty</name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>value</name></expr>;</return></block_content></block></if></if_stmt>
+
+	<comment type="block">/* Remap each bound, if present. */</comment>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><name><name>upper</name><operator>.</operator><name>infinite</name></name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name><name>upper</name><operator>.</operator><name>val</name></name> <operator>=</operator> <call><name>TRRemap</name><argument_list>(<argument><expr><name>remapper</name></expr></argument>, <argument><expr><name><name>remapinfo</name><operator>-&gt;</operator><name>bound_remap</name></name></expr></argument>,
+							<argument><expr><name><name>upper</name><operator>.</operator><name>val</name></name></expr></argument>, <argument><expr><operator>&amp;</operator><name>bound_changed</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><name><name>lower</name><operator>.</operator><name>infinite</name></name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name><name>lower</name><operator>.</operator><name>val</name></name> <operator>=</operator> <call><name>TRRemap</name><argument_list>(<argument><expr><name>remapper</name></expr></argument>, <argument><expr><name><name>remapinfo</name><operator>-&gt;</operator><name>bound_remap</name></name></expr></argument>,
+							<argument><expr><name><name>lower</name><operator>.</operator><name>val</name></name></expr></argument>, <argument><expr><operator>&amp;</operator><name>bound_changed</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>bound_changed</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* Reserialize.  */</comment>
+		<expr_stmt><expr><operator>*</operator><name>changed</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name>range</name> <operator>=</operator> <call><name>range_serialize</name><argument_list>(<argument><expr><name><name>remapinfo</name><operator>-&gt;</operator><name>typcache</name></name></expr></argument>, <argument><expr><operator>&amp;</operator><name>lower</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>upper</name></expr></argument>, <argument><expr><name>empty</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<return>return <expr><call><name>RangeTypePGetDatum</name><argument_list>(<argument><expr><name>range</name></expr></argument>)</argument_list></call></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/* Else just return the value as-is. */</comment>
+	<return>return <expr><name>value</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Process the given record datum and replace any transient record typmods
+ * contained in it.  Set *changed to TRUE if we actually changed the datum.
+ */</comment>
+<function><type><specifier>static</specifier> <name>Datum</name></type>
+<name>TRRemapRecord</name><parameter_list>(<parameter><decl><type><name>TupleRemapper</name> <modifier>*</modifier></type><name>remapper</name></decl></parameter>, <parameter><decl><type><name>RecordRemapInfo</name> <modifier>*</modifier></type><name>remapinfo</name></decl></parameter>,
+			  <parameter><decl><type><name>Datum</name></type> <name>value</name></decl></parameter>, <parameter><decl><type><name>bool</name> <modifier>*</modifier></type><name>changed</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>HeapTupleHeader</name></type> <name>tup</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Oid</name></type>			<name>typid</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int32</name></type>		<name>typmod</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type>		<name>changed_typmod</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>TupleDesc</name></type>	<name>tupledesc</name></decl>;</decl_stmt>
+
+	<comment type="block">/* Extract type OID and typmod from tuple. */</comment>
+	<expr_stmt><expr><name>tup</name> <operator>=</operator> <call><name>DatumGetHeapTupleHeader</name><argument_list>(<argument><expr><name>value</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>typid</name> <operator>=</operator> <call><name>HeapTupleHeaderGetTypeId</name><argument_list>(<argument><expr><name>tup</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>typmod</name> <operator>=</operator> <call><name>HeapTupleHeaderGetTypMod</name><argument_list>(<argument><expr><name>tup</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * If first time through, or if this isn't the same composite type as last
+	 * time, identify the required typmod mapping, and then look up the
+	 * necessary information for processing the fields.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name>typid</name> <operator>!=</operator> <name><name>remapinfo</name><operator>-&gt;</operator><name>rectypid</name></name> <operator>||</operator> <name>typmod</name> <operator>!=</operator> <name><name>remapinfo</name><operator>-&gt;</operator><name>rectypmod</name></name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* Free any old data. */</comment>
+		<if_stmt><if>if <condition>(<expr><name><name>remapinfo</name><operator>-&gt;</operator><name>tupledesc</name></name> <operator>!=</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>FreeTupleDesc</name><argument_list>(<argument><expr><name><name>remapinfo</name><operator>-&gt;</operator><name>tupledesc</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+		<comment type="block">/* Is it worth trying to free substructure of the remap tree? */</comment>
+		<if_stmt><if>if <condition>(<expr><name><name>remapinfo</name><operator>-&gt;</operator><name>field_remap</name></name> <operator>!=</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>pfree</name><argument_list>(<argument><expr><name><name>remapinfo</name><operator>-&gt;</operator><name>field_remap</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+		<comment type="block">/* If transient record type, look up matching local typmod. */</comment>
+		<if_stmt><if>if <condition>(<expr><name>typid</name> <operator>==</operator> <name>RECORDOID</name></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>remapper</name><operator>-&gt;</operator><name>typmodmap</name></name> <operator>!=</operator> <name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>typmod</name> <operator>&gt;=</operator> <literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<if_stmt><if>if <condition>(<expr><name>typmod</name> <operator>&gt;=</operator> <name><name>remapper</name><operator>-&gt;</operator><name>typmodmapsize</name></name></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"received unknown record type with typmod %d"</literal></expr></argument>, <argument><expr><name>typmod</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+			<expr_stmt><expr><name><name>remapinfo</name><operator>-&gt;</operator><name>localtypmod</name></name> <operator>=</operator> <name><name>remapper</name><operator>-&gt;</operator><name>typmodmap</name><index>[<expr><name>typmod</name></expr>]</index></name></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>remapinfo</name><operator>-&gt;</operator><name>localtypmod</name></name> <operator>&gt;=</operator> <literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></if>
+		<else>else<block type="pseudo"><block_content>
+			<expr_stmt><expr><name><name>remapinfo</name><operator>-&gt;</operator><name>localtypmod</name></name> <operator>=</operator> <operator>-</operator><literal type="number">1</literal></expr>;</expr_stmt></block_content></block></else></if_stmt>
+
+		<comment type="block">/* Look up tuple descriptor in typcache. */</comment>
+		<expr_stmt><expr><name>tupledesc</name> <operator>=</operator> <call><name>lookup_rowtype_tupdesc</name><argument_list>(<argument><expr><name>typid</name></expr></argument>, <argument><expr><name><name>remapinfo</name><operator>-&gt;</operator><name>localtypmod</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/* Figure out whether fields need recursive processing. */</comment>
+		<expr_stmt><expr><name><name>remapinfo</name><operator>-&gt;</operator><name>field_remap</name></name> <operator>=</operator> <call><name>BuildFieldRemapInfo</name><argument_list>(<argument><expr><name>tupledesc</name></expr></argument>,
+													 <argument><expr><name><name>remapper</name><operator>-&gt;</operator><name>mycontext</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<if_stmt><if>if <condition>(<expr><name><name>remapinfo</name><operator>-&gt;</operator><name>field_remap</name></name> <operator>!=</operator> <name>NULL</name></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/*
+			 * We need to inspect the record contents, so save a copy of the
+			 * tupdesc.  (We could possibly just reference the typcache's
+			 * copy, but then it's problematic when to release the refcount.)
+			 */</comment>
+			<decl_stmt><decl><type><name>MemoryContext</name></type> <name>oldcontext</name> <init>= <expr><call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name><name>remapper</name><operator>-&gt;</operator><name>mycontext</name></name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+			<expr_stmt><expr><name><name>remapinfo</name><operator>-&gt;</operator><name>tupledesc</name></name> <operator>=</operator> <call><name>CreateTupleDescCopy</name><argument_list>(<argument><expr><name>tupledesc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>oldcontext</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></if>
+		<else>else
+		<block>{<block_content>
+			<comment type="block">/* No fields of the record require remapping. */</comment>
+			<expr_stmt><expr><name><name>remapinfo</name><operator>-&gt;</operator><name>tupledesc</name></name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+		</block_content>}</block></else></if_stmt>
+		<expr_stmt><expr><name><name>remapinfo</name><operator>-&gt;</operator><name>rectypid</name></name> <operator>=</operator> <name>typid</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>remapinfo</name><operator>-&gt;</operator><name>rectypmod</name></name> <operator>=</operator> <name>typmod</name></expr>;</expr_stmt>
+
+		<comment type="block">/* Release reference count acquired by lookup_rowtype_tupdesc. */</comment>
+		<expr_stmt><expr><call><name>DecrTupleDescRefCount</name><argument_list>(<argument><expr><name>tupledesc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/* If transient record, replace remote typmod with local typmod. */</comment>
+	<if_stmt><if>if <condition>(<expr><name>typid</name> <operator>==</operator> <name>RECORDOID</name> <operator>&amp;&amp;</operator> <name>typmod</name> <operator>!=</operator> <name><name>remapinfo</name><operator>-&gt;</operator><name>localtypmod</name></name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name>typmod</name> <operator>=</operator> <name><name>remapinfo</name><operator>-&gt;</operator><name>localtypmod</name></name></expr>;</expr_stmt>
+		<expr_stmt><expr><name>changed_typmod</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<else>else<block type="pseudo"><block_content>
+		<expr_stmt><expr><name>changed_typmod</name> <operator>=</operator> <name>false</name></expr>;</expr_stmt></block_content></block></else></if_stmt>
+
+	<comment type="block">/*
+	 * If we need to change the typmod, or if there are any potentially
+	 * remappable fields, replace the tuple.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name>changed_typmod</name> <operator>||</operator> <name><name>remapinfo</name><operator>-&gt;</operator><name>field_remap</name></name> <operator>!=</operator> <name>NULL</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>HeapTupleData</name></type> <name>htup</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>HeapTuple</name></type>	<name>atup</name></decl>;</decl_stmt>
+
+		<comment type="block">/* For now, assume we always need to change the tuple in this case. */</comment>
+		<expr_stmt><expr><operator>*</operator><name>changed</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+
+		<comment type="block">/* Copy tuple, possibly remapping contained fields. */</comment>
+		<expr_stmt><expr><call><name>ItemPointerSetInvalid</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>htup</name><operator>.</operator><name>t_self</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>htup</name><operator>.</operator><name>t_len</name></name> <operator>=</operator> <call><name>HeapTupleHeaderGetDatumLength</name><argument_list>(<argument><expr><name>tup</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>htup</name><operator>.</operator><name>t_data</name></name> <operator>=</operator> <name>tup</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name>atup</name> <operator>=</operator> <call><name>TRRemapTuple</name><argument_list>(<argument><expr><name>remapper</name></expr></argument>,
+							<argument><expr><name><name>remapinfo</name><operator>-&gt;</operator><name>tupledesc</name></name></expr></argument>,
+							<argument><expr><name><name>remapinfo</name><operator>-&gt;</operator><name>field_remap</name></name></expr></argument>,
+							<argument><expr><operator>&amp;</operator><name>htup</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/* Apply the correct labeling for a local Datum. */</comment>
+		<expr_stmt><expr><call><name>HeapTupleHeaderSetTypeId</name><argument_list>(<argument><expr><name><name>atup</name><operator>-&gt;</operator><name>t_data</name></name></expr></argument>, <argument><expr><name>typid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>HeapTupleHeaderSetTypMod</name><argument_list>(<argument><expr><name><name>atup</name><operator>-&gt;</operator><name>t_data</name></name></expr></argument>, <argument><expr><name>typmod</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>HeapTupleHeaderSetDatumLength</name><argument_list>(<argument><expr><name><name>atup</name><operator>-&gt;</operator><name>t_data</name></name></expr></argument>, <argument><expr><name><name>htup</name><operator>.</operator><name>t_len</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/* And return the results. */</comment>
+		<return>return <expr><call><name>PointerGetDatum</name><argument_list>(<argument><expr><name><name>atup</name><operator>-&gt;</operator><name>t_data</name></name></expr></argument>)</argument_list></call></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/* Else just return the value as-is. */</comment>
+	<return>return <expr><name>value</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Build remap info for the specified data type, storing it in mycontext.
+ * Returns NULL if neither the type nor any subtype could require remapping.
+ */</comment>
+<function><type><specifier>static</specifier> <name>TupleRemapInfo</name> <modifier>*</modifier></type>
+<name>BuildTupleRemapInfo</name><parameter_list>(<parameter><decl><type><name>Oid</name></type> <name>typid</name></decl></parameter>, <parameter><decl><type><name>MemoryContext</name></type> <name>mycontext</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>HeapTuple</name></type>	<name>tup</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Form_pg_type</name></type> <name>typ</name></decl>;</decl_stmt>
+
+	<comment type="block">/* This is recursive, so it could be driven to stack overflow. */</comment>
+	<expr_stmt><expr><call><name>check_stack_depth</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+<label><name>restart</name>:</label>
+	<expr_stmt><expr><name>tup</name> <operator>=</operator> <call><name>SearchSysCache1</name><argument_list>(<argument><expr><name>TYPEOID</name></expr></argument>, <argument><expr><call><name>ObjectIdGetDatum</name><argument_list>(<argument><expr><name>typid</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>HeapTupleIsValid</name><argument_list>(<argument><expr><name>tup</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"cache lookup failed for type %u"</literal></expr></argument>, <argument><expr><name>typid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	<expr_stmt><expr><name>typ</name> <operator>=</operator> <operator>(</operator><name>Form_pg_type</name><operator>)</operator> <call><name>GETSTRUCT</name><argument_list>(<argument><expr><name>tup</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Look through domains to underlying base type. */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>typ</name><operator>-&gt;</operator><name>typtype</name></name> <operator>==</operator> <name>TYPTYPE_DOMAIN</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name>typid</name> <operator>=</operator> <name><name>typ</name><operator>-&gt;</operator><name>typbasetype</name></name></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>ReleaseSysCache</name><argument_list>(<argument><expr><name>tup</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<goto>goto <name>restart</name>;</goto>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/* If it's a true array type, deal with it that way. */</comment>
+	<if_stmt><if>if <condition>(<expr><call><name>OidIsValid</name><argument_list>(<argument><expr><name><name>typ</name><operator>-&gt;</operator><name>typelem</name></name></expr></argument>)</argument_list></call> <operator>&amp;&amp;</operator> <name><name>typ</name><operator>-&gt;</operator><name>typlen</name></name> <operator>==</operator> <operator>-</operator><literal type="number">1</literal></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name>typid</name> <operator>=</operator> <name><name>typ</name><operator>-&gt;</operator><name>typelem</name></name></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>ReleaseSysCache</name><argument_list>(<argument><expr><name>tup</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<return>return <expr><call><name>BuildArrayRemapInfo</name><argument_list>(<argument><expr><name>typid</name></expr></argument>, <argument><expr><name>mycontext</name></expr></argument>)</argument_list></call></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/* Similarly, deal with ranges appropriately. */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>typ</name><operator>-&gt;</operator><name>typtype</name></name> <operator>==</operator> <name>TYPTYPE_RANGE</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>ReleaseSysCache</name><argument_list>(<argument><expr><name>tup</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<return>return <expr><call><name>BuildRangeRemapInfo</name><argument_list>(<argument><expr><name>typid</name></expr></argument>, <argument><expr><name>mycontext</name></expr></argument>)</argument_list></call></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/*
+	 * If it's a composite type (including RECORD), set up for remapping.  We
+	 * don't attempt to determine the status of subfields here, since we do
+	 * not have enough information yet; just mark everything invalid.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>typ</name><operator>-&gt;</operator><name>typtype</name></name> <operator>==</operator> <name>TYPTYPE_COMPOSITE</name> <operator>||</operator> <name>typid</name> <operator>==</operator> <name>RECORDOID</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>TupleRemapInfo</name> <modifier>*</modifier></type><name>remapinfo</name></decl>;</decl_stmt>
+
+		<expr_stmt><expr><name>remapinfo</name> <operator>=</operator> <operator>(</operator><name>TupleRemapInfo</name> <operator>*</operator><operator>)</operator>
+			<call><name>MemoryContextAlloc</name><argument_list>(<argument><expr><name>mycontext</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>TupleRemapInfo</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>remapinfo</name><operator>-&gt;</operator><name>remapclass</name></name> <operator>=</operator> <name>TUPLE_REMAP_RECORD</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>remapinfo</name><operator>-&gt;</operator><name>u</name><operator>.</operator><name>rec</name><operator>.</operator><name>rectypid</name></name> <operator>=</operator> <name>InvalidOid</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>remapinfo</name><operator>-&gt;</operator><name>u</name><operator>.</operator><name>rec</name><operator>.</operator><name>rectypmod</name></name> <operator>=</operator> <operator>-</operator><literal type="number">1</literal></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>remapinfo</name><operator>-&gt;</operator><name>u</name><operator>.</operator><name>rec</name><operator>.</operator><name>localtypmod</name></name> <operator>=</operator> <operator>-</operator><literal type="number">1</literal></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>remapinfo</name><operator>-&gt;</operator><name>u</name><operator>.</operator><name>rec</name><operator>.</operator><name>tupledesc</name></name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>remapinfo</name><operator>-&gt;</operator><name>u</name><operator>.</operator><name>rec</name><operator>.</operator><name>field_remap</name></name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>ReleaseSysCache</name><argument_list>(<argument><expr><name>tup</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<return>return <expr><name>remapinfo</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/* Nothing else can possibly need remapping attention. */</comment>
+	<expr_stmt><expr><call><name>ReleaseSysCache</name><argument_list>(<argument><expr><name>tup</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<return>return <expr><name>NULL</name></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><specifier>static</specifier> <name>TupleRemapInfo</name> <modifier>*</modifier></type>
+<name>BuildArrayRemapInfo</name><parameter_list>(<parameter><decl><type><name>Oid</name></type> <name>elemtypid</name></decl></parameter>, <parameter><decl><type><name>MemoryContext</name></type> <name>mycontext</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>TupleRemapInfo</name> <modifier>*</modifier></type><name>remapinfo</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>TupleRemapInfo</name> <modifier>*</modifier></type><name>element_remapinfo</name></decl>;</decl_stmt>
+
+	<comment type="block">/* See if element type requires remapping. */</comment>
+	<expr_stmt><expr><name>element_remapinfo</name> <operator>=</operator> <call><name>BuildTupleRemapInfo</name><argument_list>(<argument><expr><name>elemtypid</name></expr></argument>, <argument><expr><name>mycontext</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<comment type="block">/* If not, the array doesn't either. */</comment>
+	<if_stmt><if>if <condition>(<expr><name>element_remapinfo</name> <operator>==</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>NULL</name></expr>;</return></block_content></block></if></if_stmt>
+	<comment type="block">/* OK, set up to remap the array. */</comment>
+	<expr_stmt><expr><name>remapinfo</name> <operator>=</operator> <operator>(</operator><name>TupleRemapInfo</name> <operator>*</operator><operator>)</operator>
+		<call><name>MemoryContextAlloc</name><argument_list>(<argument><expr><name>mycontext</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>TupleRemapInfo</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>remapinfo</name><operator>-&gt;</operator><name>remapclass</name></name> <operator>=</operator> <name>TUPLE_REMAP_ARRAY</name></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>get_typlenbyvalalign</name><argument_list>(<argument><expr><name>elemtypid</name></expr></argument>,
+						 <argument><expr><operator>&amp;</operator><name><name>remapinfo</name><operator>-&gt;</operator><name>u</name><operator>.</operator><name>arr</name><operator>.</operator><name>typlen</name></name></expr></argument>,
+						 <argument><expr><operator>&amp;</operator><name><name>remapinfo</name><operator>-&gt;</operator><name>u</name><operator>.</operator><name>arr</name><operator>.</operator><name>typbyval</name></name></expr></argument>,
+						 <argument><expr><operator>&amp;</operator><name><name>remapinfo</name><operator>-&gt;</operator><name>u</name><operator>.</operator><name>arr</name><operator>.</operator><name>typalign</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>remapinfo</name><operator>-&gt;</operator><name>u</name><operator>.</operator><name>arr</name><operator>.</operator><name>element_remap</name></name> <operator>=</operator> <name>element_remapinfo</name></expr>;</expr_stmt>
+	<return>return <expr><name>remapinfo</name></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><specifier>static</specifier> <name>TupleRemapInfo</name> <modifier>*</modifier></type>
+<name>BuildRangeRemapInfo</name><parameter_list>(<parameter><decl><type><name>Oid</name></type> <name>rngtypid</name></decl></parameter>, <parameter><decl><type><name>MemoryContext</name></type> <name>mycontext</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>TupleRemapInfo</name> <modifier>*</modifier></type><name>remapinfo</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>TupleRemapInfo</name> <modifier>*</modifier></type><name>bound_remapinfo</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>TypeCacheEntry</name> <modifier>*</modifier></type><name>typcache</name></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * Get range info from the typcache.  We assume this pointer will stay
+	 * valid for the duration of the query.
+	 */</comment>
+	<expr_stmt><expr><name>typcache</name> <operator>=</operator> <call><name>lookup_type_cache</name><argument_list>(<argument><expr><name>rngtypid</name></expr></argument>, <argument><expr><name>TYPECACHE_RANGE_INFO</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><name><name>typcache</name><operator>-&gt;</operator><name>rngelemtype</name></name> <operator>==</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"type %u is not a range type"</literal></expr></argument>, <argument><expr><name>rngtypid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<comment type="block">/* See if range bound type requires remapping. */</comment>
+	<expr_stmt><expr><name>bound_remapinfo</name> <operator>=</operator> <call><name>BuildTupleRemapInfo</name><argument_list>(<argument><expr><name><name>typcache</name><operator>-&gt;</operator><name>rngelemtype</name><operator>-&gt;</operator><name>type_id</name></name></expr></argument>,
+										  <argument><expr><name>mycontext</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<comment type="block">/* If not, the range doesn't either. */</comment>
+	<if_stmt><if>if <condition>(<expr><name>bound_remapinfo</name> <operator>==</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>NULL</name></expr>;</return></block_content></block></if></if_stmt>
+	<comment type="block">/* OK, set up to remap the range. */</comment>
+	<expr_stmt><expr><name>remapinfo</name> <operator>=</operator> <operator>(</operator><name>TupleRemapInfo</name> <operator>*</operator><operator>)</operator>
+		<call><name>MemoryContextAlloc</name><argument_list>(<argument><expr><name>mycontext</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>TupleRemapInfo</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>remapinfo</name><operator>-&gt;</operator><name>remapclass</name></name> <operator>=</operator> <name>TUPLE_REMAP_RANGE</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>remapinfo</name><operator>-&gt;</operator><name>u</name><operator>.</operator><name>rng</name><operator>.</operator><name>typcache</name></name> <operator>=</operator> <name>typcache</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>remapinfo</name><operator>-&gt;</operator><name>u</name><operator>.</operator><name>rng</name><operator>.</operator><name>bound_remap</name></name> <operator>=</operator> <name>bound_remapinfo</name></expr>;</expr_stmt>
+	<return>return <expr><name>remapinfo</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Build remap info for fields of the type described by the given tupdesc.
+ * Returns an array of TupleRemapInfo pointers, or NULL if no field
+ * requires remapping.  Data is allocated in mycontext.
+ */</comment>
+<function><type><specifier>static</specifier> <name>TupleRemapInfo</name> <modifier>*</modifier><modifier>*</modifier></type>
+<name>BuildFieldRemapInfo</name><parameter_list>(<parameter><decl><type><name>TupleDesc</name></type> <name>tupledesc</name></decl></parameter>, <parameter><decl><type><name>MemoryContext</name></type> <name>mycontext</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>TupleRemapInfo</name> <modifier>*</modifier><modifier>*</modifier></type><name>remapinfo</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type>		<name>noop</name> <init>= <expr><name>true</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>i</name></decl>;</decl_stmt>
+
+	<comment type="block">/* Recursively determine the remapping status of each field. */</comment>
+	<expr_stmt><expr><name>remapinfo</name> <operator>=</operator> <operator>(</operator><name>TupleRemapInfo</name> <operator>*</operator><operator>*</operator><operator>)</operator>
+		<call><name>MemoryContextAlloc</name><argument_list>(<argument><expr><name>mycontext</name></expr></argument>,
+						   <argument><expr><name><name>tupledesc</name><operator>-&gt;</operator><name>natts</name></name> <operator>*</operator> <sizeof>sizeof<argument_list>(<argument><expr><name>TupleRemapInfo</name> <operator>*</operator></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name><name>tupledesc</name><operator>-&gt;</operator><name>natts</name></name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>Form_pg_attribute</name></type> <name>attr</name> <init>= <expr><call><name>TupleDescAttr</name><argument_list>(<argument><expr><name>tupledesc</name></expr></argument>, <argument><expr><name>i</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name><name>attr</name><operator>-&gt;</operator><name>attisdropped</name></name></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><name><name>remapinfo</name><index>[<expr><name>i</name></expr>]</index></name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+			<continue>continue;</continue>
+		</block_content>}</block></if></if_stmt>
+		<expr_stmt><expr><name><name>remapinfo</name><index>[<expr><name>i</name></expr>]</index></name> <operator>=</operator> <call><name>BuildTupleRemapInfo</name><argument_list>(<argument><expr><name><name>attr</name><operator>-&gt;</operator><name>atttypid</name></name></expr></argument>, <argument><expr><name>mycontext</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<if_stmt><if>if <condition>(<expr><name><name>remapinfo</name><index>[<expr><name>i</name></expr>]</index></name> <operator>!=</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><name>noop</name> <operator>=</operator> <name>false</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	</block_content>}</block></for>
+
+	<comment type="block">/* If no fields require remapping, report that by returning NULL. */</comment>
+	<if_stmt><if>if <condition>(<expr><name>noop</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>pfree</name><argument_list>(<argument><expr><name>remapinfo</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name>remapinfo</name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<return>return <expr><name>remapinfo</name></expr>;</return>
+</block_content>}</block></function>
+</unit>

@@ -1,0 +1,706 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<unit xmlns="http://www.srcML.org/srcML/src" xmlns:cpp="http://www.srcML.org/srcML/cpp" revision="1.0.0" language="C" filename="/cloned_projects/agensgraph/src/backend/storage/buffer/freelist.c"><comment type="block">/*-------------------------------------------------------------------------
+ *
+ * freelist.c
+ *	  routines for managing the buffer pool's replacement strategy.
+ *
+ *
+ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1994, Regents of the University of California
+ *
+ *
+ * IDENTIFICATION
+ *	  src/backend/storage/buffer/freelist.c
+ *
+ *-------------------------------------------------------------------------
+ */</comment>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"postgres.h"</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"port/atomics.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/buf_internals.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/bufmgr.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/proc.h"</cpp:file></cpp:include>
+
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>INT_ACCESS_ONCE</name><parameter_list>(<parameter><type><name>var</name></type></parameter>)</parameter_list></cpp:macro>	<cpp:value>((int)(*((volatile int *)&amp;(var))))</cpp:value></cpp:define>
+
+
+<comment type="block">/*
+ * The shared freelist control information.
+ */</comment>
+<typedef>typedef <type><struct>struct
+<block>{
+	<comment type="block">/* Spinlock: protects the values below */</comment>
+	<decl_stmt><decl><type><name>slock_t</name></type>		<name>buffer_strategy_lock</name></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * Clock sweep hand: index of next buffer to consider grabbing. Note that
+	 * this isn't a concrete buffer - we only ever increase the value. So, to
+	 * get an actual buffer, it needs to be used modulo NBuffers.
+	 */</comment>
+	<decl_stmt><decl><type><name>pg_atomic_uint32</name></type> <name>nextVictimBuffer</name></decl>;</decl_stmt>
+
+	<decl_stmt><decl><type><name>int</name></type>			<name>firstFreeBuffer</name></decl>;</decl_stmt>	<comment type="block">/* Head of list of unused buffers */</comment>
+	<decl_stmt><decl><type><name>int</name></type>			<name>lastFreeBuffer</name></decl>;</decl_stmt> <comment type="block">/* Tail of list of unused buffers */</comment>
+
+	<comment type="block">/*
+	 * NOTE: lastFreeBuffer is undefined when firstFreeBuffer is -1 (that is,
+	 * when the list is empty)
+	 */</comment>
+
+	<comment type="block">/*
+	 * Statistics.  These counters should be wide enough that they can't
+	 * overflow during a single bgwriter cycle.
+	 */</comment>
+	<decl_stmt><decl><type><name>uint32</name></type>		<name>completePasses</name></decl>;</decl_stmt> <comment type="block">/* Complete cycles of the clock sweep */</comment>
+	<decl_stmt><decl><type><name>pg_atomic_uint32</name></type> <name>numBufferAllocs</name></decl>;</decl_stmt>	<comment type="block">/* Buffers allocated since last reset */</comment>
+
+	<comment type="block">/*
+	 * Bgworker process to be notified upon activity or -1 if none. See
+	 * StrategyNotifyBgWriter.
+	 */</comment>
+	<decl_stmt><decl><type><name>int</name></type>			<name>bgwprocno</name></decl>;</decl_stmt>
+}</block></struct></type> <name>BufferStrategyControl</name>;</typedef>
+
+<comment type="block">/* Pointers to shared state */</comment>
+<decl_stmt><decl><type><specifier>static</specifier> <name>BufferStrategyControl</name> <modifier>*</modifier></type><name>StrategyControl</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+
+<comment type="block">/*
+ * Private (non-shared) state for managing a ring of shared buffers to re-use.
+ * This is currently the only kind of BufferAccessStrategy object, but someday
+ * we might have more kinds.
+ */</comment>
+<typedef>typedef <type><struct>struct <name>BufferAccessStrategyData</name>
+<block>{
+	<comment type="block">/* Overall strategy type */</comment>
+	<decl_stmt><decl><type><name>BufferAccessStrategyType</name></type> <name>btype</name></decl>;</decl_stmt>
+	<comment type="block">/* Number of elements in buffers[] array */</comment>
+	<decl_stmt><decl><type><name>int</name></type>			<name>ring_size</name></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * Index of the "current" slot in the ring, ie, the one most recently
+	 * returned by GetBufferFromRing.
+	 */</comment>
+	<decl_stmt><decl><type><name>int</name></type>			<name>current</name></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * True if the buffer just returned by StrategyGetBuffer had been in the
+	 * ring already.
+	 */</comment>
+	<decl_stmt><decl><type><name>bool</name></type>		<name>current_was_in_ring</name></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * Array of buffer numbers.  InvalidBuffer (that is, zero) indicates we
+	 * have not yet selected a buffer for this ring slot.  For allocation
+	 * simplicity this is palloc'd together with the fixed fields of the
+	 * struct.
+	 */</comment>
+	<decl_stmt><decl><type><name>Buffer</name></type>		<name><name>buffers</name><index>[<expr><name>FLEXIBLE_ARRAY_MEMBER</name></expr>]</index></name></decl>;</decl_stmt>
+}</block></struct></type>			<name>BufferAccessStrategyData</name>;</typedef>
+
+
+<comment type="block">/* Prototypes for internal functions */</comment>
+<function_decl><type><specifier>static</specifier> <name>BufferDesc</name> <modifier>*</modifier></type><name>GetBufferFromRing</name><parameter_list>(<parameter><decl><type><name>BufferAccessStrategy</name></type> <name>strategy</name></decl></parameter>,
+									 <parameter><decl><type><name>uint32</name> <modifier>*</modifier></type><name>buf_state</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>AddBufferToRing</name><parameter_list>(<parameter><decl><type><name>BufferAccessStrategy</name></type> <name>strategy</name></decl></parameter>,
+							<parameter><decl><type><name>BufferDesc</name> <modifier>*</modifier></type><name>buf</name></decl></parameter>)</parameter_list>;</function_decl>
+
+<comment type="block">/*
+ * ClockSweepTick - Helper routine for StrategyGetBuffer()
+ *
+ * Move the clock hand one buffer ahead of its current position and return the
+ * id of the buffer now under the hand.
+ */</comment>
+<function><type><specifier>static</specifier> <specifier>inline</specifier> <name>uint32</name></type>
+<name>ClockSweepTick</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>uint32</name></type>		<name>victim</name></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * Atomically move hand ahead one buffer - if there's several processes
+	 * doing this, this can lead to buffers being returned slightly out of
+	 * apparent order.
+	 */</comment>
+	<expr_stmt><expr><name>victim</name> <operator>=</operator>
+		<call><name>pg_atomic_fetch_add_u32</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>StrategyControl</name><operator>-&gt;</operator><name>nextVictimBuffer</name></name></expr></argument>, <argument><expr><literal type="number">1</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>victim</name> <operator>&gt;=</operator> <name>NBuffers</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>uint32</name></type>		<name>originalVictim</name> <init>= <expr><name>victim</name></expr></init></decl>;</decl_stmt>
+
+		<comment type="block">/* always wrap what we look up in BufferDescriptors */</comment>
+		<expr_stmt><expr><name>victim</name> <operator>=</operator> <name>victim</name> <operator>%</operator> <name>NBuffers</name></expr>;</expr_stmt>
+
+		<comment type="block">/*
+		 * If we're the one that just caused a wraparound, force
+		 * completePasses to be incremented while holding the spinlock. We
+		 * need the spinlock so StrategySyncStart() can return a consistent
+		 * value consisting of nextVictimBuffer and completePasses.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><name>victim</name> <operator>==</operator> <literal type="number">0</literal></expr>)</condition>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>uint32</name></type>		<name>expected</name></decl>;</decl_stmt>
+			<decl_stmt><decl><type><name>uint32</name></type>		<name>wrapped</name></decl>;</decl_stmt>
+			<decl_stmt><decl><type><name>bool</name></type>		<name>success</name> <init>= <expr><name>false</name></expr></init></decl>;</decl_stmt>
+
+			<expr_stmt><expr><name>expected</name> <operator>=</operator> <name>originalVictim</name> <operator>+</operator> <literal type="number">1</literal></expr>;</expr_stmt>
+
+			<while>while <condition>(<expr><operator>!</operator><name>success</name></expr>)</condition>
+			<block>{<block_content>
+				<comment type="block">/*
+				 * Acquire the spinlock while increasing completePasses. That
+				 * allows other readers to read nextVictimBuffer and
+				 * completePasses in a consistent manner which is required for
+				 * StrategySyncStart().  In theory delaying the increment
+				 * could lead to an overflow of nextVictimBuffers, but that's
+				 * highly unlikely and wouldn't be particularly harmful.
+				 */</comment>
+				<expr_stmt><expr><call><name>SpinLockAcquire</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>StrategyControl</name><operator>-&gt;</operator><name>buffer_strategy_lock</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+				<expr_stmt><expr><name>wrapped</name> <operator>=</operator> <name>expected</name> <operator>%</operator> <name>NBuffers</name></expr>;</expr_stmt>
+
+				<expr_stmt><expr><name>success</name> <operator>=</operator> <call><name>pg_atomic_compare_exchange_u32</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>StrategyControl</name><operator>-&gt;</operator><name>nextVictimBuffer</name></name></expr></argument>,
+														 <argument><expr><operator>&amp;</operator><name>expected</name></expr></argument>, <argument><expr><name>wrapped</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<if_stmt><if>if <condition>(<expr><name>success</name></expr>)</condition><block type="pseudo"><block_content>
+					<expr_stmt><expr><name><name>StrategyControl</name><operator>-&gt;</operator><name>completePasses</name></name><operator>++</operator></expr>;</expr_stmt></block_content></block></if></if_stmt>
+				<expr_stmt><expr><call><name>SpinLockRelease</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>StrategyControl</name><operator>-&gt;</operator><name>buffer_strategy_lock</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			</block_content>}</block></while>
+		</block_content>}</block></if></if_stmt>
+	</block_content>}</block></if></if_stmt>
+	<return>return <expr><name>victim</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * have_free_buffer -- a lockless check to see if there is a free buffer in
+ *					   buffer pool.
+ *
+ * If the result is true that will become stale once free buffers are moved out
+ * by other operations, so the caller who strictly want to use a free buffer
+ * should not call this.
+ */</comment>
+<function><type><name>bool</name></type>
+<name>have_free_buffer</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<if_stmt><if>if <condition>(<expr><name><name>StrategyControl</name><operator>-&gt;</operator><name>firstFreeBuffer</name></name> <operator>&gt;=</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>true</name></expr>;</return></block_content></block></if>
+	<else>else<block type="pseudo"><block_content>
+		<return>return <expr><name>false</name></expr>;</return></block_content></block></else></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * StrategyGetBuffer
+ *
+ *	Called by the bufmgr to get the next candidate buffer to use in
+ *	BufferAlloc(). The only hard requirement BufferAlloc() has is that
+ *	the selected buffer must not currently be pinned by anyone.
+ *
+ *	strategy is a BufferAccessStrategy object, or NULL for default strategy.
+ *
+ *	To ensure that no one else can pin the buffer before we do, we must
+ *	return the buffer with the buffer header spinlock still held.
+ */</comment>
+<function><type><name>BufferDesc</name> <modifier>*</modifier></type>
+<name>StrategyGetBuffer</name><parameter_list>(<parameter><decl><type><name>BufferAccessStrategy</name></type> <name>strategy</name></decl></parameter>, <parameter><decl><type><name>uint32</name> <modifier>*</modifier></type><name>buf_state</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>BufferDesc</name> <modifier>*</modifier></type><name>buf</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>bgwprocno</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>trycounter</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>uint32</name></type>		<name>local_buf_state</name></decl>;</decl_stmt>	<comment type="block">/* to avoid repeated (de-)referencing */</comment>
+
+	<comment type="block">/*
+	 * If given a strategy object, see whether it can select a buffer. We
+	 * assume strategy objects don't need buffer_strategy_lock.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name>strategy</name> <operator>!=</operator> <name>NULL</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name>buf</name> <operator>=</operator> <call><name>GetBufferFromRing</name><argument_list>(<argument><expr><name>strategy</name></expr></argument>, <argument><expr><name>buf_state</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<if_stmt><if>if <condition>(<expr><name>buf</name> <operator>!=</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+			<return>return <expr><name>buf</name></expr>;</return></block_content></block></if></if_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/*
+	 * If asked, we need to waken the bgwriter. Since we don't want to rely on
+	 * a spinlock for this we force a read from shared memory once, and then
+	 * set the latch based on that value. We need to go through that length
+	 * because otherwise bgwprocno might be reset while/after we check because
+	 * the compiler might just reread from memory.
+	 *
+	 * This can possibly set the latch of the wrong process if the bgwriter
+	 * dies in the wrong moment. But since PGPROC-&gt;procLatch is never
+	 * deallocated the worst consequence of that is that we set the latch of
+	 * some arbitrary process.
+	 */</comment>
+	<expr_stmt><expr><name>bgwprocno</name> <operator>=</operator> <call><name>INT_ACCESS_ONCE</name><argument_list>(<argument><expr><name><name>StrategyControl</name><operator>-&gt;</operator><name>bgwprocno</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><name>bgwprocno</name> <operator>!=</operator> <operator>-</operator><literal type="number">1</literal></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* reset bgwprocno first, before setting the latch */</comment>
+		<expr_stmt><expr><name><name>StrategyControl</name><operator>-&gt;</operator><name>bgwprocno</name></name> <operator>=</operator> <operator>-</operator><literal type="number">1</literal></expr>;</expr_stmt>
+
+		<comment type="block">/*
+		 * Not acquiring ProcArrayLock here which is slightly icky. It's
+		 * actually fine because procLatch isn't ever freed, so we just can
+		 * potentially set the wrong process' (or no process') latch.
+		 */</comment>
+		<expr_stmt><expr><call><name>SetLatch</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>ProcGlobal</name><operator>-&gt;</operator><name>allProcs</name><index>[<expr><name>bgwprocno</name></expr>]</index></name><operator>.</operator><name>procLatch</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/*
+	 * We count buffer allocation requests so that the bgwriter can estimate
+	 * the rate of buffer consumption.  Note that buffers recycled by a
+	 * strategy object are intentionally not counted here.
+	 */</comment>
+	<expr_stmt><expr><call><name>pg_atomic_fetch_add_u32</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>StrategyControl</name><operator>-&gt;</operator><name>numBufferAllocs</name></name></expr></argument>, <argument><expr><literal type="number">1</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * First check, without acquiring the lock, whether there's buffers in the
+	 * freelist. Since we otherwise don't require the spinlock in every
+	 * StrategyGetBuffer() invocation, it'd be sad to acquire it here -
+	 * uselessly in most cases. That obviously leaves a race where a buffer is
+	 * put on the freelist but we don't see the store yet - but that's pretty
+	 * harmless, it'll just get used during the next buffer acquisition.
+	 *
+	 * If there's buffers on the freelist, acquire the spinlock to pop one
+	 * buffer of the freelist. Then check whether that buffer is usable and
+	 * repeat if not.
+	 *
+	 * Note that the freeNext fields are considered to be protected by the
+	 * buffer_strategy_lock not the individual buffer spinlocks, so it's OK to
+	 * manipulate them without holding the spinlock.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>StrategyControl</name><operator>-&gt;</operator><name>firstFreeBuffer</name></name> <operator>&gt;=</operator> <literal type="number">0</literal></expr>)</condition>
+	<block>{<block_content>
+		<while>while <condition>(<expr><name>true</name></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/* Acquire the spinlock to remove element from the freelist */</comment>
+			<expr_stmt><expr><call><name>SpinLockAcquire</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>StrategyControl</name><operator>-&gt;</operator><name>buffer_strategy_lock</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+			<if_stmt><if>if <condition>(<expr><name><name>StrategyControl</name><operator>-&gt;</operator><name>firstFreeBuffer</name></name> <operator>&lt;</operator> <literal type="number">0</literal></expr>)</condition>
+			<block>{<block_content>
+				<expr_stmt><expr><call><name>SpinLockRelease</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>StrategyControl</name><operator>-&gt;</operator><name>buffer_strategy_lock</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<break>break;</break>
+			</block_content>}</block></if></if_stmt>
+
+			<expr_stmt><expr><name>buf</name> <operator>=</operator> <call><name>GetBufferDescriptor</name><argument_list>(<argument><expr><name><name>StrategyControl</name><operator>-&gt;</operator><name>firstFreeBuffer</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>buf</name><operator>-&gt;</operator><name>freeNext</name></name> <operator>!=</operator> <name>FREENEXT_NOT_IN_LIST</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+			<comment type="block">/* Unconditionally remove buffer from freelist */</comment>
+			<expr_stmt><expr><name><name>StrategyControl</name><operator>-&gt;</operator><name>firstFreeBuffer</name></name> <operator>=</operator> <name><name>buf</name><operator>-&gt;</operator><name>freeNext</name></name></expr>;</expr_stmt>
+			<expr_stmt><expr><name><name>buf</name><operator>-&gt;</operator><name>freeNext</name></name> <operator>=</operator> <name>FREENEXT_NOT_IN_LIST</name></expr>;</expr_stmt>
+
+			<comment type="block">/*
+			 * Release the lock so someone else can access the freelist while
+			 * we check out this buffer.
+			 */</comment>
+			<expr_stmt><expr><call><name>SpinLockRelease</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>StrategyControl</name><operator>-&gt;</operator><name>buffer_strategy_lock</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+			<comment type="block">/*
+			 * If the buffer is pinned or has a nonzero usage_count, we cannot
+			 * use it; discard it and retry.  (This can only happen if VACUUM
+			 * put a valid buffer in the freelist and then someone else used
+			 * it before we got to it.  It's probably impossible altogether as
+			 * of 8.3, but we'd better check anyway.)
+			 */</comment>
+			<expr_stmt><expr><name>local_buf_state</name> <operator>=</operator> <call><name>LockBufHdr</name><argument_list>(<argument><expr><name>buf</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<if_stmt><if>if <condition>(<expr><call><name>BUF_STATE_GET_REFCOUNT</name><argument_list>(<argument><expr><name>local_buf_state</name></expr></argument>)</argument_list></call> <operator>==</operator> <literal type="number">0</literal>
+				<operator>&amp;&amp;</operator> <call><name>BUF_STATE_GET_USAGECOUNT</name><argument_list>(<argument><expr><name>local_buf_state</name></expr></argument>)</argument_list></call> <operator>==</operator> <literal type="number">0</literal></expr>)</condition>
+			<block>{<block_content>
+				<if_stmt><if>if <condition>(<expr><name>strategy</name> <operator>!=</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+					<expr_stmt><expr><call><name>AddBufferToRing</name><argument_list>(<argument><expr><name>strategy</name></expr></argument>, <argument><expr><name>buf</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+				<expr_stmt><expr><operator>*</operator><name>buf_state</name> <operator>=</operator> <name>local_buf_state</name></expr>;</expr_stmt>
+				<return>return <expr><name>buf</name></expr>;</return>
+			</block_content>}</block></if></if_stmt>
+			<expr_stmt><expr><call><name>UnlockBufHdr</name><argument_list>(<argument><expr><name>buf</name></expr></argument>, <argument><expr><name>local_buf_state</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		</block_content>}</block></while>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/* Nothing on the freelist, so run the "clock sweep" algorithm */</comment>
+	<expr_stmt><expr><name>trycounter</name> <operator>=</operator> <name>NBuffers</name></expr>;</expr_stmt>
+	<for>for <control>(<init>;</init><condition>;</condition><incr/>)</control>
+	<block>{<block_content>
+		<expr_stmt><expr><name>buf</name> <operator>=</operator> <call><name>GetBufferDescriptor</name><argument_list>(<argument><expr><call><name>ClockSweepTick</name><argument_list>()</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/*
+		 * If the buffer is pinned or has a nonzero usage_count, we cannot use
+		 * it; decrement the usage_count (unless pinned) and keep scanning.
+		 */</comment>
+		<expr_stmt><expr><name>local_buf_state</name> <operator>=</operator> <call><name>LockBufHdr</name><argument_list>(<argument><expr><name>buf</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<if_stmt><if>if <condition>(<expr><call><name>BUF_STATE_GET_REFCOUNT</name><argument_list>(<argument><expr><name>local_buf_state</name></expr></argument>)</argument_list></call> <operator>==</operator> <literal type="number">0</literal></expr>)</condition>
+		<block>{<block_content>
+			<if_stmt><if>if <condition>(<expr><call><name>BUF_STATE_GET_USAGECOUNT</name><argument_list>(<argument><expr><name>local_buf_state</name></expr></argument>)</argument_list></call> <operator>!=</operator> <literal type="number">0</literal></expr>)</condition>
+			<block>{<block_content>
+				<expr_stmt><expr><name>local_buf_state</name> <operator>-=</operator> <name>BUF_USAGECOUNT_ONE</name></expr>;</expr_stmt>
+
+				<expr_stmt><expr><name>trycounter</name> <operator>=</operator> <name>NBuffers</name></expr>;</expr_stmt>
+			</block_content>}</block></if>
+			<else>else
+			<block>{<block_content>
+				<comment type="block">/* Found a usable buffer */</comment>
+				<if_stmt><if>if <condition>(<expr><name>strategy</name> <operator>!=</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+					<expr_stmt><expr><call><name>AddBufferToRing</name><argument_list>(<argument><expr><name>strategy</name></expr></argument>, <argument><expr><name>buf</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+				<expr_stmt><expr><operator>*</operator><name>buf_state</name> <operator>=</operator> <name>local_buf_state</name></expr>;</expr_stmt>
+				<return>return <expr><name>buf</name></expr>;</return>
+			</block_content>}</block></else></if_stmt>
+		</block_content>}</block></if>
+		<if type="elseif">else if <condition>(<expr><operator>--</operator><name>trycounter</name> <operator>==</operator> <literal type="number">0</literal></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/*
+			 * We've scanned all the buffers without making any state changes,
+			 * so all the buffers are pinned (or were when we looked at them).
+			 * We could hope that someone will free one eventually, but it's
+			 * probably better to fail than to risk getting stuck in an
+			 * infinite loop.
+			 */</comment>
+			<expr_stmt><expr><call><name>UnlockBufHdr</name><argument_list>(<argument><expr><name>buf</name></expr></argument>, <argument><expr><name>local_buf_state</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"no unpinned buffers available"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+		<expr_stmt><expr><call><name>UnlockBufHdr</name><argument_list>(<argument><expr><name>buf</name></expr></argument>, <argument><expr><name>local_buf_state</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></for>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * StrategyFreeBuffer: put a buffer on the freelist
+ */</comment>
+<function><type><name>void</name></type>
+<name>StrategyFreeBuffer</name><parameter_list>(<parameter><decl><type><name>BufferDesc</name> <modifier>*</modifier></type><name>buf</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>SpinLockAcquire</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>StrategyControl</name><operator>-&gt;</operator><name>buffer_strategy_lock</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * It is possible that we are told to put something in the freelist that
+	 * is already in it; don't screw up the list if so.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>buf</name><operator>-&gt;</operator><name>freeNext</name></name> <operator>==</operator> <name>FREENEXT_NOT_IN_LIST</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name><name>buf</name><operator>-&gt;</operator><name>freeNext</name></name> <operator>=</operator> <name><name>StrategyControl</name><operator>-&gt;</operator><name>firstFreeBuffer</name></name></expr>;</expr_stmt>
+		<if_stmt><if>if <condition>(<expr><name><name>buf</name><operator>-&gt;</operator><name>freeNext</name></name> <operator>&lt;</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><name><name>StrategyControl</name><operator>-&gt;</operator><name>lastFreeBuffer</name></name> <operator>=</operator> <name><name>buf</name><operator>-&gt;</operator><name>buf_id</name></name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+		<expr_stmt><expr><name><name>StrategyControl</name><operator>-&gt;</operator><name>firstFreeBuffer</name></name> <operator>=</operator> <name><name>buf</name><operator>-&gt;</operator><name>buf_id</name></name></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>SpinLockRelease</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>StrategyControl</name><operator>-&gt;</operator><name>buffer_strategy_lock</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * StrategySyncStart -- tell BufferSync where to start syncing
+ *
+ * The result is the buffer index of the best buffer to sync first.
+ * BufferSync() will proceed circularly around the buffer array from there.
+ *
+ * In addition, we return the completed-pass count (which is effectively
+ * the higher-order bits of nextVictimBuffer) and the count of recent buffer
+ * allocs if non-NULL pointers are passed.  The alloc count is reset after
+ * being read.
+ */</comment>
+<function><type><name>int</name></type>
+<name>StrategySyncStart</name><parameter_list>(<parameter><decl><type><name>uint32</name> <modifier>*</modifier></type><name>complete_passes</name></decl></parameter>, <parameter><decl><type><name>uint32</name> <modifier>*</modifier></type><name>num_buf_alloc</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>uint32</name></type>		<name>nextVictimBuffer</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>result</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>SpinLockAcquire</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>StrategyControl</name><operator>-&gt;</operator><name>buffer_strategy_lock</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>nextVictimBuffer</name> <operator>=</operator> <call><name>pg_atomic_read_u32</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>StrategyControl</name><operator>-&gt;</operator><name>nextVictimBuffer</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>result</name> <operator>=</operator> <name>nextVictimBuffer</name> <operator>%</operator> <name>NBuffers</name></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>complete_passes</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><operator>*</operator><name>complete_passes</name> <operator>=</operator> <name><name>StrategyControl</name><operator>-&gt;</operator><name>completePasses</name></name></expr>;</expr_stmt>
+
+		<comment type="block">/*
+		 * Additionally add the number of wraparounds that happened before
+		 * completePasses could be incremented. C.f. ClockSweepTick().
+		 */</comment>
+		<expr_stmt><expr><operator>*</operator><name>complete_passes</name> <operator>+=</operator> <name>nextVictimBuffer</name> <operator>/</operator> <name>NBuffers</name></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>num_buf_alloc</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><operator>*</operator><name>num_buf_alloc</name> <operator>=</operator> <call><name>pg_atomic_exchange_u32</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>StrategyControl</name><operator>-&gt;</operator><name>numBufferAllocs</name></name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+	<expr_stmt><expr><call><name>SpinLockRelease</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>StrategyControl</name><operator>-&gt;</operator><name>buffer_strategy_lock</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<return>return <expr><name>result</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * StrategyNotifyBgWriter -- set or clear allocation notification latch
+ *
+ * If bgwprocno isn't -1, the next invocation of StrategyGetBuffer will
+ * set that latch.  Pass -1 to clear the pending notification before it
+ * happens.  This feature is used by the bgwriter process to wake itself up
+ * from hibernation, and is not meant for anybody else to use.
+ */</comment>
+<function><type><name>void</name></type>
+<name>StrategyNotifyBgWriter</name><parameter_list>(<parameter><decl><type><name>int</name></type> <name>bgwprocno</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<comment type="block">/*
+	 * We acquire buffer_strategy_lock just to ensure that the store appears
+	 * atomic to StrategyGetBuffer.  The bgwriter should call this rather
+	 * infrequently, so there's no performance penalty from being safe.
+	 */</comment>
+	<expr_stmt><expr><call><name>SpinLockAcquire</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>StrategyControl</name><operator>-&gt;</operator><name>buffer_strategy_lock</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>StrategyControl</name><operator>-&gt;</operator><name>bgwprocno</name></name> <operator>=</operator> <name>bgwprocno</name></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>SpinLockRelease</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>StrategyControl</name><operator>-&gt;</operator><name>buffer_strategy_lock</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * StrategyShmemSize
+ *
+ * estimate the size of shared memory used by the freelist-related structures.
+ *
+ * Note: for somewhat historical reasons, the buffer lookup hashtable size
+ * is also determined here.
+ */</comment>
+<function><type><name>Size</name></type>
+<name>StrategyShmemSize</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>Size</name></type>		<name>size</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+
+	<comment type="block">/* size of lookup hash table ... see comment in StrategyInitialize */</comment>
+	<expr_stmt><expr><name>size</name> <operator>=</operator> <call><name>add_size</name><argument_list>(<argument><expr><name>size</name></expr></argument>, <argument><expr><call><name>BufTableShmemSize</name><argument_list>(<argument><expr><name>NBuffers</name> <operator>+</operator> <name>NUM_BUFFER_PARTITIONS</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* size of the shared replacement strategy control block */</comment>
+	<expr_stmt><expr><name>size</name> <operator>=</operator> <call><name>add_size</name><argument_list>(<argument><expr><name>size</name></expr></argument>, <argument><expr><call><name>MAXALIGN</name><argument_list>(<argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>BufferStrategyControl</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<return>return <expr><name>size</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * StrategyInitialize -- initialize the buffer cache replacement
+ *		strategy.
+ *
+ * Assumes: All of the buffers are already built into a linked list.
+ *		Only called by postmaster and only during initialization.
+ */</comment>
+<function><type><name>void</name></type>
+<name>StrategyInitialize</name><parameter_list>(<parameter><decl><type><name>bool</name></type> <name>init</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>bool</name></type>		<name>found</name></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * Initialize the shared buffer lookup hashtable.
+	 *
+	 * Since we can't tolerate running out of lookup table entries, we must be
+	 * sure to specify an adequate table size here.  The maximum steady-state
+	 * usage is of course NBuffers entries, but BufferAlloc() tries to insert
+	 * a new entry before deleting the old.  In principle this could be
+	 * happening in each partition concurrently, so we could need as many as
+	 * NBuffers + NUM_BUFFER_PARTITIONS entries.
+	 */</comment>
+	<expr_stmt><expr><call><name>InitBufTable</name><argument_list>(<argument><expr><name>NBuffers</name> <operator>+</operator> <name>NUM_BUFFER_PARTITIONS</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Get or create the shared strategy control block
+	 */</comment>
+	<expr_stmt><expr><name>StrategyControl</name> <operator>=</operator> <operator>(</operator><name>BufferStrategyControl</name> <operator>*</operator><operator>)</operator>
+		<call><name>ShmemInitStruct</name><argument_list>(<argument><expr><literal type="string">"Buffer Strategy Status"</literal></expr></argument>,
+						<argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>BufferStrategyControl</name></expr></argument>)</argument_list></sizeof></expr></argument>,
+						<argument><expr><operator>&amp;</operator><name>found</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><name>found</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/*
+		 * Only done once, usually in postmaster
+		 */</comment>
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>init</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><call><name>SpinLockInit</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>StrategyControl</name><operator>-&gt;</operator><name>buffer_strategy_lock</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/*
+		 * Grab the whole linked list of free buffers for our strategy. We
+		 * assume it was previously set up by InitBufferPool().
+		 */</comment>
+		<expr_stmt><expr><name><name>StrategyControl</name><operator>-&gt;</operator><name>firstFreeBuffer</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>StrategyControl</name><operator>-&gt;</operator><name>lastFreeBuffer</name></name> <operator>=</operator> <name>NBuffers</name> <operator>-</operator> <literal type="number">1</literal></expr>;</expr_stmt>
+
+		<comment type="block">/* Initialize the clock sweep pointer */</comment>
+		<expr_stmt><expr><call><name>pg_atomic_init_u32</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>StrategyControl</name><operator>-&gt;</operator><name>nextVictimBuffer</name></name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/* Clear statistics */</comment>
+		<expr_stmt><expr><name><name>StrategyControl</name><operator>-&gt;</operator><name>completePasses</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>pg_atomic_init_u32</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>StrategyControl</name><operator>-&gt;</operator><name>numBufferAllocs</name></name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/* No pending notification */</comment>
+		<expr_stmt><expr><name><name>StrategyControl</name><operator>-&gt;</operator><name>bgwprocno</name></name> <operator>=</operator> <operator>-</operator><literal type="number">1</literal></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<else>else<block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><operator>!</operator><name>init</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></else></if_stmt>
+</block_content>}</block></function>
+
+
+<comment type="block">/* ----------------------------------------------------------------
+ *				Backend-private buffer ring management
+ * ----------------------------------------------------------------
+ */</comment>
+
+
+<comment type="block">/*
+ * GetAccessStrategy -- create a BufferAccessStrategy object
+ *
+ * The object is allocated in the current memory context.
+ */</comment>
+<function><type><name>BufferAccessStrategy</name></type>
+<name>GetAccessStrategy</name><parameter_list>(<parameter><decl><type><name>BufferAccessStrategyType</name></type> <name>btype</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>BufferAccessStrategy</name></type> <name>strategy</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>ring_size</name></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * Select ring size to use.  See buffer/README for rationales.
+	 *
+	 * Note: if you change the ring size for BAS_BULKREAD, see also
+	 * SYNC_SCAN_REPORT_INTERVAL in access/heap/syncscan.c.
+	 */</comment>
+	<switch>switch <condition>(<expr><name>btype</name></expr>)</condition>
+	<block>{<block_content>
+		<case>case <expr><name>BAS_NORMAL</name></expr>:</case>
+			<comment type="block">/* if someone asks for NORMAL, just give 'em a "default" object */</comment>
+			<return>return <expr><name>NULL</name></expr>;</return>
+
+		<case>case <expr><name>BAS_BULKREAD</name></expr>:</case>
+			<expr_stmt><expr><name>ring_size</name> <operator>=</operator> <literal type="number">256</literal> <operator>*</operator> <literal type="number">1024</literal> <operator>/</operator> <name>BLCKSZ</name></expr>;</expr_stmt>
+			<break>break;</break>
+		<case>case <expr><name>BAS_BULKWRITE</name></expr>:</case>
+			<expr_stmt><expr><name>ring_size</name> <operator>=</operator> <literal type="number">16</literal> <operator>*</operator> <literal type="number">1024</literal> <operator>*</operator> <literal type="number">1024</literal> <operator>/</operator> <name>BLCKSZ</name></expr>;</expr_stmt>
+			<break>break;</break>
+		<case>case <expr><name>BAS_VACUUM</name></expr>:</case>
+			<expr_stmt><expr><name>ring_size</name> <operator>=</operator> <literal type="number">256</literal> <operator>*</operator> <literal type="number">1024</literal> <operator>/</operator> <name>BLCKSZ</name></expr>;</expr_stmt>
+			<break>break;</break>
+
+		<default>default:</default>
+			<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"unrecognized buffer access strategy: %d"</literal></expr></argument>,
+				 <argument><expr><operator>(</operator><name>int</name><operator>)</operator> <name>btype</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<return>return <expr><name>NULL</name></expr>;</return>		<comment type="block">/* keep compiler quiet */</comment>
+	</block_content>}</block></switch>
+
+	<comment type="block">/* Make sure ring isn't an undue fraction of shared buffers */</comment>
+	<expr_stmt><expr><name>ring_size</name> <operator>=</operator> <call><name>Min</name><argument_list>(<argument><expr><name>NBuffers</name> <operator>/</operator> <literal type="number">8</literal></expr></argument>, <argument><expr><name>ring_size</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Allocate the object and initialize all elements to zeroes */</comment>
+	<expr_stmt><expr><name>strategy</name> <operator>=</operator> <operator>(</operator><name>BufferAccessStrategy</name><operator>)</operator>
+		<call><name>palloc0</name><argument_list>(<argument><expr><call><name>offsetof</name><argument_list>(<argument><expr><name>BufferAccessStrategyData</name></expr></argument>, <argument><expr><name>buffers</name></expr></argument>)</argument_list></call> <operator>+</operator>
+				<name>ring_size</name> <operator>*</operator> <sizeof>sizeof<argument_list>(<argument><expr><name>Buffer</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Set fields that don't start out zero */</comment>
+	<expr_stmt><expr><name><name>strategy</name><operator>-&gt;</operator><name>btype</name></name> <operator>=</operator> <name>btype</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>strategy</name><operator>-&gt;</operator><name>ring_size</name></name> <operator>=</operator> <name>ring_size</name></expr>;</expr_stmt>
+
+	<return>return <expr><name>strategy</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * FreeAccessStrategy -- release a BufferAccessStrategy object
+ *
+ * A simple pfree would do at the moment, but we would prefer that callers
+ * don't assume that much about the representation of BufferAccessStrategy.
+ */</comment>
+<function><type><name>void</name></type>
+<name>FreeAccessStrategy</name><parameter_list>(<parameter><decl><type><name>BufferAccessStrategy</name></type> <name>strategy</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<comment type="block">/* don't crash if called on a "default" strategy */</comment>
+	<if_stmt><if>if <condition>(<expr><name>strategy</name> <operator>!=</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>pfree</name><argument_list>(<argument><expr><name>strategy</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * GetBufferFromRing -- returns a buffer from the ring, or NULL if the
+ *		ring is empty.
+ *
+ * The bufhdr spin lock is held on the returned buffer.
+ */</comment>
+<function><type><specifier>static</specifier> <name>BufferDesc</name> <modifier>*</modifier></type>
+<name>GetBufferFromRing</name><parameter_list>(<parameter><decl><type><name>BufferAccessStrategy</name></type> <name>strategy</name></decl></parameter>, <parameter><decl><type><name>uint32</name> <modifier>*</modifier></type><name>buf_state</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>BufferDesc</name> <modifier>*</modifier></type><name>buf</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Buffer</name></type>		<name>bufnum</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>uint32</name></type>		<name>local_buf_state</name></decl>;</decl_stmt>	<comment type="block">/* to avoid repeated (de-)referencing */</comment>
+
+
+	<comment type="block">/* Advance to next ring slot */</comment>
+	<if_stmt><if>if <condition>(<expr><operator>++</operator><name><name>strategy</name><operator>-&gt;</operator><name>current</name></name> <operator>&gt;=</operator> <name><name>strategy</name><operator>-&gt;</operator><name>ring_size</name></name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name><name>strategy</name><operator>-&gt;</operator><name>current</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<comment type="block">/*
+	 * If the slot hasn't been filled yet, tell the caller to allocate a new
+	 * buffer with the normal allocation strategy.  He will then fill this
+	 * slot by calling AddBufferToRing with the new buffer.
+	 */</comment>
+	<expr_stmt><expr><name>bufnum</name> <operator>=</operator> <name><name>strategy</name><operator>-&gt;</operator><name>buffers</name><index>[<expr><name><name>strategy</name><operator>-&gt;</operator><name>current</name></name></expr>]</index></name></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><name>bufnum</name> <operator>==</operator> <name>InvalidBuffer</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name><name>strategy</name><operator>-&gt;</operator><name>current_was_in_ring</name></name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+		<return>return <expr><name>NULL</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/*
+	 * If the buffer is pinned we cannot use it under any circumstances.
+	 *
+	 * If usage_count is 0 or 1 then the buffer is fair game (we expect 1,
+	 * since our own previous usage of the ring element would have left it
+	 * there, but it might've been decremented by clock sweep since then). A
+	 * higher usage_count indicates someone else has touched the buffer, so we
+	 * shouldn't re-use it.
+	 */</comment>
+	<expr_stmt><expr><name>buf</name> <operator>=</operator> <call><name>GetBufferDescriptor</name><argument_list>(<argument><expr><name>bufnum</name> <operator>-</operator> <literal type="number">1</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>local_buf_state</name> <operator>=</operator> <call><name>LockBufHdr</name><argument_list>(<argument><expr><name>buf</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><call><name>BUF_STATE_GET_REFCOUNT</name><argument_list>(<argument><expr><name>local_buf_state</name></expr></argument>)</argument_list></call> <operator>==</operator> <literal type="number">0</literal>
+		<operator>&amp;&amp;</operator> <call><name>BUF_STATE_GET_USAGECOUNT</name><argument_list>(<argument><expr><name>local_buf_state</name></expr></argument>)</argument_list></call> <operator>&lt;=</operator> <literal type="number">1</literal></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name><name>strategy</name><operator>-&gt;</operator><name>current_was_in_ring</name></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+		<expr_stmt><expr><operator>*</operator><name>buf_state</name> <operator>=</operator> <name>local_buf_state</name></expr>;</expr_stmt>
+		<return>return <expr><name>buf</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+	<expr_stmt><expr><call><name>UnlockBufHdr</name><argument_list>(<argument><expr><name>buf</name></expr></argument>, <argument><expr><name>local_buf_state</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Tell caller to allocate a new buffer with the normal allocation
+	 * strategy.  He'll then replace this ring element via AddBufferToRing.
+	 */</comment>
+	<expr_stmt><expr><name><name>strategy</name><operator>-&gt;</operator><name>current_was_in_ring</name></name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+	<return>return <expr><name>NULL</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * AddBufferToRing -- add a buffer to the buffer ring
+ *
+ * Caller must hold the buffer header spinlock on the buffer.  Since this
+ * is called with the spinlock held, it had better be quite cheap.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>AddBufferToRing</name><parameter_list>(<parameter><decl><type><name>BufferAccessStrategy</name></type> <name>strategy</name></decl></parameter>, <parameter><decl><type><name>BufferDesc</name> <modifier>*</modifier></type><name>buf</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><name><name>strategy</name><operator>-&gt;</operator><name>buffers</name><index>[<expr><name><name>strategy</name><operator>-&gt;</operator><name>current</name></name></expr>]</index></name> <operator>=</operator> <call><name>BufferDescriptorGetBuffer</name><argument_list>(<argument><expr><name>buf</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * StrategyRejectBuffer -- consider rejecting a dirty buffer
+ *
+ * When a nondefault strategy is used, the buffer manager calls this function
+ * when it turns out that the buffer selected by StrategyGetBuffer needs to
+ * be written out and doing so would require flushing WAL too.  This gives us
+ * a chance to choose a different victim.
+ *
+ * Returns true if buffer manager should ask for a new victim, and false
+ * if this buffer should be written and re-used.
+ */</comment>
+<function><type><name>bool</name></type>
+<name>StrategyRejectBuffer</name><parameter_list>(<parameter><decl><type><name>BufferAccessStrategy</name></type> <name>strategy</name></decl></parameter>, <parameter><decl><type><name>BufferDesc</name> <modifier>*</modifier></type><name>buf</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<comment type="block">/* We only do this in bulkread mode */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>strategy</name><operator>-&gt;</operator><name>btype</name></name> <operator>!=</operator> <name>BAS_BULKREAD</name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>false</name></expr>;</return></block_content></block></if></if_stmt>
+
+	<comment type="block">/* Don't muck with behavior of normal buffer-replacement strategy */</comment>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><name><name>strategy</name><operator>-&gt;</operator><name>current_was_in_ring</name></name> <operator>||</operator>
+		<name><name>strategy</name><operator>-&gt;</operator><name>buffers</name><index>[<expr><name><name>strategy</name><operator>-&gt;</operator><name>current</name></name></expr>]</index></name> <operator>!=</operator> <call><name>BufferDescriptorGetBuffer</name><argument_list>(<argument><expr><name>buf</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>false</name></expr>;</return></block_content></block></if></if_stmt>
+
+	<comment type="block">/*
+	 * Remove the dirty buffer from the ring; necessary to prevent infinite
+	 * loop if all ring members are dirty.
+	 */</comment>
+	<expr_stmt><expr><name><name>strategy</name><operator>-&gt;</operator><name>buffers</name><index>[<expr><name><name>strategy</name><operator>-&gt;</operator><name>current</name></name></expr>]</index></name> <operator>=</operator> <name>InvalidBuffer</name></expr>;</expr_stmt>
+
+	<return>return <expr><name>true</name></expr>;</return>
+</block_content>}</block></function>
+</unit>

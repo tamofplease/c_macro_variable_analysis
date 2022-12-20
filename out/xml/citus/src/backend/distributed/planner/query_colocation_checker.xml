@@ -1,0 +1,498 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<unit xmlns="http://www.srcML.org/srcML/src" xmlns:cpp="http://www.srcML.org/srcML/cpp" revision="1.0.0" language="C" filename="/cloned_projects/citus/src/backend/distributed/planner/query_colocation_checker.c"><comment type="block">/*-------------------------------------------------------------------------
+ *
+ * query_colocation_checker.c implements the logic for determining
+ * whether any subqueries in a given query are co-located (e.g.,
+ * distribution keys of the relations inside subqueries are equal).
+ *
+ * The main logic behind non colocated subquery joins is that we pick
+ * an anchor range table entry and check for distribution key equality
+ * of any other subqueries in the given query. If for a given subquery,
+ * we cannot find distribution key equality with the anchor rte, we
+ * recursively plan that subquery.
+ *
+ * We also used a hacky solution for picking relations as the anchor range
+ * table entries. The hack is that we wrap them into a subquery. This is only
+ * necessary since some of the attribute equivalence checks are based on
+ * queries rather than range table entries.
+ *
+ * Copyright (c) Citus Data, Inc.
+ *-------------------------------------------------------------------------
+ */</comment>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"postgres.h"</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/pg_version_constants.h"</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/relation.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/multi_logical_planner.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/query_colocation_checker.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/pg_dist_partition.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/relation_restriction_equivalence.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/metadata_cache.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/multi_logical_planner.h"</cpp:file></cpp:include> <comment type="block">/* only to access utility functions */</comment>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/pg_type.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"nodes/makefuncs.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"nodes/nodeFuncs.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"parser/parsetree.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/listutils.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"parser/parse_relation.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"optimizer/planner.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"optimizer/prep.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/rel.h"</cpp:file></cpp:include>
+
+
+<function_decl><type><specifier>static</specifier> <name>RangeTblEntry</name> <modifier>*</modifier></type> <name>AnchorRte</name><parameter_list>(<parameter><decl><type><name>Query</name> <modifier>*</modifier></type><name>subquery</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>List</name> <modifier>*</modifier></type> <name>UnionRelationRestrictionLists</name><parameter_list>(<parameter><decl><type><name>List</name> <modifier>*</modifier></type><name>firstRelationList</name></decl></parameter>,
+											<parameter><decl><type><name>List</name> <modifier>*</modifier></type><name>secondRelationList</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>List</name> <modifier>*</modifier></type> <name>CreateFilteredTargetListForRelation</name><parameter_list>(<parameter><decl><type><name>Oid</name></type> <name>relationId</name></decl></parameter>,
+												  <parameter><decl><type><name>List</name> <modifier>*</modifier></type><name>requiredAttributes</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>List</name> <modifier>*</modifier></type> <name>CreateDummyTargetList</name><parameter_list>(<parameter><decl><type><name>Oid</name></type> <name>relationId</name></decl></parameter>, <parameter><decl><type><name>List</name> <modifier>*</modifier></type><name>requiredAttributes</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>TargetEntry</name> <modifier>*</modifier></type> <name>CreateTargetEntryForColumn</name><parameter_list>(<parameter><decl><type><name>Form_pg_attribute</name></type> <name>attributeTuple</name></decl></parameter>, <parameter><decl><type><name>Index</name></type>
+												<name>rteIndex</name></decl></parameter>,
+												<parameter><decl><type><name>int</name></type> <name>attributeNumber</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>resno</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>TargetEntry</name> <modifier>*</modifier></type> <name>CreateTargetEntryForNullCol</name><parameter_list>(<parameter><decl><type><name>Form_pg_attribute</name></type> <name>attributeTuple</name></decl></parameter>, <parameter><decl><type><name>int</name></type>
+												 <name>resno</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>TargetEntry</name> <modifier>*</modifier></type> <name>CreateUnusedTargetEntry</name><parameter_list>(<parameter><decl><type><name>int</name></type> <name>resno</name></decl></parameter>)</parameter_list>;</function_decl>
+
+<comment type="block">/*
+ * CreateColocatedJoinChecker is a helper function that simply calculates
+ * a ColocatedJoinChecker with the given input and returns it.
+ */</comment>
+<function><type><name>ColocatedJoinChecker</name></type>
+<name>CreateColocatedJoinChecker</name><parameter_list>(<parameter><decl><type><name>Query</name> <modifier>*</modifier></type><name>subquery</name></decl></parameter>, <parameter><decl><type><name>PlannerRestrictionContext</name> <modifier>*</modifier></type><name>restrictionContext</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>ColocatedJoinChecker</name></type> <name>colocatedJoinChecker</name> <init>= <expr><block>{ <expr><literal type="number">0</literal></expr> }</block></expr></init></decl>;</decl_stmt>
+
+	<decl_stmt><decl><type><name>Query</name> <modifier>*</modifier></type><name>anchorSubquery</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+
+	<comment type="block">/* we couldn't pick an anchor subquery, no need to continue */</comment>
+	<decl_stmt><decl><type><name>RangeTblEntry</name> <modifier>*</modifier></type><name>anchorRangeTblEntry</name> <init>= <expr><call><name>AnchorRte</name><argument_list>(<argument><expr><name>subquery</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<if_stmt><if>if <condition>(<expr><name>anchorRangeTblEntry</name> <operator>==</operator> <name>NULL</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name><name>colocatedJoinChecker</name><operator>.</operator><name>anchorRelationRestrictionList</name></name> <operator>=</operator> <name>NIL</name></expr>;</expr_stmt>
+
+		<return>return <expr><name>colocatedJoinChecker</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name><name>anchorRangeTblEntry</name><operator>-&gt;</operator><name>rtekind</name></name> <operator>==</operator> <name>RTE_RELATION</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/*
+		 * If we get a relation as our anchor, wrap into a subquery. The only
+		 * reason that we wrap the relation into a subquery is that some of the utility
+		 * functions (i.e., FilterPlannerRestrictionForQuery()) rely on queries
+		 * not relations.
+		 */</comment>
+		<expr_stmt><expr><name>anchorSubquery</name> <operator>=</operator> <call><name>WrapRteRelationIntoSubquery</name><argument_list>(<argument><expr><name>anchorRangeTblEntry</name></expr></argument>, <argument><expr><name>NIL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<if type="elseif">else if <condition>(<expr><name><name>anchorRangeTblEntry</name><operator>-&gt;</operator><name>rtekind</name></name> <operator>==</operator> <name>RTE_SUBQUERY</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name>anchorSubquery</name> <operator>=</operator> <name><name>anchorRangeTblEntry</name><operator>-&gt;</operator><name>subquery</name></name></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<else>else
+	<block>{<block_content>
+		<comment type="block">/* we don't expect any other RTE type here */</comment>
+		<expr_stmt><expr><call><name>pg_unreachable</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></else></if_stmt>
+
+	<decl_stmt><decl><type><name>PlannerRestrictionContext</name> <modifier>*</modifier></type><name>anchorPlannerRestrictionContext</name> <init>=
+		<expr><call><name>FilterPlannerRestrictionForQuery</name><argument_list>(<argument><expr><name>restrictionContext</name></expr></argument>, <argument><expr><name>anchorSubquery</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>RelationRestrictionContext</name> <modifier>*</modifier></type><name>anchorRelationRestrictionContext</name> <init>=
+		<expr><name><name>anchorPlannerRestrictionContext</name><operator>-&gt;</operator><name>relationRestrictionContext</name></name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>List</name> <modifier>*</modifier></type><name>anchorRestrictionEquivalences</name> <init>=
+		<expr><call><name>GenerateAllAttributeEquivalences</name><argument_list>(<argument><expr><name>anchorPlannerRestrictionContext</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<comment type="block">/* fill the non colocated planning context */</comment>
+	<expr_stmt><expr><name><name>colocatedJoinChecker</name><operator>.</operator><name>subquery</name></name> <operator>=</operator> <name>subquery</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>colocatedJoinChecker</name><operator>.</operator><name>subqueryPlannerRestriction</name></name> <operator>=</operator> <name>restrictionContext</name></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name><name>colocatedJoinChecker</name><operator>.</operator><name>anchorRelationRestrictionList</name></name> <operator>=</operator>
+		<name><name>anchorRelationRestrictionContext</name><operator>-&gt;</operator><name>relationRestrictionList</name></name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>colocatedJoinChecker</name><operator>.</operator><name>anchorAttributeEquivalences</name></name> <operator>=</operator> <name>anchorRestrictionEquivalences</name></expr>;</expr_stmt>
+
+	<return>return <expr><name>colocatedJoinChecker</name></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * AnchorRte gets a query and searches for a relation or a subquery within
+ * the join tree of the query such that we can use it as our anchor range
+ * table entry during our non colocated subquery planning.
+ *
+ * The function returns NULL if it cannot find a proper range table entry for our
+ * purposes. See the function for the details.
+ */</comment>
+<function><type><specifier>static</specifier> <name>RangeTblEntry</name> <modifier>*</modifier></type>
+<name>AnchorRte</name><parameter_list>(<parameter><decl><type><name>Query</name> <modifier>*</modifier></type><name>subquery</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>FromExpr</name> <modifier>*</modifier></type><name>joinTree</name> <init>= <expr><name><name>subquery</name><operator>-&gt;</operator><name>jointree</name></name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Relids</name></type> <name>joinRelIds</name> <init>= <expr><call><name>get_relids_in_jointree</name><argument_list>(<argument><expr><operator>(</operator><name>Node</name> <operator>*</operator><operator>)</operator> <name>joinTree</name></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type> <name>currentRTEIndex</name> <init>= <expr><operator>-</operator><literal type="number">1</literal></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>RangeTblEntry</name> <modifier>*</modifier></type><name>anchorRangeTblEntry</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * Pick a random anchor relation or subquery (i.e., the first) for now. We
+	 * might consider picking a better rte as the anchor. For example, we could
+	 * iterate on the joinRelIds, and check which rteIndex has more distribution
+	 * key equiality with rteIndexes. For the time being, the current primitive
+	 * approach helps us in many cases.
+	 */</comment>
+	<while>while <condition>(<expr><operator>(</operator><name>currentRTEIndex</name> <operator>=</operator> <call><name>bms_next_member</name><argument_list>(<argument><expr><name>joinRelIds</name></expr></argument>, <argument><expr><name>currentRTEIndex</name></expr></argument>)</argument_list></call><operator>)</operator> <operator>&gt;=</operator> <literal type="number">0</literal></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>RangeTblEntry</name> <modifier>*</modifier></type><name>currentRte</name> <init>= <expr><call><name>rt_fetch</name><argument_list>(<argument><expr><name>currentRTEIndex</name></expr></argument>, <argument><expr><name><name>subquery</name><operator>-&gt;</operator><name>rtable</name></name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+		<comment type="block">/*
+		 * We always prefer distributed relations if we can find any. The
+		 * reason is that Citus is currently able to recursively plan
+		 * subqueries, but not relations.
+		 *
+		 * For the subqueries, make sure that the subquery contains at least one
+		 * distributed table and doesn't have a set operation.
+		 *
+		 * TODO: The set operation restriction might sound weird, but, the restriction
+		 * equivalence generation functions ignore set operations. We should
+		 * integrate the logic in SafeToPushdownUnionSubquery() to
+		 * GenerateAllAttributeEquivalences() such that the latter becomes aware of
+		 * the set operations.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><name>anchorRangeTblEntry</name> <operator>==</operator> <name>NULL</name> <operator>&amp;&amp;</operator> <name><name>currentRte</name><operator>-&gt;</operator><name>rtekind</name></name> <operator>==</operator> <name>RTE_SUBQUERY</name> <operator>&amp;&amp;</operator>
+			<call><name>FindNodeMatchingCheckFunction</name><argument_list>(<argument><expr><operator>(</operator><name>Node</name> <operator>*</operator><operator>)</operator> <name><name>currentRte</name><operator>-&gt;</operator><name>subquery</name></name></expr></argument>,
+										  <argument><expr><name>IsDistributedTableRTE</name></expr></argument>)</argument_list></call> <operator>&amp;&amp;</operator>
+			<name><name>currentRte</name><operator>-&gt;</operator><name>subquery</name><operator>-&gt;</operator><name>setOperations</name></name> <operator>==</operator> <name>NULL</name> <operator>&amp;&amp;</operator>
+			<operator>!</operator><call><name>ContainsUnionSubquery</name><argument_list>(<argument><expr><name><name>currentRte</name><operator>-&gt;</operator><name>subquery</name></name></expr></argument>)</argument_list></call></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/* found a subquery, keep it if we cannot find a relation */</comment>
+			<expr_stmt><expr><name>anchorRangeTblEntry</name> <operator>=</operator> <name>currentRte</name></expr>;</expr_stmt>
+		</block_content>}</block></if>
+		<if type="elseif">else if <condition>(<expr><name><name>currentRte</name><operator>-&gt;</operator><name>rtekind</name></name> <operator>==</operator> <name>RTE_RELATION</name></expr>)</condition>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>Oid</name></type> <name>relationId</name> <init>= <expr><name><name>currentRte</name><operator>-&gt;</operator><name>relid</name></name></expr></init></decl>;</decl_stmt>
+
+			<if_stmt><if>if <condition>(<expr><call><name>IsCitusTableType</name><argument_list>(<argument><expr><name>relationId</name></expr></argument>, <argument><expr><name>CITUS_TABLE_WITH_NO_DIST_KEY</name></expr></argument>)</argument_list></call></expr>)</condition>
+			<block>{<block_content>
+				<comment type="block">/*
+				 * Non-distributed tables should not be the anchor rte since they
+				 * don't have distribution key.
+				 */</comment>
+				<continue>continue;</continue>
+			</block_content>}</block></if></if_stmt>
+
+			<expr_stmt><expr><name>anchorRangeTblEntry</name> <operator>=</operator> <name>currentRte</name></expr>;</expr_stmt>
+			<break>break;</break>
+		</block_content>}</block></if></if_stmt>
+	</block_content>}</block></while>
+
+	<return>return <expr><name>anchorRangeTblEntry</name></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * SubqueryColocated returns true if the input subquery has a distribution
+ * key equality with the anchor subquery. In other words, we refer the
+ * distribution key equality of relations as "colocation" in this context.
+ */</comment>
+<function><type><name>bool</name></type>
+<name>SubqueryColocated</name><parameter_list>(<parameter><decl><type><name>Query</name> <modifier>*</modifier></type><name>subquery</name></decl></parameter>, <parameter><decl><type><name>ColocatedJoinChecker</name> <modifier>*</modifier></type><name>checker</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>List</name> <modifier>*</modifier></type><name>anchorRelationRestrictionList</name> <init>= <expr><name><name>checker</name><operator>-&gt;</operator><name>anchorRelationRestrictionList</name></name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>List</name> <modifier>*</modifier></type><name>anchorAttributeEquivalences</name> <init>= <expr><name><name>checker</name><operator>-&gt;</operator><name>anchorAttributeEquivalences</name></name></expr></init></decl>;</decl_stmt>
+
+	<decl_stmt><decl><type><name>PlannerRestrictionContext</name> <modifier>*</modifier></type><name>restrictionContext</name> <init>= <expr><name><name>checker</name><operator>-&gt;</operator><name>subqueryPlannerRestriction</name></name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>PlannerRestrictionContext</name> <modifier>*</modifier></type><name>filteredPlannerContext</name> <init>=
+		<expr><call><name>FilterPlannerRestrictionForQuery</name><argument_list>(<argument><expr><name>restrictionContext</name></expr></argument>, <argument><expr><name>subquery</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>List</name> <modifier>*</modifier></type><name>filteredRestrictionList</name> <init>=
+		<expr><name><name>filteredPlannerContext</name><operator>-&gt;</operator><name>relationRestrictionContext</name><operator>-&gt;</operator><name>relationRestrictionList</name></name></expr></init></decl>;</decl_stmt>
+
+
+	<comment type="block">/*
+	 * There are no relations in the input subquery, such as a subquery
+	 * that consist of only intermediate results or without FROM
+	 * clause or subquery in WHERE clause anded with FALSE.
+	 *
+	 * Note that for the subquery in WHERE clause, the input original
+	 * subquery (a.k.a., which didn't go through standard_planner()) may
+	 * contain distributed relations, but postgres is smart enough to
+	 * not generate the restriction information. That's the reason for
+	 * not asserting non-existence of distributed relations.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><call><name>list_length</name><argument_list>(<argument><expr><name>filteredRestrictionList</name></expr></argument>)</argument_list></call> <operator>==</operator> <literal type="number">0</literal></expr>)</condition>
+	<block>{<block_content>
+		<return>return <expr><name>true</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/*
+	 * We merge the relation restrictions of the input subquery and the anchor
+	 * restrictions to form a temporary relation restriction context. The aim of
+	 * forming this temporary context is to check whether the context contains
+	 * distribution key equality or not.
+	 */</comment>
+	<decl_stmt><decl><type><name>List</name> <modifier>*</modifier></type><name>unionedRelationRestrictionList</name> <init>=
+		<expr><call><name>UnionRelationRestrictionLists</name><argument_list>(<argument><expr><name>anchorRelationRestrictionList</name></expr></argument>,
+									  <argument><expr><name>filteredRestrictionList</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * We already have the attributeEquivalences, thus, only need to prepare
+	 * the planner restrictions with unioned relations for our purpose of
+	 * distribution key equality. Note that we don't need to calculate the
+	 * join restrictions, we're already relying on the attributeEquivalences
+	 * provided by the context.
+	 */</comment>
+	<decl_stmt><decl><type><name>RelationRestrictionContext</name> <modifier>*</modifier></type><name>unionedRelationRestrictionContext</name> <init>= <expr><call><name>palloc0</name><argument_list>(
+		<argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>RelationRestrictionContext</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<expr_stmt><expr><name><name>unionedRelationRestrictionContext</name><operator>-&gt;</operator><name>relationRestrictionList</name></name> <operator>=</operator>
+		<name>unionedRelationRestrictionList</name></expr>;</expr_stmt>
+
+	<decl_stmt><decl><type><name>PlannerRestrictionContext</name> <modifier>*</modifier></type><name>unionedPlannerRestrictionContext</name> <init>= <expr><call><name>palloc0</name><argument_list>(
+		<argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>PlannerRestrictionContext</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<expr_stmt><expr><name><name>unionedPlannerRestrictionContext</name><operator>-&gt;</operator><name>relationRestrictionContext</name></name> <operator>=</operator>
+		<name>unionedRelationRestrictionContext</name></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>RestrictionEquivalenceForPartitionKeysViaEquivalences</name><argument_list>(
+			<argument><expr><name>unionedPlannerRestrictionContext</name></expr></argument>,
+			<argument><expr><name>anchorAttributeEquivalences</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<return>return <expr><name>false</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<return>return <expr><name>true</name></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * WrapRteRelationIntoSubquery wraps the given relation range table entry
+ * in a newly constructed "(SELECT * FROM table_name as anchor_relation)" query.
+ *
+ * Note that the query returned by this function does not contain any filters or
+ * projections. The returned query should be used cautiosly and it is mostly
+ * designed for generating a stub query.
+ */</comment>
+<function><type><name>Query</name> <modifier>*</modifier></type>
+<name>WrapRteRelationIntoSubquery</name><parameter_list>(<parameter><decl><type><name>RangeTblEntry</name> <modifier>*</modifier></type><name>rteRelation</name></decl></parameter>, <parameter><decl><type><name>List</name> <modifier>*</modifier></type><name>requiredAttributes</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>Query</name> <modifier>*</modifier></type><name>subquery</name> <init>= <expr><call><name>makeNode</name><argument_list>(<argument><expr><name>Query</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>RangeTblRef</name> <modifier>*</modifier></type><name>newRangeTableRef</name> <init>= <expr><call><name>makeNode</name><argument_list>(<argument><expr><name>RangeTblRef</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name><name>subquery</name><operator>-&gt;</operator><name>commandType</name></name> <operator>=</operator> <name>CMD_SELECT</name></expr>;</expr_stmt>
+
+	<comment type="block">/* we copy the input rteRelation to preserve the rteIdentity */</comment>
+	<decl_stmt><decl><type><name>RangeTblEntry</name> <modifier>*</modifier></type><name>newRangeTableEntry</name> <init>= <expr><call><name>copyObject</name><argument_list>(<argument><expr><name>rteRelation</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<expr_stmt><expr><name><name>subquery</name><operator>-&gt;</operator><name>rtable</name></name> <operator>=</operator> <call><name>list_make1</name><argument_list>(<argument><expr><name>newRangeTableEntry</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* set the FROM expression to the subquery */</comment>
+	<expr_stmt><expr><name>newRangeTableRef</name> <operator>=</operator> <call><name>makeNode</name><argument_list>(<argument><expr><name>RangeTblRef</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>newRangeTableRef</name><operator>-&gt;</operator><name>rtindex</name></name> <operator>=</operator> <name>SINGLE_RTE_INDEX</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>subquery</name><operator>-&gt;</operator><name>jointree</name></name> <operator>=</operator> <call><name>makeFromExpr</name><argument_list>(<argument><expr><call><name>list_make1</name><argument_list>(<argument><expr><name>newRangeTableRef</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name><name>subquery</name><operator>-&gt;</operator><name>targetList</name></name> <operator>=</operator>
+		<call><name>CreateFilteredTargetListForRelation</name><argument_list>(<argument><expr><name><name>rteRelation</name><operator>-&gt;</operator><name>relid</name></name></expr></argument>, <argument><expr><name>requiredAttributes</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><call><name>list_length</name><argument_list>(<argument><expr><name><name>subquery</name><operator>-&gt;</operator><name>targetList</name></name></expr></argument>)</argument_list></call> <operator>==</operator> <literal type="number">0</literal></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/*
+		 * in case there is no required column, we assign one dummy NULL target entry
+		 * to the subquery targetList so that it has at least one target.
+		 * (targetlist should have at least one element)
+		 */</comment>
+		<expr_stmt><expr><name><name>subquery</name><operator>-&gt;</operator><name>targetList</name></name> <operator>=</operator> <call><name>CreateDummyTargetList</name><argument_list>(<argument><expr><name><name>rteRelation</name><operator>-&gt;</operator><name>relid</name></name></expr></argument>,
+													 <argument><expr><name>requiredAttributes</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<return>return <expr><name>subquery</name></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * CreateAllTargetListForRelation creates a target list which contains all the columns
+ * of the given relation. If the column is not in required columns, then it is added
+ * as a NULL column.
+ */</comment>
+<function><type><name>List</name> <modifier>*</modifier></type>
+<name>CreateAllTargetListForRelation</name><parameter_list>(<parameter><decl><type><name>Oid</name></type> <name>relationId</name></decl></parameter>, <parameter><decl><type><name>List</name> <modifier>*</modifier></type><name>requiredAttributes</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>Relation</name></type> <name>relation</name> <init>= <expr><call><name>relation_open</name><argument_list>(<argument><expr><name>relationId</name></expr></argument>, <argument><expr><name>AccessShareLock</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type> <name>numberOfAttributes</name> <init>= <expr><call><name>RelationGetNumberOfAttributes</name><argument_list>(<argument><expr><name>relation</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<decl_stmt><decl><type><name>List</name> <modifier>*</modifier></type><name>targetList</name> <init>= <expr><name>NIL</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type> <name>varAttrNo</name> <init>= <expr><literal type="number">1</literal></expr></init></decl>;</decl_stmt>
+
+	<for>for <control>(<init><decl><type><name>int</name></type> <name>attrNum</name> <init>= <expr><literal type="number">1</literal></expr></init></decl>;</init> <condition><expr><name>attrNum</name> <operator>&lt;=</operator> <name>numberOfAttributes</name></expr>;</condition> <incr><expr><name>attrNum</name><operator>++</operator></expr></incr>)</control>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>Form_pg_attribute</name></type> <name>attributeTuple</name> <init>=
+			<expr><call><name>TupleDescAttr</name><argument_list>(<argument><expr><name><name>relation</name><operator>-&gt;</operator><name>rd_att</name></name></expr></argument>, <argument><expr><name>attrNum</name> <operator>-</operator> <literal type="number">1</literal></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+		<decl_stmt><decl><type><name>int</name></type> <name>resNo</name> <init>= <expr><name>attrNum</name></expr></init></decl>;</decl_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name><name>attributeTuple</name><operator>-&gt;</operator><name>attisdropped</name></name></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/*
+			 * For dropped columns, we generate a dummy null column because
+			 * varattno in relation and subquery are different things, however if
+			 * we put the NULL columns to the subquery for the dropped columns,
+			 * they will point to the same variable.
+			 */</comment>
+			<decl_stmt><decl><type><name>TargetEntry</name> <modifier>*</modifier></type><name>nullTargetEntry</name> <init>= <expr><call><name>CreateUnusedTargetEntry</name><argument_list>(<argument><expr><name>resNo</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+			<expr_stmt><expr><name>targetList</name> <operator>=</operator> <call><name>lappend</name><argument_list>(<argument><expr><name>targetList</name></expr></argument>, <argument><expr><name>nullTargetEntry</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<continue>continue;</continue>
+		</block_content>}</block></if></if_stmt>
+
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>list_member_int</name><argument_list>(<argument><expr><name>requiredAttributes</name></expr></argument>, <argument><expr><name>attrNum</name></expr></argument>)</argument_list></call></expr>)</condition>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>TargetEntry</name> <modifier>*</modifier></type><name>nullTargetEntry</name> <init>=
+				<expr><call><name>CreateTargetEntryForNullCol</name><argument_list>(<argument><expr><name>attributeTuple</name></expr></argument>, <argument><expr><name>resNo</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+			<expr_stmt><expr><name>targetList</name> <operator>=</operator> <call><name>lappend</name><argument_list>(<argument><expr><name>targetList</name></expr></argument>, <argument><expr><name>nullTargetEntry</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></if>
+		<else>else
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>TargetEntry</name> <modifier>*</modifier></type><name>targetEntry</name> <init>=
+				<expr><call><name>CreateTargetEntryForColumn</name><argument_list>(<argument><expr><name>attributeTuple</name></expr></argument>, <argument><expr><name>SINGLE_RTE_INDEX</name></expr></argument>, <argument><expr><name>varAttrNo</name><operator>++</operator></expr></argument>,
+										   <argument><expr><name>resNo</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+			<expr_stmt><expr><name>targetList</name> <operator>=</operator> <call><name>lappend</name><argument_list>(<argument><expr><name>targetList</name></expr></argument>, <argument><expr><name>targetEntry</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></else></if_stmt>
+	</block_content>}</block></for>
+
+	<expr_stmt><expr><call><name>relation_close</name><argument_list>(<argument><expr><name>relation</name></expr></argument>, <argument><expr><name>NoLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<return>return <expr><name>targetList</name></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * CreateFilteredTargetListForRelation creates a target list which contains
+ * only the required columns of the given relation. If there is not required
+ * columns then a dummy NULL column is put as the only entry.
+ */</comment>
+<function><type><specifier>static</specifier> <name>List</name> <modifier>*</modifier></type>
+<name>CreateFilteredTargetListForRelation</name><parameter_list>(<parameter><decl><type><name>Oid</name></type> <name>relationId</name></decl></parameter>, <parameter><decl><type><name>List</name> <modifier>*</modifier></type><name>requiredAttributes</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>Relation</name></type> <name>relation</name> <init>= <expr><call><name>relation_open</name><argument_list>(<argument><expr><name>relationId</name></expr></argument>, <argument><expr><name>AccessShareLock</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type> <name>numberOfAttributes</name> <init>= <expr><call><name>RelationGetNumberOfAttributes</name><argument_list>(<argument><expr><name>relation</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<decl_stmt><decl><type><name>List</name> <modifier>*</modifier></type><name>targetList</name> <init>= <expr><name>NIL</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type> <name>resultNo</name> <init>= <expr><literal type="number">1</literal></expr></init></decl>;</decl_stmt>
+	<for>for <control>(<init><decl><type><name>int</name></type> <name>attrNum</name> <init>= <expr><literal type="number">1</literal></expr></init></decl>;</init> <condition><expr><name>attrNum</name> <operator>&lt;=</operator> <name>numberOfAttributes</name></expr>;</condition> <incr><expr><name>attrNum</name><operator>++</operator></expr></incr>)</control>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>Form_pg_attribute</name></type> <name>attributeTuple</name> <init>=
+			<expr><call><name>TupleDescAttr</name><argument_list>(<argument><expr><name><name>relation</name><operator>-&gt;</operator><name>rd_att</name></name></expr></argument>, <argument><expr><name>attrNum</name> <operator>-</operator> <literal type="number">1</literal></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+		<if_stmt><if>if <condition>(<expr><call><name>list_member_int</name><argument_list>(<argument><expr><name>requiredAttributes</name></expr></argument>, <argument><expr><name>attrNum</name></expr></argument>)</argument_list></call></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/* In the subquery with only required attribute numbers, the result no
+			 * corresponds to the ordinal index of it in targetList.
+			 */</comment>
+			<decl_stmt><decl><type><name>TargetEntry</name> <modifier>*</modifier></type><name>targetEntry</name> <init>=
+				<expr><call><name>CreateTargetEntryForColumn</name><argument_list>(<argument><expr><name>attributeTuple</name></expr></argument>, <argument><expr><name>SINGLE_RTE_INDEX</name></expr></argument>, <argument><expr><name>attrNum</name></expr></argument>,
+										   <argument><expr><name>resultNo</name><operator>++</operator></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+			<expr_stmt><expr><name>targetList</name> <operator>=</operator> <call><name>lappend</name><argument_list>(<argument><expr><name>targetList</name></expr></argument>, <argument><expr><name>targetEntry</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+	</block_content>}</block></for>
+	<expr_stmt><expr><call><name>relation_close</name><argument_list>(<argument><expr><name>relation</name></expr></argument>, <argument><expr><name>NoLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<return>return <expr><name>targetList</name></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * CreateDummyTargetList creates a target list which contains only a
+ * NULL entry.
+ */</comment>
+<function><type><specifier>static</specifier> <name>List</name> <modifier>*</modifier></type>
+<name>CreateDummyTargetList</name><parameter_list>(<parameter><decl><type><name>Oid</name></type> <name>relationId</name></decl></parameter>, <parameter><decl><type><name>List</name> <modifier>*</modifier></type><name>requiredAttributes</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>int</name></type> <name>resno</name> <init>= <expr><literal type="number">1</literal></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>TargetEntry</name> <modifier>*</modifier></type><name>dummyTargetEntry</name> <init>= <expr><call><name>CreateUnusedTargetEntry</name><argument_list>(<argument><expr><name>resno</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<return>return <expr><call><name>list_make1</name><argument_list>(<argument><expr><name>dummyTargetEntry</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * CreateTargetEntryForColumn creates a target entry for the given
+ * column.
+ */</comment>
+<function><type><specifier>static</specifier> <name>TargetEntry</name> <modifier>*</modifier></type>
+<name>CreateTargetEntryForColumn</name><parameter_list>(<parameter><decl><type><name>Form_pg_attribute</name></type> <name>attributeTuple</name></decl></parameter>, <parameter><decl><type><name>Index</name></type> <name>rteIndex</name></decl></parameter>,
+						   <parameter><decl><type><name>int</name></type> <name>attributeNumber</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>resno</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>Var</name> <modifier>*</modifier></type><name>targetColumn</name> <init>=
+		<expr><call><name>makeVar</name><argument_list>(<argument><expr><name>rteIndex</name></expr></argument>, <argument><expr><name>attributeNumber</name></expr></argument>, <argument><expr><name><name>attributeTuple</name><operator>-&gt;</operator><name>atttypid</name></name></expr></argument>,
+				<argument><expr><name><name>attributeTuple</name><operator>-&gt;</operator><name>atttypmod</name></name></expr></argument>, <argument><expr><name><name>attributeTuple</name><operator>-&gt;</operator><name>attcollation</name></name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>TargetEntry</name> <modifier>*</modifier></type><name>targetEntry</name> <init>=
+		<expr><call><name>makeTargetEntry</name><argument_list>(<argument><expr><operator>(</operator><name>Expr</name> <operator>*</operator><operator>)</operator> <name>targetColumn</name></expr></argument>, <argument><expr><name>resno</name></expr></argument>,
+						<argument><expr><call><name>strdup</name><argument_list>(<argument><expr><name><name>attributeTuple</name><operator>-&gt;</operator><name>attname</name><operator>.</operator><name>data</name></name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<return>return <expr><name>targetEntry</name></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * CreateTargetEntryForNullCol creates a target entry that has a NULL expression.
+ */</comment>
+<function><type><specifier>static</specifier> <name>TargetEntry</name> <modifier>*</modifier></type>
+<name>CreateTargetEntryForNullCol</name><parameter_list>(<parameter><decl><type><name>Form_pg_attribute</name></type> <name>attributeTuple</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>resno</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>Expr</name> <modifier>*</modifier></type><name>nullExpr</name> <init>= <expr><operator>(</operator><name>Expr</name> <operator>*</operator><operator>)</operator> <call><name>makeNullConst</name><argument_list>(<argument><expr><name><name>attributeTuple</name><operator>-&gt;</operator><name>atttypid</name></name></expr></argument>,
+											<argument><expr><name><name>attributeTuple</name><operator>-&gt;</operator><name>atttypmod</name></name></expr></argument>,
+											<argument><expr><name><name>attributeTuple</name><operator>-&gt;</operator><name>attcollation</name></name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>char</name> <modifier>*</modifier></type><name>resName</name> <init>= <expr><name><name>attributeTuple</name><operator>-&gt;</operator><name>attname</name><operator>.</operator><name>data</name></name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>TargetEntry</name> <modifier>*</modifier></type><name>targetEntry</name> <init>=
+		<expr><call><name>makeTargetEntry</name><argument_list>(<argument><expr><name>nullExpr</name></expr></argument>, <argument><expr><name>resno</name></expr></argument>, <argument><expr><call><name>strdup</name><argument_list>(<argument><expr><name>resName</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<return>return <expr><name>targetEntry</name></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * CreateUnusedTargetEntry creates a dummy target entry which is not used
+ * in postgres query.
+ */</comment>
+<function><type><specifier>static</specifier> <name>TargetEntry</name> <modifier>*</modifier></type>
+<name>CreateUnusedTargetEntry</name><parameter_list>(<parameter><decl><type><name>int</name></type> <name>resno</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>StringInfo</name></type> <name>colname</name> <init>= <expr><call><name>makeStringInfo</name><argument_list>()</argument_list></call></expr></init></decl>;</decl_stmt>
+	<expr_stmt><expr><call><name>appendStringInfo</name><argument_list>(<argument><expr><name>colname</name></expr></argument>, <argument><expr><literal type="string">"dummy-%d"</literal></expr></argument>, <argument><expr><name>resno</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<decl_stmt><decl><type><name>Expr</name> <modifier>*</modifier></type><name>nullExpr</name> <init>= <expr><operator>(</operator><name>Expr</name> <operator>*</operator><operator>)</operator> <call><name>makeNullConst</name><argument_list>(<argument><expr><name>INT4OID</name></expr></argument>,
+											<argument><expr><literal type="number">0</literal></expr></argument>,
+											<argument><expr><name>InvalidOid</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>TargetEntry</name> <modifier>*</modifier></type><name>targetEntry</name> <init>=
+		<expr><call><name>makeTargetEntry</name><argument_list>(<argument><expr><name>nullExpr</name></expr></argument>, <argument><expr><name>resno</name></expr></argument>, <argument><expr><name><name>colname</name><operator>-&gt;</operator><name>data</name></name></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<return>return <expr><name>targetEntry</name></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * UnionRelationRestrictionLists merges two relation restriction lists
+ * and returns a newly allocated list. The merged relation restriction
+ * list doesn't contain any duplicate elements.
+ */</comment>
+<function><type><specifier>static</specifier> <name>List</name> <modifier>*</modifier></type>
+<name>UnionRelationRestrictionLists</name><parameter_list>(<parameter><decl><type><name>List</name> <modifier>*</modifier></type><name>firstRelationList</name></decl></parameter>, <parameter><decl><type><name>List</name> <modifier>*</modifier></type><name>secondRelationList</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>List</name> <modifier>*</modifier></type><name>unionedRelationRestrictionList</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>ListCell</name> <modifier>*</modifier></type><name>relationRestrictionCell</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Relids</name></type> <name>rteIdentities</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+
+	<comment type="block">/* list_concat destructively modifies the first list, thus copy it */</comment>
+	<expr_stmt><expr><name>firstRelationList</name> <operator>=</operator> <call><name>list_copy</name><argument_list>(<argument><expr><name>firstRelationList</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<decl_stmt><decl><type><name>List</name> <modifier>*</modifier></type><name>allRestrictionList</name> <init>= <expr><call><name>list_concat</name><argument_list>(<argument><expr><name>firstRelationList</name></expr></argument>, <argument><expr><name>secondRelationList</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<macro><name>foreach</name><argument_list>(<argument>relationRestrictionCell</argument>, <argument>allRestrictionList</argument>)</argument_list></macro>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>RelationRestriction</name> <modifier>*</modifier></type><name>restriction</name> <init>=
+			<expr><operator>(</operator><name>RelationRestriction</name> <operator>*</operator><operator>)</operator> <call><name>lfirst</name><argument_list>(<argument><expr><name>relationRestrictionCell</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>int</name></type> <name>rteIdentity</name> <init>= <expr><call><name>GetRTEIdentity</name><argument_list>(<argument><expr><name><name>restriction</name><operator>-&gt;</operator><name>rte</name></name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+		<comment type="block">/* already have the same rte, skip */</comment>
+		<if_stmt><if>if <condition>(<expr><call><name>bms_is_member</name><argument_list>(<argument><expr><name>rteIdentity</name></expr></argument>, <argument><expr><name>rteIdentities</name></expr></argument>)</argument_list></call></expr>)</condition>
+		<block>{<block_content>
+			<continue>continue;</continue>
+		</block_content>}</block></if></if_stmt>
+
+		<expr_stmt><expr><name>unionedRelationRestrictionList</name> <operator>=</operator>
+			<call><name>lappend</name><argument_list>(<argument><expr><name>unionedRelationRestrictionList</name></expr></argument>, <argument><expr><name>restriction</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><name>rteIdentities</name> <operator>=</operator> <call><name>bms_add_member</name><argument_list>(<argument><expr><name>rteIdentities</name></expr></argument>, <argument><expr><name>rteIdentity</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block>
+
+	<decl_stmt><decl><type><name>RelationRestrictionContext</name> <modifier>*</modifier></type><name>unionedRestrictionContext</name> <init>= <expr><call><name>palloc0</name><argument_list>(
+		<argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>RelationRestrictionContext</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<expr_stmt><expr><name><name>unionedRestrictionContext</name><operator>-&gt;</operator><name>relationRestrictionList</name></name> <operator>=</operator> <name>unionedRelationRestrictionList</name></expr>;</expr_stmt>
+
+	<return>return <expr><name>unionedRelationRestrictionList</name></expr>;</return>
+</block_content>}</block></function>
+</unit>

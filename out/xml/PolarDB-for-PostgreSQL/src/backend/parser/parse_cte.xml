@@ -1,0 +1,975 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<unit xmlns="http://www.srcML.org/srcML/src" xmlns:cpp="http://www.srcML.org/srcML/cpp" revision="1.0.0" language="C" filename="/cloned_projects/PolarDB-for-PostgreSQL/src/backend/parser/parse_cte.c"><comment type="block">/*-------------------------------------------------------------------------
+ *
+ * parse_cte.c
+ *	  handle CTEs (common table expressions) in parser
+ *
+ * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1994, Regents of the University of California
+ *
+ *
+ * IDENTIFICATION
+ *	  src/backend/parser/parse_cte.c
+ *
+ *-------------------------------------------------------------------------
+ */</comment>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"postgres.h"</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/pg_collation.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/pg_type.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"nodes/nodeFuncs.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"parser/analyze.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"parser/parse_cte.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/builtins.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/lsyscache.h"</cpp:file></cpp:include>
+
+
+<comment type="block">/* Enumeration of contexts in which a self-reference is disallowed */</comment>
+<typedef>typedef <type><enum>enum
+<block>{
+	<decl><name>RECURSION_OK</name></decl>,
+	<decl><name>RECURSION_NONRECURSIVETERM</name></decl>, <comment type="block">/* inside the left-hand term */</comment>
+	<decl><name>RECURSION_SUBLINK</name></decl>,			<comment type="block">/* inside a sublink */</comment>
+	<decl><name>RECURSION_OUTERJOIN</name></decl>,		<comment type="block">/* inside nullable side of an outer join */</comment>
+	<decl><name>RECURSION_INTERSECT</name></decl>,		<comment type="block">/* underneath INTERSECT (ALL) */</comment>
+	<decl><name>RECURSION_EXCEPT</name></decl>			<comment type="block">/* underneath EXCEPT (ALL) */</comment>
+}</block></enum></type> <name>RecursionContext</name>;</typedef>
+
+<comment type="block">/* Associated error messages --- each must have one %s for CTE name */</comment>
+<decl_stmt><decl><type><specifier>static</specifier> <specifier>const</specifier> <name>char</name> <modifier>*</modifier><specifier>const</specifier></type> <name><name>recursion_errormsgs</name><index>[]</index></name> <init>= <expr><block>{
+	<comment type="block">/* RECURSION_OK */</comment>
+	<expr><name>NULL</name></expr>,
+	<comment type="block">/* RECURSION_NONRECURSIVETERM */</comment>
+	<expr><call><name>gettext_noop</name><argument_list>(<argument><expr><literal type="string">"recursive reference to query \"%s\" must not appear within its non-recursive term"</literal></expr></argument>)</argument_list></call></expr>,
+	<comment type="block">/* RECURSION_SUBLINK */</comment>
+	<expr><call><name>gettext_noop</name><argument_list>(<argument><expr><literal type="string">"recursive reference to query \"%s\" must not appear within a subquery"</literal></expr></argument>)</argument_list></call></expr>,
+	<comment type="block">/* RECURSION_OUTERJOIN */</comment>
+	<expr><call><name>gettext_noop</name><argument_list>(<argument><expr><literal type="string">"recursive reference to query \"%s\" must not appear within an outer join"</literal></expr></argument>)</argument_list></call></expr>,
+	<comment type="block">/* RECURSION_INTERSECT */</comment>
+	<expr><call><name>gettext_noop</name><argument_list>(<argument><expr><literal type="string">"recursive reference to query \"%s\" must not appear within INTERSECT"</literal></expr></argument>)</argument_list></call></expr>,
+	<comment type="block">/* RECURSION_EXCEPT */</comment>
+	<macro><name>gettext_noop</name><argument_list>(<argument><literal type="string">"recursive reference to query \"%s\" must not appear within EXCEPT"</literal></argument>)</argument_list></macro>
+}</block></expr></init></decl>;</decl_stmt>
+
+<comment type="block">/*
+ * For WITH RECURSIVE, we have to find an ordering of the clause members
+ * with no forward references, and determine which members are recursive
+ * (i.e., self-referential).  It is convenient to do this with an array
+ * of CteItems instead of a list of CommonTableExprs.
+ */</comment>
+<typedef>typedef <type><struct>struct <name>CteItem</name>
+<block>{
+	<decl_stmt><decl><type><name>CommonTableExpr</name> <modifier>*</modifier></type><name>cte</name></decl>;</decl_stmt>		<comment type="block">/* One CTE to examine */</comment>
+	<decl_stmt><decl><type><name>int</name></type>			<name>id</name></decl>;</decl_stmt>				<comment type="block">/* Its ID number for dependencies */</comment>
+	<decl_stmt><decl><type><name>Bitmapset</name>  <modifier>*</modifier></type><name>depends_on</name></decl>;</decl_stmt>		<comment type="block">/* CTEs depended on (not including self) */</comment>
+}</block></struct></type> <name>CteItem</name>;</typedef>
+
+<comment type="block">/* CteState is what we need to pass around in the tree walkers */</comment>
+<typedef>typedef <type><struct>struct <name>CteState</name>
+<block>{
+	<comment type="block">/* global state: */</comment>
+	<decl_stmt><decl><type><name>ParseState</name> <modifier>*</modifier></type><name>pstate</name></decl>;</decl_stmt>			<comment type="block">/* global parse state */</comment>
+	<decl_stmt><decl><type><name>CteItem</name>    <modifier>*</modifier></type><name>items</name></decl>;</decl_stmt>			<comment type="block">/* array of CTEs and extra data */</comment>
+	<decl_stmt><decl><type><name>int</name></type>			<name>numitems</name></decl>;</decl_stmt>		<comment type="block">/* number of CTEs */</comment>
+	<comment type="block">/* working state during a tree walk: */</comment>
+	<decl_stmt><decl><type><name>int</name></type>			<name>curitem</name></decl>;</decl_stmt>		<comment type="block">/* index of item currently being examined */</comment>
+	<decl_stmt><decl><type><name>List</name>	   <modifier>*</modifier></type><name>innerwiths</name></decl>;</decl_stmt>		<comment type="block">/* list of lists of CommonTableExpr */</comment>
+	<comment type="block">/* working state for checkWellFormedRecursion walk only: */</comment>
+	<decl_stmt><decl><type><name>int</name></type>			<name>selfrefcount</name></decl>;</decl_stmt>	<comment type="block">/* number of self-references detected */</comment>
+	<decl_stmt><decl><type><name>RecursionContext</name></type> <name>context</name></decl>;</decl_stmt>	<comment type="block">/* context to allow or disallow self-ref */</comment>
+}</block></struct></type> <name>CteState</name>;</typedef>
+
+
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>analyzeCTE</name><parameter_list>(<parameter><decl><type><name>ParseState</name> <modifier>*</modifier></type><name>pstate</name></decl></parameter>, <parameter><decl><type><name>CommonTableExpr</name> <modifier>*</modifier></type><name>cte</name></decl></parameter>)</parameter_list>;</function_decl>
+
+<comment type="block">/* Dependency processing functions */</comment>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>makeDependencyGraph</name><parameter_list>(<parameter><decl><type><name>CteState</name> <modifier>*</modifier></type><name>cstate</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>bool</name></type> <name>makeDependencyGraphWalker</name><parameter_list>(<parameter><decl><type><name>Node</name> <modifier>*</modifier></type><name>node</name></decl></parameter>, <parameter><decl><type><name>CteState</name> <modifier>*</modifier></type><name>cstate</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>TopologicalSort</name><parameter_list>(<parameter><decl><type><name>ParseState</name> <modifier>*</modifier></type><name>pstate</name></decl></parameter>, <parameter><decl><type><name>CteItem</name> <modifier>*</modifier></type><name>items</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>numitems</name></decl></parameter>)</parameter_list>;</function_decl>
+
+<comment type="block">/* Recursion validity checker functions */</comment>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>checkWellFormedRecursion</name><parameter_list>(<parameter><decl><type><name>CteState</name> <modifier>*</modifier></type><name>cstate</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>bool</name></type> <name>checkWellFormedRecursionWalker</name><parameter_list>(<parameter><decl><type><name>Node</name> <modifier>*</modifier></type><name>node</name></decl></parameter>, <parameter><decl><type><name>CteState</name> <modifier>*</modifier></type><name>cstate</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>checkWellFormedSelectStmt</name><parameter_list>(<parameter><decl><type><name>SelectStmt</name> <modifier>*</modifier></type><name>stmt</name></decl></parameter>, <parameter><decl><type><name>CteState</name> <modifier>*</modifier></type><name>cstate</name></decl></parameter>)</parameter_list>;</function_decl>
+
+
+<comment type="block">/*
+ * transformWithClause -
+ *	  Transform the list of WITH clause "common table expressions" into
+ *	  Query nodes.
+ *
+ * The result is the list of transformed CTEs to be put into the output
+ * Query.  (This is in fact the same as the ending value of p_ctenamespace,
+ * but it seems cleaner to not expose that in the function's API.)
+ */</comment>
+<function><type><name>List</name> <modifier>*</modifier></type>
+<name>transformWithClause</name><parameter_list>(<parameter><decl><type><name>ParseState</name> <modifier>*</modifier></type><name>pstate</name></decl></parameter>, <parameter><decl><type><name>WithClause</name> <modifier>*</modifier></type><name>withClause</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>ListCell</name>   <modifier>*</modifier></type><name>lc</name></decl>;</decl_stmt>
+
+	<comment type="block">/* Only one WITH clause per query level */</comment>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>pstate</name><operator>-&gt;</operator><name>p_ctenamespace</name></name> <operator>==</operator> <name>NIL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>pstate</name><operator>-&gt;</operator><name>p_future_ctes</name></name> <operator>==</operator> <name>NIL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * For either type of WITH, there must not be duplicate CTE names in the
+	 * list.  Check this right away so we needn't worry later.
+	 *
+	 * Also, tentatively mark each CTE as non-recursive, and initialize its
+	 * reference count to zero, and set pstate-&gt;p_hasModifyingCTE if needed.
+	 */</comment>
+	<macro><name>foreach</name><argument_list>(<argument>lc</argument>, <argument>withClause-&gt;ctes</argument>)</argument_list></macro>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>CommonTableExpr</name> <modifier>*</modifier></type><name>cte</name> <init>= <expr><operator>(</operator><name>CommonTableExpr</name> <operator>*</operator><operator>)</operator> <call><name>lfirst</name><argument_list>(<argument><expr><name>lc</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>ListCell</name>   <modifier>*</modifier></type><name>rest</name></decl>;</decl_stmt>
+
+		<macro><name>for_each_cell</name><argument_list>(<argument>rest</argument>, <argument>lnext(lc)</argument>)</argument_list></macro>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>CommonTableExpr</name> <modifier>*</modifier></type><name>cte2</name> <init>= <expr><operator>(</operator><name>CommonTableExpr</name> <operator>*</operator><operator>)</operator> <call><name>lfirst</name><argument_list>(<argument><expr><name>rest</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+			<if_stmt><if>if <condition>(<expr><call><name>strcmp</name><argument_list>(<argument><expr><name><name>cte</name><operator>-&gt;</operator><name>ctename</name></name></expr></argument>, <argument><expr><name><name>cte2</name><operator>-&gt;</operator><name>ctename</name></name></expr></argument>)</argument_list></call> <operator>==</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+						<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_DUPLICATE_ALIAS</name></expr></argument>)</argument_list></call><operator>,</operator>
+						 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"WITH query name \"%s\" specified more than once"</literal></expr></argument>,
+								<argument><expr><name><name>cte2</name><operator>-&gt;</operator><name>ctename</name></name></expr></argument>)</argument_list></call><operator>,</operator>
+						 <call><name>parser_errposition</name><argument_list>(<argument><expr><name>pstate</name></expr></argument>, <argument><expr><name><name>cte2</name><operator>-&gt;</operator><name>location</name></name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+		</block_content>}</block>
+
+		<expr_stmt><expr><name><name>cte</name><operator>-&gt;</operator><name>cterecursive</name></name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>cte</name><operator>-&gt;</operator><name>cterefcount</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>IsA</name><argument_list>(<argument><expr><name><name>cte</name><operator>-&gt;</operator><name>ctequery</name></name></expr></argument>, <argument><expr><name>SelectStmt</name></expr></argument>)</argument_list></call></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/* must be a data-modifying statement */</comment>
+			<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>IsA</name><argument_list>(<argument><expr><name><name>cte</name><operator>-&gt;</operator><name>ctequery</name></name></expr></argument>, <argument><expr><name>InsertStmt</name></expr></argument>)</argument_list></call> <operator>||</operator>
+				   <call><name>IsA</name><argument_list>(<argument><expr><name><name>cte</name><operator>-&gt;</operator><name>ctequery</name></name></expr></argument>, <argument><expr><name>UpdateStmt</name></expr></argument>)</argument_list></call> <operator>||</operator>
+				   <call><name>IsA</name><argument_list>(<argument><expr><name><name>cte</name><operator>-&gt;</operator><name>ctequery</name></name></expr></argument>, <argument><expr><name>DeleteStmt</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+			<expr_stmt><expr><name><name>pstate</name><operator>-&gt;</operator><name>p_hasModifyingCTE</name></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+	</block_content>}</block>
+
+	<if_stmt><if>if <condition>(<expr><name><name>withClause</name><operator>-&gt;</operator><name>recursive</name></name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/*
+		 * For WITH RECURSIVE, we rearrange the list elements if needed to
+		 * eliminate forward references.  First, build a work array and set up
+		 * the data structure needed by the tree walkers.
+		 */</comment>
+		<decl_stmt><decl><type><name>CteState</name></type>	<name>cstate</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>int</name></type>			<name>i</name></decl>;</decl_stmt>
+
+		<expr_stmt><expr><name><name>cstate</name><operator>.</operator><name>pstate</name></name> <operator>=</operator> <name>pstate</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>cstate</name><operator>.</operator><name>numitems</name></name> <operator>=</operator> <call><name>list_length</name><argument_list>(<argument><expr><name><name>withClause</name><operator>-&gt;</operator><name>ctes</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>cstate</name><operator>.</operator><name>items</name></name> <operator>=</operator> <operator>(</operator><name>CteItem</name> <operator>*</operator><operator>)</operator> <call><name>palloc0</name><argument_list>(<argument><expr><name><name>cstate</name><operator>.</operator><name>numitems</name></name> <operator>*</operator> <sizeof>sizeof<argument_list>(<argument><expr><name>CteItem</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+		<macro><name>foreach</name><argument_list>(<argument>lc</argument>, <argument>withClause-&gt;ctes</argument>)</argument_list></macro>
+		<block>{<block_content>
+			<expr_stmt><expr><name><name>cstate</name><operator>.</operator><name>items</name><index>[<expr><name>i</name></expr>]</index></name><operator>.</operator><name>cte</name> <operator>=</operator> <operator>(</operator><name>CommonTableExpr</name> <operator>*</operator><operator>)</operator> <call><name>lfirst</name><argument_list>(<argument><expr><name>lc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><name><name>cstate</name><operator>.</operator><name>items</name><index>[<expr><name>i</name></expr>]</index></name><operator>.</operator><name>id</name> <operator>=</operator> <name>i</name></expr>;</expr_stmt>
+			<expr_stmt><expr><name>i</name><operator>++</operator></expr>;</expr_stmt>
+		</block_content>}</block>
+
+		<comment type="block">/*
+		 * Find all the dependencies and sort the CteItems into a safe
+		 * processing order.  Also, mark CTEs that contain self-references.
+		 */</comment>
+		<expr_stmt><expr><call><name>makeDependencyGraph</name><argument_list>(<argument><expr><operator>&amp;</operator><name>cstate</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/*
+		 * Check that recursive queries are well-formed.
+		 */</comment>
+		<expr_stmt><expr><call><name>checkWellFormedRecursion</name><argument_list>(<argument><expr><operator>&amp;</operator><name>cstate</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/*
+		 * Set up the ctenamespace for parse analysis.  Per spec, all the WITH
+		 * items are visible to all others, so stuff them all in before parse
+		 * analysis.  We build the list in safe processing order so that the
+		 * planner can process the queries in sequence.
+		 */</comment>
+		<for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name><name>cstate</name><operator>.</operator><name>numitems</name></name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>CommonTableExpr</name> <modifier>*</modifier></type><name>cte</name> <init>= <expr><name><name>cstate</name><operator>.</operator><name>items</name><index>[<expr><name>i</name></expr>]</index></name><operator>.</operator><name>cte</name></expr></init></decl>;</decl_stmt>
+
+			<expr_stmt><expr><name><name>pstate</name><operator>-&gt;</operator><name>p_ctenamespace</name></name> <operator>=</operator> <call><name>lappend</name><argument_list>(<argument><expr><name><name>pstate</name><operator>-&gt;</operator><name>p_ctenamespace</name></name></expr></argument>, <argument><expr><name>cte</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></for>
+
+		<comment type="block">/*
+		 * Do parse analysis in the order determined by the topological sort.
+		 */</comment>
+		<for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name><name>cstate</name><operator>.</operator><name>numitems</name></name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>CommonTableExpr</name> <modifier>*</modifier></type><name>cte</name> <init>= <expr><name><name>cstate</name><operator>.</operator><name>items</name><index>[<expr><name>i</name></expr>]</index></name><operator>.</operator><name>cte</name></expr></init></decl>;</decl_stmt>
+
+			<expr_stmt><expr><call><name>analyzeCTE</name><argument_list>(<argument><expr><name>pstate</name></expr></argument>, <argument><expr><name>cte</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></for>
+	</block_content>}</block></if>
+	<else>else
+	<block>{<block_content>
+		<comment type="block">/*
+		 * For non-recursive WITH, just analyze each CTE in sequence and then
+		 * add it to the ctenamespace.  This corresponds to the spec's
+		 * definition of the scope of each WITH name.  However, to allow error
+		 * reports to be aware of the possibility of an erroneous reference,
+		 * we maintain a list in p_future_ctes of the not-yet-visible CTEs.
+		 */</comment>
+		<expr_stmt><expr><name><name>pstate</name><operator>-&gt;</operator><name>p_future_ctes</name></name> <operator>=</operator> <call><name>list_copy</name><argument_list>(<argument><expr><name><name>withClause</name><operator>-&gt;</operator><name>ctes</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<macro><name>foreach</name><argument_list>(<argument>lc</argument>, <argument>withClause-&gt;ctes</argument>)</argument_list></macro>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>CommonTableExpr</name> <modifier>*</modifier></type><name>cte</name> <init>= <expr><operator>(</operator><name>CommonTableExpr</name> <operator>*</operator><operator>)</operator> <call><name>lfirst</name><argument_list>(<argument><expr><name>lc</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+			<expr_stmt><expr><call><name>analyzeCTE</name><argument_list>(<argument><expr><name>pstate</name></expr></argument>, <argument><expr><name>cte</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><name><name>pstate</name><operator>-&gt;</operator><name>p_ctenamespace</name></name> <operator>=</operator> <call><name>lappend</name><argument_list>(<argument><expr><name><name>pstate</name><operator>-&gt;</operator><name>p_ctenamespace</name></name></expr></argument>, <argument><expr><name>cte</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><name><name>pstate</name><operator>-&gt;</operator><name>p_future_ctes</name></name> <operator>=</operator> <call><name>list_delete_first</name><argument_list>(<argument><expr><name><name>pstate</name><operator>-&gt;</operator><name>p_future_ctes</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block>
+	</block_content>}</block></else></if_stmt>
+
+	<return>return <expr><name><name>pstate</name><operator>-&gt;</operator><name>p_ctenamespace</name></name></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * Perform the actual parse analysis transformation of one CTE.  All
+ * CTEs it depends on have already been loaded into pstate-&gt;p_ctenamespace,
+ * and have been marked with the correct output column names/types.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>analyzeCTE</name><parameter_list>(<parameter><decl><type><name>ParseState</name> <modifier>*</modifier></type><name>pstate</name></decl></parameter>, <parameter><decl><type><name>CommonTableExpr</name> <modifier>*</modifier></type><name>cte</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>Query</name>	   <modifier>*</modifier></type><name>query</name></decl>;</decl_stmt>
+
+	<comment type="block">/* Analysis not done already */</comment>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><operator>!</operator><call><name>IsA</name><argument_list>(<argument><expr><name><name>cte</name><operator>-&gt;</operator><name>ctequery</name></name></expr></argument>, <argument><expr><name>Query</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>query</name> <operator>=</operator> <call><name>parse_sub_analyze</name><argument_list>(<argument><expr><name><name>cte</name><operator>-&gt;</operator><name>ctequery</name></name></expr></argument>, <argument><expr><name>pstate</name></expr></argument>, <argument><expr><name>cte</name></expr></argument>, <argument><expr><name>false</name></expr></argument>, <argument><expr><name>true</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>cte</name><operator>-&gt;</operator><name>ctequery</name></name> <operator>=</operator> <operator>(</operator><name>Node</name> <operator>*</operator><operator>)</operator> <name>query</name></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Check that we got something reasonable.  These first two cases should
+	 * be prevented by the grammar.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>IsA</name><argument_list>(<argument><expr><name>query</name></expr></argument>, <argument><expr><name>Query</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"unexpected non-Query statement in WITH"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	<if_stmt><if>if <condition>(<expr><name><name>query</name><operator>-&gt;</operator><name>utilityStmt</name></name> <operator>!=</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"unexpected utility statement in WITH"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<comment type="block">/*
+	 * We disallow data-modifying WITH except at the top level of a query,
+	 * because it's not clear when such a modification should be executed.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>query</name><operator>-&gt;</operator><name>commandType</name></name> <operator>!=</operator> <name>CMD_SELECT</name> <operator>&amp;&amp;</operator>
+		<name><name>pstate</name><operator>-&gt;</operator><name>parentParseState</name></name> <operator>!=</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_FEATURE_NOT_SUPPORTED</name></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"WITH clause containing a data-modifying statement must be at the top level"</literal></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>parser_errposition</name><argument_list>(<argument><expr><name>pstate</name></expr></argument>, <argument><expr><name><name>cte</name><operator>-&gt;</operator><name>location</name></name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<comment type="block">/*
+	 * CTE queries are always marked not canSetTag.  (Currently this only
+	 * matters for data-modifying statements, for which the flag will be
+	 * propagated to the ModifyTable plan node.)
+	 */</comment>
+	<expr_stmt><expr><name><name>query</name><operator>-&gt;</operator><name>canSetTag</name></name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><name><name>cte</name><operator>-&gt;</operator><name>cterecursive</name></name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* Compute the output column names/types if not done yet */</comment>
+		<expr_stmt><expr><call><name>analyzeCTETargetList</name><argument_list>(<argument><expr><name>pstate</name></expr></argument>, <argument><expr><name>cte</name></expr></argument>, <argument><expr><call><name>GetCTETargetList</name><argument_list>(<argument><expr><name>cte</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<else>else
+	<block>{<block_content>
+		<comment type="block">/*
+		 * Verify that the previously determined output column types and
+		 * collations match what the query really produced.  We have to check
+		 * this because the recursive term could have overridden the
+		 * non-recursive term, and we don't have any easy way to fix that.
+		 */</comment>
+		<decl_stmt><decl><type><name>ListCell</name>   <modifier>*</modifier></type><name>lctlist</name></decl>,
+				   <decl><type ref="prev"><modifier>*</modifier></type><name>lctyp</name></decl>,
+				   <decl><type ref="prev"><modifier>*</modifier></type><name>lctypmod</name></decl>,
+				   <decl><type ref="prev"><modifier>*</modifier></type><name>lccoll</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>int</name></type>			<name>varattno</name></decl>;</decl_stmt>
+
+		<expr_stmt><expr><name>lctyp</name> <operator>=</operator> <call><name>list_head</name><argument_list>(<argument><expr><name><name>cte</name><operator>-&gt;</operator><name>ctecoltypes</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name>lctypmod</name> <operator>=</operator> <call><name>list_head</name><argument_list>(<argument><expr><name><name>cte</name><operator>-&gt;</operator><name>ctecoltypmods</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name>lccoll</name> <operator>=</operator> <call><name>list_head</name><argument_list>(<argument><expr><name><name>cte</name><operator>-&gt;</operator><name>ctecolcollations</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name>varattno</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+		<macro><name>foreach</name><argument_list>(<argument>lctlist</argument>, <argument>GetCTETargetList(cte)</argument>)</argument_list></macro>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>TargetEntry</name> <modifier>*</modifier></type><name>te</name> <init>= <expr><operator>(</operator><name>TargetEntry</name> <operator>*</operator><operator>)</operator> <call><name>lfirst</name><argument_list>(<argument><expr><name>lctlist</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+			<decl_stmt><decl><type><name>Node</name>	   <modifier>*</modifier></type><name>texpr</name></decl>;</decl_stmt>
+
+			<if_stmt><if>if <condition>(<expr><name><name>te</name><operator>-&gt;</operator><name>resjunk</name></name></expr>)</condition><block type="pseudo"><block_content>
+				<continue>continue;</continue></block_content></block></if></if_stmt>
+			<expr_stmt><expr><name>varattno</name><operator>++</operator></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>varattno</name> <operator>==</operator> <name><name>te</name><operator>-&gt;</operator><name>resno</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<if_stmt><if>if <condition>(<expr><name>lctyp</name> <operator>==</operator> <name>NULL</name> <operator>||</operator> <name>lctypmod</name> <operator>==</operator> <name>NULL</name> <operator>||</operator> <name>lccoll</name> <operator>==</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>	<comment type="block">/* shouldn't happen */</comment>
+				<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"wrong number of output columns in WITH"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+			<expr_stmt><expr><name>texpr</name> <operator>=</operator> <operator>(</operator><name>Node</name> <operator>*</operator><operator>)</operator> <name><name>te</name><operator>-&gt;</operator><name>expr</name></name></expr>;</expr_stmt>
+			<if_stmt><if>if <condition>(<expr><call><name>exprType</name><argument_list>(<argument><expr><name>texpr</name></expr></argument>)</argument_list></call> <operator>!=</operator> <call><name>lfirst_oid</name><argument_list>(<argument><expr><name>lctyp</name></expr></argument>)</argument_list></call> <operator>||</operator>
+				<call><name>exprTypmod</name><argument_list>(<argument><expr><name>texpr</name></expr></argument>)</argument_list></call> <operator>!=</operator> <call><name>lfirst_int</name><argument_list>(<argument><expr><name>lctypmod</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+						<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_DATATYPE_MISMATCH</name></expr></argument>)</argument_list></call><operator>,</operator>
+						 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"recursive query \"%s\" column %d has type %s in non-recursive term but type %s overall"</literal></expr></argument>,
+								<argument><expr><name><name>cte</name><operator>-&gt;</operator><name>ctename</name></name></expr></argument>, <argument><expr><name>varattno</name></expr></argument>,
+								<argument><expr><call><name>format_type_with_typemod</name><argument_list>(<argument><expr><call><name>lfirst_oid</name><argument_list>(<argument><expr><name>lctyp</name></expr></argument>)</argument_list></call></expr></argument>,
+														 <argument><expr><call><name>lfirst_int</name><argument_list>(<argument><expr><name>lctypmod</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr></argument>,
+								<argument><expr><call><name>format_type_with_typemod</name><argument_list>(<argument><expr><call><name>exprType</name><argument_list>(<argument><expr><name>texpr</name></expr></argument>)</argument_list></call></expr></argument>,
+														 <argument><expr><call><name>exprTypmod</name><argument_list>(<argument><expr><name>texpr</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call><operator>,</operator>
+						 <call><name>errhint</name><argument_list>(<argument><expr><literal type="string">"Cast the output of the non-recursive term to the correct type."</literal></expr></argument>)</argument_list></call><operator>,</operator>
+						 <call><name>parser_errposition</name><argument_list>(<argument><expr><name>pstate</name></expr></argument>, <argument><expr><call><name>exprLocation</name><argument_list>(<argument><expr><name>texpr</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+			<if_stmt><if>if <condition>(<expr><call><name>exprCollation</name><argument_list>(<argument><expr><name>texpr</name></expr></argument>)</argument_list></call> <operator>!=</operator> <call><name>lfirst_oid</name><argument_list>(<argument><expr><name>lccoll</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+						<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_COLLATION_MISMATCH</name></expr></argument>)</argument_list></call><operator>,</operator>
+						 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"recursive query \"%s\" column %d has collation \"%s\" in non-recursive term but collation \"%s\" overall"</literal></expr></argument>,
+								<argument><expr><name><name>cte</name><operator>-&gt;</operator><name>ctename</name></name></expr></argument>, <argument><expr><name>varattno</name></expr></argument>,
+								<argument><expr><call><name>get_collation_name</name><argument_list>(<argument><expr><call><name>lfirst_oid</name><argument_list>(<argument><expr><name>lccoll</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr></argument>,
+								<argument><expr><call><name>get_collation_name</name><argument_list>(<argument><expr><call><name>exprCollation</name><argument_list>(<argument><expr><name>texpr</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call><operator>,</operator>
+						 <call><name>errhint</name><argument_list>(<argument><expr><literal type="string">"Use the COLLATE clause to set the collation of the non-recursive term."</literal></expr></argument>)</argument_list></call><operator>,</operator>
+						 <call><name>parser_errposition</name><argument_list>(<argument><expr><name>pstate</name></expr></argument>, <argument><expr><call><name>exprLocation</name><argument_list>(<argument><expr><name>texpr</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+			<expr_stmt><expr><name>lctyp</name> <operator>=</operator> <call><name>lnext</name><argument_list>(<argument><expr><name>lctyp</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><name>lctypmod</name> <operator>=</operator> <call><name>lnext</name><argument_list>(<argument><expr><name>lctypmod</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><name>lccoll</name> <operator>=</operator> <call><name>lnext</name><argument_list>(<argument><expr><name>lccoll</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block>
+		<if_stmt><if>if <condition>(<expr><name>lctyp</name> <operator>!=</operator> <name>NULL</name> <operator>||</operator> <name>lctypmod</name> <operator>!=</operator> <name>NULL</name> <operator>||</operator> <name>lccoll</name> <operator>!=</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>	<comment type="block">/* shouldn't happen */</comment>
+			<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"wrong number of output columns in WITH"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	</block_content>}</block></else></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Compute derived fields of a CTE, given the transformed output targetlist
+ *
+ * For a nonrecursive CTE, this is called after transforming the CTE's query.
+ * For a recursive CTE, we call it after transforming the non-recursive term,
+ * and pass the targetlist emitted by the non-recursive term only.
+ *
+ * Note: in the recursive case, the passed pstate is actually the one being
+ * used to analyze the CTE's query, so it is one level lower down than in
+ * the nonrecursive case.  This doesn't matter since we only use it for
+ * error message context anyway.
+ */</comment>
+<function><type><name>void</name></type>
+<name>analyzeCTETargetList</name><parameter_list>(<parameter><decl><type><name>ParseState</name> <modifier>*</modifier></type><name>pstate</name></decl></parameter>, <parameter><decl><type><name>CommonTableExpr</name> <modifier>*</modifier></type><name>cte</name></decl></parameter>, <parameter><decl><type><name>List</name> <modifier>*</modifier></type><name>tlist</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>int</name></type>			<name>numaliases</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>varattno</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>ListCell</name>   <modifier>*</modifier></type><name>tlistitem</name></decl>;</decl_stmt>
+
+	<comment type="block">/* Not done already ... */</comment>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>cte</name><operator>-&gt;</operator><name>ctecolnames</name></name> <operator>==</operator> <name>NIL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * We need to determine column names, types, and collations.  The alias
+	 * column names override anything coming from the query itself.  (Note:
+	 * the SQL spec says that the alias list must be empty or exactly as long
+	 * as the output column set; but we allow it to be shorter for consistency
+	 * with Alias handling.)
+	 */</comment>
+	<expr_stmt><expr><name><name>cte</name><operator>-&gt;</operator><name>ctecolnames</name></name> <operator>=</operator> <call><name>copyObject</name><argument_list>(<argument><expr><name><name>cte</name><operator>-&gt;</operator><name>aliascolnames</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>cte</name><operator>-&gt;</operator><name>ctecoltypes</name></name> <operator>=</operator> <name><name>cte</name><operator>-&gt;</operator><name>ctecoltypmods</name></name> <operator>=</operator> <name><name>cte</name><operator>-&gt;</operator><name>ctecolcollations</name></name> <operator>=</operator> <name>NIL</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name>numaliases</name> <operator>=</operator> <call><name>list_length</name><argument_list>(<argument><expr><name><name>cte</name><operator>-&gt;</operator><name>aliascolnames</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>varattno</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+	<macro><name>foreach</name><argument_list>(<argument>tlistitem</argument>, <argument>tlist</argument>)</argument_list></macro>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>TargetEntry</name> <modifier>*</modifier></type><name>te</name> <init>= <expr><operator>(</operator><name>TargetEntry</name> <operator>*</operator><operator>)</operator> <call><name>lfirst</name><argument_list>(<argument><expr><name>tlistitem</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>Oid</name></type>			<name>coltype</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>int32</name></type>		<name>coltypmod</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>Oid</name></type>			<name>colcoll</name></decl>;</decl_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name><name>te</name><operator>-&gt;</operator><name>resjunk</name></name></expr>)</condition><block type="pseudo"><block_content>
+			<continue>continue;</continue></block_content></block></if></if_stmt>
+		<expr_stmt><expr><name>varattno</name><operator>++</operator></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>varattno</name> <operator>==</operator> <name><name>te</name><operator>-&gt;</operator><name>resno</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<if_stmt><if>if <condition>(<expr><name>varattno</name> <operator>&gt;</operator> <name>numaliases</name></expr>)</condition>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>attrname</name></decl>;</decl_stmt>
+
+			<expr_stmt><expr><name>attrname</name> <operator>=</operator> <call><name>pstrdup</name><argument_list>(<argument><expr><name><name>te</name><operator>-&gt;</operator><name>resname</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><name><name>cte</name><operator>-&gt;</operator><name>ctecolnames</name></name> <operator>=</operator> <call><name>lappend</name><argument_list>(<argument><expr><name><name>cte</name><operator>-&gt;</operator><name>ctecolnames</name></name></expr></argument>, <argument><expr><call><name>makeString</name><argument_list>(<argument><expr><name>attrname</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+		<expr_stmt><expr><name>coltype</name> <operator>=</operator> <call><name>exprType</name><argument_list>(<argument><expr><operator>(</operator><name>Node</name> <operator>*</operator><operator>)</operator> <name><name>te</name><operator>-&gt;</operator><name>expr</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name>coltypmod</name> <operator>=</operator> <call><name>exprTypmod</name><argument_list>(<argument><expr><operator>(</operator><name>Node</name> <operator>*</operator><operator>)</operator> <name><name>te</name><operator>-&gt;</operator><name>expr</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name>colcoll</name> <operator>=</operator> <call><name>exprCollation</name><argument_list>(<argument><expr><operator>(</operator><name>Node</name> <operator>*</operator><operator>)</operator> <name><name>te</name><operator>-&gt;</operator><name>expr</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/*
+		 * If the CTE is recursive, force the exposed column type of any
+		 * "unknown" column to "text".  We must deal with this here because
+		 * we're called on the non-recursive term before there's been any
+		 * attempt to force unknown output columns to some other type.  We
+		 * have to resolve unknowns before looking at the recursive term.
+		 *
+		 * The column might contain 'foo' COLLATE "bar", so don't override
+		 * collation if it's already set.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><name><name>cte</name><operator>-&gt;</operator><name>cterecursive</name></name> <operator>&amp;&amp;</operator> <name>coltype</name> <operator>==</operator> <name>UNKNOWNOID</name></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><name>coltype</name> <operator>=</operator> <name>TEXTOID</name></expr>;</expr_stmt>
+			<expr_stmt><expr><name>coltypmod</name> <operator>=</operator> <operator>-</operator><literal type="number">1</literal></expr>;</expr_stmt>		<comment type="block">/* should be -1 already, but be sure */</comment>
+			<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>OidIsValid</name><argument_list>(<argument><expr><name>colcoll</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><name>colcoll</name> <operator>=</operator> <name>DEFAULT_COLLATION_OID</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+		</block_content>}</block></if></if_stmt>
+		<expr_stmt><expr><name><name>cte</name><operator>-&gt;</operator><name>ctecoltypes</name></name> <operator>=</operator> <call><name>lappend_oid</name><argument_list>(<argument><expr><name><name>cte</name><operator>-&gt;</operator><name>ctecoltypes</name></name></expr></argument>, <argument><expr><name>coltype</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>cte</name><operator>-&gt;</operator><name>ctecoltypmods</name></name> <operator>=</operator> <call><name>lappend_int</name><argument_list>(<argument><expr><name><name>cte</name><operator>-&gt;</operator><name>ctecoltypmods</name></name></expr></argument>, <argument><expr><name>coltypmod</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>cte</name><operator>-&gt;</operator><name>ctecolcollations</name></name> <operator>=</operator> <call><name>lappend_oid</name><argument_list>(<argument><expr><name><name>cte</name><operator>-&gt;</operator><name>ctecolcollations</name></name></expr></argument>, <argument><expr><name>colcoll</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block>
+	<if_stmt><if>if <condition>(<expr><name>varattno</name> <operator>&lt;</operator> <name>numaliases</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_INVALID_COLUMN_REFERENCE</name></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"WITH query \"%s\" has %d columns available but %d columns specified"</literal></expr></argument>,
+						<argument><expr><name><name>cte</name><operator>-&gt;</operator><name>ctename</name></name></expr></argument>, <argument><expr><name>varattno</name></expr></argument>, <argument><expr><name>numaliases</name></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>parser_errposition</name><argument_list>(<argument><expr><name>pstate</name></expr></argument>, <argument><expr><name><name>cte</name><operator>-&gt;</operator><name>location</name></name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * Identify the cross-references of a list of WITH RECURSIVE items,
+ * and sort into an order that has no forward references.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>makeDependencyGraph</name><parameter_list>(<parameter><decl><type><name>CteState</name> <modifier>*</modifier></type><name>cstate</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>int</name></type>			<name>i</name></decl>;</decl_stmt>
+
+	<for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name><name>cstate</name><operator>-&gt;</operator><name>numitems</name></name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>CommonTableExpr</name> <modifier>*</modifier></type><name>cte</name> <init>= <expr><name><name>cstate</name><operator>-&gt;</operator><name>items</name><index>[<expr><name>i</name></expr>]</index></name><operator>.</operator><name>cte</name></expr></init></decl>;</decl_stmt>
+
+		<expr_stmt><expr><name><name>cstate</name><operator>-&gt;</operator><name>curitem</name></name> <operator>=</operator> <name>i</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>cstate</name><operator>-&gt;</operator><name>innerwiths</name></name> <operator>=</operator> <name>NIL</name></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>makeDependencyGraphWalker</name><argument_list>(<argument><expr><operator>(</operator><name>Node</name> <operator>*</operator><operator>)</operator> <name><name>cte</name><operator>-&gt;</operator><name>ctequery</name></name></expr></argument>, <argument><expr><name>cstate</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>cstate</name><operator>-&gt;</operator><name>innerwiths</name></name> <operator>==</operator> <name>NIL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></for>
+
+	<expr_stmt><expr><call><name>TopologicalSort</name><argument_list>(<argument><expr><name><name>cstate</name><operator>-&gt;</operator><name>pstate</name></name></expr></argument>, <argument><expr><name><name>cstate</name><operator>-&gt;</operator><name>items</name></name></expr></argument>, <argument><expr><name><name>cstate</name><operator>-&gt;</operator><name>numitems</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Tree walker function to detect cross-references and self-references of the
+ * CTEs in a WITH RECURSIVE list.
+ */</comment>
+<function><type><specifier>static</specifier> <name>bool</name></type>
+<name>makeDependencyGraphWalker</name><parameter_list>(<parameter><decl><type><name>Node</name> <modifier>*</modifier></type><name>node</name></decl></parameter>, <parameter><decl><type><name>CteState</name> <modifier>*</modifier></type><name>cstate</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<if_stmt><if>if <condition>(<expr><name>node</name> <operator>==</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>false</name></expr>;</return></block_content></block></if></if_stmt>
+	<if_stmt><if>if <condition>(<expr><call><name>IsA</name><argument_list>(<argument><expr><name>node</name></expr></argument>, <argument><expr><name>RangeVar</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>RangeVar</name>   <modifier>*</modifier></type><name>rv</name> <init>= <expr><operator>(</operator><name>RangeVar</name> <operator>*</operator><operator>)</operator> <name>node</name></expr></init></decl>;</decl_stmt>
+
+		<comment type="block">/* If unqualified name, might be a CTE reference */</comment>
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><name><name>rv</name><operator>-&gt;</operator><name>schemaname</name></name></expr>)</condition>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>ListCell</name>   <modifier>*</modifier></type><name>lc</name></decl>;</decl_stmt>
+			<decl_stmt><decl><type><name>int</name></type>			<name>i</name></decl>;</decl_stmt>
+
+			<comment type="block">/* ... but first see if it's captured by an inner WITH */</comment>
+			<macro><name>foreach</name><argument_list>(<argument>lc</argument>, <argument>cstate-&gt;innerwiths</argument>)</argument_list></macro>
+			<block>{<block_content>
+				<decl_stmt><decl><type><name>List</name>	   <modifier>*</modifier></type><name>withlist</name> <init>= <expr><operator>(</operator><name>List</name> <operator>*</operator><operator>)</operator> <call><name>lfirst</name><argument_list>(<argument><expr><name>lc</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+				<decl_stmt><decl><type><name>ListCell</name>   <modifier>*</modifier></type><name>lc2</name></decl>;</decl_stmt>
+
+				<macro><name>foreach</name><argument_list>(<argument>lc2</argument>, <argument>withlist</argument>)</argument_list></macro>
+				<block>{<block_content>
+					<decl_stmt><decl><type><name>CommonTableExpr</name> <modifier>*</modifier></type><name>cte</name> <init>= <expr><operator>(</operator><name>CommonTableExpr</name> <operator>*</operator><operator>)</operator> <call><name>lfirst</name><argument_list>(<argument><expr><name>lc2</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+					<if_stmt><if>if <condition>(<expr><call><name>strcmp</name><argument_list>(<argument><expr><name><name>rv</name><operator>-&gt;</operator><name>relname</name></name></expr></argument>, <argument><expr><name><name>cte</name><operator>-&gt;</operator><name>ctename</name></name></expr></argument>)</argument_list></call> <operator>==</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+						<return>return <expr><name>false</name></expr>;</return></block_content></block></if></if_stmt>	<comment type="block">/* yes, so bail out */</comment>
+				</block_content>}</block>
+			</block_content>}</block>
+
+			<comment type="block">/* No, could be a reference to the query level we are working on */</comment>
+			<for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name><name>cstate</name><operator>-&gt;</operator><name>numitems</name></name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control>
+			<block>{<block_content>
+				<decl_stmt><decl><type><name>CommonTableExpr</name> <modifier>*</modifier></type><name>cte</name> <init>= <expr><name><name>cstate</name><operator>-&gt;</operator><name>items</name><index>[<expr><name>i</name></expr>]</index></name><operator>.</operator><name>cte</name></expr></init></decl>;</decl_stmt>
+
+				<if_stmt><if>if <condition>(<expr><call><name>strcmp</name><argument_list>(<argument><expr><name><name>rv</name><operator>-&gt;</operator><name>relname</name></name></expr></argument>, <argument><expr><name><name>cte</name><operator>-&gt;</operator><name>ctename</name></name></expr></argument>)</argument_list></call> <operator>==</operator> <literal type="number">0</literal></expr>)</condition>
+				<block>{<block_content>
+					<decl_stmt><decl><type><name>int</name></type>			<name>myindex</name> <init>= <expr><name><name>cstate</name><operator>-&gt;</operator><name>curitem</name></name></expr></init></decl>;</decl_stmt>
+
+					<if_stmt><if>if <condition>(<expr><name>i</name> <operator>!=</operator> <name>myindex</name></expr>)</condition>
+					<block>{<block_content>
+						<comment type="block">/* Add cross-item dependency */</comment>
+						<expr_stmt><expr><name><name>cstate</name><operator>-&gt;</operator><name>items</name><index>[<expr><name>myindex</name></expr>]</index></name><operator>.</operator><name>depends_on</name> <operator>=</operator>
+							<call><name>bms_add_member</name><argument_list>(<argument><expr><name><name>cstate</name><operator>-&gt;</operator><name>items</name><index>[<expr><name>myindex</name></expr>]</index></name><operator>.</operator><name>depends_on</name></expr></argument>,
+										   <argument><expr><name><name>cstate</name><operator>-&gt;</operator><name>items</name><index>[<expr><name>i</name></expr>]</index></name><operator>.</operator><name>id</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+					</block_content>}</block></if>
+					<else>else
+					<block>{<block_content>
+						<comment type="block">/* Found out this one is self-referential */</comment>
+						<expr_stmt><expr><name><name>cte</name><operator>-&gt;</operator><name>cterecursive</name></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+					</block_content>}</block></else></if_stmt>
+					<break>break;</break>
+				</block_content>}</block></if></if_stmt>
+			</block_content>}</block></for>
+		</block_content>}</block></if></if_stmt>
+		<return>return <expr><name>false</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+	<if_stmt><if>if <condition>(<expr><call><name>IsA</name><argument_list>(<argument><expr><name>node</name></expr></argument>, <argument><expr><name>SelectStmt</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>SelectStmt</name> <modifier>*</modifier></type><name>stmt</name> <init>= <expr><operator>(</operator><name>SelectStmt</name> <operator>*</operator><operator>)</operator> <name>node</name></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>ListCell</name>   <modifier>*</modifier></type><name>lc</name></decl>;</decl_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name><name>stmt</name><operator>-&gt;</operator><name>withClause</name></name></expr>)</condition>
+		<block>{<block_content>
+			<if_stmt><if>if <condition>(<expr><name><name>stmt</name><operator>-&gt;</operator><name>withClause</name><operator>-&gt;</operator><name>recursive</name></name></expr>)</condition>
+			<block>{<block_content>
+				<comment type="block">/*
+				 * In the RECURSIVE case, all query names of the WITH are
+				 * visible to all WITH items as well as the main query. So
+				 * push them all on, process, pop them all off.
+				 */</comment>
+				<expr_stmt><expr><name><name>cstate</name><operator>-&gt;</operator><name>innerwiths</name></name> <operator>=</operator> <call><name>lcons</name><argument_list>(<argument><expr><name><name>stmt</name><operator>-&gt;</operator><name>withClause</name><operator>-&gt;</operator><name>ctes</name></name></expr></argument>,
+										   <argument><expr><name><name>cstate</name><operator>-&gt;</operator><name>innerwiths</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<macro><name>foreach</name><argument_list>(<argument>lc</argument>, <argument>stmt-&gt;withClause-&gt;ctes</argument>)</argument_list></macro>
+				<block>{<block_content>
+					<decl_stmt><decl><type><name>CommonTableExpr</name> <modifier>*</modifier></type><name>cte</name> <init>= <expr><operator>(</operator><name>CommonTableExpr</name> <operator>*</operator><operator>)</operator> <call><name>lfirst</name><argument_list>(<argument><expr><name>lc</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+					<expr_stmt><expr><operator>(</operator><name>void</name><operator>)</operator> <call><name>makeDependencyGraphWalker</name><argument_list>(<argument><expr><name><name>cte</name><operator>-&gt;</operator><name>ctequery</name></name></expr></argument>, <argument><expr><name>cstate</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				</block_content>}</block>
+				<expr_stmt><expr><operator>(</operator><name>void</name><operator>)</operator> <call><name>raw_expression_tree_walker</name><argument_list>(<argument><expr><name>node</name></expr></argument>,
+												  <argument><expr><name>makeDependencyGraphWalker</name></expr></argument>,
+												  <argument><expr><operator>(</operator><name>void</name> <operator>*</operator><operator>)</operator> <name>cstate</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<expr_stmt><expr><name><name>cstate</name><operator>-&gt;</operator><name>innerwiths</name></name> <operator>=</operator> <call><name>list_delete_first</name><argument_list>(<argument><expr><name><name>cstate</name><operator>-&gt;</operator><name>innerwiths</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			</block_content>}</block></if>
+			<else>else
+			<block>{<block_content>
+				<comment type="block">/*
+				 * In the non-RECURSIVE case, query names are visible to the
+				 * WITH items after them and to the main query.
+				 */</comment>
+				<decl_stmt><decl><type><name>ListCell</name>   <modifier>*</modifier></type><name>cell1</name></decl>;</decl_stmt>
+
+				<expr_stmt><expr><name><name>cstate</name><operator>-&gt;</operator><name>innerwiths</name></name> <operator>=</operator> <call><name>lcons</name><argument_list>(<argument><expr><name>NIL</name></expr></argument>, <argument><expr><name><name>cstate</name><operator>-&gt;</operator><name>innerwiths</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<expr_stmt><expr><name>cell1</name> <operator>=</operator> <call><name>list_head</name><argument_list>(<argument><expr><name><name>cstate</name><operator>-&gt;</operator><name>innerwiths</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<macro><name>foreach</name><argument_list>(<argument>lc</argument>, <argument>stmt-&gt;withClause-&gt;ctes</argument>)</argument_list></macro>
+				<block>{<block_content>
+					<decl_stmt><decl><type><name>CommonTableExpr</name> <modifier>*</modifier></type><name>cte</name> <init>= <expr><operator>(</operator><name>CommonTableExpr</name> <operator>*</operator><operator>)</operator> <call><name>lfirst</name><argument_list>(<argument><expr><name>lc</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+					<expr_stmt><expr><operator>(</operator><name>void</name><operator>)</operator> <call><name>makeDependencyGraphWalker</name><argument_list>(<argument><expr><name><name>cte</name><operator>-&gt;</operator><name>ctequery</name></name></expr></argument>, <argument><expr><name>cstate</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+					<expr_stmt><expr><call><name>lfirst</name><argument_list>(<argument><expr><name>cell1</name></expr></argument>)</argument_list></call> <operator>=</operator> <call><name>lappend</name><argument_list>(<argument><expr><operator>(</operator><name>List</name> <operator>*</operator><operator>)</operator> <call><name>lfirst</name><argument_list>(<argument><expr><name>cell1</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>cte</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				</block_content>}</block>
+				<expr_stmt><expr><operator>(</operator><name>void</name><operator>)</operator> <call><name>raw_expression_tree_walker</name><argument_list>(<argument><expr><name>node</name></expr></argument>,
+												  <argument><expr><name>makeDependencyGraphWalker</name></expr></argument>,
+												  <argument><expr><operator>(</operator><name>void</name> <operator>*</operator><operator>)</operator> <name>cstate</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<expr_stmt><expr><name><name>cstate</name><operator>-&gt;</operator><name>innerwiths</name></name> <operator>=</operator> <call><name>list_delete_first</name><argument_list>(<argument><expr><name><name>cstate</name><operator>-&gt;</operator><name>innerwiths</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			</block_content>}</block></else></if_stmt>
+			<comment type="block">/* We're done examining the SelectStmt */</comment>
+			<return>return <expr><name>false</name></expr>;</return>
+		</block_content>}</block></if></if_stmt>
+		<comment type="block">/* if no WITH clause, just fall through for normal processing */</comment>
+	</block_content>}</block></if></if_stmt>
+	<if_stmt><if>if <condition>(<expr><call><name>IsA</name><argument_list>(<argument><expr><name>node</name></expr></argument>, <argument><expr><name>WithClause</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/*
+		 * Prevent raw_expression_tree_walker from recursing directly into a
+		 * WITH clause.  We need that to happen only under the control of the
+		 * code above.
+		 */</comment>
+		<return>return <expr><name>false</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+	<return>return <expr><call><name>raw_expression_tree_walker</name><argument_list>(<argument><expr><name>node</name></expr></argument>,
+									  <argument><expr><name>makeDependencyGraphWalker</name></expr></argument>,
+									  <argument><expr><operator>(</operator><name>void</name> <operator>*</operator><operator>)</operator> <name>cstate</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Sort by dependencies, using a standard topological sort operation
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>TopologicalSort</name><parameter_list>(<parameter><decl><type><name>ParseState</name> <modifier>*</modifier></type><name>pstate</name></decl></parameter>, <parameter><decl><type><name>CteItem</name> <modifier>*</modifier></type><name>items</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>numitems</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>int</name></type>			<name>i</name></decl>,
+				<decl><type ref="prev"/><name>j</name></decl>;</decl_stmt>
+
+	<comment type="block">/* for each position in sequence ... */</comment>
+	<for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name>numitems</name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control>
+	<block>{<block_content>
+		<comment type="block">/* ... scan the remaining items to find one that has no dependencies */</comment>
+		<for>for <control>(<init><expr><name>j</name> <operator>=</operator> <name>i</name></expr>;</init> <condition><expr><name>j</name> <operator>&lt;</operator> <name>numitems</name></expr>;</condition> <incr><expr><name>j</name><operator>++</operator></expr></incr>)</control>
+		<block>{<block_content>
+			<if_stmt><if>if <condition>(<expr><call><name>bms_is_empty</name><argument_list>(<argument><expr><name><name>items</name><index>[<expr><name>j</name></expr>]</index></name><operator>.</operator><name>depends_on</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+				<break>break;</break></block_content></block></if></if_stmt>
+		</block_content>}</block></for>
+
+		<comment type="block">/* if we didn't find one, the dependency graph has a cycle */</comment>
+		<if_stmt><if>if <condition>(<expr><name>j</name> <operator>&gt;=</operator> <name>numitems</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+					<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_FEATURE_NOT_SUPPORTED</name></expr></argument>)</argument_list></call><operator>,</operator>
+					 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"mutual recursion between WITH items is not implemented"</literal></expr></argument>)</argument_list></call><operator>,</operator>
+					 <call><name>parser_errposition</name><argument_list>(<argument><expr><name>pstate</name></expr></argument>, <argument><expr><name><name>items</name><index>[<expr><name>i</name></expr>]</index></name><operator>.</operator><name><name>cte</name><operator>-&gt;</operator><name>location</name></name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+		<comment type="block">/*
+		 * Found one.  Move it to front and remove it from every other item's
+		 * dependencies.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><name>i</name> <operator>!=</operator> <name>j</name></expr>)</condition>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>CteItem</name></type>		<name>tmp</name></decl>;</decl_stmt>
+
+			<expr_stmt><expr><name>tmp</name> <operator>=</operator> <name><name>items</name><index>[<expr><name>i</name></expr>]</index></name></expr>;</expr_stmt>
+			<expr_stmt><expr><name><name>items</name><index>[<expr><name>i</name></expr>]</index></name> <operator>=</operator> <name><name>items</name><index>[<expr><name>j</name></expr>]</index></name></expr>;</expr_stmt>
+			<expr_stmt><expr><name><name>items</name><index>[<expr><name>j</name></expr>]</index></name> <operator>=</operator> <name>tmp</name></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+
+		<comment type="block">/*
+		 * Items up through i are known to have no dependencies left, so we
+		 * can skip them in this loop.
+		 */</comment>
+		<for>for <control>(<init><expr><name>j</name> <operator>=</operator> <name>i</name> <operator>+</operator> <literal type="number">1</literal></expr>;</init> <condition><expr><name>j</name> <operator>&lt;</operator> <name>numitems</name></expr>;</condition> <incr><expr><name>j</name><operator>++</operator></expr></incr>)</control>
+		<block>{<block_content>
+			<expr_stmt><expr><name><name>items</name><index>[<expr><name>j</name></expr>]</index></name><operator>.</operator><name>depends_on</name> <operator>=</operator> <call><name>bms_del_member</name><argument_list>(<argument><expr><name><name>items</name><index>[<expr><name>j</name></expr>]</index></name><operator>.</operator><name>depends_on</name></expr></argument>,
+												 <argument><expr><name><name>items</name><index>[<expr><name>i</name></expr>]</index></name><operator>.</operator><name>id</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></for>
+	</block_content>}</block></for>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * Check that recursive queries are well-formed.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>checkWellFormedRecursion</name><parameter_list>(<parameter><decl><type><name>CteState</name> <modifier>*</modifier></type><name>cstate</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>int</name></type>			<name>i</name></decl>;</decl_stmt>
+
+	<for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name><name>cstate</name><operator>-&gt;</operator><name>numitems</name></name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>CommonTableExpr</name> <modifier>*</modifier></type><name>cte</name> <init>= <expr><name><name>cstate</name><operator>-&gt;</operator><name>items</name><index>[<expr><name>i</name></expr>]</index></name><operator>.</operator><name>cte</name></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>SelectStmt</name> <modifier>*</modifier></type><name>stmt</name> <init>= <expr><operator>(</operator><name>SelectStmt</name> <operator>*</operator><operator>)</operator> <name><name>cte</name><operator>-&gt;</operator><name>ctequery</name></name></expr></init></decl>;</decl_stmt>
+
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><operator>!</operator><call><name>IsA</name><argument_list>(<argument><expr><name>stmt</name></expr></argument>, <argument><expr><name>Query</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>	<comment type="block">/* not analyzed yet */</comment>
+
+		<comment type="block">/* Ignore items that weren't found to be recursive */</comment>
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><name><name>cte</name><operator>-&gt;</operator><name>cterecursive</name></name></expr>)</condition><block type="pseudo"><block_content>
+			<continue>continue;</continue></block_content></block></if></if_stmt>
+
+		<comment type="block">/* Must be a SELECT statement */</comment>
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>IsA</name><argument_list>(<argument><expr><name>stmt</name></expr></argument>, <argument><expr><name>SelectStmt</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+					<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_INVALID_RECURSION</name></expr></argument>)</argument_list></call><operator>,</operator>
+					 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"recursive query \"%s\" must not contain data-modifying statements"</literal></expr></argument>,
+							<argument><expr><name><name>cte</name><operator>-&gt;</operator><name>ctename</name></name></expr></argument>)</argument_list></call><operator>,</operator>
+					 <call><name>parser_errposition</name><argument_list>(<argument><expr><name><name>cstate</name><operator>-&gt;</operator><name>pstate</name></name></expr></argument>, <argument><expr><name><name>cte</name><operator>-&gt;</operator><name>location</name></name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+		<comment type="block">/* Must have top-level UNION */</comment>
+		<if_stmt><if>if <condition>(<expr><name><name>stmt</name><operator>-&gt;</operator><name>op</name></name> <operator>!=</operator> <name>SETOP_UNION</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+					<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_INVALID_RECURSION</name></expr></argument>)</argument_list></call><operator>,</operator>
+					 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"recursive query \"%s\" does not have the form non-recursive-term UNION [ALL] recursive-term"</literal></expr></argument>,
+							<argument><expr><name><name>cte</name><operator>-&gt;</operator><name>ctename</name></name></expr></argument>)</argument_list></call><operator>,</operator>
+					 <call><name>parser_errposition</name><argument_list>(<argument><expr><name><name>cstate</name><operator>-&gt;</operator><name>pstate</name></name></expr></argument>, <argument><expr><name><name>cte</name><operator>-&gt;</operator><name>location</name></name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+		<comment type="block">/* The left-hand operand mustn't contain self-reference at all */</comment>
+		<expr_stmt><expr><name><name>cstate</name><operator>-&gt;</operator><name>curitem</name></name> <operator>=</operator> <name>i</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>cstate</name><operator>-&gt;</operator><name>innerwiths</name></name> <operator>=</operator> <name>NIL</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>cstate</name><operator>-&gt;</operator><name>selfrefcount</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>cstate</name><operator>-&gt;</operator><name>context</name></name> <operator>=</operator> <name>RECURSION_NONRECURSIVETERM</name></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>checkWellFormedRecursionWalker</name><argument_list>(<argument><expr><operator>(</operator><name>Node</name> <operator>*</operator><operator>)</operator> <name><name>stmt</name><operator>-&gt;</operator><name>larg</name></name></expr></argument>, <argument><expr><name>cstate</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>cstate</name><operator>-&gt;</operator><name>innerwiths</name></name> <operator>==</operator> <name>NIL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/* Right-hand operand should contain one reference in a valid place */</comment>
+		<expr_stmt><expr><name><name>cstate</name><operator>-&gt;</operator><name>curitem</name></name> <operator>=</operator> <name>i</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>cstate</name><operator>-&gt;</operator><name>innerwiths</name></name> <operator>=</operator> <name>NIL</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>cstate</name><operator>-&gt;</operator><name>selfrefcount</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>cstate</name><operator>-&gt;</operator><name>context</name></name> <operator>=</operator> <name>RECURSION_OK</name></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>checkWellFormedRecursionWalker</name><argument_list>(<argument><expr><operator>(</operator><name>Node</name> <operator>*</operator><operator>)</operator> <name><name>stmt</name><operator>-&gt;</operator><name>rarg</name></name></expr></argument>, <argument><expr><name>cstate</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>cstate</name><operator>-&gt;</operator><name>innerwiths</name></name> <operator>==</operator> <name>NIL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<if_stmt><if>if <condition>(<expr><name><name>cstate</name><operator>-&gt;</operator><name>selfrefcount</name></name> <operator>!=</operator> <literal type="number">1</literal></expr>)</condition><block type="pseudo"><block_content>	<comment type="block">/* shouldn't happen */</comment>
+			<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"missing recursive reference"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+		<comment type="block">/* WITH mustn't contain self-reference, either */</comment>
+		<if_stmt><if>if <condition>(<expr><name><name>stmt</name><operator>-&gt;</operator><name>withClause</name></name></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><name><name>cstate</name><operator>-&gt;</operator><name>curitem</name></name> <operator>=</operator> <name>i</name></expr>;</expr_stmt>
+			<expr_stmt><expr><name><name>cstate</name><operator>-&gt;</operator><name>innerwiths</name></name> <operator>=</operator> <name>NIL</name></expr>;</expr_stmt>
+			<expr_stmt><expr><name><name>cstate</name><operator>-&gt;</operator><name>selfrefcount</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+			<expr_stmt><expr><name><name>cstate</name><operator>-&gt;</operator><name>context</name></name> <operator>=</operator> <name>RECURSION_SUBLINK</name></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>checkWellFormedRecursionWalker</name><argument_list>(<argument><expr><operator>(</operator><name>Node</name> <operator>*</operator><operator>)</operator> <name><name>stmt</name><operator>-&gt;</operator><name>withClause</name><operator>-&gt;</operator><name>ctes</name></name></expr></argument>,
+										   <argument><expr><name>cstate</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>cstate</name><operator>-&gt;</operator><name>innerwiths</name></name> <operator>==</operator> <name>NIL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+
+		<comment type="block">/*
+		 * Disallow ORDER BY and similar decoration atop the UNION. These
+		 * don't make sense because it's impossible to figure out what they
+		 * mean when we have only part of the recursive query's results. (If
+		 * we did allow them, we'd have to check for recursive references
+		 * inside these subtrees.)
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><name><name>stmt</name><operator>-&gt;</operator><name>sortClause</name></name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+					<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_FEATURE_NOT_SUPPORTED</name></expr></argument>)</argument_list></call><operator>,</operator>
+					 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"ORDER BY in a recursive query is not implemented"</literal></expr></argument>)</argument_list></call><operator>,</operator>
+					 <call><name>parser_errposition</name><argument_list>(<argument><expr><name><name>cstate</name><operator>-&gt;</operator><name>pstate</name></name></expr></argument>,
+										<argument><expr><call><name>exprLocation</name><argument_list>(<argument><expr><operator>(</operator><name>Node</name> <operator>*</operator><operator>)</operator> <name><name>stmt</name><operator>-&gt;</operator><name>sortClause</name></name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+		<if_stmt><if>if <condition>(<expr><name><name>stmt</name><operator>-&gt;</operator><name>limitOffset</name></name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+					<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_FEATURE_NOT_SUPPORTED</name></expr></argument>)</argument_list></call><operator>,</operator>
+					 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"OFFSET in a recursive query is not implemented"</literal></expr></argument>)</argument_list></call><operator>,</operator>
+					 <call><name>parser_errposition</name><argument_list>(<argument><expr><name><name>cstate</name><operator>-&gt;</operator><name>pstate</name></name></expr></argument>,
+										<argument><expr><call><name>exprLocation</name><argument_list>(<argument><expr><name><name>stmt</name><operator>-&gt;</operator><name>limitOffset</name></name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+		<if_stmt><if>if <condition>(<expr><name><name>stmt</name><operator>-&gt;</operator><name>limitCount</name></name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+					<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_FEATURE_NOT_SUPPORTED</name></expr></argument>)</argument_list></call><operator>,</operator>
+					 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"LIMIT in a recursive query is not implemented"</literal></expr></argument>)</argument_list></call><operator>,</operator>
+					 <call><name>parser_errposition</name><argument_list>(<argument><expr><name><name>cstate</name><operator>-&gt;</operator><name>pstate</name></name></expr></argument>,
+										<argument><expr><call><name>exprLocation</name><argument_list>(<argument><expr><name><name>stmt</name><operator>-&gt;</operator><name>limitCount</name></name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+		<if_stmt><if>if <condition>(<expr><name><name>stmt</name><operator>-&gt;</operator><name>lockingClause</name></name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+					<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_FEATURE_NOT_SUPPORTED</name></expr></argument>)</argument_list></call><operator>,</operator>
+					 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"FOR UPDATE/SHARE in a recursive query is not implemented"</literal></expr></argument>)</argument_list></call><operator>,</operator>
+					 <call><name>parser_errposition</name><argument_list>(<argument><expr><name><name>cstate</name><operator>-&gt;</operator><name>pstate</name></name></expr></argument>,
+										<argument><expr><call><name>exprLocation</name><argument_list>(<argument><expr><operator>(</operator><name>Node</name> <operator>*</operator><operator>)</operator> <name><name>stmt</name><operator>-&gt;</operator><name>lockingClause</name></name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	</block_content>}</block></for>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Tree walker function to detect invalid self-references in a recursive query.
+ */</comment>
+<function><type><specifier>static</specifier> <name>bool</name></type>
+<name>checkWellFormedRecursionWalker</name><parameter_list>(<parameter><decl><type><name>Node</name> <modifier>*</modifier></type><name>node</name></decl></parameter>, <parameter><decl><type><name>CteState</name> <modifier>*</modifier></type><name>cstate</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>RecursionContext</name></type> <name>save_context</name> <init>= <expr><name><name>cstate</name><operator>-&gt;</operator><name>context</name></name></expr></init></decl>;</decl_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>node</name> <operator>==</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>false</name></expr>;</return></block_content></block></if></if_stmt>
+	<if_stmt><if>if <condition>(<expr><call><name>IsA</name><argument_list>(<argument><expr><name>node</name></expr></argument>, <argument><expr><name>RangeVar</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>RangeVar</name>   <modifier>*</modifier></type><name>rv</name> <init>= <expr><operator>(</operator><name>RangeVar</name> <operator>*</operator><operator>)</operator> <name>node</name></expr></init></decl>;</decl_stmt>
+
+		<comment type="block">/* If unqualified name, might be a CTE reference */</comment>
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><name><name>rv</name><operator>-&gt;</operator><name>schemaname</name></name></expr>)</condition>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>ListCell</name>   <modifier>*</modifier></type><name>lc</name></decl>;</decl_stmt>
+			<decl_stmt><decl><type><name>CommonTableExpr</name> <modifier>*</modifier></type><name>mycte</name></decl>;</decl_stmt>
+
+			<comment type="block">/* ... but first see if it's captured by an inner WITH */</comment>
+			<macro><name>foreach</name><argument_list>(<argument>lc</argument>, <argument>cstate-&gt;innerwiths</argument>)</argument_list></macro>
+			<block>{<block_content>
+				<decl_stmt><decl><type><name>List</name>	   <modifier>*</modifier></type><name>withlist</name> <init>= <expr><operator>(</operator><name>List</name> <operator>*</operator><operator>)</operator> <call><name>lfirst</name><argument_list>(<argument><expr><name>lc</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+				<decl_stmt><decl><type><name>ListCell</name>   <modifier>*</modifier></type><name>lc2</name></decl>;</decl_stmt>
+
+				<macro><name>foreach</name><argument_list>(<argument>lc2</argument>, <argument>withlist</argument>)</argument_list></macro>
+				<block>{<block_content>
+					<decl_stmt><decl><type><name>CommonTableExpr</name> <modifier>*</modifier></type><name>cte</name> <init>= <expr><operator>(</operator><name>CommonTableExpr</name> <operator>*</operator><operator>)</operator> <call><name>lfirst</name><argument_list>(<argument><expr><name>lc2</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+					<if_stmt><if>if <condition>(<expr><call><name>strcmp</name><argument_list>(<argument><expr><name><name>rv</name><operator>-&gt;</operator><name>relname</name></name></expr></argument>, <argument><expr><name><name>cte</name><operator>-&gt;</operator><name>ctename</name></name></expr></argument>)</argument_list></call> <operator>==</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+						<return>return <expr><name>false</name></expr>;</return></block_content></block></if></if_stmt>	<comment type="block">/* yes, so bail out */</comment>
+				</block_content>}</block>
+			</block_content>}</block>
+
+			<comment type="block">/* No, could be a reference to the query level we are working on */</comment>
+			<expr_stmt><expr><name>mycte</name> <operator>=</operator> <name><name>cstate</name><operator>-&gt;</operator><name>items</name><index>[<expr><name><name>cstate</name><operator>-&gt;</operator><name>curitem</name></name></expr>]</index></name><operator>.</operator><name>cte</name></expr>;</expr_stmt>
+			<if_stmt><if>if <condition>(<expr><call><name>strcmp</name><argument_list>(<argument><expr><name><name>rv</name><operator>-&gt;</operator><name>relname</name></name></expr></argument>, <argument><expr><name><name>mycte</name><operator>-&gt;</operator><name>ctename</name></name></expr></argument>)</argument_list></call> <operator>==</operator> <literal type="number">0</literal></expr>)</condition>
+			<block>{<block_content>
+				<comment type="block">/* Found a recursive reference to the active query */</comment>
+				<if_stmt><if>if <condition>(<expr><name><name>cstate</name><operator>-&gt;</operator><name>context</name></name> <operator>!=</operator> <name>RECURSION_OK</name></expr>)</condition><block type="pseudo"><block_content>
+					<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+							<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_INVALID_RECURSION</name></expr></argument>)</argument_list></call><operator>,</operator>
+							 <call><name>errmsg</name><argument_list>(<argument><expr><name><name>recursion_errormsgs</name><index>[<expr><name><name>cstate</name><operator>-&gt;</operator><name>context</name></name></expr>]</index></name></expr></argument>,
+									<argument><expr><name><name>mycte</name><operator>-&gt;</operator><name>ctename</name></name></expr></argument>)</argument_list></call><operator>,</operator>
+							 <call><name>parser_errposition</name><argument_list>(<argument><expr><name><name>cstate</name><operator>-&gt;</operator><name>pstate</name></name></expr></argument>,
+												<argument><expr><name><name>rv</name><operator>-&gt;</operator><name>location</name></name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+				<comment type="block">/* Count references */</comment>
+				<if_stmt><if>if <condition>(<expr><operator>++</operator><operator>(</operator><name><name>cstate</name><operator>-&gt;</operator><name>selfrefcount</name></name><operator>)</operator> <operator>&gt;</operator> <literal type="number">1</literal></expr>)</condition><block type="pseudo"><block_content>
+					<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+							<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_INVALID_RECURSION</name></expr></argument>)</argument_list></call><operator>,</operator>
+							 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"recursive reference to query \"%s\" must not appear more than once"</literal></expr></argument>,
+									<argument><expr><name><name>mycte</name><operator>-&gt;</operator><name>ctename</name></name></expr></argument>)</argument_list></call><operator>,</operator>
+							 <call><name>parser_errposition</name><argument_list>(<argument><expr><name><name>cstate</name><operator>-&gt;</operator><name>pstate</name></name></expr></argument>,
+												<argument><expr><name><name>rv</name><operator>-&gt;</operator><name>location</name></name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+			</block_content>}</block></if></if_stmt>
+		</block_content>}</block></if></if_stmt>
+		<return>return <expr><name>false</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+	<if_stmt><if>if <condition>(<expr><call><name>IsA</name><argument_list>(<argument><expr><name>node</name></expr></argument>, <argument><expr><name>SelectStmt</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>SelectStmt</name> <modifier>*</modifier></type><name>stmt</name> <init>= <expr><operator>(</operator><name>SelectStmt</name> <operator>*</operator><operator>)</operator> <name>node</name></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>ListCell</name>   <modifier>*</modifier></type><name>lc</name></decl>;</decl_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name><name>stmt</name><operator>-&gt;</operator><name>withClause</name></name></expr>)</condition>
+		<block>{<block_content>
+			<if_stmt><if>if <condition>(<expr><name><name>stmt</name><operator>-&gt;</operator><name>withClause</name><operator>-&gt;</operator><name>recursive</name></name></expr>)</condition>
+			<block>{<block_content>
+				<comment type="block">/*
+				 * In the RECURSIVE case, all query names of the WITH are
+				 * visible to all WITH items as well as the main query. So
+				 * push them all on, process, pop them all off.
+				 */</comment>
+				<expr_stmt><expr><name><name>cstate</name><operator>-&gt;</operator><name>innerwiths</name></name> <operator>=</operator> <call><name>lcons</name><argument_list>(<argument><expr><name><name>stmt</name><operator>-&gt;</operator><name>withClause</name><operator>-&gt;</operator><name>ctes</name></name></expr></argument>,
+										   <argument><expr><name><name>cstate</name><operator>-&gt;</operator><name>innerwiths</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<macro><name>foreach</name><argument_list>(<argument>lc</argument>, <argument>stmt-&gt;withClause-&gt;ctes</argument>)</argument_list></macro>
+				<block>{<block_content>
+					<decl_stmt><decl><type><name>CommonTableExpr</name> <modifier>*</modifier></type><name>cte</name> <init>= <expr><operator>(</operator><name>CommonTableExpr</name> <operator>*</operator><operator>)</operator> <call><name>lfirst</name><argument_list>(<argument><expr><name>lc</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+					<expr_stmt><expr><operator>(</operator><name>void</name><operator>)</operator> <call><name>checkWellFormedRecursionWalker</name><argument_list>(<argument><expr><name><name>cte</name><operator>-&gt;</operator><name>ctequery</name></name></expr></argument>, <argument><expr><name>cstate</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				</block_content>}</block>
+				<expr_stmt><expr><call><name>checkWellFormedSelectStmt</name><argument_list>(<argument><expr><name>stmt</name></expr></argument>, <argument><expr><name>cstate</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<expr_stmt><expr><name><name>cstate</name><operator>-&gt;</operator><name>innerwiths</name></name> <operator>=</operator> <call><name>list_delete_first</name><argument_list>(<argument><expr><name><name>cstate</name><operator>-&gt;</operator><name>innerwiths</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			</block_content>}</block></if>
+			<else>else
+			<block>{<block_content>
+				<comment type="block">/*
+				 * In the non-RECURSIVE case, query names are visible to the
+				 * WITH items after them and to the main query.
+				 */</comment>
+				<decl_stmt><decl><type><name>ListCell</name>   <modifier>*</modifier></type><name>cell1</name></decl>;</decl_stmt>
+
+				<expr_stmt><expr><name><name>cstate</name><operator>-&gt;</operator><name>innerwiths</name></name> <operator>=</operator> <call><name>lcons</name><argument_list>(<argument><expr><name>NIL</name></expr></argument>, <argument><expr><name><name>cstate</name><operator>-&gt;</operator><name>innerwiths</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<expr_stmt><expr><name>cell1</name> <operator>=</operator> <call><name>list_head</name><argument_list>(<argument><expr><name><name>cstate</name><operator>-&gt;</operator><name>innerwiths</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<macro><name>foreach</name><argument_list>(<argument>lc</argument>, <argument>stmt-&gt;withClause-&gt;ctes</argument>)</argument_list></macro>
+				<block>{<block_content>
+					<decl_stmt><decl><type><name>CommonTableExpr</name> <modifier>*</modifier></type><name>cte</name> <init>= <expr><operator>(</operator><name>CommonTableExpr</name> <operator>*</operator><operator>)</operator> <call><name>lfirst</name><argument_list>(<argument><expr><name>lc</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+					<expr_stmt><expr><operator>(</operator><name>void</name><operator>)</operator> <call><name>checkWellFormedRecursionWalker</name><argument_list>(<argument><expr><name><name>cte</name><operator>-&gt;</operator><name>ctequery</name></name></expr></argument>, <argument><expr><name>cstate</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+					<expr_stmt><expr><call><name>lfirst</name><argument_list>(<argument><expr><name>cell1</name></expr></argument>)</argument_list></call> <operator>=</operator> <call><name>lappend</name><argument_list>(<argument><expr><operator>(</operator><name>List</name> <operator>*</operator><operator>)</operator> <call><name>lfirst</name><argument_list>(<argument><expr><name>cell1</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>cte</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				</block_content>}</block>
+				<expr_stmt><expr><call><name>checkWellFormedSelectStmt</name><argument_list>(<argument><expr><name>stmt</name></expr></argument>, <argument><expr><name>cstate</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<expr_stmt><expr><name><name>cstate</name><operator>-&gt;</operator><name>innerwiths</name></name> <operator>=</operator> <call><name>list_delete_first</name><argument_list>(<argument><expr><name><name>cstate</name><operator>-&gt;</operator><name>innerwiths</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			</block_content>}</block></else></if_stmt>
+		</block_content>}</block></if>
+		<else>else<block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>checkWellFormedSelectStmt</name><argument_list>(<argument><expr><name>stmt</name></expr></argument>, <argument><expr><name>cstate</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></else></if_stmt>
+		<comment type="block">/* We're done examining the SelectStmt */</comment>
+		<return>return <expr><name>false</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+	<if_stmt><if>if <condition>(<expr><call><name>IsA</name><argument_list>(<argument><expr><name>node</name></expr></argument>, <argument><expr><name>WithClause</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/*
+		 * Prevent raw_expression_tree_walker from recursing directly into a
+		 * WITH clause.  We need that to happen only under the control of the
+		 * code above.
+		 */</comment>
+		<return>return <expr><name>false</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+	<if_stmt><if>if <condition>(<expr><call><name>IsA</name><argument_list>(<argument><expr><name>node</name></expr></argument>, <argument><expr><name>JoinExpr</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>JoinExpr</name>   <modifier>*</modifier></type><name>j</name> <init>= <expr><operator>(</operator><name>JoinExpr</name> <operator>*</operator><operator>)</operator> <name>node</name></expr></init></decl>;</decl_stmt>
+
+		<switch>switch <condition>(<expr><name><name>j</name><operator>-&gt;</operator><name>jointype</name></name></expr>)</condition>
+		<block>{<block_content>
+			<case>case <expr><name>JOIN_INNER</name></expr>:</case>
+				<expr_stmt><expr><call><name>checkWellFormedRecursionWalker</name><argument_list>(<argument><expr><name><name>j</name><operator>-&gt;</operator><name>larg</name></name></expr></argument>, <argument><expr><name>cstate</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<expr_stmt><expr><call><name>checkWellFormedRecursionWalker</name><argument_list>(<argument><expr><name><name>j</name><operator>-&gt;</operator><name>rarg</name></name></expr></argument>, <argument><expr><name>cstate</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<expr_stmt><expr><call><name>checkWellFormedRecursionWalker</name><argument_list>(<argument><expr><name><name>j</name><operator>-&gt;</operator><name>quals</name></name></expr></argument>, <argument><expr><name>cstate</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<break>break;</break>
+			<case>case <expr><name>JOIN_LEFT</name></expr>:</case>
+				<expr_stmt><expr><call><name>checkWellFormedRecursionWalker</name><argument_list>(<argument><expr><name><name>j</name><operator>-&gt;</operator><name>larg</name></name></expr></argument>, <argument><expr><name>cstate</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<if_stmt><if>if <condition>(<expr><name>save_context</name> <operator>==</operator> <name>RECURSION_OK</name></expr>)</condition><block type="pseudo"><block_content>
+					<expr_stmt><expr><name><name>cstate</name><operator>-&gt;</operator><name>context</name></name> <operator>=</operator> <name>RECURSION_OUTERJOIN</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+				<expr_stmt><expr><call><name>checkWellFormedRecursionWalker</name><argument_list>(<argument><expr><name><name>j</name><operator>-&gt;</operator><name>rarg</name></name></expr></argument>, <argument><expr><name>cstate</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<expr_stmt><expr><name><name>cstate</name><operator>-&gt;</operator><name>context</name></name> <operator>=</operator> <name>save_context</name></expr>;</expr_stmt>
+				<expr_stmt><expr><call><name>checkWellFormedRecursionWalker</name><argument_list>(<argument><expr><name><name>j</name><operator>-&gt;</operator><name>quals</name></name></expr></argument>, <argument><expr><name>cstate</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<break>break;</break>
+			<case>case <expr><name>JOIN_FULL</name></expr>:</case>
+				<if_stmt><if>if <condition>(<expr><name>save_context</name> <operator>==</operator> <name>RECURSION_OK</name></expr>)</condition><block type="pseudo"><block_content>
+					<expr_stmt><expr><name><name>cstate</name><operator>-&gt;</operator><name>context</name></name> <operator>=</operator> <name>RECURSION_OUTERJOIN</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+				<expr_stmt><expr><call><name>checkWellFormedRecursionWalker</name><argument_list>(<argument><expr><name><name>j</name><operator>-&gt;</operator><name>larg</name></name></expr></argument>, <argument><expr><name>cstate</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<expr_stmt><expr><call><name>checkWellFormedRecursionWalker</name><argument_list>(<argument><expr><name><name>j</name><operator>-&gt;</operator><name>rarg</name></name></expr></argument>, <argument><expr><name>cstate</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<expr_stmt><expr><name><name>cstate</name><operator>-&gt;</operator><name>context</name></name> <operator>=</operator> <name>save_context</name></expr>;</expr_stmt>
+				<expr_stmt><expr><call><name>checkWellFormedRecursionWalker</name><argument_list>(<argument><expr><name><name>j</name><operator>-&gt;</operator><name>quals</name></name></expr></argument>, <argument><expr><name>cstate</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<break>break;</break>
+			<case>case <expr><name>JOIN_RIGHT</name></expr>:</case>
+				<if_stmt><if>if <condition>(<expr><name>save_context</name> <operator>==</operator> <name>RECURSION_OK</name></expr>)</condition><block type="pseudo"><block_content>
+					<expr_stmt><expr><name><name>cstate</name><operator>-&gt;</operator><name>context</name></name> <operator>=</operator> <name>RECURSION_OUTERJOIN</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+				<expr_stmt><expr><call><name>checkWellFormedRecursionWalker</name><argument_list>(<argument><expr><name><name>j</name><operator>-&gt;</operator><name>larg</name></name></expr></argument>, <argument><expr><name>cstate</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<expr_stmt><expr><name><name>cstate</name><operator>-&gt;</operator><name>context</name></name> <operator>=</operator> <name>save_context</name></expr>;</expr_stmt>
+				<expr_stmt><expr><call><name>checkWellFormedRecursionWalker</name><argument_list>(<argument><expr><name><name>j</name><operator>-&gt;</operator><name>rarg</name></name></expr></argument>, <argument><expr><name>cstate</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<expr_stmt><expr><call><name>checkWellFormedRecursionWalker</name><argument_list>(<argument><expr><name><name>j</name><operator>-&gt;</operator><name>quals</name></name></expr></argument>, <argument><expr><name>cstate</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<break>break;</break>
+			<default>default:</default>
+				<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"unrecognized join type: %d"</literal></expr></argument>,
+					 <argument><expr><operator>(</operator><name>int</name><operator>)</operator> <name><name>j</name><operator>-&gt;</operator><name>jointype</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></switch>
+		<return>return <expr><name>false</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+	<if_stmt><if>if <condition>(<expr><call><name>IsA</name><argument_list>(<argument><expr><name>node</name></expr></argument>, <argument><expr><name>SubLink</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>SubLink</name>    <modifier>*</modifier></type><name>sl</name> <init>= <expr><operator>(</operator><name>SubLink</name> <operator>*</operator><operator>)</operator> <name>node</name></expr></init></decl>;</decl_stmt>
+
+		<comment type="block">/*
+		 * we intentionally override outer context, since subquery is
+		 * independent
+		 */</comment>
+		<expr_stmt><expr><name><name>cstate</name><operator>-&gt;</operator><name>context</name></name> <operator>=</operator> <name>RECURSION_SUBLINK</name></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>checkWellFormedRecursionWalker</name><argument_list>(<argument><expr><name><name>sl</name><operator>-&gt;</operator><name>subselect</name></name></expr></argument>, <argument><expr><name>cstate</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>cstate</name><operator>-&gt;</operator><name>context</name></name> <operator>=</operator> <name>save_context</name></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>checkWellFormedRecursionWalker</name><argument_list>(<argument><expr><name><name>sl</name><operator>-&gt;</operator><name>testexpr</name></name></expr></argument>, <argument><expr><name>cstate</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<return>return <expr><name>false</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+	<return>return <expr><call><name>raw_expression_tree_walker</name><argument_list>(<argument><expr><name>node</name></expr></argument>,
+									  <argument><expr><name>checkWellFormedRecursionWalker</name></expr></argument>,
+									  <argument><expr><operator>(</operator><name>void</name> <operator>*</operator><operator>)</operator> <name>cstate</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * subroutine for checkWellFormedRecursionWalker: process a SelectStmt
+ * without worrying about its WITH clause
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>checkWellFormedSelectStmt</name><parameter_list>(<parameter><decl><type><name>SelectStmt</name> <modifier>*</modifier></type><name>stmt</name></decl></parameter>, <parameter><decl><type><name>CteState</name> <modifier>*</modifier></type><name>cstate</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>RecursionContext</name></type> <name>save_context</name> <init>= <expr><name><name>cstate</name><operator>-&gt;</operator><name>context</name></name></expr></init></decl>;</decl_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>save_context</name> <operator>!=</operator> <name>RECURSION_OK</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* just recurse without changing state */</comment>
+		<expr_stmt><expr><call><name>raw_expression_tree_walker</name><argument_list>(<argument><expr><operator>(</operator><name>Node</name> <operator>*</operator><operator>)</operator> <name>stmt</name></expr></argument>,
+								   <argument><expr><name>checkWellFormedRecursionWalker</name></expr></argument>,
+								   <argument><expr><operator>(</operator><name>void</name> <operator>*</operator><operator>)</operator> <name>cstate</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<else>else
+	<block>{<block_content>
+		<switch>switch <condition>(<expr><name><name>stmt</name><operator>-&gt;</operator><name>op</name></name></expr>)</condition>
+		<block>{<block_content>
+			<case>case <expr><name>SETOP_NONE</name></expr>:</case>
+			<case>case <expr><name>SETOP_UNION</name></expr>:</case>
+				<expr_stmt><expr><call><name>raw_expression_tree_walker</name><argument_list>(<argument><expr><operator>(</operator><name>Node</name> <operator>*</operator><operator>)</operator> <name>stmt</name></expr></argument>,
+										   <argument><expr><name>checkWellFormedRecursionWalker</name></expr></argument>,
+										   <argument><expr><operator>(</operator><name>void</name> <operator>*</operator><operator>)</operator> <name>cstate</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<break>break;</break>
+			<case>case <expr><name>SETOP_INTERSECT</name></expr>:</case>
+				<if_stmt><if>if <condition>(<expr><name><name>stmt</name><operator>-&gt;</operator><name>all</name></name></expr>)</condition><block type="pseudo"><block_content>
+					<expr_stmt><expr><name><name>cstate</name><operator>-&gt;</operator><name>context</name></name> <operator>=</operator> <name>RECURSION_INTERSECT</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+				<expr_stmt><expr><call><name>checkWellFormedRecursionWalker</name><argument_list>(<argument><expr><operator>(</operator><name>Node</name> <operator>*</operator><operator>)</operator> <name><name>stmt</name><operator>-&gt;</operator><name>larg</name></name></expr></argument>,
+											   <argument><expr><name>cstate</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<expr_stmt><expr><call><name>checkWellFormedRecursionWalker</name><argument_list>(<argument><expr><operator>(</operator><name>Node</name> <operator>*</operator><operator>)</operator> <name><name>stmt</name><operator>-&gt;</operator><name>rarg</name></name></expr></argument>,
+											   <argument><expr><name>cstate</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<expr_stmt><expr><name><name>cstate</name><operator>-&gt;</operator><name>context</name></name> <operator>=</operator> <name>save_context</name></expr>;</expr_stmt>
+				<expr_stmt><expr><call><name>checkWellFormedRecursionWalker</name><argument_list>(<argument><expr><operator>(</operator><name>Node</name> <operator>*</operator><operator>)</operator> <name><name>stmt</name><operator>-&gt;</operator><name>sortClause</name></name></expr></argument>,
+											   <argument><expr><name>cstate</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<expr_stmt><expr><call><name>checkWellFormedRecursionWalker</name><argument_list>(<argument><expr><operator>(</operator><name>Node</name> <operator>*</operator><operator>)</operator> <name><name>stmt</name><operator>-&gt;</operator><name>limitOffset</name></name></expr></argument>,
+											   <argument><expr><name>cstate</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<expr_stmt><expr><call><name>checkWellFormedRecursionWalker</name><argument_list>(<argument><expr><operator>(</operator><name>Node</name> <operator>*</operator><operator>)</operator> <name><name>stmt</name><operator>-&gt;</operator><name>limitCount</name></name></expr></argument>,
+											   <argument><expr><name>cstate</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<expr_stmt><expr><call><name>checkWellFormedRecursionWalker</name><argument_list>(<argument><expr><operator>(</operator><name>Node</name> <operator>*</operator><operator>)</operator> <name><name>stmt</name><operator>-&gt;</operator><name>lockingClause</name></name></expr></argument>,
+											   <argument><expr><name>cstate</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<comment type="block">/* stmt-&gt;withClause is intentionally ignored here */</comment>
+				<break>break;</break>
+			<case>case <expr><name>SETOP_EXCEPT</name></expr>:</case>
+				<if_stmt><if>if <condition>(<expr><name><name>stmt</name><operator>-&gt;</operator><name>all</name></name></expr>)</condition><block type="pseudo"><block_content>
+					<expr_stmt><expr><name><name>cstate</name><operator>-&gt;</operator><name>context</name></name> <operator>=</operator> <name>RECURSION_EXCEPT</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+				<expr_stmt><expr><call><name>checkWellFormedRecursionWalker</name><argument_list>(<argument><expr><operator>(</operator><name>Node</name> <operator>*</operator><operator>)</operator> <name><name>stmt</name><operator>-&gt;</operator><name>larg</name></name></expr></argument>,
+											   <argument><expr><name>cstate</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<expr_stmt><expr><name><name>cstate</name><operator>-&gt;</operator><name>context</name></name> <operator>=</operator> <name>RECURSION_EXCEPT</name></expr>;</expr_stmt>
+				<expr_stmt><expr><call><name>checkWellFormedRecursionWalker</name><argument_list>(<argument><expr><operator>(</operator><name>Node</name> <operator>*</operator><operator>)</operator> <name><name>stmt</name><operator>-&gt;</operator><name>rarg</name></name></expr></argument>,
+											   <argument><expr><name>cstate</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<expr_stmt><expr><name><name>cstate</name><operator>-&gt;</operator><name>context</name></name> <operator>=</operator> <name>save_context</name></expr>;</expr_stmt>
+				<expr_stmt><expr><call><name>checkWellFormedRecursionWalker</name><argument_list>(<argument><expr><operator>(</operator><name>Node</name> <operator>*</operator><operator>)</operator> <name><name>stmt</name><operator>-&gt;</operator><name>sortClause</name></name></expr></argument>,
+											   <argument><expr><name>cstate</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<expr_stmt><expr><call><name>checkWellFormedRecursionWalker</name><argument_list>(<argument><expr><operator>(</operator><name>Node</name> <operator>*</operator><operator>)</operator> <name><name>stmt</name><operator>-&gt;</operator><name>limitOffset</name></name></expr></argument>,
+											   <argument><expr><name>cstate</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<expr_stmt><expr><call><name>checkWellFormedRecursionWalker</name><argument_list>(<argument><expr><operator>(</operator><name>Node</name> <operator>*</operator><operator>)</operator> <name><name>stmt</name><operator>-&gt;</operator><name>limitCount</name></name></expr></argument>,
+											   <argument><expr><name>cstate</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<expr_stmt><expr><call><name>checkWellFormedRecursionWalker</name><argument_list>(<argument><expr><operator>(</operator><name>Node</name> <operator>*</operator><operator>)</operator> <name><name>stmt</name><operator>-&gt;</operator><name>lockingClause</name></name></expr></argument>,
+											   <argument><expr><name>cstate</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<comment type="block">/* stmt-&gt;withClause is intentionally ignored here */</comment>
+				<break>break;</break>
+			<default>default:</default>
+				<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"unrecognized set op: %d"</literal></expr></argument>,
+					 <argument><expr><operator>(</operator><name>int</name><operator>)</operator> <name><name>stmt</name><operator>-&gt;</operator><name>op</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></switch>
+	</block_content>}</block></else></if_stmt>
+</block_content>}</block></function>
+</unit>

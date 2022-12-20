@@ -1,0 +1,1569 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<unit xmlns="http://www.srcML.org/srcML/src" xmlns:cpp="http://www.srcML.org/srcML/cpp" revision="1.0.0" language="C" filename="/cloned_projects/gpdb/src/backend/replication/logical/origin.c"><comment type="block">/*-------------------------------------------------------------------------
+ *
+ * origin.c
+ *	  Logical replication progress tracking support.
+ *
+ * Copyright (c) 2013-2019, PostgreSQL Global Development Group
+ *
+ * IDENTIFICATION
+ *	  src/backend/replication/logical/origin.c
+ *
+ * NOTES
+ *
+ * This file provides the following:
+ * * An infrastructure to name nodes in a replication setup
+ * * A facility to efficiently store and persist replication progress in an
+ *	 efficient and durable manner.
+ *
+ * Replication origin consist out of a descriptive, user defined, external
+ * name and a short, thus space efficient, internal 2 byte one. This split
+ * exists because replication origin have to be stored in WAL and shared
+ * memory and long descriptors would be inefficient.  For now only use 2 bytes
+ * for the internal id of a replication origin as it seems unlikely that there
+ * soon will be more than 65k nodes in one replication setup; and using only
+ * two bytes allow us to be more space efficient.
+ *
+ * Replication progress is tracked in a shared memory table
+ * (ReplicationState) that's dumped to disk every checkpoint. Entries
+ * ('slots') in this table are identified by the internal id. That's the case
+ * because it allows to increase replication progress during crash
+ * recovery. To allow doing so we store the original LSN (from the originating
+ * system) of a transaction in the commit record. That allows to recover the
+ * precise replayed state after crash recovery; without requiring synchronous
+ * commits. Allowing logical replication to use asynchronous commit is
+ * generally good for performance, but especially important as it allows a
+ * single threaded replay process to keep up with a source that has multiple
+ * backends generating changes concurrently.  For efficiency and simplicity
+ * reasons a backend can setup one replication origin that's from then used as
+ * the source of changes produced by the backend, until reset again.
+ *
+ * This infrastructure is intended to be used in cooperation with logical
+ * decoding. When replaying from a remote system the configured origin is
+ * provided to output plugins, allowing prevention of replication loops and
+ * other filtering.
+ *
+ * There are several levels of locking at work:
+ *
+ * * To create and drop replication origins an exclusive lock on
+ *	 pg_replication_slot is required for the duration. That allows us to
+ *	 safely and conflict free assign new origins using a dirty snapshot.
+ *
+ * * When creating an in-memory replication progress slot the ReplicationOrigin
+ *	 LWLock has to be held exclusively; when iterating over the replication
+ *	 progress a shared lock has to be held, the same when advancing the
+ *	 replication progress of an individual backend that has not setup as the
+ *	 session's replication origin.
+ *
+ * * When manipulating or looking at the remote_lsn and local_lsn fields of a
+ *	 replication progress slot that slot's lwlock has to be held. That's
+ *	 primarily because we do not assume 8 byte writes (the LSN) is atomic on
+ *	 all our platforms, but it also simplifies memory ordering concerns
+ *	 between the remote and local lsn. We use a lwlock instead of a spinlock
+ *	 so it's less harmful to hold the lock over a WAL write
+ *	 (cf. AdvanceReplicationProgress).
+ *
+ * ---------------------------------------------------------------------------
+ */</comment>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"postgres.h"</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;unistd.h&gt;</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;sys/stat.h&gt;</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"funcapi.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"miscadmin.h"</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/genam.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/htup_details.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/table.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/xact.h"</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/catalog.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/indexing.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"nodes/execnodes.h"</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"replication/origin.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"replication/logical.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"pgstat.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/fd.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/ipc.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/lmgr.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/condition_variable.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/copydir.h"</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/builtins.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/fmgroids.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/pg_lsn.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/rel.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/syscache.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/snapmgr.h"</cpp:file></cpp:include>
+
+<comment type="block">/*
+ * Replay progress of a single remote node.
+ */</comment>
+<typedef>typedef <type><struct>struct <name>ReplicationState</name>
+<block>{
+	<comment type="block">/*
+	 * Local identifier for the remote node.
+	 */</comment>
+	<decl_stmt><decl><type><name>RepOriginId</name></type> <name>roident</name></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * Location of the latest commit from the remote side.
+	 */</comment>
+	<decl_stmt><decl><type><name>XLogRecPtr</name></type>	<name>remote_lsn</name></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * Remember the local lsn of the commit record so we can XLogFlush() to it
+	 * during a checkpoint so we know the commit record actually is safe on
+	 * disk.
+	 */</comment>
+	<decl_stmt><decl><type><name>XLogRecPtr</name></type>	<name>local_lsn</name></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * PID of backend that's acquired slot, or 0 if none.
+	 */</comment>
+	<decl_stmt><decl><type><name>int</name></type>			<name>acquired_by</name></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * Condition variable that's signalled when acquired_by changes.
+	 */</comment>
+	<decl_stmt><decl><type><name>ConditionVariable</name></type> <name>origin_cv</name></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * Lock protecting remote_lsn and local_lsn.
+	 */</comment>
+	<decl_stmt><decl><type><name>LWLock</name></type>		<name>lock</name></decl>;</decl_stmt>
+}</block></struct></type> <name>ReplicationState</name>;</typedef>
+
+<comment type="block">/*
+ * On disk version of ReplicationState.
+ */</comment>
+<typedef>typedef <type><struct>struct <name>ReplicationStateOnDisk</name>
+<block>{
+	<decl_stmt><decl><type><name>RepOriginId</name></type> <name>roident</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>XLogRecPtr</name></type>	<name>remote_lsn</name></decl>;</decl_stmt>
+}</block></struct></type> <name>ReplicationStateOnDisk</name>;</typedef>
+
+
+<typedef>typedef <type><struct>struct <name>ReplicationStateCtl</name>
+<block>{
+	<decl_stmt><decl><type><name>int</name></type>			<name>tranche_id</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>ReplicationState</name></type> <name><name>states</name><index>[<expr><name>FLEXIBLE_ARRAY_MEMBER</name></expr>]</index></name></decl>;</decl_stmt>
+}</block></struct></type> <name>ReplicationStateCtl</name>;</typedef>
+
+<comment type="block">/* external variables */</comment>
+<decl_stmt><decl><type><name>RepOriginId</name></type> <name>replorigin_session_origin</name> <init>= <expr><name>InvalidRepOriginId</name></expr></init></decl>;</decl_stmt> <comment type="block">/* assumed identity */</comment>
+<decl_stmt><decl><type><name>XLogRecPtr</name></type>	<name>replorigin_session_origin_lsn</name> <init>= <expr><name>InvalidXLogRecPtr</name></expr></init></decl>;</decl_stmt>
+<decl_stmt><decl><type><name>TimestampTz</name></type> <name>replorigin_session_origin_timestamp</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+
+<comment type="block">/*
+ * Base address into a shared memory array of replication states of size
+ * max_replication_slots.
+ *
+ * XXX: Should we use a separate variable to size this rather than
+ * max_replication_slots?
+ */</comment>
+<decl_stmt><decl><type><specifier>static</specifier> <name>ReplicationState</name> <modifier>*</modifier></type><name>replication_states</name></decl>;</decl_stmt>
+<decl_stmt><decl><type><specifier>static</specifier> <name>ReplicationStateCtl</name> <modifier>*</modifier></type><name>replication_states_ctl</name></decl>;</decl_stmt>
+
+<comment type="block">/*
+ * Backend-local, cached element from ReplicationState for use in a backend
+ * replaying remote commits, so we don't have to search ReplicationState for
+ * the backends current RepOriginId.
+ */</comment>
+<decl_stmt><decl><type><specifier>static</specifier> <name>ReplicationState</name> <modifier>*</modifier></type><name>session_replication_state</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+
+<comment type="block">/* Magic for on disk files. */</comment>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>REPLICATION_STATE_MAGIC</name></cpp:macro> <cpp:value>((uint32) 0x1257DADE)</cpp:value></cpp:define>
+
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>replorigin_check_prerequisites</name><parameter_list>(<parameter><decl><type><name>bool</name></type> <name>check_slots</name></decl></parameter>, <parameter><decl><type><name>bool</name></type> <name>recoveryOK</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>superuser</name><argument_list>()</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_INSUFFICIENT_PRIVILEGE</name></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"only superusers can query or manipulate replication origins"</literal></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>check_slots</name> <operator>&amp;&amp;</operator> <name>max_replication_slots</name> <operator>==</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE</name></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"cannot query or manipulate replication origin when max_replication_slots = 0"</literal></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><name>recoveryOK</name> <operator>&amp;&amp;</operator> <call><name>RecoveryInProgress</name><argument_list>()</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_READ_ONLY_SQL_TRANSACTION</name></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"cannot manipulate replication origins during recovery"</literal></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+</block_content>}</block></function>
+
+
+<comment type="block">/* ---------------------------------------------------------------------------
+ * Functions for working with replication origins themselves.
+ * ---------------------------------------------------------------------------
+ */</comment>
+
+<comment type="block">/*
+ * Check for a persistent replication origin identified by name.
+ *
+ * Returns InvalidOid if the node isn't known yet and missing_ok is true.
+ */</comment>
+<function><type><name>RepOriginId</name></type>
+<name>replorigin_by_name</name><parameter_list>(<parameter><decl><type><name>char</name> <modifier>*</modifier></type><name>roname</name></decl></parameter>, <parameter><decl><type><name>bool</name></type> <name>missing_ok</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>Form_pg_replication_origin</name></type> <name>ident</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Oid</name></type>			<name>roident</name> <init>= <expr><name>InvalidOid</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>HeapTuple</name></type>	<name>tuple</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Datum</name></type>		<name>roname_d</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name>roname_d</name> <operator>=</operator> <call><name>CStringGetTextDatum</name><argument_list>(<argument><expr><name>roname</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>tuple</name> <operator>=</operator> <call><name>SearchSysCache1</name><argument_list>(<argument><expr><name>REPLORIGNAME</name></expr></argument>, <argument><expr><name>roname_d</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><call><name>HeapTupleIsValid</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name>ident</name> <operator>=</operator> <operator>(</operator><name>Form_pg_replication_origin</name><operator>)</operator> <call><name>GETSTRUCT</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name>roident</name> <operator>=</operator> <name><name>ident</name><operator>-&gt;</operator><name>roident</name></name></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>ReleaseSysCache</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<if type="elseif">else if <condition>(<expr><operator>!</operator><name>missing_ok</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_UNDEFINED_OBJECT</name></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"replication origin \"%s\" does not exist"</literal></expr></argument>,
+						<argument><expr><name>roname</name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<return>return <expr><name>roident</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Create a replication origin.
+ *
+ * Needs to be called in a transaction.
+ */</comment>
+<function><type><name>RepOriginId</name></type>
+<name>replorigin_create</name><parameter_list>(<parameter><decl><type><name>char</name> <modifier>*</modifier></type><name>roname</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>Oid</name></type>			<name>roident</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>HeapTuple</name></type>	<name>tuple</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Relation</name></type>	<name>rel</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Datum</name></type>		<name>roname_d</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>SnapshotData</name></type> <name>SnapshotDirty</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>SysScanDesc</name></type> <name>scan</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>ScanKeyData</name></type> <name>key</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name>roname_d</name> <operator>=</operator> <call><name>CStringGetTextDatum</name><argument_list>(<argument><expr><name>roname</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>IsTransactionState</name><argument_list>()</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * We need the numeric replication origin to be 16bit wide, so we cannot
+	 * rely on the normal oid allocation. Instead we simply scan
+	 * pg_replication_origin for the first unused id. That's not particularly
+	 * efficient, but this should be a fairly infrequent operation - we can
+	 * easily spend a bit more code on this when it turns out it needs to be
+	 * faster.
+	 *
+	 * We handle concurrency by taking an exclusive lock (allowing reads!)
+	 * over the table for the duration of the search. Because we use a "dirty
+	 * snapshot" we can read rows that other in-progress sessions have
+	 * written, even though they would be invisible with normal snapshots. Due
+	 * to the exclusive lock there's no danger that new rows can appear while
+	 * we're checking.
+	 */</comment>
+	<expr_stmt><expr><call><name>InitDirtySnapshot</name><argument_list>(<argument><expr><name>SnapshotDirty</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>rel</name> <operator>=</operator> <call><name>table_open</name><argument_list>(<argument><expr><name>ReplicationOriginRelationId</name></expr></argument>, <argument><expr><name>ExclusiveLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<for>for <control>(<init><expr><name>roident</name> <operator>=</operator> <name>InvalidOid</name> <operator>+</operator> <literal type="number">1</literal></expr>;</init> <condition><expr><name>roident</name> <operator>&lt;</operator> <name>PG_UINT16_MAX</name></expr>;</condition> <incr><expr><name>roident</name><operator>++</operator></expr></incr>)</control>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>bool</name></type>		<name><name>nulls</name><index>[<expr><name>Natts_pg_replication_origin</name></expr>]</index></name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>Datum</name></type>		<name><name>values</name><index>[<expr><name>Natts_pg_replication_origin</name></expr>]</index></name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>bool</name></type>		<name>collides</name></decl>;</decl_stmt>
+
+		<expr_stmt><expr><call><name>CHECK_FOR_INTERRUPTS</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><call><name>ScanKeyInit</name><argument_list>(<argument><expr><operator>&amp;</operator><name>key</name></expr></argument>,
+					<argument><expr><name>Anum_pg_replication_origin_roident</name></expr></argument>,
+					<argument><expr><name>BTEqualStrategyNumber</name></expr></argument>, <argument><expr><name>F_OIDEQ</name></expr></argument>,
+					<argument><expr><call><name>ObjectIdGetDatum</name><argument_list>(<argument><expr><name>roident</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><name>scan</name> <operator>=</operator> <call><name>systable_beginscan</name><argument_list>(<argument><expr><name>rel</name></expr></argument>, <argument><expr><name>ReplicationOriginIdentIndex</name></expr></argument>,
+								  <argument><expr><name>true</name></expr></argument> <comment type="block">/* indexOK */</comment> ,
+								  <argument><expr><operator>&amp;</operator><name>SnapshotDirty</name></expr></argument>,
+								  <argument><expr><literal type="number">1</literal></expr></argument>, <argument><expr><operator>&amp;</operator><name>key</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><name>collides</name> <operator>=</operator> <call><name>HeapTupleIsValid</name><argument_list>(<argument><expr><call><name>systable_getnext</name><argument_list>(<argument><expr><name>scan</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><call><name>systable_endscan</name><argument_list>(<argument><expr><name>scan</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><name>collides</name></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/*
+			 * Ok, found an unused roident, insert the new row and do a CCI,
+			 * so our callers can look it up if they want to.
+			 */</comment>
+			<expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><operator>&amp;</operator><name>nulls</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>nulls</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+			<expr_stmt><expr><name><name>values</name><index>[<expr><name>Anum_pg_replication_origin_roident</name> <operator>-</operator> <literal type="number">1</literal></expr>]</index></name> <operator>=</operator> <call><name>ObjectIdGetDatum</name><argument_list>(<argument><expr><name>roident</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><name><name>values</name><index>[<expr><name>Anum_pg_replication_origin_roname</name> <operator>-</operator> <literal type="number">1</literal></expr>]</index></name> <operator>=</operator> <name>roname_d</name></expr>;</expr_stmt>
+
+			<expr_stmt><expr><name>tuple</name> <operator>=</operator> <call><name>heap_form_tuple</name><argument_list>(<argument><expr><call><name>RelationGetDescr</name><argument_list>(<argument><expr><name>rel</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>values</name></expr></argument>, <argument><expr><name>nulls</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>CatalogTupleInsert</name><argument_list>(<argument><expr><name>rel</name></expr></argument>, <argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>CommandCounterIncrement</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+			<break>break;</break>
+		</block_content>}</block></if></if_stmt>
+	</block_content>}</block></for>
+
+	<comment type="block">/* now release lock again,	*/</comment>
+	<expr_stmt><expr><call><name>table_close</name><argument_list>(<argument><expr><name>rel</name></expr></argument>, <argument><expr><name>ExclusiveLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>tuple</name> <operator>==</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_PROGRAM_LIMIT_EXCEEDED</name></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"could not find free replication origin OID"</literal></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>heap_freetuple</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<return>return <expr><name>roident</name></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * Drop replication origin.
+ *
+ * Needs to be called in a transaction.
+ */</comment>
+<function><type><name>void</name></type>
+<name>replorigin_drop</name><parameter_list>(<parameter><decl><type><name>RepOriginId</name></type> <name>roident</name></decl></parameter>, <parameter><decl><type><name>bool</name></type> <name>nowait</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>HeapTuple</name></type>	<name>tuple</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Relation</name></type>	<name>rel</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>i</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>IsTransactionState</name><argument_list>()</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * To interlock against concurrent drops, we hold ExclusiveLock on
+	 * pg_replication_origin throughout this function.
+	 */</comment>
+	<expr_stmt><expr><name>rel</name> <operator>=</operator> <call><name>table_open</name><argument_list>(<argument><expr><name>ReplicationOriginRelationId</name></expr></argument>, <argument><expr><name>ExclusiveLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * First, clean up the slot state info, if there is any matching slot.
+	 */</comment>
+<label><name>restart</name>:</label>
+	<expr_stmt><expr><name>tuple</name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>LWLockAcquire</name><argument_list>(<argument><expr><name>ReplicationOriginLock</name></expr></argument>, <argument><expr><name>LW_EXCLUSIVE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name>max_replication_slots</name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>ReplicationState</name> <modifier>*</modifier></type><name>state</name> <init>= <expr><operator>&amp;</operator><name><name>replication_states</name><index>[<expr><name>i</name></expr>]</index></name></expr></init></decl>;</decl_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name><name>state</name><operator>-&gt;</operator><name>roident</name></name> <operator>==</operator> <name>roident</name></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/* found our slot, is it busy? */</comment>
+			<if_stmt><if>if <condition>(<expr><name><name>state</name><operator>-&gt;</operator><name>acquired_by</name></name> <operator>!=</operator> <literal type="number">0</literal></expr>)</condition>
+			<block>{<block_content>
+				<decl_stmt><decl><type><name>ConditionVariable</name> <modifier>*</modifier></type><name>cv</name></decl>;</decl_stmt>
+
+				<if_stmt><if>if <condition>(<expr><name>nowait</name></expr>)</condition><block type="pseudo"><block_content>
+					<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+							<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_OBJECT_IN_USE</name></expr></argument>)</argument_list></call><operator>,</operator>
+							 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"could not drop replication origin with OID %d, in use by PID %d"</literal></expr></argument>,
+									<argument><expr><name><name>state</name><operator>-&gt;</operator><name>roident</name></name></expr></argument>,
+									<argument><expr><name><name>state</name><operator>-&gt;</operator><name>acquired_by</name></name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+				<comment type="block">/*
+				 * We must wait and then retry.  Since we don't know which CV
+				 * to wait on until here, we can't readily use
+				 * ConditionVariablePrepareToSleep (calling it here would be
+				 * wrong, since we could miss the signal if we did so); just
+				 * use ConditionVariableSleep directly.
+				 */</comment>
+				<expr_stmt><expr><name>cv</name> <operator>=</operator> <operator>&amp;</operator><name><name>state</name><operator>-&gt;</operator><name>origin_cv</name></name></expr>;</expr_stmt>
+
+				<expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><name>ReplicationOriginLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+				<expr_stmt><expr><call><name>ConditionVariableSleep</name><argument_list>(<argument><expr><name>cv</name></expr></argument>, <argument><expr><name>WAIT_EVENT_REPLICATION_ORIGIN_DROP</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<goto>goto <name>restart</name>;</goto>
+			</block_content>}</block></if></if_stmt>
+
+			<comment type="block">/* first make a WAL log entry */</comment>
+			<block>{<block_content>
+				<decl_stmt><decl><type><name>xl_replorigin_drop</name></type> <name>xlrec</name></decl>;</decl_stmt>
+
+				<expr_stmt><expr><name><name>xlrec</name><operator>.</operator><name>node_id</name></name> <operator>=</operator> <name>roident</name></expr>;</expr_stmt>
+				<expr_stmt><expr><call><name>XLogBeginInsert</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+				<expr_stmt><expr><call><name>XLogRegisterData</name><argument_list>(<argument><expr><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <operator>(</operator><operator>&amp;</operator><name>xlrec</name><operator>)</operator></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>xlrec</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<expr_stmt><expr><call><name>XLogInsert</name><argument_list>(<argument><expr><name>RM_REPLORIGIN_ID</name></expr></argument>, <argument><expr><name>XLOG_REPLORIGIN_DROP</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			</block_content>}</block>
+
+			<comment type="block">/* then clear the in-memory slot */</comment>
+			<expr_stmt><expr><name><name>state</name><operator>-&gt;</operator><name>roident</name></name> <operator>=</operator> <name>InvalidRepOriginId</name></expr>;</expr_stmt>
+			<expr_stmt><expr><name><name>state</name><operator>-&gt;</operator><name>remote_lsn</name></name> <operator>=</operator> <name>InvalidXLogRecPtr</name></expr>;</expr_stmt>
+			<expr_stmt><expr><name><name>state</name><operator>-&gt;</operator><name>local_lsn</name></name> <operator>=</operator> <name>InvalidXLogRecPtr</name></expr>;</expr_stmt>
+			<break>break;</break>
+		</block_content>}</block></if></if_stmt>
+	</block_content>}</block></for>
+	<expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><name>ReplicationOriginLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>ConditionVariableCancelSleep</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Now, we can delete the catalog entry.
+	 */</comment>
+	<expr_stmt><expr><name>tuple</name> <operator>=</operator> <call><name>SearchSysCache1</name><argument_list>(<argument><expr><name>REPLORIGIDENT</name></expr></argument>, <argument><expr><call><name>ObjectIdGetDatum</name><argument_list>(<argument><expr><name>roident</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>HeapTupleIsValid</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"cache lookup failed for replication origin with oid %u"</literal></expr></argument>,
+			 <argument><expr><name>roident</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>CatalogTupleDelete</name><argument_list>(<argument><expr><name>rel</name></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>tuple</name><operator>-&gt;</operator><name>t_self</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>ReleaseSysCache</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>CommandCounterIncrement</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* now release lock again */</comment>
+	<expr_stmt><expr><call><name>table_close</name><argument_list>(<argument><expr><name>rel</name></expr></argument>, <argument><expr><name>ExclusiveLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * Lookup replication origin via it's oid and return the name.
+ *
+ * The external name is palloc'd in the calling context.
+ *
+ * Returns true if the origin is known, false otherwise.
+ */</comment>
+<function><type><name>bool</name></type>
+<name>replorigin_by_oid</name><parameter_list>(<parameter><decl><type><name>RepOriginId</name></type> <name>roident</name></decl></parameter>, <parameter><decl><type><name>bool</name></type> <name>missing_ok</name></decl></parameter>, <parameter><decl><type><name>char</name> <modifier>*</modifier><modifier>*</modifier></type><name>roname</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>HeapTuple</name></type>	<name>tuple</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Form_pg_replication_origin</name></type> <name>ric</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>OidIsValid</name><argument_list>(<argument><expr><operator>(</operator><name>Oid</name><operator>)</operator> <name>roident</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>roident</name> <operator>!=</operator> <name>InvalidRepOriginId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>roident</name> <operator>!=</operator> <name>DoNotReplicateId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>tuple</name> <operator>=</operator> <call><name>SearchSysCache1</name><argument_list>(<argument><expr><name>REPLORIGIDENT</name></expr></argument>,
+							<argument><expr><call><name>ObjectIdGetDatum</name><argument_list>(<argument><expr><operator>(</operator><name>Oid</name><operator>)</operator> <name>roident</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><call><name>HeapTupleIsValid</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name>ric</name> <operator>=</operator> <operator>(</operator><name>Form_pg_replication_origin</name><operator>)</operator> <call><name>GETSTRUCT</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><operator>*</operator><name>roname</name> <operator>=</operator> <call><name>text_to_cstring</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>ric</name><operator>-&gt;</operator><name>roname</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>ReleaseSysCache</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<return>return <expr><name>true</name></expr>;</return>
+	</block_content>}</block></if>
+	<else>else
+	<block>{<block_content>
+		<expr_stmt><expr><operator>*</operator><name>roname</name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><name>missing_ok</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+					<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_UNDEFINED_OBJECT</name></expr></argument>)</argument_list></call><operator>,</operator>
+					 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"replication origin with OID %u does not exist"</literal></expr></argument>,
+							<argument><expr><name>roident</name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+		<return>return <expr><name>false</name></expr>;</return>
+	</block_content>}</block></else></if_stmt>
+</block_content>}</block></function>
+
+
+<comment type="block">/* ---------------------------------------------------------------------------
+ * Functions for handling replication progress.
+ * ---------------------------------------------------------------------------
+ */</comment>
+
+<function><type><name>Size</name></type>
+<name>ReplicationOriginShmemSize</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>Size</name></type>		<name>size</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * XXX: max_replication_slots is arguably the wrong thing to use, as here
+	 * we keep the replay state of *remote* transactions. But for now it seems
+	 * sufficient to reuse it, lest we introduce a separate GUC.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name>max_replication_slots</name> <operator>==</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>size</name></expr>;</return></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><name>size</name> <operator>=</operator> <call><name>add_size</name><argument_list>(<argument><expr><name>size</name></expr></argument>, <argument><expr><call><name>offsetof</name><argument_list>(<argument><expr><name>ReplicationStateCtl</name></expr></argument>, <argument><expr><name>states</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>size</name> <operator>=</operator> <call><name>add_size</name><argument_list>(<argument><expr><name>size</name></expr></argument>,
+					<argument><expr><call><name>mul_size</name><argument_list>(<argument><expr><name>max_replication_slots</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>ReplicationState</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<return>return <expr><name>size</name></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><name>void</name></type>
+<name>ReplicationOriginShmemInit</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>bool</name></type>		<name>found</name></decl>;</decl_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>max_replication_slots</name> <operator>==</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+		<return>return;</return></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><name>replication_states_ctl</name> <operator>=</operator> <operator>(</operator><name>ReplicationStateCtl</name> <operator>*</operator><operator>)</operator>
+		<call><name>ShmemInitStruct</name><argument_list>(<argument><expr><literal type="string">"ReplicationOriginState"</literal></expr></argument>,
+						<argument><expr><call><name>ReplicationOriginShmemSize</name><argument_list>()</argument_list></call></expr></argument>,
+						<argument><expr><operator>&amp;</operator><name>found</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>replication_states</name> <operator>=</operator> <name><name>replication_states_ctl</name><operator>-&gt;</operator><name>states</name></name></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><name>found</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>int</name></type>			<name>i</name></decl>;</decl_stmt>
+
+		<expr_stmt><expr><name><name>replication_states_ctl</name><operator>-&gt;</operator><name>tranche_id</name></name> <operator>=</operator> <name>LWTRANCHE_REPLICATION_ORIGIN</name></expr>;</expr_stmt>
+
+		<expr_stmt><expr><call><name>MemSet</name><argument_list>(<argument><expr><name>replication_states</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><call><name>ReplicationOriginShmemSize</name><argument_list>()</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name>max_replication_slots</name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control>
+		<block>{<block_content>
+			<expr_stmt><expr><call><name>LWLockInitialize</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>replication_states</name><index>[<expr><name>i</name></expr>]</index></name><operator>.</operator><name>lock</name></expr></argument>,
+							 <argument><expr><name><name>replication_states_ctl</name><operator>-&gt;</operator><name>tranche_id</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>ConditionVariableInit</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>replication_states</name><index>[<expr><name>i</name></expr>]</index></name><operator>.</operator><name>origin_cv</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></for>
+	</block_content>}</block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>LWLockRegisterTranche</name><argument_list>(<argument><expr><name><name>replication_states_ctl</name><operator>-&gt;</operator><name>tranche_id</name></name></expr></argument>,
+						  <argument><expr><literal type="string">"replication_origin"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/* ---------------------------------------------------------------------------
+ * Perform a checkpoint of each replication origin's progress with respect to
+ * the replayed remote_lsn. Make sure that all transactions we refer to in the
+ * checkpoint (local_lsn) are actually on-disk. This might not yet be the case
+ * if the transactions were originally committed asynchronously.
+ *
+ * We store checkpoints in the following format:
+ * +-------+------------------------+------------------+-----+--------+
+ * | MAGIC | ReplicationStateOnDisk | struct Replic... | ... | CRC32C | EOF
+ * +-------+------------------------+------------------+-----+--------+
+ *
+ * So its just the magic, followed by the statically sized
+ * ReplicationStateOnDisk structs. Note that the maximum number of
+ * ReplicationState is determined by max_replication_slots.
+ * ---------------------------------------------------------------------------
+ */</comment>
+<function><type><name>void</name></type>
+<name>CheckPointReplicationOrigin</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>tmppath</name> <init>= <expr><literal type="string">"pg_logical/replorigin_checkpoint.tmp"</literal></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>path</name> <init>= <expr><literal type="string">"pg_logical/replorigin_checkpoint"</literal></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>tmpfd</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>i</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>uint32</name></type>		<name>magic</name> <init>= <expr><name>REPLICATION_STATE_MAGIC</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>pg_crc32c</name></type>	<name>crc</name></decl>;</decl_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>max_replication_slots</name> <operator>==</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+		<return>return;</return></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>INIT_CRC32C</name><argument_list>(<argument><expr><name>crc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* make sure no old temp file is remaining */</comment>
+	<if_stmt><if>if <condition>(<expr><call><name>unlink</name><argument_list>(<argument><expr><name>tmppath</name></expr></argument>)</argument_list></call> <operator>&lt;</operator> <literal type="number">0</literal> <operator>&amp;&amp;</operator> <name>errno</name> <operator>!=</operator> <name>ENOENT</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>PANIC</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode_for_file_access</name><argument_list>()</argument_list></call><operator>,</operator>
+				 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"could not remove file \"%s\": %m"</literal></expr></argument>,
+						<argument><expr><name>tmppath</name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<comment type="block">/*
+	 * no other backend can perform this at the same time, we're protected by
+	 * CheckpointLock.
+	 */</comment>
+	<expr_stmt><expr><name>tmpfd</name> <operator>=</operator> <call><name>OpenTransientFile</name><argument_list>(<argument><expr><name>tmppath</name></expr></argument>,
+							  <argument><expr><name>O_CREAT</name> <operator>|</operator> <name>O_EXCL</name> <operator>|</operator> <name>O_WRONLY</name> <operator>|</operator> <name>PG_BINARY</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><name>tmpfd</name> <operator>&lt;</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>PANIC</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode_for_file_access</name><argument_list>()</argument_list></call><operator>,</operator>
+				 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"could not create file \"%s\": %m"</literal></expr></argument>,
+						<argument><expr><name>tmppath</name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<comment type="block">/* write magic */</comment>
+	<expr_stmt><expr><name>errno</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><operator>(</operator><call><name>write</name><argument_list>(<argument><expr><name>tmpfd</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>magic</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>magic</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call><operator>)</operator> <operator>!=</operator> <sizeof>sizeof<argument_list>(<argument><expr><name>magic</name></expr></argument>)</argument_list></sizeof></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* if write didn't set errno, assume problem is no disk space */</comment>
+		<if_stmt><if>if <condition>(<expr><name>errno</name> <operator>==</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><name>errno</name> <operator>=</operator> <name>ENOSPC</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>PANIC</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode_for_file_access</name><argument_list>()</argument_list></call><operator>,</operator>
+				 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"could not write to file \"%s\": %m"</literal></expr></argument>,
+						<argument><expr><name>tmppath</name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+	<expr_stmt><expr><call><name>COMP_CRC32C</name><argument_list>(<argument><expr><name>crc</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>magic</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>magic</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* prevent concurrent creations/drops */</comment>
+	<expr_stmt><expr><call><name>LWLockAcquire</name><argument_list>(<argument><expr><name>ReplicationOriginLock</name></expr></argument>, <argument><expr><name>LW_SHARED</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* write actual data */</comment>
+	<for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name>max_replication_slots</name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>ReplicationStateOnDisk</name></type> <name>disk_state</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>ReplicationState</name> <modifier>*</modifier></type><name>curstate</name> <init>= <expr><operator>&amp;</operator><name><name>replication_states</name><index>[<expr><name>i</name></expr>]</index></name></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>XLogRecPtr</name></type>	<name>local_lsn</name></decl>;</decl_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name><name>curstate</name><operator>-&gt;</operator><name>roident</name></name> <operator>==</operator> <name>InvalidRepOriginId</name></expr>)</condition><block type="pseudo"><block_content>
+			<continue>continue;</continue></block_content></block></if></if_stmt>
+
+		<comment type="block">/* zero, to avoid uninitialized padding bytes */</comment>
+		<expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><operator>&amp;</operator><name>disk_state</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>disk_state</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><call><name>LWLockAcquire</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>curstate</name><operator>-&gt;</operator><name>lock</name></name></expr></argument>, <argument><expr><name>LW_SHARED</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><name><name>disk_state</name><operator>.</operator><name>roident</name></name> <operator>=</operator> <name><name>curstate</name><operator>-&gt;</operator><name>roident</name></name></expr>;</expr_stmt>
+
+		<expr_stmt><expr><name><name>disk_state</name><operator>.</operator><name>remote_lsn</name></name> <operator>=</operator> <name><name>curstate</name><operator>-&gt;</operator><name>remote_lsn</name></name></expr>;</expr_stmt>
+		<expr_stmt><expr><name>local_lsn</name> <operator>=</operator> <name><name>curstate</name><operator>-&gt;</operator><name>local_lsn</name></name></expr>;</expr_stmt>
+
+		<expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>curstate</name><operator>-&gt;</operator><name>lock</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/* make sure we only write out a commit that's persistent */</comment>
+		<expr_stmt><expr><call><name>XLogFlush</name><argument_list>(<argument><expr><name>local_lsn</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><name>errno</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+		<if_stmt><if>if <condition>(<expr><operator>(</operator><call><name>write</name><argument_list>(<argument><expr><name>tmpfd</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>disk_state</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>disk_state</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call><operator>)</operator> <operator>!=</operator>
+			<sizeof>sizeof<argument_list>(<argument><expr><name>disk_state</name></expr></argument>)</argument_list></sizeof></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/* if write didn't set errno, assume problem is no disk space */</comment>
+			<if_stmt><if>if <condition>(<expr><name>errno</name> <operator>==</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><name>errno</name> <operator>=</operator> <name>ENOSPC</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+			<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>PANIC</name></expr></argument>,
+					<argument><expr><operator>(</operator><call><name>errcode_for_file_access</name><argument_list>()</argument_list></call><operator>,</operator>
+					 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"could not write to file \"%s\": %m"</literal></expr></argument>,
+							<argument><expr><name>tmppath</name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+
+		<expr_stmt><expr><call><name>COMP_CRC32C</name><argument_list>(<argument><expr><name>crc</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>disk_state</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>disk_state</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></for>
+
+	<expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><name>ReplicationOriginLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* write out the CRC */</comment>
+	<expr_stmt><expr><call><name>FIN_CRC32C</name><argument_list>(<argument><expr><name>crc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>errno</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><operator>(</operator><call><name>write</name><argument_list>(<argument><expr><name>tmpfd</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>crc</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>crc</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call><operator>)</operator> <operator>!=</operator> <sizeof>sizeof<argument_list>(<argument><expr><name>crc</name></expr></argument>)</argument_list></sizeof></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* if write didn't set errno, assume problem is no disk space */</comment>
+		<if_stmt><if>if <condition>(<expr><name>errno</name> <operator>==</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><name>errno</name> <operator>=</operator> <name>ENOSPC</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>PANIC</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode_for_file_access</name><argument_list>()</argument_list></call><operator>,</operator>
+				 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"could not write to file \"%s\": %m"</literal></expr></argument>,
+						<argument><expr><name>tmppath</name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><call><name>CloseTransientFile</name><argument_list>(<argument><expr><name>tmpfd</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>PANIC</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode_for_file_access</name><argument_list>()</argument_list></call><operator>,</operator>
+				 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"could not close file \"%s\": %m"</literal></expr></argument>,
+						<argument><expr><name>tmppath</name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<comment type="block">/* fsync, rename to permanent file, fsync file and directory */</comment>
+	<expr_stmt><expr><call><name>durable_rename</name><argument_list>(<argument><expr><name>tmppath</name></expr></argument>, <argument><expr><name>path</name></expr></argument>, <argument><expr><name>PANIC</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Recover replication replay status from checkpoint data saved earlier by
+ * CheckPointReplicationOrigin.
+ *
+ * This only needs to be called at startup and *not* during every checkpoint
+ * read during recovery (e.g. in HS or PITR from a base backup) afterwards. All
+ * state thereafter can be recovered by looking at commit records.
+ */</comment>
+<function><type><name>void</name></type>
+<name>StartupReplicationOrigin</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>path</name> <init>= <expr><literal type="string">"pg_logical/replorigin_checkpoint"</literal></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>fd</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>readBytes</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>uint32</name></type>		<name>magic</name> <init>= <expr><name>REPLICATION_STATE_MAGIC</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>last_state</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>pg_crc32c</name></type>	<name>file_crc</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>pg_crc32c</name></type>	<name>crc</name></decl>;</decl_stmt>
+
+	<comment type="block">/* don't want to overwrite already existing state */</comment>
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>USE_ASSERT_CHECKING</name></cpp:ifdef>
+	<decl_stmt><decl><type><specifier>static</specifier> <name>bool</name></type> <name>already_started</name> <init>= <expr><name>false</name></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><operator>!</operator><name>already_started</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>already_started</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+	<if_stmt><if>if <condition>(<expr><name>max_replication_slots</name> <operator>==</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+		<return>return;</return></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>INIT_CRC32C</name><argument_list>(<argument><expr><name>crc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>DEBUG2</name></expr></argument>, <argument><expr><literal type="string">"starting up replication origin progress state"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>fd</name> <operator>=</operator> <call><name>OpenTransientFile</name><argument_list>(<argument><expr><name>path</name></expr></argument>, <argument><expr><name>O_RDONLY</name> <operator>|</operator> <name>PG_BINARY</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * might have had max_replication_slots == 0 last run, or we just brought
+	 * up a standby.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name>fd</name> <operator>&lt;</operator> <literal type="number">0</literal> <operator>&amp;&amp;</operator> <name>errno</name> <operator>==</operator> <name>ENOENT</name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return;</return></block_content></block></if>
+	<if type="elseif">else if <condition>(<expr><name>fd</name> <operator>&lt;</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>PANIC</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode_for_file_access</name><argument_list>()</argument_list></call><operator>,</operator>
+				 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"could not open file \"%s\": %m"</literal></expr></argument>,
+						<argument><expr><name>path</name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<comment type="block">/* verify magic, that is written even if nothing was active */</comment>
+	<expr_stmt><expr><name>readBytes</name> <operator>=</operator> <call><name>read</name><argument_list>(<argument><expr><name>fd</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>magic</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>magic</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><name>readBytes</name> <operator>!=</operator> <sizeof>sizeof<argument_list>(<argument><expr><name>magic</name></expr></argument>)</argument_list></sizeof></expr>)</condition>
+	<block>{<block_content>
+		<if_stmt><if>if <condition>(<expr><name>readBytes</name> <operator>&lt;</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>PANIC</name></expr></argument>,
+					<argument><expr><operator>(</operator><call><name>errcode_for_file_access</name><argument_list>()</argument_list></call><operator>,</operator>
+					 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"could not read file \"%s\": %m"</literal></expr></argument>,
+							<argument><expr><name>path</name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if>
+		<else>else<block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>PANIC</name></expr></argument>,
+					<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_DATA_CORRUPTED</name></expr></argument>)</argument_list></call><operator>,</operator>
+					 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"could not read file \"%s\": read %d of %zu"</literal></expr></argument>,
+							<argument><expr><name>path</name></expr></argument>, <argument><expr><name>readBytes</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>magic</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></else></if_stmt>
+	</block_content>}</block></if></if_stmt>
+	<expr_stmt><expr><call><name>COMP_CRC32C</name><argument_list>(<argument><expr><name>crc</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>magic</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>magic</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>magic</name> <operator>!=</operator> <name>REPLICATION_STATE_MAGIC</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>PANIC</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"replication checkpoint has wrong magic %u instead of %u"</literal></expr></argument>,
+						<argument><expr><name>magic</name></expr></argument>, <argument><expr><name>REPLICATION_STATE_MAGIC</name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<comment type="block">/* we can skip locking here, no other access is possible */</comment>
+
+	<comment type="block">/* recover individual states, until there are no more to be found */</comment>
+	<while>while <condition>(<expr><name>true</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>ReplicationStateOnDisk</name></type> <name>disk_state</name></decl>;</decl_stmt>
+
+		<expr_stmt><expr><name>readBytes</name> <operator>=</operator> <call><name>read</name><argument_list>(<argument><expr><name>fd</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>disk_state</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>disk_state</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/* no further data */</comment>
+		<if_stmt><if>if <condition>(<expr><name>readBytes</name> <operator>==</operator> <sizeof>sizeof<argument_list>(<argument><expr><name>crc</name></expr></argument>)</argument_list></sizeof></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/* not pretty, but simple ... */</comment>
+			<expr_stmt><expr><name>file_crc</name> <operator>=</operator> <operator>*</operator><operator>(</operator><name>pg_crc32c</name> <operator>*</operator><operator>)</operator> <operator>&amp;</operator><name>disk_state</name></expr>;</expr_stmt>
+			<break>break;</break>
+		</block_content>}</block></if></if_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name>readBytes</name> <operator>&lt;</operator> <literal type="number">0</literal></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>PANIC</name></expr></argument>,
+					<argument><expr><operator>(</operator><call><name>errcode_for_file_access</name><argument_list>()</argument_list></call><operator>,</operator>
+					 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"could not read file \"%s\": %m"</literal></expr></argument>,
+							<argument><expr><name>path</name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name>readBytes</name> <operator>!=</operator> <sizeof>sizeof<argument_list>(<argument><expr><name>disk_state</name></expr></argument>)</argument_list></sizeof></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>PANIC</name></expr></argument>,
+					<argument><expr><operator>(</operator><call><name>errcode_for_file_access</name><argument_list>()</argument_list></call><operator>,</operator>
+					 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"could not read file \"%s\": read %d of %zu"</literal></expr></argument>,
+							<argument><expr><name>path</name></expr></argument>, <argument><expr><name>readBytes</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>disk_state</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+
+		<expr_stmt><expr><call><name>COMP_CRC32C</name><argument_list>(<argument><expr><name>crc</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>disk_state</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>disk_state</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name>last_state</name> <operator>==</operator> <name>max_replication_slots</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>PANIC</name></expr></argument>,
+					<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_CONFIGURATION_LIMIT_EXCEEDED</name></expr></argument>)</argument_list></call><operator>,</operator>
+					 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"could not find free replication state, increase max_replication_slots"</literal></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+		<comment type="block">/* copy data to shared memory */</comment>
+		<expr_stmt><expr><name><name>replication_states</name><index>[<expr><name>last_state</name></expr>]</index></name><operator>.</operator><name>roident</name> <operator>=</operator> <name><name>disk_state</name><operator>.</operator><name>roident</name></name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>replication_states</name><index>[<expr><name>last_state</name></expr>]</index></name><operator>.</operator><name>remote_lsn</name> <operator>=</operator> <name><name>disk_state</name><operator>.</operator><name>remote_lsn</name></name></expr>;</expr_stmt>
+		<expr_stmt><expr><name>last_state</name><operator>++</operator></expr>;</expr_stmt>
+
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>LOG</name></expr></argument>, <argument><expr><literal type="string">"recovered replication state of node %u to %X/%X"</literal></expr></argument>,
+			 <argument><expr><name><name>disk_state</name><operator>.</operator><name>roident</name></name></expr></argument>,
+			 <argument><expr><operator>(</operator><name>uint32</name><operator>)</operator> <operator>(</operator><name><name>disk_state</name><operator>.</operator><name>remote_lsn</name></name> <operator>&gt;&gt;</operator> <literal type="number">32</literal><operator>)</operator></expr></argument>,
+			 <argument><expr><operator>(</operator><name>uint32</name><operator>)</operator> <name><name>disk_state</name><operator>.</operator><name>remote_lsn</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></while>
+
+	<comment type="block">/* now check checksum */</comment>
+	<expr_stmt><expr><call><name>FIN_CRC32C</name><argument_list>(<argument><expr><name>crc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><name>file_crc</name> <operator>!=</operator> <name>crc</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>PANIC</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_CONFIGURATION_LIMIT_EXCEEDED</name></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"replication slot checkpoint has wrong checksum %u, expected %u"</literal></expr></argument>,
+						<argument><expr><name>crc</name></expr></argument>, <argument><expr><name>file_crc</name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><call><name>CloseTransientFile</name><argument_list>(<argument><expr><name>fd</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>PANIC</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode_for_file_access</name><argument_list>()</argument_list></call><operator>,</operator>
+				 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"could not close file \"%s\": %m"</literal></expr></argument>,
+						<argument><expr><name>path</name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+</block_content>}</block></function>
+
+<function><type><name>void</name></type>
+<name>replorigin_redo</name><parameter_list>(<parameter><decl><type><name>XLogReaderState</name> <modifier>*</modifier></type><name>record</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>uint8</name></type>		<name>info</name> <init>= <expr><call><name>XLogRecGetInfo</name><argument_list>(<argument><expr><name>record</name></expr></argument>)</argument_list></call> <operator>&amp;</operator> <operator>~</operator><name>XLR_INFO_MASK</name></expr></init></decl>;</decl_stmt>
+
+	<switch>switch <condition>(<expr><name>info</name></expr>)</condition>
+	<block>{<block_content>
+		<case>case <expr><name>XLOG_REPLORIGIN_SET</name></expr>:</case>
+			<block>{<block_content>
+				<decl_stmt><decl><type><name>xl_replorigin_set</name> <modifier>*</modifier></type><name>xlrec</name> <init>=
+				<expr><operator>(</operator><name>xl_replorigin_set</name> <operator>*</operator><operator>)</operator> <call><name>XLogRecGetData</name><argument_list>(<argument><expr><name>record</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+				<expr_stmt><expr><call><name>replorigin_advance</name><argument_list>(<argument><expr><name><name>xlrec</name><operator>-&gt;</operator><name>node_id</name></name></expr></argument>,
+								   <argument><expr><name><name>xlrec</name><operator>-&gt;</operator><name>remote_lsn</name></name></expr></argument>, <argument><expr><name><name>record</name><operator>-&gt;</operator><name>EndRecPtr</name></name></expr></argument>,
+								   <argument><expr><name><name>xlrec</name><operator>-&gt;</operator><name>force</name></name></expr></argument> <comment type="block">/* backward */</comment> ,
+								   <argument><expr><name>false</name></expr></argument> <comment type="block">/* WAL log */</comment> )</argument_list></call></expr>;</expr_stmt>
+				<break>break;</break>
+			</block_content>}</block>
+		<case>case <expr><name>XLOG_REPLORIGIN_DROP</name></expr>:</case>
+			<block>{<block_content>
+				<decl_stmt><decl><type><name>xl_replorigin_drop</name> <modifier>*</modifier></type><name>xlrec</name></decl>;</decl_stmt>
+				<decl_stmt><decl><type><name>int</name></type>			<name>i</name></decl>;</decl_stmt>
+
+				<expr_stmt><expr><name>xlrec</name> <operator>=</operator> <operator>(</operator><name>xl_replorigin_drop</name> <operator>*</operator><operator>)</operator> <call><name>XLogRecGetData</name><argument_list>(<argument><expr><name>record</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+				<for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name>max_replication_slots</name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control>
+				<block>{<block_content>
+					<decl_stmt><decl><type><name>ReplicationState</name> <modifier>*</modifier></type><name>state</name> <init>= <expr><operator>&amp;</operator><name><name>replication_states</name><index>[<expr><name>i</name></expr>]</index></name></expr></init></decl>;</decl_stmt>
+
+					<comment type="block">/* found our slot */</comment>
+					<if_stmt><if>if <condition>(<expr><name><name>state</name><operator>-&gt;</operator><name>roident</name></name> <operator>==</operator> <name><name>xlrec</name><operator>-&gt;</operator><name>node_id</name></name></expr>)</condition>
+					<block>{<block_content>
+						<comment type="block">/* reset entry */</comment>
+						<expr_stmt><expr><name><name>state</name><operator>-&gt;</operator><name>roident</name></name> <operator>=</operator> <name>InvalidRepOriginId</name></expr>;</expr_stmt>
+						<expr_stmt><expr><name><name>state</name><operator>-&gt;</operator><name>remote_lsn</name></name> <operator>=</operator> <name>InvalidXLogRecPtr</name></expr>;</expr_stmt>
+						<expr_stmt><expr><name><name>state</name><operator>-&gt;</operator><name>local_lsn</name></name> <operator>=</operator> <name>InvalidXLogRecPtr</name></expr>;</expr_stmt>
+						<break>break;</break>
+					</block_content>}</block></if></if_stmt>
+				</block_content>}</block></for>
+				<break>break;</break>
+			</block_content>}</block>
+		<default>default:</default>
+			<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>PANIC</name></expr></argument>, <argument><expr><literal type="string">"replorigin_redo: unknown op code %u"</literal></expr></argument>, <argument><expr><name>info</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></switch>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * Tell the replication origin progress machinery that a commit from 'node'
+ * that originated at the LSN remote_commit on the remote node was replayed
+ * successfully and that we don't need to do so again. In combination with
+ * setting up replorigin_session_origin_lsn and replorigin_session_origin
+ * that ensures we won't loose knowledge about that after a crash if the
+ * transaction had a persistent effect (think of asynchronous commits).
+ *
+ * local_commit needs to be a local LSN of the commit so that we can make sure
+ * upon a checkpoint that enough WAL has been persisted to disk.
+ *
+ * Needs to be called with a RowExclusiveLock on pg_replication_origin,
+ * unless running in recovery.
+ */</comment>
+<function><type><name>void</name></type>
+<name>replorigin_advance</name><parameter_list>(<parameter><decl><type><name>RepOriginId</name></type> <name>node</name></decl></parameter>,
+				   <parameter><decl><type><name>XLogRecPtr</name></type> <name>remote_commit</name></decl></parameter>, <parameter><decl><type><name>XLogRecPtr</name></type> <name>local_commit</name></decl></parameter>,
+				   <parameter><decl><type><name>bool</name></type> <name>go_backward</name></decl></parameter>, <parameter><decl><type><name>bool</name></type> <name>wal_log</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>int</name></type>			<name>i</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>ReplicationState</name> <modifier>*</modifier></type><name>replication_state</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>ReplicationState</name> <modifier>*</modifier></type><name>free_state</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>node</name> <operator>!=</operator> <name>InvalidRepOriginId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* we don't track DoNotReplicateId */</comment>
+	<if_stmt><if>if <condition>(<expr><name>node</name> <operator>==</operator> <name>DoNotReplicateId</name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return;</return></block_content></block></if></if_stmt>
+
+	<comment type="block">/*
+	 * XXX: For the case where this is called by WAL replay, it'd be more
+	 * efficient to restore into a backend local hashtable and only dump into
+	 * shmem after recovery is finished. Let's wait with implementing that
+	 * till it's shown to be a measurable expense
+	 */</comment>
+
+	<comment type="block">/* Lock exclusively, as we may have to create a new table entry. */</comment>
+	<expr_stmt><expr><call><name>LWLockAcquire</name><argument_list>(<argument><expr><name>ReplicationOriginLock</name></expr></argument>, <argument><expr><name>LW_EXCLUSIVE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Search for either an existing slot for the origin, or a free one we can
+	 * use.
+	 */</comment>
+	<for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name>max_replication_slots</name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>ReplicationState</name> <modifier>*</modifier></type><name>curstate</name> <init>= <expr><operator>&amp;</operator><name><name>replication_states</name><index>[<expr><name>i</name></expr>]</index></name></expr></init></decl>;</decl_stmt>
+
+		<comment type="block">/* remember where to insert if necessary */</comment>
+		<if_stmt><if>if <condition>(<expr><name><name>curstate</name><operator>-&gt;</operator><name>roident</name></name> <operator>==</operator> <name>InvalidRepOriginId</name> <operator>&amp;&amp;</operator>
+			<name>free_state</name> <operator>==</operator> <name>NULL</name></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><name>free_state</name> <operator>=</operator> <name>curstate</name></expr>;</expr_stmt>
+			<continue>continue;</continue>
+		</block_content>}</block></if></if_stmt>
+
+		<comment type="block">/* not our slot */</comment>
+		<if_stmt><if>if <condition>(<expr><name><name>curstate</name><operator>-&gt;</operator><name>roident</name></name> <operator>!=</operator> <name>node</name></expr>)</condition>
+		<block>{<block_content>
+			<continue>continue;</continue>
+		</block_content>}</block></if></if_stmt>
+
+		<comment type="block">/* ok, found slot */</comment>
+		<expr_stmt><expr><name>replication_state</name> <operator>=</operator> <name>curstate</name></expr>;</expr_stmt>
+
+		<expr_stmt><expr><call><name>LWLockAcquire</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>replication_state</name><operator>-&gt;</operator><name>lock</name></name></expr></argument>, <argument><expr><name>LW_EXCLUSIVE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/* Make sure it's not used by somebody else */</comment>
+		<if_stmt><if>if <condition>(<expr><name><name>replication_state</name><operator>-&gt;</operator><name>acquired_by</name></name> <operator>!=</operator> <literal type="number">0</literal></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+					<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_OBJECT_IN_USE</name></expr></argument>)</argument_list></call><operator>,</operator>
+					 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"replication origin with OID %d is already active for PID %d"</literal></expr></argument>,
+							<argument><expr><name><name>replication_state</name><operator>-&gt;</operator><name>roident</name></name></expr></argument>,
+							<argument><expr><name><name>replication_state</name><operator>-&gt;</operator><name>acquired_by</name></name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+
+		<break>break;</break>
+	</block_content>}</block></for>
+
+	<if_stmt><if>if <condition>(<expr><name>replication_state</name> <operator>==</operator> <name>NULL</name> <operator>&amp;&amp;</operator> <name>free_state</name> <operator>==</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_CONFIGURATION_LIMIT_EXCEEDED</name></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"could not find free replication state slot for replication origin with OID %u"</literal></expr></argument>,
+						<argument><expr><name>node</name></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errhint</name><argument_list>(<argument><expr><literal type="string">"Increase max_replication_slots and try again."</literal></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>replication_state</name> <operator>==</operator> <name>NULL</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* initialize new slot */</comment>
+		<expr_stmt><expr><call><name>LWLockAcquire</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>free_state</name><operator>-&gt;</operator><name>lock</name></name></expr></argument>, <argument><expr><name>LW_EXCLUSIVE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name>replication_state</name> <operator>=</operator> <name>free_state</name></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>replication_state</name><operator>-&gt;</operator><name>remote_lsn</name></name> <operator>==</operator> <name>InvalidXLogRecPtr</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>replication_state</name><operator>-&gt;</operator><name>local_lsn</name></name> <operator>==</operator> <name>InvalidXLogRecPtr</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>replication_state</name><operator>-&gt;</operator><name>roident</name></name> <operator>=</operator> <name>node</name></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>replication_state</name><operator>-&gt;</operator><name>roident</name></name> <operator>!=</operator> <name>InvalidRepOriginId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * If somebody "forcefully" sets this slot, WAL log it, so it's durable
+	 * and the standby gets the message. Primarily this will be called during
+	 * WAL replay (of commit records) where no WAL logging is necessary.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name>wal_log</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>xl_replorigin_set</name></type> <name>xlrec</name></decl>;</decl_stmt>
+
+		<expr_stmt><expr><name><name>xlrec</name><operator>.</operator><name>remote_lsn</name></name> <operator>=</operator> <name>remote_commit</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>xlrec</name><operator>.</operator><name>node_id</name></name> <operator>=</operator> <name>node</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>xlrec</name><operator>.</operator><name>force</name></name> <operator>=</operator> <name>go_backward</name></expr>;</expr_stmt>
+
+		<expr_stmt><expr><call><name>XLogBeginInsert</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>XLogRegisterData</name><argument_list>(<argument><expr><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <operator>(</operator><operator>&amp;</operator><name>xlrec</name><operator>)</operator></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>xlrec</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><call><name>XLogInsert</name><argument_list>(<argument><expr><name>RM_REPLORIGIN_ID</name></expr></argument>, <argument><expr><name>XLOG_REPLORIGIN_SET</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/*
+	 * Due to - harmless - race conditions during a checkpoint we could see
+	 * values here that are older than the ones we already have in memory.
+	 * Don't overwrite those.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name>go_backward</name> <operator>||</operator> <name><name>replication_state</name><operator>-&gt;</operator><name>remote_lsn</name></name> <operator>&lt;</operator> <name>remote_commit</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name><name>replication_state</name><operator>-&gt;</operator><name>remote_lsn</name></name> <operator>=</operator> <name>remote_commit</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	<if_stmt><if>if <condition>(<expr><name>local_commit</name> <operator>!=</operator> <name>InvalidXLogRecPtr</name> <operator>&amp;&amp;</operator>
+		<operator>(</operator><name>go_backward</name> <operator>||</operator> <name><name>replication_state</name><operator>-&gt;</operator><name>local_lsn</name></name> <operator>&lt;</operator> <name>local_commit</name><operator>)</operator></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name><name>replication_state</name><operator>-&gt;</operator><name>local_lsn</name></name> <operator>=</operator> <name>local_commit</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	<expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>replication_state</name><operator>-&gt;</operator><name>lock</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Release *after* changing the LSNs, slot isn't acquired and thus could
+	 * otherwise be dropped anytime.
+	 */</comment>
+	<expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><name>ReplicationOriginLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+
+<function><type><name>XLogRecPtr</name></type>
+<name>replorigin_get_progress</name><parameter_list>(<parameter><decl><type><name>RepOriginId</name></type> <name>node</name></decl></parameter>, <parameter><decl><type><name>bool</name></type> <name>flush</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>int</name></type>			<name>i</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>XLogRecPtr</name></type>	<name>local_lsn</name> <init>= <expr><name>InvalidXLogRecPtr</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>XLogRecPtr</name></type>	<name>remote_lsn</name> <init>= <expr><name>InvalidXLogRecPtr</name></expr></init></decl>;</decl_stmt>
+
+	<comment type="block">/* prevent slots from being concurrently dropped */</comment>
+	<expr_stmt><expr><call><name>LWLockAcquire</name><argument_list>(<argument><expr><name>ReplicationOriginLock</name></expr></argument>, <argument><expr><name>LW_SHARED</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name>max_replication_slots</name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>ReplicationState</name> <modifier>*</modifier></type><name>state</name></decl>;</decl_stmt>
+
+		<expr_stmt><expr><name>state</name> <operator>=</operator> <operator>&amp;</operator><name><name>replication_states</name><index>[<expr><name>i</name></expr>]</index></name></expr>;</expr_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name><name>state</name><operator>-&gt;</operator><name>roident</name></name> <operator>==</operator> <name>node</name></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><call><name>LWLockAcquire</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>state</name><operator>-&gt;</operator><name>lock</name></name></expr></argument>, <argument><expr><name>LW_SHARED</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+			<expr_stmt><expr><name>remote_lsn</name> <operator>=</operator> <name><name>state</name><operator>-&gt;</operator><name>remote_lsn</name></name></expr>;</expr_stmt>
+			<expr_stmt><expr><name>local_lsn</name> <operator>=</operator> <name><name>state</name><operator>-&gt;</operator><name>local_lsn</name></name></expr>;</expr_stmt>
+
+			<expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>state</name><operator>-&gt;</operator><name>lock</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+			<break>break;</break>
+		</block_content>}</block></if></if_stmt>
+	</block_content>}</block></for>
+
+	<expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><name>ReplicationOriginLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>flush</name> <operator>&amp;&amp;</operator> <name>local_lsn</name> <operator>!=</operator> <name>InvalidXLogRecPtr</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>XLogFlush</name><argument_list>(<argument><expr><name>local_lsn</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<return>return <expr><name>remote_lsn</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Tear down a (possibly) configured session replication origin during process
+ * exit.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>ReplicationOriginExitCleanup</name><parameter_list>(<parameter><decl><type><name>int</name></type> <name>code</name></decl></parameter>, <parameter><decl><type><name>Datum</name></type> <name>arg</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>ConditionVariable</name> <modifier>*</modifier></type><name>cv</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>LWLockAcquire</name><argument_list>(<argument><expr><name>ReplicationOriginLock</name></expr></argument>, <argument><expr><name>LW_EXCLUSIVE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>session_replication_state</name> <operator>!=</operator> <name>NULL</name> <operator>&amp;&amp;</operator>
+		<name><name>session_replication_state</name><operator>-&gt;</operator><name>acquired_by</name></name> <operator>==</operator> <name>MyProcPid</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name>cv</name> <operator>=</operator> <operator>&amp;</operator><name><name>session_replication_state</name><operator>-&gt;</operator><name>origin_cv</name></name></expr>;</expr_stmt>
+
+		<expr_stmt><expr><name><name>session_replication_state</name><operator>-&gt;</operator><name>acquired_by</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+		<expr_stmt><expr><name>session_replication_state</name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><name>ReplicationOriginLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>cv</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ConditionVariableBroadcast</name><argument_list>(<argument><expr><name>cv</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Setup a replication origin in the shared memory struct if it doesn't
+ * already exists and cache access to the specific ReplicationSlot so the
+ * array doesn't have to be searched when calling
+ * replorigin_session_advance().
+ *
+ * Obviously only one such cached origin can exist per process and the current
+ * cached value can only be set again after the previous value is torn down
+ * with replorigin_session_reset().
+ */</comment>
+<function><type><name>void</name></type>
+<name>replorigin_session_setup</name><parameter_list>(<parameter><decl><type><name>RepOriginId</name></type> <name>node</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><specifier>static</specifier> <name>bool</name></type> <name>registered_cleanup</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>i</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>free_slot</name> <init>= <expr><operator>-</operator><literal type="number">1</literal></expr></init></decl>;</decl_stmt>
+
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><name>registered_cleanup</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>on_shmem_exit</name><argument_list>(<argument><expr><name>ReplicationOriginExitCleanup</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name>registered_cleanup</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>max_replication_slots</name> <operator>&gt;</operator> <literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>session_replication_state</name> <operator>!=</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE</name></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"cannot setup replication origin when one is already setup"</literal></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<comment type="block">/* Lock exclusively, as we may have to create a new table entry. */</comment>
+	<expr_stmt><expr><call><name>LWLockAcquire</name><argument_list>(<argument><expr><name>ReplicationOriginLock</name></expr></argument>, <argument><expr><name>LW_EXCLUSIVE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Search for either an existing slot for the origin, or a free one we can
+	 * use.
+	 */</comment>
+	<for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name>max_replication_slots</name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>ReplicationState</name> <modifier>*</modifier></type><name>curstate</name> <init>= <expr><operator>&amp;</operator><name><name>replication_states</name><index>[<expr><name>i</name></expr>]</index></name></expr></init></decl>;</decl_stmt>
+
+		<comment type="block">/* remember where to insert if necessary */</comment>
+		<if_stmt><if>if <condition>(<expr><name><name>curstate</name><operator>-&gt;</operator><name>roident</name></name> <operator>==</operator> <name>InvalidRepOriginId</name> <operator>&amp;&amp;</operator>
+			<name>free_slot</name> <operator>==</operator> <operator>-</operator><literal type="number">1</literal></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><name>free_slot</name> <operator>=</operator> <name>i</name></expr>;</expr_stmt>
+			<continue>continue;</continue>
+		</block_content>}</block></if></if_stmt>
+
+		<comment type="block">/* not our slot */</comment>
+		<if_stmt><if>if <condition>(<expr><name><name>curstate</name><operator>-&gt;</operator><name>roident</name></name> <operator>!=</operator> <name>node</name></expr>)</condition><block type="pseudo"><block_content>
+			<continue>continue;</continue></block_content></block></if>
+
+		<if type="elseif">else if <condition>(<expr><name><name>curstate</name><operator>-&gt;</operator><name>acquired_by</name></name> <operator>!=</operator> <literal type="number">0</literal></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+					<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_OBJECT_IN_USE</name></expr></argument>)</argument_list></call><operator>,</operator>
+					 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"replication identifier %d is already active for PID %d"</literal></expr></argument>,
+							<argument><expr><name><name>curstate</name><operator>-&gt;</operator><name>roident</name></name></expr></argument>, <argument><expr><name><name>curstate</name><operator>-&gt;</operator><name>acquired_by</name></name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+
+		<comment type="block">/* ok, found slot */</comment>
+		<expr_stmt><expr><name>session_replication_state</name> <operator>=</operator> <name>curstate</name></expr>;</expr_stmt>
+	</block_content>}</block></for>
+
+
+	<if_stmt><if>if <condition>(<expr><name>session_replication_state</name> <operator>==</operator> <name>NULL</name> <operator>&amp;&amp;</operator> <name>free_slot</name> <operator>==</operator> <operator>-</operator><literal type="number">1</literal></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_CONFIGURATION_LIMIT_EXCEEDED</name></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"could not find free replication state slot for replication origin with OID %u"</literal></expr></argument>,
+						<argument><expr><name>node</name></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errhint</name><argument_list>(<argument><expr><literal type="string">"Increase max_replication_slots and try again."</literal></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if>
+	<if type="elseif">else if <condition>(<expr><name>session_replication_state</name> <operator>==</operator> <name>NULL</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* initialize new slot */</comment>
+		<expr_stmt><expr><name>session_replication_state</name> <operator>=</operator> <operator>&amp;</operator><name><name>replication_states</name><index>[<expr><name>free_slot</name></expr>]</index></name></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>session_replication_state</name><operator>-&gt;</operator><name>remote_lsn</name></name> <operator>==</operator> <name>InvalidXLogRecPtr</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>session_replication_state</name><operator>-&gt;</operator><name>local_lsn</name></name> <operator>==</operator> <name>InvalidXLogRecPtr</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>session_replication_state</name><operator>-&gt;</operator><name>roident</name></name> <operator>=</operator> <name>node</name></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>session_replication_state</name><operator>-&gt;</operator><name>roident</name></name> <operator>!=</operator> <name>InvalidRepOriginId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name><name>session_replication_state</name><operator>-&gt;</operator><name>acquired_by</name></name> <operator>=</operator> <name>MyProcPid</name></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><name>ReplicationOriginLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* probably this one is pointless */</comment>
+	<expr_stmt><expr><call><name>ConditionVariableBroadcast</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>session_replication_state</name><operator>-&gt;</operator><name>origin_cv</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Reset replay state previously setup in this session.
+ *
+ * This function may only be called if an origin was setup with
+ * replorigin_session_setup().
+ */</comment>
+<function><type><name>void</name></type>
+<name>replorigin_session_reset</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>ConditionVariable</name> <modifier>*</modifier></type><name>cv</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>max_replication_slots</name> <operator>!=</operator> <literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>session_replication_state</name> <operator>==</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE</name></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"no replication origin is configured"</literal></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>LWLockAcquire</name><argument_list>(<argument><expr><name>ReplicationOriginLock</name></expr></argument>, <argument><expr><name>LW_EXCLUSIVE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name><name>session_replication_state</name><operator>-&gt;</operator><name>acquired_by</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+	<expr_stmt><expr><name>cv</name> <operator>=</operator> <operator>&amp;</operator><name><name>session_replication_state</name><operator>-&gt;</operator><name>origin_cv</name></name></expr>;</expr_stmt>
+	<expr_stmt><expr><name>session_replication_state</name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><name>ReplicationOriginLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>ConditionVariableBroadcast</name><argument_list>(<argument><expr><name>cv</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Do the same work replorigin_advance() does, just on the session's
+ * configured origin.
+ *
+ * This is noticeably cheaper than using replorigin_advance().
+ */</comment>
+<function><type><name>void</name></type>
+<name>replorigin_session_advance</name><parameter_list>(<parameter><decl><type><name>XLogRecPtr</name></type> <name>remote_commit</name></decl></parameter>, <parameter><decl><type><name>XLogRecPtr</name></type> <name>local_commit</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>session_replication_state</name> <operator>!=</operator> <name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>session_replication_state</name><operator>-&gt;</operator><name>roident</name></name> <operator>!=</operator> <name>InvalidRepOriginId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>LWLockAcquire</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>session_replication_state</name><operator>-&gt;</operator><name>lock</name></name></expr></argument>, <argument><expr><name>LW_EXCLUSIVE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><name><name>session_replication_state</name><operator>-&gt;</operator><name>local_lsn</name></name> <operator>&lt;</operator> <name>local_commit</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name><name>session_replication_state</name><operator>-&gt;</operator><name>local_lsn</name></name> <operator>=</operator> <name>local_commit</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	<if_stmt><if>if <condition>(<expr><name><name>session_replication_state</name><operator>-&gt;</operator><name>remote_lsn</name></name> <operator>&lt;</operator> <name>remote_commit</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name><name>session_replication_state</name><operator>-&gt;</operator><name>remote_lsn</name></name> <operator>=</operator> <name>remote_commit</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	<expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>session_replication_state</name><operator>-&gt;</operator><name>lock</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Ask the machinery about the point up to which we successfully replayed
+ * changes from an already setup replication origin.
+ */</comment>
+<function><type><name>XLogRecPtr</name></type>
+<name>replorigin_session_get_progress</name><parameter_list>(<parameter><decl><type><name>bool</name></type> <name>flush</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>XLogRecPtr</name></type>	<name>remote_lsn</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>XLogRecPtr</name></type>	<name>local_lsn</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>session_replication_state</name> <operator>!=</operator> <name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>LWLockAcquire</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>session_replication_state</name><operator>-&gt;</operator><name>lock</name></name></expr></argument>, <argument><expr><name>LW_SHARED</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>remote_lsn</name> <operator>=</operator> <name><name>session_replication_state</name><operator>-&gt;</operator><name>remote_lsn</name></name></expr>;</expr_stmt>
+	<expr_stmt><expr><name>local_lsn</name> <operator>=</operator> <name><name>session_replication_state</name><operator>-&gt;</operator><name>local_lsn</name></name></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>session_replication_state</name><operator>-&gt;</operator><name>lock</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>flush</name> <operator>&amp;&amp;</operator> <name>local_lsn</name> <operator>!=</operator> <name>InvalidXLogRecPtr</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>XLogFlush</name><argument_list>(<argument><expr><name>local_lsn</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<return>return <expr><name>remote_lsn</name></expr>;</return>
+</block_content>}</block></function>
+
+
+
+<comment type="block">/* ---------------------------------------------------------------------------
+ * SQL functions for working with replication origin.
+ *
+ * These mostly should be fairly short wrappers around more generic functions.
+ * ---------------------------------------------------------------------------
+ */</comment>
+
+<comment type="block">/*
+ * Create replication origin for the passed in name, and return the assigned
+ * oid.
+ */</comment>
+<function><type><name>Datum</name></type>
+<name>pg_replication_origin_create</name><parameter_list>(<parameter><decl><type><name>PG_FUNCTION_ARGS</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>name</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>RepOriginId</name></type> <name>roident</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>replorigin_check_prerequisites</name><argument_list>(<argument><expr><name>false</name></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>name</name> <operator>=</operator> <call><name>text_to_cstring</name><argument_list>(<argument><expr><operator>(</operator><name>text</name> <operator>*</operator><operator>)</operator> <call><name>DatumGetPointer</name><argument_list>(<argument><expr><call><name>PG_GETARG_DATUM</name><argument_list>(<argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Replication origins "pg_xxx" are reserved for internal use */</comment>
+	<if_stmt><if>if <condition>(<expr><call><name>IsReservedName</name><argument_list>(<argument><expr><name>name</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_RESERVED_NAME</name></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"replication origin name \"%s\" is reserved"</literal></expr></argument>,
+						<argument><expr><name>name</name></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errdetail</name><argument_list>(<argument><expr><literal type="string">"Origin names starting with \"pg_\" are reserved."</literal></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<comment type="block">/*
+	 * If built with appropriate switch, whine when regression-testing
+	 * conventions for replication origin names are violated.
+	 */</comment>
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>ENFORCE_REGRESSION_TEST_NAME_RESTRICTIONS</name></cpp:ifdef>
+	<if_stmt><if>if <condition>(<expr><call><name>strncmp</name><argument_list>(<argument><expr><name>name</name></expr></argument>, <argument><expr><literal type="string">"regress_"</literal></expr></argument>, <argument><expr><literal type="number">8</literal></expr></argument>)</argument_list></call> <operator>!=</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>WARNING</name></expr></argument>, <argument><expr><literal type="string">"replication origins created by regression test cases should have names starting with \"regress_\""</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+	<expr_stmt><expr><name>roident</name> <operator>=</operator> <call><name>replorigin_create</name><argument_list>(<argument><expr><name>name</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>pfree</name><argument_list>(<argument><expr><name>name</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>PG_RETURN_OID</name><argument_list>(<argument><expr><name>roident</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Drop replication origin.
+ */</comment>
+<function><type><name>Datum</name></type>
+<name>pg_replication_origin_drop</name><parameter_list>(<parameter><decl><type><name>PG_FUNCTION_ARGS</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>name</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>RepOriginId</name></type> <name>roident</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>replorigin_check_prerequisites</name><argument_list>(<argument><expr><name>false</name></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>name</name> <operator>=</operator> <call><name>text_to_cstring</name><argument_list>(<argument><expr><operator>(</operator><name>text</name> <operator>*</operator><operator>)</operator> <call><name>DatumGetPointer</name><argument_list>(<argument><expr><call><name>PG_GETARG_DATUM</name><argument_list>(<argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>roident</name> <operator>=</operator> <call><name>replorigin_by_name</name><argument_list>(<argument><expr><name>name</name></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>OidIsValid</name><argument_list>(<argument><expr><name>roident</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>replorigin_drop</name><argument_list>(<argument><expr><name>roident</name></expr></argument>, <argument><expr><name>true</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>pfree</name><argument_list>(<argument><expr><name>name</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>PG_RETURN_VOID</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Return oid of a replication origin.
+ */</comment>
+<function><type><name>Datum</name></type>
+<name>pg_replication_origin_oid</name><parameter_list>(<parameter><decl><type><name>PG_FUNCTION_ARGS</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>name</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>RepOriginId</name></type> <name>roident</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>replorigin_check_prerequisites</name><argument_list>(<argument><expr><name>false</name></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>name</name> <operator>=</operator> <call><name>text_to_cstring</name><argument_list>(<argument><expr><operator>(</operator><name>text</name> <operator>*</operator><operator>)</operator> <call><name>DatumGetPointer</name><argument_list>(<argument><expr><call><name>PG_GETARG_DATUM</name><argument_list>(<argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>roident</name> <operator>=</operator> <call><name>replorigin_by_name</name><argument_list>(<argument><expr><name>name</name></expr></argument>, <argument><expr><name>true</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>pfree</name><argument_list>(<argument><expr><name>name</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><call><name>OidIsValid</name><argument_list>(<argument><expr><name>roident</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>PG_RETURN_OID</name><argument_list>(<argument><expr><name>roident</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	<expr_stmt><expr><call><name>PG_RETURN_NULL</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Setup a replication origin for this session.
+ */</comment>
+<function><type><name>Datum</name></type>
+<name>pg_replication_origin_session_setup</name><parameter_list>(<parameter><decl><type><name>PG_FUNCTION_ARGS</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>name</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>RepOriginId</name></type> <name>origin</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>replorigin_check_prerequisites</name><argument_list>(<argument><expr><name>true</name></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>name</name> <operator>=</operator> <call><name>text_to_cstring</name><argument_list>(<argument><expr><operator>(</operator><name>text</name> <operator>*</operator><operator>)</operator> <call><name>DatumGetPointer</name><argument_list>(<argument><expr><call><name>PG_GETARG_DATUM</name><argument_list>(<argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>origin</name> <operator>=</operator> <call><name>replorigin_by_name</name><argument_list>(<argument><expr><name>name</name></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>replorigin_session_setup</name><argument_list>(<argument><expr><name>origin</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>replorigin_session_origin</name> <operator>=</operator> <name>origin</name></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>pfree</name><argument_list>(<argument><expr><name>name</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>PG_RETURN_VOID</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Reset previously setup origin in this session
+ */</comment>
+<function><type><name>Datum</name></type>
+<name>pg_replication_origin_session_reset</name><parameter_list>(<parameter><decl><type><name>PG_FUNCTION_ARGS</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>replorigin_check_prerequisites</name><argument_list>(<argument><expr><name>true</name></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>replorigin_session_reset</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>replorigin_session_origin</name> <operator>=</operator> <name>InvalidRepOriginId</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name>replorigin_session_origin_lsn</name> <operator>=</operator> <name>InvalidXLogRecPtr</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name>replorigin_session_origin_timestamp</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>PG_RETURN_VOID</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Has a replication origin been setup for this session.
+ */</comment>
+<function><type><name>Datum</name></type>
+<name>pg_replication_origin_session_is_setup</name><parameter_list>(<parameter><decl><type><name>PG_FUNCTION_ARGS</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>replorigin_check_prerequisites</name><argument_list>(<argument><expr><name>false</name></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>PG_RETURN_BOOL</name><argument_list>(<argument><expr><name>replorigin_session_origin</name> <operator>!=</operator> <name>InvalidRepOriginId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * Return the replication progress for origin setup in the current session.
+ *
+ * If 'flush' is set to true it is ensured that the returned value corresponds
+ * to a local transaction that has been flushed. This is useful if asynchronous
+ * commits are used when replaying replicated transactions.
+ */</comment>
+<function><type><name>Datum</name></type>
+<name>pg_replication_origin_session_progress</name><parameter_list>(<parameter><decl><type><name>PG_FUNCTION_ARGS</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>XLogRecPtr</name></type>	<name>remote_lsn</name> <init>= <expr><name>InvalidXLogRecPtr</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type>		<name>flush</name> <init>= <expr><call><name>PG_GETARG_BOOL</name><argument_list>(<argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>replorigin_check_prerequisites</name><argument_list>(<argument><expr><name>true</name></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>session_replication_state</name> <operator>==</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE</name></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"no replication origin is configured"</literal></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><name>remote_lsn</name> <operator>=</operator> <call><name>replorigin_session_get_progress</name><argument_list>(<argument><expr><name>flush</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>remote_lsn</name> <operator>==</operator> <name>InvalidXLogRecPtr</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>PG_RETURN_NULL</name><argument_list>()</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>PG_RETURN_LSN</name><argument_list>(<argument><expr><name>remote_lsn</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<function><type><name>Datum</name></type>
+<name>pg_replication_origin_xact_setup</name><parameter_list>(<parameter><decl><type><name>PG_FUNCTION_ARGS</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>XLogRecPtr</name></type>	<name>location</name> <init>= <expr><call><name>PG_GETARG_LSN</name><argument_list>(<argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>replorigin_check_prerequisites</name><argument_list>(<argument><expr><name>true</name></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>session_replication_state</name> <operator>==</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE</name></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"no replication origin is configured"</literal></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><name>replorigin_session_origin_lsn</name> <operator>=</operator> <name>location</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name>replorigin_session_origin_timestamp</name> <operator>=</operator> <call><name>PG_GETARG_TIMESTAMPTZ</name><argument_list>(<argument><expr><literal type="number">1</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>PG_RETURN_VOID</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<function><type><name>Datum</name></type>
+<name>pg_replication_origin_xact_reset</name><parameter_list>(<parameter><decl><type><name>PG_FUNCTION_ARGS</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>replorigin_check_prerequisites</name><argument_list>(<argument><expr><name>true</name></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>replorigin_session_origin_lsn</name> <operator>=</operator> <name>InvalidXLogRecPtr</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name>replorigin_session_origin_timestamp</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>PG_RETURN_VOID</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+
+<function><type><name>Datum</name></type>
+<name>pg_replication_origin_advance</name><parameter_list>(<parameter><decl><type><name>PG_FUNCTION_ARGS</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>text</name>	   <modifier>*</modifier></type><name>name</name> <init>= <expr><call><name>PG_GETARG_TEXT_PP</name><argument_list>(<argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>XLogRecPtr</name></type>	<name>remote_commit</name> <init>= <expr><call><name>PG_GETARG_LSN</name><argument_list>(<argument><expr><literal type="number">1</literal></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>RepOriginId</name></type> <name>node</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>replorigin_check_prerequisites</name><argument_list>(<argument><expr><name>true</name></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* lock to prevent the replication origin from vanishing */</comment>
+	<expr_stmt><expr><call><name>LockRelationOid</name><argument_list>(<argument><expr><name>ReplicationOriginRelationId</name></expr></argument>, <argument><expr><name>RowExclusiveLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>node</name> <operator>=</operator> <call><name>replorigin_by_name</name><argument_list>(<argument><expr><call><name>text_to_cstring</name><argument_list>(<argument><expr><name>name</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Can't sensibly pass a local commit to be flushed at checkpoint - this
+	 * xact hasn't committed yet. This is why this function should be used to
+	 * set up the initial replication state, but not for replay.
+	 */</comment>
+	<expr_stmt><expr><call><name>replorigin_advance</name><argument_list>(<argument><expr><name>node</name></expr></argument>, <argument><expr><name>remote_commit</name></expr></argument>, <argument><expr><name>InvalidXLogRecPtr</name></expr></argument>,
+					   <argument><expr><name>true</name></expr></argument> <comment type="block">/* go backward */</comment> , <argument><expr><name>true</name></expr></argument> <comment type="block">/* WAL log */</comment> )</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>UnlockRelationOid</name><argument_list>(<argument><expr><name>ReplicationOriginRelationId</name></expr></argument>, <argument><expr><name>RowExclusiveLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>PG_RETURN_VOID</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * Return the replication progress for an individual replication origin.
+ *
+ * If 'flush' is set to true it is ensured that the returned value corresponds
+ * to a local transaction that has been flushed. This is useful if asynchronous
+ * commits are used when replaying replicated transactions.
+ */</comment>
+<function><type><name>Datum</name></type>
+<name>pg_replication_origin_progress</name><parameter_list>(<parameter><decl><type><name>PG_FUNCTION_ARGS</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>name</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type>		<name>flush</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>RepOriginId</name></type> <name>roident</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>XLogRecPtr</name></type>	<name>remote_lsn</name> <init>= <expr><name>InvalidXLogRecPtr</name></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>replorigin_check_prerequisites</name><argument_list>(<argument><expr><name>true</name></expr></argument>, <argument><expr><name>true</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>name</name> <operator>=</operator> <call><name>text_to_cstring</name><argument_list>(<argument><expr><operator>(</operator><name>text</name> <operator>*</operator><operator>)</operator> <call><name>DatumGetPointer</name><argument_list>(<argument><expr><call><name>PG_GETARG_DATUM</name><argument_list>(<argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>flush</name> <operator>=</operator> <call><name>PG_GETARG_BOOL</name><argument_list>(<argument><expr><literal type="number">1</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>roident</name> <operator>=</operator> <call><name>replorigin_by_name</name><argument_list>(<argument><expr><name>name</name></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>OidIsValid</name><argument_list>(<argument><expr><name>roident</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>remote_lsn</name> <operator>=</operator> <call><name>replorigin_get_progress</name><argument_list>(<argument><expr><name>roident</name></expr></argument>, <argument><expr><name>flush</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>remote_lsn</name> <operator>==</operator> <name>InvalidXLogRecPtr</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>PG_RETURN_NULL</name><argument_list>()</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>PG_RETURN_LSN</name><argument_list>(<argument><expr><name>remote_lsn</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+
+<function><type><name>Datum</name></type>
+<name>pg_show_replication_origin_status</name><parameter_list>(<parameter><decl><type><name>PG_FUNCTION_ARGS</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>ReturnSetInfo</name> <modifier>*</modifier></type><name>rsinfo</name> <init>= <expr><operator>(</operator><name>ReturnSetInfo</name> <operator>*</operator><operator>)</operator> <name><name>fcinfo</name><operator>-&gt;</operator><name>resultinfo</name></name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>TupleDesc</name></type>	<name>tupdesc</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Tuplestorestate</name> <modifier>*</modifier></type><name>tupstore</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>MemoryContext</name></type> <name>per_query_ctx</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>MemoryContext</name></type> <name>oldcontext</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>i</name></decl>;</decl_stmt>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>REPLICATION_ORIGIN_PROGRESS_COLS</name></cpp:macro> <cpp:value>4</cpp:value></cpp:define>
+
+	<comment type="block">/* we want to return 0 rows if slot is set to zero */</comment>
+	<expr_stmt><expr><call><name>replorigin_check_prerequisites</name><argument_list>(<argument><expr><name>false</name></expr></argument>, <argument><expr><name>true</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>rsinfo</name> <operator>==</operator> <name>NULL</name> <operator>||</operator> <operator>!</operator><call><name>IsA</name><argument_list>(<argument><expr><name>rsinfo</name></expr></argument>, <argument><expr><name>ReturnSetInfo</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_FEATURE_NOT_SUPPORTED</name></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"set-valued function called in context that cannot accept a set"</literal></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><operator>(</operator><name><name>rsinfo</name><operator>-&gt;</operator><name>allowedModes</name></name> <operator>&amp;</operator> <name>SFRM_Materialize</name><operator>)</operator></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_FEATURE_NOT_SUPPORTED</name></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"materialize mode required, but it is not allowed in this context"</literal></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	<if_stmt><if>if <condition>(<expr><call><name>get_call_result_type</name><argument_list>(<argument><expr><name>fcinfo</name></expr></argument>, <argument><expr><name>NULL</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>tupdesc</name></expr></argument>)</argument_list></call> <operator>!=</operator> <name>TYPEFUNC_COMPOSITE</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"return type must be a row type"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name><name>tupdesc</name><operator>-&gt;</operator><name>natts</name></name> <operator>!=</operator> <name>REPLICATION_ORIGIN_PROGRESS_COLS</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"wrong function definition"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><name>per_query_ctx</name> <operator>=</operator> <name><name>rsinfo</name><operator>-&gt;</operator><name>econtext</name><operator>-&gt;</operator><name>ecxt_per_query_memory</name></name></expr>;</expr_stmt>
+	<expr_stmt><expr><name>oldcontext</name> <operator>=</operator> <call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>per_query_ctx</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>tupstore</name> <operator>=</operator> <call><name>tuplestore_begin_heap</name><argument_list>(<argument><expr><name>true</name></expr></argument>, <argument><expr><name>false</name></expr></argument>, <argument><expr><name>work_mem</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>rsinfo</name><operator>-&gt;</operator><name>returnMode</name></name> <operator>=</operator> <name>SFRM_Materialize</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>rsinfo</name><operator>-&gt;</operator><name>setResult</name></name> <operator>=</operator> <name>tupstore</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>rsinfo</name><operator>-&gt;</operator><name>setDesc</name></name> <operator>=</operator> <name>tupdesc</name></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>oldcontext</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+
+	<comment type="block">/* prevent slots from being concurrently dropped */</comment>
+	<expr_stmt><expr><call><name>LWLockAcquire</name><argument_list>(<argument><expr><name>ReplicationOriginLock</name></expr></argument>, <argument><expr><name>LW_SHARED</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Iterate through all possible replication_states, display if they are
+	 * filled. Note that we do not take any locks, so slightly corrupted/out
+	 * of date values are a possibility.
+	 */</comment>
+	<for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name>max_replication_slots</name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>ReplicationState</name> <modifier>*</modifier></type><name>state</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>Datum</name></type>		<name><name>values</name><index>[<expr><name>REPLICATION_ORIGIN_PROGRESS_COLS</name></expr>]</index></name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>bool</name></type>		<name><name>nulls</name><index>[<expr><name>REPLICATION_ORIGIN_PROGRESS_COLS</name></expr>]</index></name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>roname</name></decl>;</decl_stmt>
+
+		<expr_stmt><expr><name>state</name> <operator>=</operator> <operator>&amp;</operator><name><name>replication_states</name><index>[<expr><name>i</name></expr>]</index></name></expr>;</expr_stmt>
+
+		<comment type="block">/* unused slot, nothing to display */</comment>
+		<if_stmt><if>if <condition>(<expr><name><name>state</name><operator>-&gt;</operator><name>roident</name></name> <operator>==</operator> <name>InvalidRepOriginId</name></expr>)</condition><block type="pseudo"><block_content>
+			<continue>continue;</continue></block_content></block></if></if_stmt>
+
+		<expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><name>values</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>values</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><name>nulls</name></expr></argument>, <argument><expr><literal type="number">1</literal></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>nulls</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><name><name>values</name><index>[<expr><literal type="number">0</literal></expr>]</index></name> <operator>=</operator> <call><name>ObjectIdGetDatum</name><argument_list>(<argument><expr><name><name>state</name><operator>-&gt;</operator><name>roident</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>nulls</name><index>[<expr><literal type="number">0</literal></expr>]</index></name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+
+		<comment type="block">/*
+		 * We're not preventing the origin to be dropped concurrently, so
+		 * silently accept that it might be gone.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><call><name>replorigin_by_oid</name><argument_list>(<argument><expr><name><name>state</name><operator>-&gt;</operator><name>roident</name></name></expr></argument>, <argument><expr><name>true</name></expr></argument>,
+							  <argument><expr><operator>&amp;</operator><name>roname</name></expr></argument>)</argument_list></call></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><name><name>values</name><index>[<expr><literal type="number">1</literal></expr>]</index></name> <operator>=</operator> <call><name>CStringGetTextDatum</name><argument_list>(<argument><expr><name>roname</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><name><name>nulls</name><index>[<expr><literal type="number">1</literal></expr>]</index></name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+
+		<expr_stmt><expr><call><name>LWLockAcquire</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>state</name><operator>-&gt;</operator><name>lock</name></name></expr></argument>, <argument><expr><name>LW_SHARED</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><name><name>values</name><index>[<expr><literal type="number">2</literal></expr>]</index></name> <operator>=</operator> <call><name>LSNGetDatum</name><argument_list>(<argument><expr><name><name>state</name><operator>-&gt;</operator><name>remote_lsn</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>nulls</name><index>[<expr><literal type="number">2</literal></expr>]</index></name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+
+		<expr_stmt><expr><name><name>values</name><index>[<expr><literal type="number">3</literal></expr>]</index></name> <operator>=</operator> <call><name>LSNGetDatum</name><argument_list>(<argument><expr><name><name>state</name><operator>-&gt;</operator><name>local_lsn</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>nulls</name><index>[<expr><literal type="number">3</literal></expr>]</index></name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+
+		<expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>state</name><operator>-&gt;</operator><name>lock</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><call><name>tuplestore_putvalues</name><argument_list>(<argument><expr><name>tupstore</name></expr></argument>, <argument><expr><name>tupdesc</name></expr></argument>, <argument><expr><name>values</name></expr></argument>, <argument><expr><name>nulls</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></for>
+
+	<expr_stmt><expr><call><name>tuplestore_donestoring</name><argument_list>(<argument><expr><name>tupstore</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><name>ReplicationOriginLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+<cpp:undef>#<cpp:directive>undef</cpp:directive> <name>REPLICATION_ORIGIN_PROGRESS_COLS</name></cpp:undef>
+
+	<return>return <expr><operator>(</operator><name>Datum</name><operator>)</operator> <literal type="number">0</literal></expr>;</return>
+</block_content>}</block></function>
+</unit>

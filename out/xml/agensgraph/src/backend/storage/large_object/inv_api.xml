@@ -1,0 +1,957 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<unit xmlns="http://www.srcML.org/srcML/src" xmlns:cpp="http://www.srcML.org/srcML/cpp" revision="1.0.0" language="C" filename="/cloned_projects/agensgraph/src/backend/storage/large_object/inv_api.c"><comment type="block">/*-------------------------------------------------------------------------
+ *
+ * inv_api.c
+ *	  routines for manipulating inversion fs large objects. This file
+ *	  contains the user-level large object application interface routines.
+ *
+ *
+ * Note: we access pg_largeobject.data using its C struct declaration.
+ * This is safe because it immediately follows pageno which is an int4 field,
+ * and therefore the data field will always be 4-byte aligned, even if it
+ * is in the short 1-byte-header format.  We have to detoast it since it's
+ * quite likely to be in compressed or short format.  We also need to check
+ * for NULLs, since initdb will mark loid and pageno but not data as NOT NULL.
+ *
+ * Note: many of these routines leak memory in CurrentMemoryContext, as indeed
+ * does most of the backend code.  We expect that CurrentMemoryContext will
+ * be a short-lived context.  Data that must persist across function calls
+ * is kept either in CacheMemoryContext (the Relation structs) or in the
+ * memory context given to inv_open (for LargeObjectDesc structs).
+ *
+ *
+ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1994, Regents of the University of California
+ *
+ *
+ * IDENTIFICATION
+ *	  src/backend/storage/large_object/inv_api.c
+ *
+ *-------------------------------------------------------------------------
+ */</comment>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"postgres.h"</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;limits.h&gt;</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/detoast.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/genam.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/htup_details.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/sysattr.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/table.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/xact.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/dependency.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/indexing.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/objectaccess.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/pg_largeobject.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/pg_largeobject_metadata.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"libpq/libpq-fs.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"miscadmin.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/large_object.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/acl.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/fmgroids.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/rel.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/snapmgr.h"</cpp:file></cpp:include>
+
+
+<comment type="block">/*
+ * GUC: backwards-compatibility flag to suppress LO permission checks
+ */</comment>
+<decl_stmt><decl><type><name>bool</name></type>		<name>lo_compat_privileges</name></decl>;</decl_stmt>
+
+<comment type="block">/*
+ * All accesses to pg_largeobject and its index make use of a single Relation
+ * reference, so that we only need to open pg_relation once per transaction.
+ * To avoid problems when the first such reference occurs inside a
+ * subtransaction, we execute a slightly klugy maneuver to assign ownership of
+ * the Relation reference to TopTransactionResourceOwner.
+ */</comment>
+<decl_stmt><decl><type><specifier>static</specifier> <name>Relation</name></type> <name>lo_heap_r</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+<decl_stmt><decl><type><specifier>static</specifier> <name>Relation</name></type> <name>lo_index_r</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+
+
+<comment type="block">/*
+ * Open pg_largeobject and its index, if not already done in current xact
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>open_lo_relation</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>ResourceOwner</name></type> <name>currentOwner</name></decl>;</decl_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>lo_heap_r</name> <operator>&amp;&amp;</operator> <name>lo_index_r</name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return;</return></block_content></block></if></if_stmt>					<comment type="block">/* already open in current xact */</comment>
+
+	<comment type="block">/* Arrange for the top xact to own these relation references */</comment>
+	<expr_stmt><expr><name>currentOwner</name> <operator>=</operator> <name>CurrentResourceOwner</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name>CurrentResourceOwner</name> <operator>=</operator> <name>TopTransactionResourceOwner</name></expr>;</expr_stmt>
+
+	<comment type="block">/* Use RowExclusiveLock since we might either read or write */</comment>
+	<if_stmt><if>if <condition>(<expr><name>lo_heap_r</name> <operator>==</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name>lo_heap_r</name> <operator>=</operator> <call><name>table_open</name><argument_list>(<argument><expr><name>LargeObjectRelationId</name></expr></argument>, <argument><expr><name>RowExclusiveLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	<if_stmt><if>if <condition>(<expr><name>lo_index_r</name> <operator>==</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name>lo_index_r</name> <operator>=</operator> <call><name>index_open</name><argument_list>(<argument><expr><name>LargeObjectLOidPNIndexId</name></expr></argument>, <argument><expr><name>RowExclusiveLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><name>CurrentResourceOwner</name> <operator>=</operator> <name>currentOwner</name></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Clean up at main transaction end
+ */</comment>
+<function><type><name>void</name></type>
+<name>close_lo_relation</name><parameter_list>(<parameter><decl><type><name>bool</name></type> <name>isCommit</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<if_stmt><if>if <condition>(<expr><name>lo_heap_r</name> <operator>||</operator> <name>lo_index_r</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/*
+		 * Only bother to close if committing; else abort cleanup will handle
+		 * it
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><name>isCommit</name></expr>)</condition>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>ResourceOwner</name></type> <name>currentOwner</name></decl>;</decl_stmt>
+
+			<expr_stmt><expr><name>currentOwner</name> <operator>=</operator> <name>CurrentResourceOwner</name></expr>;</expr_stmt>
+			<expr_stmt><expr><name>CurrentResourceOwner</name> <operator>=</operator> <name>TopTransactionResourceOwner</name></expr>;</expr_stmt>
+
+			<if_stmt><if>if <condition>(<expr><name>lo_index_r</name></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><call><name>index_close</name><argument_list>(<argument><expr><name>lo_index_r</name></expr></argument>, <argument><expr><name>NoLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+			<if_stmt><if>if <condition>(<expr><name>lo_heap_r</name></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><call><name>table_close</name><argument_list>(<argument><expr><name>lo_heap_r</name></expr></argument>, <argument><expr><name>NoLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+			<expr_stmt><expr><name>CurrentResourceOwner</name> <operator>=</operator> <name>currentOwner</name></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+		<expr_stmt><expr><name>lo_heap_r</name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name>lo_index_r</name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * Same as pg_largeobject.c's LargeObjectExists(), except snapshot to
+ * read with can be specified.
+ */</comment>
+<function><type><specifier>static</specifier> <name>bool</name></type>
+<name>myLargeObjectExists</name><parameter_list>(<parameter><decl><type><name>Oid</name></type> <name>loid</name></decl></parameter>, <parameter><decl><type><name>Snapshot</name></type> <name>snapshot</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>Relation</name></type>	<name>pg_lo_meta</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>ScanKeyData</name></type> <name><name>skey</name><index>[<expr><literal type="number">1</literal></expr>]</index></name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>SysScanDesc</name></type> <name>sd</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>HeapTuple</name></type>	<name>tuple</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type>		<name>retval</name> <init>= <expr><name>false</name></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>ScanKeyInit</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>skey</name><index>[<expr><literal type="number">0</literal></expr>]</index></name></expr></argument>,
+				<argument><expr><name>Anum_pg_largeobject_metadata_oid</name></expr></argument>,
+				<argument><expr><name>BTEqualStrategyNumber</name></expr></argument>, <argument><expr><name>F_OIDEQ</name></expr></argument>,
+				<argument><expr><call><name>ObjectIdGetDatum</name><argument_list>(<argument><expr><name>loid</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>pg_lo_meta</name> <operator>=</operator> <call><name>table_open</name><argument_list>(<argument><expr><name>LargeObjectMetadataRelationId</name></expr></argument>,
+							<argument><expr><name>AccessShareLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>sd</name> <operator>=</operator> <call><name>systable_beginscan</name><argument_list>(<argument><expr><name>pg_lo_meta</name></expr></argument>,
+							<argument><expr><name>LargeObjectMetadataOidIndexId</name></expr></argument>, <argument><expr><name>true</name></expr></argument>,
+							<argument><expr><name>snapshot</name></expr></argument>, <argument><expr><literal type="number">1</literal></expr></argument>, <argument><expr><name>skey</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>tuple</name> <operator>=</operator> <call><name>systable_getnext</name><argument_list>(<argument><expr><name>sd</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><call><name>HeapTupleIsValid</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name>retval</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>systable_endscan</name><argument_list>(<argument><expr><name>sd</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>table_close</name><argument_list>(<argument><expr><name>pg_lo_meta</name></expr></argument>, <argument><expr><name>AccessShareLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<return>return <expr><name>retval</name></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * Extract data field from a pg_largeobject tuple, detoasting if needed
+ * and verifying that the length is sane.  Returns data pointer (a bytea *),
+ * data length, and an indication of whether to pfree the data pointer.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>getdatafield</name><parameter_list>(<parameter><decl><type><name>Form_pg_largeobject</name></type> <name>tuple</name></decl></parameter>,
+			 <parameter><decl><type><name>bytea</name> <modifier>*</modifier><modifier>*</modifier></type><name>pdatafield</name></decl></parameter>,
+			 <parameter><decl><type><name>int</name> <modifier>*</modifier></type><name>plen</name></decl></parameter>,
+			 <parameter><decl><type><name>bool</name> <modifier>*</modifier></type><name>pfreeit</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>bytea</name>	   <modifier>*</modifier></type><name>datafield</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>len</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type>		<name>freeit</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name>datafield</name> <operator>=</operator> <operator>&amp;</operator><operator>(</operator><name><name>tuple</name><operator>-&gt;</operator><name>data</name></name><operator>)</operator></expr>;</expr_stmt> <comment type="block">/* see note at top of file */</comment>
+	<expr_stmt><expr><name>freeit</name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><call><name>VARATT_IS_EXTENDED</name><argument_list>(<argument><expr><name>datafield</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name>datafield</name> <operator>=</operator> <operator>(</operator><name>bytea</name> <operator>*</operator><operator>)</operator>
+			<call><name>detoast_attr</name><argument_list>(<argument><expr><operator>(</operator>struct <name>varlena</name> <operator>*</operator><operator>)</operator> <name>datafield</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name>freeit</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+	<expr_stmt><expr><name>len</name> <operator>=</operator> <call><name>VARSIZE</name><argument_list>(<argument><expr><name>datafield</name></expr></argument>)</argument_list></call> <operator>-</operator> <name>VARHDRSZ</name></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><name><name>len</name> <argument_list type="generic">&lt; <argument><expr><literal type="number">0</literal> <operator>||</operator> <name>len</name></expr></argument> &gt;</argument_list></name> <name>LOBLKSIZE</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_DATA_CORRUPTED</name></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"pg_largeobject entry for OID %u, page %d has invalid data field size %d"</literal></expr></argument>,
+						<argument><expr><name><name>tuple</name><operator>-&gt;</operator><name>loid</name></name></expr></argument>, <argument><expr><name><name>tuple</name><operator>-&gt;</operator><name>pageno</name></name></expr></argument>, <argument><expr><name>len</name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	<expr_stmt><expr><operator>*</operator><name>pdatafield</name> <operator>=</operator> <name>datafield</name></expr>;</expr_stmt>
+	<expr_stmt><expr><operator>*</operator><name>plen</name> <operator>=</operator> <name>len</name></expr>;</expr_stmt>
+	<expr_stmt><expr><operator>*</operator><name>pfreeit</name> <operator>=</operator> <name>freeit</name></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ *	inv_create -- create a new large object
+ *
+ *	Arguments:
+ *	  lobjId - OID to use for new large object, or InvalidOid to pick one
+ *
+ *	Returns:
+ *	  OID of new object
+ *
+ * If lobjId is not InvalidOid, then an error occurs if the OID is already
+ * in use.
+ */</comment>
+<function><type><name>Oid</name></type>
+<name>inv_create</name><parameter_list>(<parameter><decl><type><name>Oid</name></type> <name>lobjId</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>Oid</name></type>			<name>lobjId_new</name></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * Create a new largeobject with empty data pages
+	 */</comment>
+	<expr_stmt><expr><name>lobjId_new</name> <operator>=</operator> <call><name>LargeObjectCreate</name><argument_list>(<argument><expr><name>lobjId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * dependency on the owner of largeobject
+	 *
+	 * The reason why we use LargeObjectRelationId instead of
+	 * LargeObjectMetadataRelationId here is to provide backward compatibility
+	 * to the applications which utilize a knowledge about internal layout of
+	 * system catalogs. OID of pg_largeobject_metadata and loid of
+	 * pg_largeobject are same value, so there are no actual differences here.
+	 */</comment>
+	<expr_stmt><expr><call><name>recordDependencyOnOwner</name><argument_list>(<argument><expr><name>LargeObjectRelationId</name></expr></argument>,
+							<argument><expr><name>lobjId_new</name></expr></argument>, <argument><expr><call><name>GetUserId</name><argument_list>()</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Post creation hook for new large object */</comment>
+	<expr_stmt><expr><call><name>InvokeObjectPostCreateHook</name><argument_list>(<argument><expr><name>LargeObjectRelationId</name></expr></argument>, <argument><expr><name>lobjId_new</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Advance command counter to make new tuple visible to later operations.
+	 */</comment>
+	<expr_stmt><expr><call><name>CommandCounterIncrement</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+	<return>return <expr><name>lobjId_new</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ *	inv_open -- access an existing large object.
+ *
+ * Returns a large object descriptor, appropriately filled in.
+ * The descriptor and subsidiary data are allocated in the specified
+ * memory context, which must be suitably long-lived for the caller's
+ * purposes.  If the returned descriptor has a snapshot associated
+ * with it, the caller must ensure that it also lives long enough,
+ * e.g. by calling RegisterSnapshotOnOwner
+ */</comment>
+<function><type><name>LargeObjectDesc</name> <modifier>*</modifier></type>
+<name>inv_open</name><parameter_list>(<parameter><decl><type><name>Oid</name></type> <name>lobjId</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>flags</name></decl></parameter>, <parameter><decl><type><name>MemoryContext</name></type> <name>mcxt</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>LargeObjectDesc</name> <modifier>*</modifier></type><name>retval</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Snapshot</name></type>	<name>snapshot</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>descflags</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * Historically, no difference is made between (INV_WRITE) and (INV_WRITE
+	 * | INV_READ), the caller being allowed to read the large object
+	 * descriptor in either case.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name>flags</name> <operator>&amp;</operator> <name>INV_WRITE</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name>descflags</name> <operator>|=</operator> <name>IFS_WRLOCK</name> <operator>|</operator> <name>IFS_RDLOCK</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	<if_stmt><if>if <condition>(<expr><name>flags</name> <operator>&amp;</operator> <name>INV_READ</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name>descflags</name> <operator>|=</operator> <name>IFS_RDLOCK</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>descflags</name> <operator>==</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_INVALID_PARAMETER_VALUE</name></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"invalid flags for opening a large object: %d"</literal></expr></argument>,
+						<argument><expr><name>flags</name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<comment type="block">/* Get snapshot.  If write is requested, use an instantaneous snapshot. */</comment>
+	<if_stmt><if>if <condition>(<expr><name>descflags</name> <operator>&amp;</operator> <name>IFS_WRLOCK</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name>snapshot</name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt></block_content></block></if>
+	<else>else<block type="pseudo"><block_content>
+		<expr_stmt><expr><name>snapshot</name> <operator>=</operator> <call><name>GetActiveSnapshot</name><argument_list>()</argument_list></call></expr>;</expr_stmt></block_content></block></else></if_stmt>
+
+	<comment type="block">/* Can't use LargeObjectExists here because we need to specify snapshot */</comment>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>myLargeObjectExists</name><argument_list>(<argument><expr><name>lobjId</name></expr></argument>, <argument><expr><name>snapshot</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_UNDEFINED_OBJECT</name></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"large object %u does not exist"</literal></expr></argument>, <argument><expr><name>lobjId</name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<comment type="block">/* Apply permission checks, again specifying snapshot */</comment>
+	<if_stmt><if>if <condition>(<expr><operator>(</operator><name>descflags</name> <operator>&amp;</operator> <name>IFS_RDLOCK</name><operator>)</operator> <operator>!=</operator> <literal type="number">0</literal></expr>)</condition>
+	<block>{<block_content>
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><name>lo_compat_privileges</name> <operator>&amp;&amp;</operator>
+			<call><name>pg_largeobject_aclcheck_snapshot</name><argument_list>(<argument><expr><name>lobjId</name></expr></argument>,
+											 <argument><expr><call><name>GetUserId</name><argument_list>()</argument_list></call></expr></argument>,
+											 <argument><expr><name>ACL_SELECT</name></expr></argument>,
+											 <argument><expr><name>snapshot</name></expr></argument>)</argument_list></call> <operator>!=</operator> <name>ACLCHECK_OK</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+					<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_INSUFFICIENT_PRIVILEGE</name></expr></argument>)</argument_list></call><operator>,</operator>
+					 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"permission denied for large object %u"</literal></expr></argument>,
+							<argument><expr><name>lobjId</name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	</block_content>}</block></if></if_stmt>
+	<if_stmt><if>if <condition>(<expr><operator>(</operator><name>descflags</name> <operator>&amp;</operator> <name>IFS_WRLOCK</name><operator>)</operator> <operator>!=</operator> <literal type="number">0</literal></expr>)</condition>
+	<block>{<block_content>
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><name>lo_compat_privileges</name> <operator>&amp;&amp;</operator>
+			<call><name>pg_largeobject_aclcheck_snapshot</name><argument_list>(<argument><expr><name>lobjId</name></expr></argument>,
+											 <argument><expr><call><name>GetUserId</name><argument_list>()</argument_list></call></expr></argument>,
+											 <argument><expr><name>ACL_UPDATE</name></expr></argument>,
+											 <argument><expr><name>snapshot</name></expr></argument>)</argument_list></call> <operator>!=</operator> <name>ACLCHECK_OK</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+					<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_INSUFFICIENT_PRIVILEGE</name></expr></argument>)</argument_list></call><operator>,</operator>
+					 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"permission denied for large object %u"</literal></expr></argument>,
+							<argument><expr><name>lobjId</name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/* OK to create a descriptor */</comment>
+	<expr_stmt><expr><name>retval</name> <operator>=</operator> <operator>(</operator><name>LargeObjectDesc</name> <operator>*</operator><operator>)</operator> <call><name>MemoryContextAlloc</name><argument_list>(<argument><expr><name>mcxt</name></expr></argument>,
+													<argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>LargeObjectDesc</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>retval</name><operator>-&gt;</operator><name>id</name></name> <operator>=</operator> <name>lobjId</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>retval</name><operator>-&gt;</operator><name>offset</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>retval</name><operator>-&gt;</operator><name>flags</name></name> <operator>=</operator> <name>descflags</name></expr>;</expr_stmt>
+
+	<comment type="block">/* caller sets if needed, not used by the functions in this file */</comment>
+	<expr_stmt><expr><name><name>retval</name><operator>-&gt;</operator><name>subid</name></name> <operator>=</operator> <name>InvalidSubTransactionId</name></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * The snapshot (if any) is just the currently active snapshot.  The
+	 * caller will replace it with a longer-lived copy if needed.
+	 */</comment>
+	<expr_stmt><expr><name><name>retval</name><operator>-&gt;</operator><name>snapshot</name></name> <operator>=</operator> <name>snapshot</name></expr>;</expr_stmt>
+
+	<return>return <expr><name>retval</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Closes a large object descriptor previously made by inv_open(), and
+ * releases the long-term memory used by it.
+ */</comment>
+<function><type><name>void</name></type>
+<name>inv_close</name><parameter_list>(<parameter><decl><type><name>LargeObjectDesc</name> <modifier>*</modifier></type><name>obj_desc</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>PointerIsValid</name><argument_list>(<argument><expr><name>obj_desc</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>pfree</name><argument_list>(<argument><expr><name>obj_desc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Destroys an existing large object (not to be confused with a descriptor!)
+ *
+ * Note we expect caller to have done any required permissions check.
+ */</comment>
+<function><type><name>int</name></type>
+<name>inv_drop</name><parameter_list>(<parameter><decl><type><name>Oid</name></type> <name>lobjId</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>ObjectAddress</name></type> <name>object</name></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * Delete any comments and dependencies on the large object
+	 */</comment>
+	<expr_stmt><expr><name><name>object</name><operator>.</operator><name>classId</name></name> <operator>=</operator> <name>LargeObjectRelationId</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>object</name><operator>.</operator><name>objectId</name></name> <operator>=</operator> <name>lobjId</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>object</name><operator>.</operator><name>objectSubId</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>performDeletion</name><argument_list>(<argument><expr><operator>&amp;</operator><name>object</name></expr></argument>, <argument><expr><name>DROP_CASCADE</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Advance command counter so that tuple removal will be seen by later
+	 * large-object operations in this transaction.
+	 */</comment>
+	<expr_stmt><expr><call><name>CommandCounterIncrement</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* For historical reasons, we always return 1 on success. */</comment>
+	<return>return <expr><literal type="number">1</literal></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Determine size of a large object
+ *
+ * NOTE: LOs can contain gaps, just like Unix files.  We actually return
+ * the offset of the last byte + 1.
+ */</comment>
+<function><type><specifier>static</specifier> <name>uint64</name></type>
+<name>inv_getsize</name><parameter_list>(<parameter><decl><type><name>LargeObjectDesc</name> <modifier>*</modifier></type><name>obj_desc</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>uint64</name></type>		<name>lastbyte</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>ScanKeyData</name></type> <name><name>skey</name><index>[<expr><literal type="number">1</literal></expr>]</index></name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>SysScanDesc</name></type> <name>sd</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>HeapTuple</name></type>	<name>tuple</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>PointerIsValid</name><argument_list>(<argument><expr><name>obj_desc</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>open_lo_relation</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>ScanKeyInit</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>skey</name><index>[<expr><literal type="number">0</literal></expr>]</index></name></expr></argument>,
+				<argument><expr><name>Anum_pg_largeobject_loid</name></expr></argument>,
+				<argument><expr><name>BTEqualStrategyNumber</name></expr></argument>, <argument><expr><name>F_OIDEQ</name></expr></argument>,
+				<argument><expr><call><name>ObjectIdGetDatum</name><argument_list>(<argument><expr><name><name>obj_desc</name><operator>-&gt;</operator><name>id</name></name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>sd</name> <operator>=</operator> <call><name>systable_beginscan_ordered</name><argument_list>(<argument><expr><name>lo_heap_r</name></expr></argument>, <argument><expr><name>lo_index_r</name></expr></argument>,
+									<argument><expr><name><name>obj_desc</name><operator>-&gt;</operator><name>snapshot</name></name></expr></argument>, <argument><expr><literal type="number">1</literal></expr></argument>, <argument><expr><name>skey</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Because the pg_largeobject index is on both loid and pageno, but we
+	 * constrain only loid, a backwards scan should visit all pages of the
+	 * large object in reverse pageno order.  So, it's sufficient to examine
+	 * the first valid tuple (== last valid page).
+	 */</comment>
+	<expr_stmt><expr><name>tuple</name> <operator>=</operator> <call><name>systable_getnext_ordered</name><argument_list>(<argument><expr><name>sd</name></expr></argument>, <argument><expr><name>BackwardScanDirection</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><call><name>HeapTupleIsValid</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>Form_pg_largeobject</name></type> <name>data</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>bytea</name>	   <modifier>*</modifier></type><name>datafield</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>int</name></type>			<name>len</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>bool</name></type>		<name>pfreeit</name></decl>;</decl_stmt>
+
+		<if_stmt><if>if <condition>(<expr><call><name>HeapTupleHasNulls</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>	<comment type="block">/* paranoia */</comment>
+			<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"null field found in pg_largeobject"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+		<expr_stmt><expr><name>data</name> <operator>=</operator> <operator>(</operator><name>Form_pg_largeobject</name><operator>)</operator> <call><name>GETSTRUCT</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>getdatafield</name><argument_list>(<argument><expr><name>data</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>datafield</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>len</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>pfreeit</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name>lastbyte</name> <operator>=</operator> <operator>(</operator><name>uint64</name><operator>)</operator> <name><name>data</name><operator>-&gt;</operator><name>pageno</name></name> <operator>*</operator> <name>LOBLKSIZE</name> <operator>+</operator> <name>len</name></expr>;</expr_stmt>
+		<if_stmt><if>if <condition>(<expr><name>pfreeit</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>pfree</name><argument_list>(<argument><expr><name>datafield</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>systable_endscan_ordered</name><argument_list>(<argument><expr><name>sd</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<return>return <expr><name>lastbyte</name></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><name>int64</name></type>
+<name>inv_seek</name><parameter_list>(<parameter><decl><type><name>LargeObjectDesc</name> <modifier>*</modifier></type><name>obj_desc</name></decl></parameter>, <parameter><decl><type><name>int64</name></type> <name>offset</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>whence</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>int64</name></type>		<name>newoffset</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>PointerIsValid</name><argument_list>(<argument><expr><name>obj_desc</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * We allow seek/tell if you have either read or write permission, so no
+	 * need for a permission check here.
+	 */</comment>
+
+	<comment type="block">/*
+	 * Note: overflow in the additions is possible, but since we will reject
+	 * negative results, we don't need any extra test for that.
+	 */</comment>
+	<switch>switch <condition>(<expr><name>whence</name></expr>)</condition>
+	<block>{<block_content>
+		<case>case <expr><name>SEEK_SET</name></expr>:</case>
+			<expr_stmt><expr><name>newoffset</name> <operator>=</operator> <name>offset</name></expr>;</expr_stmt>
+			<break>break;</break>
+		<case>case <expr><name>SEEK_CUR</name></expr>:</case>
+			<expr_stmt><expr><name>newoffset</name> <operator>=</operator> <name><name>obj_desc</name><operator>-&gt;</operator><name>offset</name></name> <operator>+</operator> <name>offset</name></expr>;</expr_stmt>
+			<break>break;</break>
+		<case>case <expr><name>SEEK_END</name></expr>:</case>
+			<expr_stmt><expr><name>newoffset</name> <operator>=</operator> <call><name>inv_getsize</name><argument_list>(<argument><expr><name>obj_desc</name></expr></argument>)</argument_list></call> <operator>+</operator> <name>offset</name></expr>;</expr_stmt>
+			<break>break;</break>
+		<default>default:</default>
+			<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+					<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_INVALID_PARAMETER_VALUE</name></expr></argument>)</argument_list></call><operator>,</operator>
+					 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"invalid whence setting: %d"</literal></expr></argument>, <argument><expr><name>whence</name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><name>newoffset</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>		<comment type="block">/* keep compiler quiet */</comment>
+			<break>break;</break>
+	</block_content>}</block></switch>
+
+	<comment type="block">/*
+	 * use errmsg_internal here because we don't want to expose INT64_FORMAT
+	 * in translatable strings; doing better is not worth the trouble
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>newoffset</name> <argument_list type="generic">&lt; <argument><expr><literal type="number">0</literal> <operator>||</operator> <name>newoffset</name></expr></argument> &gt;</argument_list></name> <name>MAX_LARGE_OBJECT_SIZE</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_INVALID_PARAMETER_VALUE</name></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errmsg_internal</name><argument_list>(<argument><expr><literal type="string">"invalid large object seek target: "</literal> <name>INT64_FORMAT</name></expr></argument>,
+								 <argument><expr><name>newoffset</name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><name><name>obj_desc</name><operator>-&gt;</operator><name>offset</name></name> <operator>=</operator> <name>newoffset</name></expr>;</expr_stmt>
+	<return>return <expr><name>newoffset</name></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><name>int64</name></type>
+<name>inv_tell</name><parameter_list>(<parameter><decl><type><name>LargeObjectDesc</name> <modifier>*</modifier></type><name>obj_desc</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>PointerIsValid</name><argument_list>(<argument><expr><name>obj_desc</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * We allow seek/tell if you have either read or write permission, so no
+	 * need for a permission check here.
+	 */</comment>
+
+	<return>return <expr><name><name>obj_desc</name><operator>-&gt;</operator><name>offset</name></name></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><name>int</name></type>
+<name>inv_read</name><parameter_list>(<parameter><decl><type><name>LargeObjectDesc</name> <modifier>*</modifier></type><name>obj_desc</name></decl></parameter>, <parameter><decl><type><name>char</name> <modifier>*</modifier></type><name>buf</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>nbytes</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>int</name></type>			<name>nread</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int64</name></type>		<name>n</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int64</name></type>		<name>off</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>len</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int32</name></type>		<name>pageno</name> <init>= <expr><operator>(</operator><name>int32</name><operator>)</operator> <operator>(</operator><name><name>obj_desc</name><operator>-&gt;</operator><name>offset</name></name> <operator>/</operator> <name>LOBLKSIZE</name><operator>)</operator></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>uint64</name></type>		<name>pageoff</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>ScanKeyData</name></type> <name><name>skey</name><index>[<expr><literal type="number">2</literal></expr>]</index></name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>SysScanDesc</name></type> <name>sd</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>HeapTuple</name></type>	<name>tuple</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>PointerIsValid</name><argument_list>(<argument><expr><name>obj_desc</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>buf</name> <operator>!=</operator> <name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><operator>(</operator><name><name>obj_desc</name><operator>-&gt;</operator><name>flags</name></name> <operator>&amp;</operator> <name>IFS_RDLOCK</name><operator>)</operator> <operator>==</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_INSUFFICIENT_PRIVILEGE</name></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"permission denied for large object %u"</literal></expr></argument>,
+						<argument><expr><name><name>obj_desc</name><operator>-&gt;</operator><name>id</name></name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>nbytes</name> <operator>&lt;=</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><literal type="number">0</literal></expr>;</return></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>open_lo_relation</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>ScanKeyInit</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>skey</name><index>[<expr><literal type="number">0</literal></expr>]</index></name></expr></argument>,
+				<argument><expr><name>Anum_pg_largeobject_loid</name></expr></argument>,
+				<argument><expr><name>BTEqualStrategyNumber</name></expr></argument>, <argument><expr><name>F_OIDEQ</name></expr></argument>,
+				<argument><expr><call><name>ObjectIdGetDatum</name><argument_list>(<argument><expr><name><name>obj_desc</name><operator>-&gt;</operator><name>id</name></name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>ScanKeyInit</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>skey</name><index>[<expr><literal type="number">1</literal></expr>]</index></name></expr></argument>,
+				<argument><expr><name>Anum_pg_largeobject_pageno</name></expr></argument>,
+				<argument><expr><name>BTGreaterEqualStrategyNumber</name></expr></argument>, <argument><expr><name>F_INT4GE</name></expr></argument>,
+				<argument><expr><call><name>Int32GetDatum</name><argument_list>(<argument><expr><name>pageno</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>sd</name> <operator>=</operator> <call><name>systable_beginscan_ordered</name><argument_list>(<argument><expr><name>lo_heap_r</name></expr></argument>, <argument><expr><name>lo_index_r</name></expr></argument>,
+									<argument><expr><name><name>obj_desc</name><operator>-&gt;</operator><name>snapshot</name></name></expr></argument>, <argument><expr><literal type="number">2</literal></expr></argument>, <argument><expr><name>skey</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<while>while <condition>(<expr><operator>(</operator><name>tuple</name> <operator>=</operator> <call><name>systable_getnext_ordered</name><argument_list>(<argument><expr><name>sd</name></expr></argument>, <argument><expr><name>ForwardScanDirection</name></expr></argument>)</argument_list></call><operator>)</operator> <operator>!=</operator> <name>NULL</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>Form_pg_largeobject</name></type> <name>data</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>bytea</name>	   <modifier>*</modifier></type><name>datafield</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>bool</name></type>		<name>pfreeit</name></decl>;</decl_stmt>
+
+		<if_stmt><if>if <condition>(<expr><call><name>HeapTupleHasNulls</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>	<comment type="block">/* paranoia */</comment>
+			<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"null field found in pg_largeobject"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+		<expr_stmt><expr><name>data</name> <operator>=</operator> <operator>(</operator><name>Form_pg_largeobject</name><operator>)</operator> <call><name>GETSTRUCT</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/*
+		 * We expect the indexscan will deliver pages in order.  However,
+		 * there may be missing pages if the LO contains unwritten "holes". We
+		 * want missing sections to read out as zeroes.
+		 */</comment>
+		<expr_stmt><expr><name>pageoff</name> <operator>=</operator> <operator>(</operator><operator>(</operator><name>uint64</name><operator>)</operator> <name><name>data</name><operator>-&gt;</operator><name>pageno</name></name><operator>)</operator> <operator>*</operator> <name>LOBLKSIZE</name></expr>;</expr_stmt>
+		<if_stmt><if>if <condition>(<expr><name>pageoff</name> <operator>&gt;</operator> <name><name>obj_desc</name><operator>-&gt;</operator><name>offset</name></name></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><name>n</name> <operator>=</operator> <name>pageoff</name> <operator>-</operator> <name><name>obj_desc</name><operator>-&gt;</operator><name>offset</name></name></expr>;</expr_stmt>
+			<expr_stmt><expr><name>n</name> <operator>=</operator> <ternary><condition><expr><operator>(</operator><name>n</name> <operator>&lt;=</operator> <operator>(</operator><name>nbytes</name> <operator>-</operator> <name>nread</name><operator>)</operator><operator>)</operator></expr> ?</condition><then> <expr><name>n</name></expr> </then><else>: <expr><operator>(</operator><name>nbytes</name> <operator>-</operator> <name>nread</name><operator>)</operator></expr></else></ternary></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>MemSet</name><argument_list>(<argument><expr><name>buf</name> <operator>+</operator> <name>nread</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><name>n</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><name>nread</name> <operator>+=</operator> <name>n</name></expr>;</expr_stmt>
+			<expr_stmt><expr><name><name>obj_desc</name><operator>-&gt;</operator><name>offset</name></name> <operator>+=</operator> <name>n</name></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name>nread</name> <operator>&lt;</operator> <name>nbytes</name></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>obj_desc</name><operator>-&gt;</operator><name>offset</name></name> <operator>&gt;=</operator> <name>pageoff</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><name>off</name> <operator>=</operator> <operator>(</operator><name>int</name><operator>)</operator> <operator>(</operator><name><name>obj_desc</name><operator>-&gt;</operator><name>offset</name></name> <operator>-</operator> <name>pageoff</name><operator>)</operator></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>off</name> <operator>&gt;=</operator> <literal type="number">0</literal> <operator>&amp;&amp;</operator> <name>off</name> <operator>&lt;</operator> <name>LOBLKSIZE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+			<expr_stmt><expr><call><name>getdatafield</name><argument_list>(<argument><expr><name>data</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>datafield</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>len</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>pfreeit</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<if_stmt><if>if <condition>(<expr><name>len</name> <operator>&gt;</operator> <name>off</name></expr>)</condition>
+			<block>{<block_content>
+				<expr_stmt><expr><name>n</name> <operator>=</operator> <name>len</name> <operator>-</operator> <name>off</name></expr>;</expr_stmt>
+				<expr_stmt><expr><name>n</name> <operator>=</operator> <ternary><condition><expr><operator>(</operator><name>n</name> <operator>&lt;=</operator> <operator>(</operator><name>nbytes</name> <operator>-</operator> <name>nread</name><operator>)</operator><operator>)</operator></expr> ?</condition><then> <expr><name>n</name></expr> </then><else>: <expr><operator>(</operator><name>nbytes</name> <operator>-</operator> <name>nread</name><operator>)</operator></expr></else></ternary></expr>;</expr_stmt>
+				<expr_stmt><expr><call><name>memcpy</name><argument_list>(<argument><expr><name>buf</name> <operator>+</operator> <name>nread</name></expr></argument>, <argument><expr><call><name>VARDATA</name><argument_list>(<argument><expr><name>datafield</name></expr></argument>)</argument_list></call> <operator>+</operator> <name>off</name></expr></argument>, <argument><expr><name>n</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<expr_stmt><expr><name>nread</name> <operator>+=</operator> <name>n</name></expr>;</expr_stmt>
+				<expr_stmt><expr><name><name>obj_desc</name><operator>-&gt;</operator><name>offset</name></name> <operator>+=</operator> <name>n</name></expr>;</expr_stmt>
+			</block_content>}</block></if></if_stmt>
+			<if_stmt><if>if <condition>(<expr><name>pfreeit</name></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><call><name>pfree</name><argument_list>(<argument><expr><name>datafield</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+		</block_content>}</block></if></if_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name>nread</name> <operator>&gt;=</operator> <name>nbytes</name></expr>)</condition><block type="pseudo"><block_content>
+			<break>break;</break></block_content></block></if></if_stmt>
+	</block_content>}</block></while>
+
+	<expr_stmt><expr><call><name>systable_endscan_ordered</name><argument_list>(<argument><expr><name>sd</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<return>return <expr><name>nread</name></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><name>int</name></type>
+<name>inv_write</name><parameter_list>(<parameter><decl><type><name>LargeObjectDesc</name> <modifier>*</modifier></type><name>obj_desc</name></decl></parameter>, <parameter><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>buf</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>nbytes</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>int</name></type>			<name>nwritten</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>n</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>off</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>len</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int32</name></type>		<name>pageno</name> <init>= <expr><operator>(</operator><name>int32</name><operator>)</operator> <operator>(</operator><name><name>obj_desc</name><operator>-&gt;</operator><name>offset</name></name> <operator>/</operator> <name>LOBLKSIZE</name><operator>)</operator></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>ScanKeyData</name></type> <name><name>skey</name><index>[<expr><literal type="number">2</literal></expr>]</index></name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>SysScanDesc</name></type> <name>sd</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>HeapTuple</name></type>	<name>oldtuple</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Form_pg_largeobject</name></type> <name>olddata</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type>		<name>neednextpage</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bytea</name>	   <modifier>*</modifier></type><name>datafield</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type>		<name>pfreeit</name></decl>;</decl_stmt>
+	<union>union
+	<block>{
+		<decl_stmt><decl><type><name>bytea</name></type>		<name>hdr</name></decl>;</decl_stmt>
+		<comment type="block">/* this is to make the union big enough for a LO data chunk: */</comment>
+		<decl_stmt><decl><type><name>char</name></type>		<name><name>data</name><index>[<expr><name>LOBLKSIZE</name> <operator>+</operator> <name>VARHDRSZ</name></expr>]</index></name></decl>;</decl_stmt>
+		<comment type="block">/* ensure union is aligned well enough: */</comment>
+		<decl_stmt><decl><type><name>int32</name></type>		<name>align_it</name></decl>;</decl_stmt>
+	}</block>			<decl><name>workbuf</name></decl>;</union>
+	<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>workb</name> <init>= <expr><call><name>VARDATA</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>workbuf</name><operator>.</operator><name>hdr</name></name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>HeapTuple</name></type>	<name>newtup</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Datum</name></type>		<name><name>values</name><index>[<expr><name>Natts_pg_largeobject</name></expr>]</index></name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type>		<name><name>nulls</name><index>[<expr><name>Natts_pg_largeobject</name></expr>]</index></name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type>		<name><name>replace</name><index>[<expr><name>Natts_pg_largeobject</name></expr>]</index></name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>CatalogIndexState</name></type> <name>indstate</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>PointerIsValid</name><argument_list>(<argument><expr><name>obj_desc</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>buf</name> <operator>!=</operator> <name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* enforce writability because snapshot is probably wrong otherwise */</comment>
+	<if_stmt><if>if <condition>(<expr><operator>(</operator><name><name>obj_desc</name><operator>-&gt;</operator><name>flags</name></name> <operator>&amp;</operator> <name>IFS_WRLOCK</name><operator>)</operator> <operator>==</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_INSUFFICIENT_PRIVILEGE</name></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"permission denied for large object %u"</literal></expr></argument>,
+						<argument><expr><name><name>obj_desc</name><operator>-&gt;</operator><name>id</name></name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>nbytes</name> <operator>&lt;=</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><literal type="number">0</literal></expr>;</return></block_content></block></if></if_stmt>
+
+	<comment type="block">/* this addition can't overflow because nbytes is only int32 */</comment>
+	<if_stmt><if>if <condition>(<expr><operator>(</operator><name>nbytes</name> <operator>+</operator> <name><name>obj_desc</name><operator>-&gt;</operator><name>offset</name></name><operator>)</operator> <operator>&gt;</operator> <name>MAX_LARGE_OBJECT_SIZE</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_INVALID_PARAMETER_VALUE</name></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"invalid large object write request size: %d"</literal></expr></argument>,
+						<argument><expr><name>nbytes</name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>open_lo_relation</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>indstate</name> <operator>=</operator> <call><name>CatalogOpenIndexes</name><argument_list>(<argument><expr><name>lo_heap_r</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>ScanKeyInit</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>skey</name><index>[<expr><literal type="number">0</literal></expr>]</index></name></expr></argument>,
+				<argument><expr><name>Anum_pg_largeobject_loid</name></expr></argument>,
+				<argument><expr><name>BTEqualStrategyNumber</name></expr></argument>, <argument><expr><name>F_OIDEQ</name></expr></argument>,
+				<argument><expr><call><name>ObjectIdGetDatum</name><argument_list>(<argument><expr><name><name>obj_desc</name><operator>-&gt;</operator><name>id</name></name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>ScanKeyInit</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>skey</name><index>[<expr><literal type="number">1</literal></expr>]</index></name></expr></argument>,
+				<argument><expr><name>Anum_pg_largeobject_pageno</name></expr></argument>,
+				<argument><expr><name>BTGreaterEqualStrategyNumber</name></expr></argument>, <argument><expr><name>F_INT4GE</name></expr></argument>,
+				<argument><expr><call><name>Int32GetDatum</name><argument_list>(<argument><expr><name>pageno</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>sd</name> <operator>=</operator> <call><name>systable_beginscan_ordered</name><argument_list>(<argument><expr><name>lo_heap_r</name></expr></argument>, <argument><expr><name>lo_index_r</name></expr></argument>,
+									<argument><expr><name><name>obj_desc</name><operator>-&gt;</operator><name>snapshot</name></name></expr></argument>, <argument><expr><literal type="number">2</literal></expr></argument>, <argument><expr><name>skey</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>oldtuple</name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name>olddata</name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name>neednextpage</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+
+	<while>while <condition>(<expr><name>nwritten</name> <operator>&lt;</operator> <name>nbytes</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/*
+		 * If possible, get next pre-existing page of the LO.  We expect the
+		 * indexscan will deliver these in order --- but there may be holes.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><name>neednextpage</name></expr>)</condition>
+		<block>{<block_content>
+			<if_stmt><if>if <condition>(<expr><operator>(</operator><name>oldtuple</name> <operator>=</operator> <call><name>systable_getnext_ordered</name><argument_list>(<argument><expr><name>sd</name></expr></argument>, <argument><expr><name>ForwardScanDirection</name></expr></argument>)</argument_list></call><operator>)</operator> <operator>!=</operator> <name>NULL</name></expr>)</condition>
+			<block>{<block_content>
+				<if_stmt><if>if <condition>(<expr><call><name>HeapTupleHasNulls</name><argument_list>(<argument><expr><name>oldtuple</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>	<comment type="block">/* paranoia */</comment>
+					<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"null field found in pg_largeobject"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+				<expr_stmt><expr><name>olddata</name> <operator>=</operator> <operator>(</operator><name>Form_pg_largeobject</name><operator>)</operator> <call><name>GETSTRUCT</name><argument_list>(<argument><expr><name>oldtuple</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>olddata</name><operator>-&gt;</operator><name>pageno</name></name> <operator>&gt;=</operator> <name>pageno</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			</block_content>}</block></if></if_stmt>
+			<expr_stmt><expr><name>neednextpage</name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+
+		<comment type="block">/*
+		 * If we have a pre-existing page, see if it is the page we want to
+		 * write, or a later one.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><name>olddata</name> <operator>!=</operator> <name>NULL</name> <operator>&amp;&amp;</operator> <name><name>olddata</name><operator>-&gt;</operator><name>pageno</name></name> <operator>==</operator> <name>pageno</name></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/*
+			 * Update an existing page with fresh data.
+			 *
+			 * First, load old data into workbuf
+			 */</comment>
+			<expr_stmt><expr><call><name>getdatafield</name><argument_list>(<argument><expr><name>olddata</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>datafield</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>len</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>pfreeit</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>memcpy</name><argument_list>(<argument><expr><name>workb</name></expr></argument>, <argument><expr><call><name>VARDATA</name><argument_list>(<argument><expr><name>datafield</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>len</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<if_stmt><if>if <condition>(<expr><name>pfreeit</name></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><call><name>pfree</name><argument_list>(<argument><expr><name>datafield</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+			<comment type="block">/*
+			 * Fill any hole
+			 */</comment>
+			<expr_stmt><expr><name>off</name> <operator>=</operator> <operator>(</operator><name>int</name><operator>)</operator> <operator>(</operator><name><name>obj_desc</name><operator>-&gt;</operator><name>offset</name></name> <operator>%</operator> <name>LOBLKSIZE</name><operator>)</operator></expr>;</expr_stmt>
+			<if_stmt><if>if <condition>(<expr><name>off</name> <operator>&gt;</operator> <name>len</name></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><call><name>MemSet</name><argument_list>(<argument><expr><name>workb</name> <operator>+</operator> <name>len</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><name>off</name> <operator>-</operator> <name>len</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+			<comment type="block">/*
+			 * Insert appropriate portion of new data
+			 */</comment>
+			<expr_stmt><expr><name>n</name> <operator>=</operator> <name>LOBLKSIZE</name> <operator>-</operator> <name>off</name></expr>;</expr_stmt>
+			<expr_stmt><expr><name>n</name> <operator>=</operator> <ternary><condition><expr><operator>(</operator><name>n</name> <operator>&lt;=</operator> <operator>(</operator><name>nbytes</name> <operator>-</operator> <name>nwritten</name><operator>)</operator><operator>)</operator></expr> ?</condition><then> <expr><name>n</name></expr> </then><else>: <expr><operator>(</operator><name>nbytes</name> <operator>-</operator> <name>nwritten</name><operator>)</operator></expr></else></ternary></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>memcpy</name><argument_list>(<argument><expr><name>workb</name> <operator>+</operator> <name>off</name></expr></argument>, <argument><expr><name>buf</name> <operator>+</operator> <name>nwritten</name></expr></argument>, <argument><expr><name>n</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><name>nwritten</name> <operator>+=</operator> <name>n</name></expr>;</expr_stmt>
+			<expr_stmt><expr><name><name>obj_desc</name><operator>-&gt;</operator><name>offset</name></name> <operator>+=</operator> <name>n</name></expr>;</expr_stmt>
+			<expr_stmt><expr><name>off</name> <operator>+=</operator> <name>n</name></expr>;</expr_stmt>
+			<comment type="block">/* compute valid length of new page */</comment>
+			<expr_stmt><expr><name>len</name> <operator>=</operator> <ternary><condition><expr><operator>(</operator><name>len</name> <operator>&gt;=</operator> <name>off</name><operator>)</operator></expr> ?</condition><then> <expr><name>len</name></expr> </then><else>: <expr><name>off</name></expr></else></ternary></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>SET_VARSIZE</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>workbuf</name><operator>.</operator><name>hdr</name></name></expr></argument>, <argument><expr><name>len</name> <operator>+</operator> <name>VARHDRSZ</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+			<comment type="block">/*
+			 * Form and insert updated tuple
+			 */</comment>
+			<expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><name>values</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>values</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><name>nulls</name></expr></argument>, <argument><expr><name>false</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>nulls</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><name>replace</name></expr></argument>, <argument><expr><name>false</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>replace</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><name><name>values</name><index>[<expr><name>Anum_pg_largeobject_data</name> <operator>-</operator> <literal type="number">1</literal></expr>]</index></name> <operator>=</operator> <call><name>PointerGetDatum</name><argument_list>(<argument><expr><operator>&amp;</operator><name>workbuf</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><name><name>replace</name><index>[<expr><name>Anum_pg_largeobject_data</name> <operator>-</operator> <literal type="number">1</literal></expr>]</index></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+			<expr_stmt><expr><name>newtup</name> <operator>=</operator> <call><name>heap_modify_tuple</name><argument_list>(<argument><expr><name>oldtuple</name></expr></argument>, <argument><expr><call><name>RelationGetDescr</name><argument_list>(<argument><expr><name>lo_heap_r</name></expr></argument>)</argument_list></call></expr></argument>,
+									   <argument><expr><name>values</name></expr></argument>, <argument><expr><name>nulls</name></expr></argument>, <argument><expr><name>replace</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>CatalogTupleUpdateWithInfo</name><argument_list>(<argument><expr><name>lo_heap_r</name></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>newtup</name><operator>-&gt;</operator><name>t_self</name></name></expr></argument>, <argument><expr><name>newtup</name></expr></argument>,
+									   <argument><expr><name>indstate</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>heap_freetuple</name><argument_list>(<argument><expr><name>newtup</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+			<comment type="block">/*
+			 * We're done with this old page.
+			 */</comment>
+			<expr_stmt><expr><name>oldtuple</name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+			<expr_stmt><expr><name>olddata</name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+			<expr_stmt><expr><name>neednextpage</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+		</block_content>}</block></if>
+		<else>else
+		<block>{<block_content>
+			<comment type="block">/*
+			 * Write a brand new page.
+			 *
+			 * First, fill any hole
+			 */</comment>
+			<expr_stmt><expr><name>off</name> <operator>=</operator> <operator>(</operator><name>int</name><operator>)</operator> <operator>(</operator><name><name>obj_desc</name><operator>-&gt;</operator><name>offset</name></name> <operator>%</operator> <name>LOBLKSIZE</name><operator>)</operator></expr>;</expr_stmt>
+			<if_stmt><if>if <condition>(<expr><name>off</name> <operator>&gt;</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><call><name>MemSet</name><argument_list>(<argument><expr><name>workb</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><name>off</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+			<comment type="block">/*
+			 * Insert appropriate portion of new data
+			 */</comment>
+			<expr_stmt><expr><name>n</name> <operator>=</operator> <name>LOBLKSIZE</name> <operator>-</operator> <name>off</name></expr>;</expr_stmt>
+			<expr_stmt><expr><name>n</name> <operator>=</operator> <ternary><condition><expr><operator>(</operator><name>n</name> <operator>&lt;=</operator> <operator>(</operator><name>nbytes</name> <operator>-</operator> <name>nwritten</name><operator>)</operator><operator>)</operator></expr> ?</condition><then> <expr><name>n</name></expr> </then><else>: <expr><operator>(</operator><name>nbytes</name> <operator>-</operator> <name>nwritten</name><operator>)</operator></expr></else></ternary></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>memcpy</name><argument_list>(<argument><expr><name>workb</name> <operator>+</operator> <name>off</name></expr></argument>, <argument><expr><name>buf</name> <operator>+</operator> <name>nwritten</name></expr></argument>, <argument><expr><name>n</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><name>nwritten</name> <operator>+=</operator> <name>n</name></expr>;</expr_stmt>
+			<expr_stmt><expr><name><name>obj_desc</name><operator>-&gt;</operator><name>offset</name></name> <operator>+=</operator> <name>n</name></expr>;</expr_stmt>
+			<comment type="block">/* compute valid length of new page */</comment>
+			<expr_stmt><expr><name>len</name> <operator>=</operator> <name>off</name> <operator>+</operator> <name>n</name></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>SET_VARSIZE</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>workbuf</name><operator>.</operator><name>hdr</name></name></expr></argument>, <argument><expr><name>len</name> <operator>+</operator> <name>VARHDRSZ</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+			<comment type="block">/*
+			 * Form and insert updated tuple
+			 */</comment>
+			<expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><name>values</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>values</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><name>nulls</name></expr></argument>, <argument><expr><name>false</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>nulls</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><name><name>values</name><index>[<expr><name>Anum_pg_largeobject_loid</name> <operator>-</operator> <literal type="number">1</literal></expr>]</index></name> <operator>=</operator> <call><name>ObjectIdGetDatum</name><argument_list>(<argument><expr><name><name>obj_desc</name><operator>-&gt;</operator><name>id</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><name><name>values</name><index>[<expr><name>Anum_pg_largeobject_pageno</name> <operator>-</operator> <literal type="number">1</literal></expr>]</index></name> <operator>=</operator> <call><name>Int32GetDatum</name><argument_list>(<argument><expr><name>pageno</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><name><name>values</name><index>[<expr><name>Anum_pg_largeobject_data</name> <operator>-</operator> <literal type="number">1</literal></expr>]</index></name> <operator>=</operator> <call><name>PointerGetDatum</name><argument_list>(<argument><expr><operator>&amp;</operator><name>workbuf</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><name>newtup</name> <operator>=</operator> <call><name>heap_form_tuple</name><argument_list>(<argument><expr><name><name>lo_heap_r</name><operator>-&gt;</operator><name>rd_att</name></name></expr></argument>, <argument><expr><name>values</name></expr></argument>, <argument><expr><name>nulls</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>CatalogTupleInsertWithInfo</name><argument_list>(<argument><expr><name>lo_heap_r</name></expr></argument>, <argument><expr><name>newtup</name></expr></argument>, <argument><expr><name>indstate</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>heap_freetuple</name><argument_list>(<argument><expr><name>newtup</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></else></if_stmt>
+		<expr_stmt><expr><name>pageno</name><operator>++</operator></expr>;</expr_stmt>
+	</block_content>}</block></while>
+
+	<expr_stmt><expr><call><name>systable_endscan_ordered</name><argument_list>(<argument><expr><name>sd</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>CatalogCloseIndexes</name><argument_list>(<argument><expr><name>indstate</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Advance command counter so that my tuple updates will be seen by later
+	 * large-object operations in this transaction.
+	 */</comment>
+	<expr_stmt><expr><call><name>CommandCounterIncrement</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+	<return>return <expr><name>nwritten</name></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><name>void</name></type>
+<name>inv_truncate</name><parameter_list>(<parameter><decl><type><name>LargeObjectDesc</name> <modifier>*</modifier></type><name>obj_desc</name></decl></parameter>, <parameter><decl><type><name>int64</name></type> <name>len</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>int32</name></type>		<name>pageno</name> <init>= <expr><operator>(</operator><name>int32</name><operator>)</operator> <operator>(</operator><name>len</name> <operator>/</operator> <name>LOBLKSIZE</name><operator>)</operator></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int32</name></type>		<name>off</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>ScanKeyData</name></type> <name><name>skey</name><index>[<expr><literal type="number">2</literal></expr>]</index></name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>SysScanDesc</name></type> <name>sd</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>HeapTuple</name></type>	<name>oldtuple</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Form_pg_largeobject</name></type> <name>olddata</name></decl>;</decl_stmt>
+	<union>union
+	<block>{
+		<decl_stmt><decl><type><name>bytea</name></type>		<name>hdr</name></decl>;</decl_stmt>
+		<comment type="block">/* this is to make the union big enough for a LO data chunk: */</comment>
+		<decl_stmt><decl><type><name>char</name></type>		<name><name>data</name><index>[<expr><name>LOBLKSIZE</name> <operator>+</operator> <name>VARHDRSZ</name></expr>]</index></name></decl>;</decl_stmt>
+		<comment type="block">/* ensure union is aligned well enough: */</comment>
+		<decl_stmt><decl><type><name>int32</name></type>		<name>align_it</name></decl>;</decl_stmt>
+	}</block>			<decl><name>workbuf</name></decl>;</union>
+	<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>workb</name> <init>= <expr><call><name>VARDATA</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>workbuf</name><operator>.</operator><name>hdr</name></name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>HeapTuple</name></type>	<name>newtup</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Datum</name></type>		<name><name>values</name><index>[<expr><name>Natts_pg_largeobject</name></expr>]</index></name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type>		<name><name>nulls</name><index>[<expr><name>Natts_pg_largeobject</name></expr>]</index></name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type>		<name><name>replace</name><index>[<expr><name>Natts_pg_largeobject</name></expr>]</index></name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>CatalogIndexState</name></type> <name>indstate</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>PointerIsValid</name><argument_list>(<argument><expr><name>obj_desc</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* enforce writability because snapshot is probably wrong otherwise */</comment>
+	<if_stmt><if>if <condition>(<expr><operator>(</operator><name><name>obj_desc</name><operator>-&gt;</operator><name>flags</name></name> <operator>&amp;</operator> <name>IFS_WRLOCK</name><operator>)</operator> <operator>==</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_INSUFFICIENT_PRIVILEGE</name></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"permission denied for large object %u"</literal></expr></argument>,
+						<argument><expr><name><name>obj_desc</name><operator>-&gt;</operator><name>id</name></name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<comment type="block">/*
+	 * use errmsg_internal here because we don't want to expose INT64_FORMAT
+	 * in translatable strings; doing better is not worth the trouble
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>len</name> <argument_list type="generic">&lt; <argument><expr><literal type="number">0</literal> <operator>||</operator> <name>len</name></expr></argument> &gt;</argument_list></name> <name>MAX_LARGE_OBJECT_SIZE</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_INVALID_PARAMETER_VALUE</name></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errmsg_internal</name><argument_list>(<argument><expr><literal type="string">"invalid large object truncation target: "</literal> <name>INT64_FORMAT</name></expr></argument>,
+								 <argument><expr><name>len</name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>open_lo_relation</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>indstate</name> <operator>=</operator> <call><name>CatalogOpenIndexes</name><argument_list>(<argument><expr><name>lo_heap_r</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Set up to find all pages with desired loid and pageno &gt;= target
+	 */</comment>
+	<expr_stmt><expr><call><name>ScanKeyInit</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>skey</name><index>[<expr><literal type="number">0</literal></expr>]</index></name></expr></argument>,
+				<argument><expr><name>Anum_pg_largeobject_loid</name></expr></argument>,
+				<argument><expr><name>BTEqualStrategyNumber</name></expr></argument>, <argument><expr><name>F_OIDEQ</name></expr></argument>,
+				<argument><expr><call><name>ObjectIdGetDatum</name><argument_list>(<argument><expr><name><name>obj_desc</name><operator>-&gt;</operator><name>id</name></name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>ScanKeyInit</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>skey</name><index>[<expr><literal type="number">1</literal></expr>]</index></name></expr></argument>,
+				<argument><expr><name>Anum_pg_largeobject_pageno</name></expr></argument>,
+				<argument><expr><name>BTGreaterEqualStrategyNumber</name></expr></argument>, <argument><expr><name>F_INT4GE</name></expr></argument>,
+				<argument><expr><call><name>Int32GetDatum</name><argument_list>(<argument><expr><name>pageno</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>sd</name> <operator>=</operator> <call><name>systable_beginscan_ordered</name><argument_list>(<argument><expr><name>lo_heap_r</name></expr></argument>, <argument><expr><name>lo_index_r</name></expr></argument>,
+									<argument><expr><name><name>obj_desc</name><operator>-&gt;</operator><name>snapshot</name></name></expr></argument>, <argument><expr><literal type="number">2</literal></expr></argument>, <argument><expr><name>skey</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * If possible, get the page the truncation point is in. The truncation
+	 * point may be beyond the end of the LO or in a hole.
+	 */</comment>
+	<expr_stmt><expr><name>olddata</name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><operator>(</operator><name>oldtuple</name> <operator>=</operator> <call><name>systable_getnext_ordered</name><argument_list>(<argument><expr><name>sd</name></expr></argument>, <argument><expr><name>ForwardScanDirection</name></expr></argument>)</argument_list></call><operator>)</operator> <operator>!=</operator> <name>NULL</name></expr>)</condition>
+	<block>{<block_content>
+		<if_stmt><if>if <condition>(<expr><call><name>HeapTupleHasNulls</name><argument_list>(<argument><expr><name>oldtuple</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>	<comment type="block">/* paranoia */</comment>
+			<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"null field found in pg_largeobject"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+		<expr_stmt><expr><name>olddata</name> <operator>=</operator> <operator>(</operator><name>Form_pg_largeobject</name><operator>)</operator> <call><name>GETSTRUCT</name><argument_list>(<argument><expr><name>oldtuple</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>olddata</name><operator>-&gt;</operator><name>pageno</name></name> <operator>&gt;=</operator> <name>pageno</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/*
+	 * If we found the page of the truncation point we need to truncate the
+	 * data in it.  Otherwise if we're in a hole, we need to create a page to
+	 * mark the end of data.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name>olddata</name> <operator>!=</operator> <name>NULL</name> <operator>&amp;&amp;</operator> <name><name>olddata</name><operator>-&gt;</operator><name>pageno</name></name> <operator>==</operator> <name>pageno</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* First, load old data into workbuf */</comment>
+		<decl_stmt><decl><type><name>bytea</name>	   <modifier>*</modifier></type><name>datafield</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>int</name></type>			<name>pagelen</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>bool</name></type>		<name>pfreeit</name></decl>;</decl_stmt>
+
+		<expr_stmt><expr><call><name>getdatafield</name><argument_list>(<argument><expr><name>olddata</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>datafield</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>pagelen</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>pfreeit</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>memcpy</name><argument_list>(<argument><expr><name>workb</name></expr></argument>, <argument><expr><call><name>VARDATA</name><argument_list>(<argument><expr><name>datafield</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>pagelen</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<if_stmt><if>if <condition>(<expr><name>pfreeit</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>pfree</name><argument_list>(<argument><expr><name>datafield</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+		<comment type="block">/*
+		 * Fill any hole
+		 */</comment>
+		<expr_stmt><expr><name>off</name> <operator>=</operator> <name>len</name> <operator>%</operator> <name>LOBLKSIZE</name></expr>;</expr_stmt>
+		<if_stmt><if>if <condition>(<expr><name>off</name> <operator>&gt;</operator> <name>pagelen</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>MemSet</name><argument_list>(<argument><expr><name>workb</name> <operator>+</operator> <name>pagelen</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><name>off</name> <operator>-</operator> <name>pagelen</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+		<comment type="block">/* compute length of new page */</comment>
+		<expr_stmt><expr><call><name>SET_VARSIZE</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>workbuf</name><operator>.</operator><name>hdr</name></name></expr></argument>, <argument><expr><name>off</name> <operator>+</operator> <name>VARHDRSZ</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/*
+		 * Form and insert updated tuple
+		 */</comment>
+		<expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><name>values</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>values</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><name>nulls</name></expr></argument>, <argument><expr><name>false</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>nulls</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><name>replace</name></expr></argument>, <argument><expr><name>false</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>replace</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>values</name><index>[<expr><name>Anum_pg_largeobject_data</name> <operator>-</operator> <literal type="number">1</literal></expr>]</index></name> <operator>=</operator> <call><name>PointerGetDatum</name><argument_list>(<argument><expr><operator>&amp;</operator><name>workbuf</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>replace</name><index>[<expr><name>Anum_pg_largeobject_data</name> <operator>-</operator> <literal type="number">1</literal></expr>]</index></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name>newtup</name> <operator>=</operator> <call><name>heap_modify_tuple</name><argument_list>(<argument><expr><name>oldtuple</name></expr></argument>, <argument><expr><call><name>RelationGetDescr</name><argument_list>(<argument><expr><name>lo_heap_r</name></expr></argument>)</argument_list></call></expr></argument>,
+								   <argument><expr><name>values</name></expr></argument>, <argument><expr><name>nulls</name></expr></argument>, <argument><expr><name>replace</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>CatalogTupleUpdateWithInfo</name><argument_list>(<argument><expr><name>lo_heap_r</name></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>newtup</name><operator>-&gt;</operator><name>t_self</name></name></expr></argument>, <argument><expr><name>newtup</name></expr></argument>,
+								   <argument><expr><name>indstate</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>heap_freetuple</name><argument_list>(<argument><expr><name>newtup</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<else>else
+	<block>{<block_content>
+		<comment type="block">/*
+		 * If the first page we found was after the truncation point, we're in
+		 * a hole that we'll fill, but we need to delete the later page
+		 * because the loop below won't visit it again.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><name>olddata</name> <operator>!=</operator> <name>NULL</name></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>olddata</name><operator>-&gt;</operator><name>pageno</name></name> <operator>&gt;</operator> <name>pageno</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>CatalogTupleDelete</name><argument_list>(<argument><expr><name>lo_heap_r</name></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>oldtuple</name><operator>-&gt;</operator><name>t_self</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+
+		<comment type="block">/*
+		 * Write a brand new page.
+		 *
+		 * Fill the hole up to the truncation point
+		 */</comment>
+		<expr_stmt><expr><name>off</name> <operator>=</operator> <name>len</name> <operator>%</operator> <name>LOBLKSIZE</name></expr>;</expr_stmt>
+		<if_stmt><if>if <condition>(<expr><name>off</name> <operator>&gt;</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>MemSet</name><argument_list>(<argument><expr><name>workb</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><name>off</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+		<comment type="block">/* compute length of new page */</comment>
+		<expr_stmt><expr><call><name>SET_VARSIZE</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>workbuf</name><operator>.</operator><name>hdr</name></name></expr></argument>, <argument><expr><name>off</name> <operator>+</operator> <name>VARHDRSZ</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/*
+		 * Form and insert new tuple
+		 */</comment>
+		<expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><name>values</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>values</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><name>nulls</name></expr></argument>, <argument><expr><name>false</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>nulls</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>values</name><index>[<expr><name>Anum_pg_largeobject_loid</name> <operator>-</operator> <literal type="number">1</literal></expr>]</index></name> <operator>=</operator> <call><name>ObjectIdGetDatum</name><argument_list>(<argument><expr><name><name>obj_desc</name><operator>-&gt;</operator><name>id</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>values</name><index>[<expr><name>Anum_pg_largeobject_pageno</name> <operator>-</operator> <literal type="number">1</literal></expr>]</index></name> <operator>=</operator> <call><name>Int32GetDatum</name><argument_list>(<argument><expr><name>pageno</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>values</name><index>[<expr><name>Anum_pg_largeobject_data</name> <operator>-</operator> <literal type="number">1</literal></expr>]</index></name> <operator>=</operator> <call><name>PointerGetDatum</name><argument_list>(<argument><expr><operator>&amp;</operator><name>workbuf</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name>newtup</name> <operator>=</operator> <call><name>heap_form_tuple</name><argument_list>(<argument><expr><name><name>lo_heap_r</name><operator>-&gt;</operator><name>rd_att</name></name></expr></argument>, <argument><expr><name>values</name></expr></argument>, <argument><expr><name>nulls</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>CatalogTupleInsertWithInfo</name><argument_list>(<argument><expr><name>lo_heap_r</name></expr></argument>, <argument><expr><name>newtup</name></expr></argument>, <argument><expr><name>indstate</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>heap_freetuple</name><argument_list>(<argument><expr><name>newtup</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></else></if_stmt>
+
+	<comment type="block">/*
+	 * Delete any pages after the truncation point.  If the initial search
+	 * didn't find a page, then of course there's nothing more to do.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name>olddata</name> <operator>!=</operator> <name>NULL</name></expr>)</condition>
+	<block>{<block_content>
+		<while>while <condition>(<expr><operator>(</operator><name>oldtuple</name> <operator>=</operator> <call><name>systable_getnext_ordered</name><argument_list>(<argument><expr><name>sd</name></expr></argument>, <argument><expr><name>ForwardScanDirection</name></expr></argument>)</argument_list></call><operator>)</operator> <operator>!=</operator> <name>NULL</name></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><call><name>CatalogTupleDelete</name><argument_list>(<argument><expr><name>lo_heap_r</name></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>oldtuple</name><operator>-&gt;</operator><name>t_self</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></while>
+	</block_content>}</block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>systable_endscan_ordered</name><argument_list>(<argument><expr><name>sd</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>CatalogCloseIndexes</name><argument_list>(<argument><expr><name>indstate</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Advance command counter so that tuple updates will be seen by later
+	 * large-object operations in this transaction.
+	 */</comment>
+	<expr_stmt><expr><call><name>CommandCounterIncrement</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+</unit>

@@ -1,0 +1,587 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<unit xmlns="http://www.srcML.org/srcML/src" xmlns:cpp="http://www.srcML.org/srcML/cpp" revision="1.0.0" language="C" filename="/cloned_projects/sysbench/third_party/concurrency_kit/ck/src/ck_epoch.c"><comment type="block">/*
+ * Copyright 2011-2015 Samy Al Bahra.
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+ * SUCH DAMAGE.
+ */</comment>
+
+<comment type="block">/*
+ * The implementation here is inspired from the work described in:
+ *   Fraser, K. 2004. Practical Lock-Freedom. PhD Thesis, University
+ *   of Cambridge Computing Laboratory.
+ */</comment>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;ck_backoff.h&gt;</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;ck_cc.h&gt;</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;ck_epoch.h&gt;</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;ck_pr.h&gt;</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;ck_stack.h&gt;</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;ck_stdbool.h&gt;</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;ck_string.h&gt;</cpp:file></cpp:include>
+
+<comment type="block">/*
+ * Only three distinct values are used for reclamation, but reclamation occurs
+ * at e+2 rather than e+1. Any thread in a "critical section" would have
+ * acquired some snapshot (e) of the global epoch value (e_g) and set an active
+ * flag. Any hazardous references will only occur after a full memory barrier.
+ * For example, assume an initial e_g value of 1, e value of 0 and active value
+ * of 0.
+ *
+ * ck_epoch_begin(...)
+ *   e = e_g
+ *   active = 1
+ *   memory_barrier();
+ *
+ * Any serialized reads may observe e = 0 or e = 1 with active = 0, or e = 0 or
+ * e = 1 with active = 1. The e_g value can only go from 1 to 2 if every thread
+ * has already observed the value of "1" (or the value we are incrementing
+ * from). This guarantees us that for any given value e_g, any threads with-in
+ * critical sections (referred to as "active" threads from here on) would have
+ * an e value of e_g-1 or e_g. This also means that hazardous references may be
+ * shared in both e_g-1 and e_g even if they are logically deleted in e_g.
+ *
+ * For example, assume all threads have an e value of e_g. Another thread may
+ * increment to e_g to e_g+1. Older threads may have a reference to an object
+ * which is only deleted in e_g+1. It could be that reader threads are
+ * executing some hash table look-ups, while some other writer thread (which
+ * causes epoch counter tick) actually deletes the same items that reader
+ * threads are looking up (this writer thread having an e value of e_g+1).
+ * This is possible if the writer thread re-observes the epoch after the
+ * counter tick.
+ *
+ * Psuedo-code for writer:
+ *   ck_epoch_begin()
+ *   ht_delete(x)
+ *   ck_epoch_end()
+ *   ck_epoch_begin()
+ *   ht_delete(x)
+ *   ck_epoch_end()
+ *
+ * Psuedo-code for reader:
+ *   for (;;) {
+ *      x = ht_lookup(x)
+ *      ck_pr_inc(&amp;x-&gt;value);
+ *   }
+ *
+ * Of course, it is also possible for references logically deleted at e_g-1 to
+ * still be accessed at e_g as threads are "active" at the same time
+ * (real-world time) mutating shared objects.
+ *
+ * Now, if the epoch counter is ticked to e_g+1, then no new hazardous
+ * references could exist to objects logically deleted at e_g-1. The reason for
+ * this is that at e_g+1, all epoch read-side critical sections started at
+ * e_g-1 must have been completed. If any epoch read-side critical sections at
+ * e_g-1 were still active, then we would never increment to e_g+1 (active != 0
+ * ^ e != e_g).  Additionally, e_g may still have hazardous references to
+ * objects logically deleted at e_g-1 which means objects logically deleted at
+ * e_g-1 cannot be deleted at e_g+1 unless all threads have observed e_g+1
+ * (since it is valid for active threads to be at e_g and threads at e_g still
+ * require safe memory accesses).
+ *
+ * However, at e_g+2, all active threads must be either at e_g+1 or e_g+2.
+ * Though e_g+2 may share hazardous references with e_g+1, and e_g+1 shares
+ * hazardous references to e_g, no active threads are at e_g or e_g-1. This
+ * means no hazardous references could exist to objects deleted at e_g-1 (at
+ * e_g+2).
+ *
+ * To summarize these important points,
+ *   1) Active threads will always have a value of e_g or e_g-1.
+ *   2) Items that are logically deleted e_g or e_g-1 cannot be physically
+ *      deleted.
+ *   3) Objects logically deleted at e_g-1 can be physically destroyed at e_g+2
+ *      or at e_g+1 if no threads are at e_g.
+ *
+ * Last but not least, if we are at e_g+2, then no active thread is at e_g
+ * which means it is safe to apply modulo-3 arithmetic to e_g value in order to
+ * re-use e_g to represent the e_g+3 state. This means it is sufficient to
+ * represent e_g using only the values 0, 1 or 2. Every time a thread re-visits
+ * a e_g (which can be determined with a non-empty deferral list) it can assume
+ * objects in the e_g deferral list involved at least three e_g transitions and
+ * are thus, safe, for physical deletion.
+ *
+ * Blocking semantics for epoch reclamation have additional restrictions.
+ * Though we only require three deferral lists, reasonable blocking semantics
+ * must be able to more gracefully handle bursty write work-loads which could
+ * easily cause e_g wrap-around if modulo-3 arithmetic is used. This allows for
+ * easy-to-trigger live-lock situations. The work-around to this is to not
+ * apply modulo arithmetic to e_g but only to deferral list indexing.
+ */</comment>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>CK_EPOCH_GRACE</name></cpp:macro> <cpp:value>3U</cpp:value></cpp:define>
+
+<enum>enum <block>{
+	<decl><name>CK_EPOCH_STATE_USED</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>,
+	<decl><name>CK_EPOCH_STATE_FREE</name> <init>= <expr><literal type="number">1</literal></expr></init></decl>
+}</block>;</enum>
+
+<macro><name>CK_STACK_CONTAINER</name><argument_list>(<argument>struct ck_epoch_record</argument>, <argument>record_next</argument>,
+    <argument>ck_epoch_record_container</argument>)</argument_list></macro>
+<macro><name>CK_STACK_CONTAINER</name><argument_list>(<argument>struct ck_epoch_entry</argument>, <argument>stack_entry</argument>,
+    <argument>ck_epoch_entry_container</argument>)</argument_list></macro>
+
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>CK_EPOCH_SENSE_MASK</name></cpp:macro>	<cpp:value>(CK_EPOCH_SENSE - 1)</cpp:value></cpp:define>
+
+<function><type><name>bool</name></type>
+<name>_ck_epoch_delref</name><parameter_list>(<parameter><decl><type><name><name>struct</name> <name>ck_epoch_record</name></name> <modifier>*</modifier></type><name>record</name></decl></parameter>,
+    <parameter><decl><type><name><name>struct</name> <name>ck_epoch_section</name></name> <modifier>*</modifier></type><name>section</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name><name>struct</name> <name>ck_epoch_ref</name></name> <modifier>*</modifier></type><name>current</name></decl>, <decl><type ref="prev"><modifier>*</modifier></type><name>other</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>unsigned</name> <name>int</name></type> <name>i</name> <init>= <expr><name><name>section</name><operator>-&gt;</operator><name>bucket</name></name></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name>current</name> <operator>=</operator> <operator>&amp;</operator><name><name>record</name><operator>-&gt;</operator><name>local</name><operator>.</operator><name>bucket</name><index>[<expr><name>i</name></expr>]</index></name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>current</name><operator>-&gt;</operator><name>count</name></name><operator>--</operator></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name><name>current</name><operator>-&gt;</operator><name>count</name></name> <operator>&gt;</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>false</name></expr>;</return></block_content></block></if></if_stmt>
+
+	<comment type="block">/*
+	 * If the current bucket no longer has any references, then
+	 * determine whether we have already transitioned into a newer
+	 * epoch. If so, then make sure to update our shared snapshot
+	 * to allow for forward progress.
+	 *
+	 * If no other active bucket exists, then the record will go
+	 * inactive in order to allow for forward progress.
+	 */</comment>
+	<expr_stmt><expr><name>other</name> <operator>=</operator> <operator>&amp;</operator><name><name>record</name><operator>-&gt;</operator><name>local</name><operator>.</operator><name>bucket</name><index>[<expr><operator>(</operator><name>i</name> <operator>+</operator> <literal type="number">1</literal><operator>)</operator> <operator>&amp;</operator> <name>CK_EPOCH_SENSE_MASK</name></expr>]</index></name></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><name><name>other</name><operator>-&gt;</operator><name>count</name></name> <operator>&gt;</operator> <literal type="number">0</literal> <operator>&amp;&amp;</operator>
+	    <operator>(</operator><operator>(</operator><name>int</name><operator>)</operator><operator>(</operator><name><name>current</name><operator>-&gt;</operator><name>epoch</name></name> <operator>-</operator> <name><name>other</name><operator>-&gt;</operator><name>epoch</name></name><operator>)</operator> <operator>&lt;</operator> <literal type="number">0</literal><operator>)</operator></expr>)</condition> <block>{<block_content>
+		<comment type="block">/*
+		 * The other epoch value is actually the newest,
+		 * transition to it.
+		 */</comment>
+		<expr_stmt><expr><call><name>ck_pr_store_uint</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>record</name><operator>-&gt;</operator><name>epoch</name></name></expr></argument>, <argument><expr><name><name>other</name><operator>-&gt;</operator><name>epoch</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<return>return <expr><name>true</name></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><name>void</name></type>
+<name>_ck_epoch_addref</name><parameter_list>(<parameter><decl><type><name><name>struct</name> <name>ck_epoch_record</name></name> <modifier>*</modifier></type><name>record</name></decl></parameter>,
+    <parameter><decl><type><name><name>struct</name> <name>ck_epoch_section</name></name> <modifier>*</modifier></type><name>section</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name><name>struct</name> <name>ck_epoch</name></name> <modifier>*</modifier></type><name>global</name> <init>= <expr><name><name>record</name><operator>-&gt;</operator><name>global</name></name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name><name>struct</name> <name>ck_epoch_ref</name></name> <modifier>*</modifier></type><name>ref</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>unsigned</name> <name>int</name></type> <name>epoch</name></decl>, <decl><type ref="prev"/><name>i</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name>epoch</name> <operator>=</operator> <call><name>ck_pr_load_uint</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>global</name><operator>-&gt;</operator><name>epoch</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>i</name> <operator>=</operator> <name>epoch</name> <operator>&amp;</operator> <name>CK_EPOCH_SENSE_MASK</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name>ref</name> <operator>=</operator> <operator>&amp;</operator><name><name>record</name><operator>-&gt;</operator><name>local</name><operator>.</operator><name>bucket</name><index>[<expr><name>i</name></expr>]</index></name></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name><name>ref</name><operator>-&gt;</operator><name>count</name></name><operator>++</operator> <operator>==</operator> <literal type="number">0</literal></expr>)</condition> <block>{<block_content>
+<cpp:ifndef>#<cpp:directive>ifndef</cpp:directive> <name>CK_MD_TSO</name></cpp:ifndef>
+		<decl_stmt><decl><type><name><name>struct</name> <name>ck_epoch_ref</name></name> <modifier>*</modifier></type><name>previous</name></decl>;</decl_stmt>
+
+		<comment type="block">/*
+		 * The system has already ticked. If another non-zero bucket
+		 * exists, make sure to order our observations with respect
+		 * to it. Otherwise, it is possible to acquire a reference
+		 * from the previous epoch generation.
+		 *
+		 * On TSO architectures, the monoticity of the global counter
+		 * and load-{store, load} ordering are sufficient to guarantee
+		 * this ordering.
+		 */</comment>
+		<expr_stmt><expr><name>previous</name> <operator>=</operator> <operator>&amp;</operator><name><name>record</name><operator>-&gt;</operator><name>local</name><operator>.</operator><name>bucket</name><index>[<expr><operator>(</operator><name>i</name> <operator>+</operator> <literal type="number">1</literal><operator>)</operator> <operator>&amp;</operator>
+		    <name>CK_EPOCH_SENSE_MASK</name></expr>]</index></name></expr>;</expr_stmt>
+		<if_stmt><if>if <condition>(<expr><name><name>previous</name><operator>-&gt;</operator><name>count</name></name> <operator>&gt;</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>ck_pr_fence_acqrel</name><argument_list>()</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif> <comment type="block">/* !CK_MD_TSO */</comment>
+
+		<comment type="block">/*
+		 * If this is this is a new reference into the current
+		 * bucket then cache the associated epoch value.
+		 */</comment>
+		<expr_stmt><expr><name><name>ref</name><operator>-&gt;</operator><name>epoch</name></name> <operator>=</operator> <name>epoch</name></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<expr_stmt><expr><name><name>section</name><operator>-&gt;</operator><name>bucket</name></name> <operator>=</operator> <name>i</name></expr>;</expr_stmt>
+	<return>return;</return>
+</block_content>}</block></function>
+
+<function><type><name>void</name></type>
+<name>ck_epoch_init</name><parameter_list>(<parameter><decl><type><name><name>struct</name> <name>ck_epoch</name></name> <modifier>*</modifier></type><name>global</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+
+	<expr_stmt><expr><call><name>ck_stack_init</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>global</name><operator>-&gt;</operator><name>records</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>global</name><operator>-&gt;</operator><name>epoch</name></name> <operator>=</operator> <literal type="number">1</literal></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>global</name><operator>-&gt;</operator><name>n_free</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>ck_pr_fence_store</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+	<return>return;</return>
+</block_content>}</block></function>
+
+<function><type><name><name>struct</name> <name>ck_epoch_record</name></name> <modifier>*</modifier></type>
+<name>ck_epoch_recycle</name><parameter_list>(<parameter><decl><type><name><name>struct</name> <name>ck_epoch</name></name> <modifier>*</modifier></type><name>global</name></decl></parameter>, <parameter><decl><type><name>void</name> <modifier>*</modifier></type><name>ct</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name><name>struct</name> <name>ck_epoch_record</name></name> <modifier>*</modifier></type><name>record</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>ck_stack_entry_t</name> <modifier>*</modifier></type><name>cursor</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>unsigned</name> <name>int</name></type> <name>state</name></decl>;</decl_stmt>
+
+	<if_stmt><if>if <condition>(<expr><call><name>ck_pr_load_uint</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>global</name><operator>-&gt;</operator><name>n_free</name></name></expr></argument>)</argument_list></call> <operator>==</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>NULL</name></expr>;</return></block_content></block></if></if_stmt>
+
+	<macro><name>CK_STACK_FOREACH</name><argument_list>(<argument>&amp;global-&gt;records</argument>, <argument>cursor</argument>)</argument_list></macro> <block>{<block_content>
+		<expr_stmt><expr><name>record</name> <operator>=</operator> <call><name>ck_epoch_record_container</name><argument_list>(<argument><expr><name>cursor</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<if_stmt><if>if <condition>(<expr><call><name>ck_pr_load_uint</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>record</name><operator>-&gt;</operator><name>state</name></name></expr></argument>)</argument_list></call> <operator>==</operator> <name>CK_EPOCH_STATE_FREE</name></expr>)</condition> <block>{<block_content>
+			<comment type="block">/* Serialize with respect to deferral list clean-up. */</comment>
+			<expr_stmt><expr><call><name>ck_pr_fence_load</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><name>state</name> <operator>=</operator> <call><name>ck_pr_fas_uint</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>record</name><operator>-&gt;</operator><name>state</name></name></expr></argument>,
+			    <argument><expr><name>CK_EPOCH_STATE_USED</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<if_stmt><if>if <condition>(<expr><name>state</name> <operator>==</operator> <name>CK_EPOCH_STATE_FREE</name></expr>)</condition> <block>{<block_content>
+				<expr_stmt><expr><call><name>ck_pr_dec_uint</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>global</name><operator>-&gt;</operator><name>n_free</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<expr_stmt><expr><call><name>ck_pr_store_ptr</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>record</name><operator>-&gt;</operator><name>ct</name></name></expr></argument>, <argument><expr><name>ct</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+				<comment type="block">/*
+				 * The context pointer is ordered by a
+				 * subsequent protected section.
+				 */</comment>
+				<return>return <expr><name>record</name></expr>;</return>
+			</block_content>}</block></if></if_stmt>
+		</block_content>}</block></if></if_stmt>
+	</block_content>}</block>
+
+	<return>return <expr><name>NULL</name></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><name>void</name></type>
+<name>ck_epoch_register</name><parameter_list>(<parameter><decl><type><name><name>struct</name> <name>ck_epoch</name></name> <modifier>*</modifier></type><name>global</name></decl></parameter>, <parameter><decl><type><name><name>struct</name> <name>ck_epoch_record</name></name> <modifier>*</modifier></type><name>record</name></decl></parameter>,
+    <parameter><decl><type><name>void</name> <modifier>*</modifier></type><name>ct</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>size_t</name></type> <name>i</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name><name>record</name><operator>-&gt;</operator><name>global</name></name> <operator>=</operator> <name>global</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>record</name><operator>-&gt;</operator><name>state</name></name> <operator>=</operator> <name>CK_EPOCH_STATE_USED</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>record</name><operator>-&gt;</operator><name>active</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>record</name><operator>-&gt;</operator><name>epoch</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>record</name><operator>-&gt;</operator><name>n_dispatch</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>record</name><operator>-&gt;</operator><name>n_peak</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>record</name><operator>-&gt;</operator><name>n_pending</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>record</name><operator>-&gt;</operator><name>ct</name></name> <operator>=</operator> <name>ct</name></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>record</name><operator>-&gt;</operator><name>local</name></name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><sizeof>sizeof <name><name>record</name><operator>-&gt;</operator><name>local</name></name></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name>CK_EPOCH_LENGTH</name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ck_stack_init</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>record</name><operator>-&gt;</operator><name>pending</name><index>[<expr><name>i</name></expr>]</index></name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></for>
+
+	<expr_stmt><expr><call><name>ck_pr_fence_store</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>ck_stack_push_upmc</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>global</name><operator>-&gt;</operator><name>records</name></name></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>record</name><operator>-&gt;</operator><name>record_next</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<return>return;</return>
+</block_content>}</block></function>
+
+<function><type><name>void</name></type>
+<name>ck_epoch_unregister</name><parameter_list>(<parameter><decl><type><name><name>struct</name> <name>ck_epoch_record</name></name> <modifier>*</modifier></type><name>record</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name><name>struct</name> <name>ck_epoch</name></name> <modifier>*</modifier></type><name>global</name> <init>= <expr><name><name>record</name><operator>-&gt;</operator><name>global</name></name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>size_t</name></type> <name>i</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name><name>record</name><operator>-&gt;</operator><name>active</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>record</name><operator>-&gt;</operator><name>epoch</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>record</name><operator>-&gt;</operator><name>n_dispatch</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>record</name><operator>-&gt;</operator><name>n_peak</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>record</name><operator>-&gt;</operator><name>n_pending</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>record</name><operator>-&gt;</operator><name>local</name></name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><sizeof>sizeof <name><name>record</name><operator>-&gt;</operator><name>local</name></name></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name>CK_EPOCH_LENGTH</name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ck_stack_init</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>record</name><operator>-&gt;</operator><name>pending</name><index>[<expr><name>i</name></expr>]</index></name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></for>
+
+	<expr_stmt><expr><call><name>ck_pr_store_ptr</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>record</name><operator>-&gt;</operator><name>ct</name></name></expr></argument>, <argument><expr><name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>ck_pr_fence_store</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>ck_pr_store_uint</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>record</name><operator>-&gt;</operator><name>state</name></name></expr></argument>, <argument><expr><name>CK_EPOCH_STATE_FREE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>ck_pr_inc_uint</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>global</name><operator>-&gt;</operator><name>n_free</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<return>return;</return>
+</block_content>}</block></function>
+
+<function><type><specifier>static</specifier> <name><name>struct</name> <name>ck_epoch_record</name></name> <modifier>*</modifier></type>
+<name>ck_epoch_scan</name><parameter_list>(<parameter><decl><type><name><name>struct</name> <name>ck_epoch</name></name> <modifier>*</modifier></type><name>global</name></decl></parameter>,
+    <parameter><decl><type><name><name>struct</name> <name>ck_epoch_record</name></name> <modifier>*</modifier></type><name>cr</name></decl></parameter>,
+    <parameter><decl><type><name>unsigned</name> <name>int</name></type> <name>epoch</name></decl></parameter>,
+    <parameter><decl><type><name>bool</name> <modifier>*</modifier></type><name>af</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>ck_stack_entry_t</name> <modifier>*</modifier></type><name>cursor</name></decl>;</decl_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>cr</name> <operator>==</operator> <name>NULL</name></expr>)</condition> <block>{<block_content>
+		<expr_stmt><expr><name>cursor</name> <operator>=</operator> <call><name>CK_STACK_FIRST</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>global</name><operator>-&gt;</operator><name>records</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><operator>*</operator><name>af</name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+	</block_content>}</block></if> <else>else <block>{<block_content>
+		<expr_stmt><expr><name>cursor</name> <operator>=</operator> <operator>&amp;</operator><name><name>cr</name><operator>-&gt;</operator><name>record_next</name></name></expr>;</expr_stmt>
+		<expr_stmt><expr><operator>*</operator><name>af</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+	</block_content>}</block></else></if_stmt>
+
+	<while>while <condition>(<expr><name>cursor</name> <operator>!=</operator> <name>NULL</name></expr>)</condition> <block>{<block_content>
+		<decl_stmt><decl><type><name>unsigned</name> <name>int</name></type> <name>state</name></decl>, <decl><type ref="prev"/><name>active</name></decl>;</decl_stmt>
+
+		<expr_stmt><expr><name>cr</name> <operator>=</operator> <call><name>ck_epoch_record_container</name><argument_list>(<argument><expr><name>cursor</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><name>state</name> <operator>=</operator> <call><name>ck_pr_load_uint</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>cr</name><operator>-&gt;</operator><name>state</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<if_stmt><if>if <condition>(<expr><name>state</name> <operator>&amp;</operator> <name>CK_EPOCH_STATE_FREE</name></expr>)</condition> <block>{<block_content>
+			<expr_stmt><expr><name>cursor</name> <operator>=</operator> <call><name>CK_STACK_NEXT</name><argument_list>(<argument><expr><name>cursor</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<continue>continue;</continue>
+		</block_content>}</block></if></if_stmt>
+
+		<expr_stmt><expr><name>active</name> <operator>=</operator> <call><name>ck_pr_load_uint</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>cr</name><operator>-&gt;</operator><name>active</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><operator>*</operator><name>af</name> <operator>|=</operator> <name>active</name></expr>;</expr_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name>active</name> <operator>!=</operator> <literal type="number">0</literal> <operator>&amp;&amp;</operator> <call><name>ck_pr_load_uint</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>cr</name><operator>-&gt;</operator><name>epoch</name></name></expr></argument>)</argument_list></call> <operator>!=</operator> <name>epoch</name></expr>)</condition><block type="pseudo"><block_content>
+			<return>return <expr><name>cr</name></expr>;</return></block_content></block></if></if_stmt>
+
+		<expr_stmt><expr><name>cursor</name> <operator>=</operator> <call><name>CK_STACK_NEXT</name><argument_list>(<argument><expr><name>cursor</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></while>
+
+	<return>return <expr><name>NULL</name></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>ck_epoch_dispatch</name><parameter_list>(<parameter><decl><type><name><name>struct</name> <name>ck_epoch_record</name></name> <modifier>*</modifier></type><name>record</name></decl></parameter>, <parameter><decl><type><name>unsigned</name> <name>int</name></type> <name>e</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>unsigned</name> <name>int</name></type> <name>epoch</name> <init>= <expr><name>e</name> <operator>&amp;</operator> <operator>(</operator><name>CK_EPOCH_LENGTH</name> <operator>-</operator> <literal type="number">1</literal><operator>)</operator></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>ck_stack_entry_t</name> <modifier>*</modifier></type><name>head</name></decl>, <decl><type ref="prev"><modifier>*</modifier></type><name>next</name></decl>, <decl><type ref="prev"><modifier>*</modifier></type><name>cursor</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>unsigned</name> <name>int</name></type> <name>n_pending</name></decl>, <decl><type ref="prev"/><name>n_peak</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>unsigned</name> <name>int</name></type> <name>i</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name>head</name> <operator>=</operator> <call><name>ck_stack_batch_pop_upmc</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>record</name><operator>-&gt;</operator><name>pending</name><index>[<expr><name>epoch</name></expr>]</index></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<for>for <control>(<init><expr><name>cursor</name> <operator>=</operator> <name>head</name></expr>;</init> <condition><expr><name>cursor</name> <operator>!=</operator> <name>NULL</name></expr>;</condition> <incr><expr><name>cursor</name> <operator>=</operator> <name>next</name></expr></incr>)</control> <block>{<block_content>
+		<decl_stmt><decl><type><name><name>struct</name> <name>ck_epoch_entry</name></name> <modifier>*</modifier></type><name>entry</name> <init>=
+		    <expr><call><name>ck_epoch_entry_container</name><argument_list>(<argument><expr><name>cursor</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+		<expr_stmt><expr><name>next</name> <operator>=</operator> <call><name>CK_STACK_NEXT</name><argument_list>(<argument><expr><name>cursor</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name><name>entry</name><operator>-&gt;</operator><name>function</name></name><argument_list>(<argument><expr><name>entry</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name>i</name><operator>++</operator></expr>;</expr_stmt>
+	</block_content>}</block></for>
+
+	<expr_stmt><expr><name>n_peak</name> <operator>=</operator> <call><name>ck_pr_load_uint</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>record</name><operator>-&gt;</operator><name>n_peak</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>n_pending</name> <operator>=</operator> <call><name>ck_pr_load_uint</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>record</name><operator>-&gt;</operator><name>n_pending</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* We don't require accuracy around peak calculation. */</comment>
+	<if_stmt><if>if <condition>(<expr><name>n_pending</name> <operator>&gt;</operator> <name>n_peak</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ck_pr_store_uint</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>record</name><operator>-&gt;</operator><name>n_peak</name></name></expr></argument>, <argument><expr><name>n_peak</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>i</name> <operator>&gt;</operator> <literal type="number">0</literal></expr>)</condition> <block>{<block_content>
+		<expr_stmt><expr><call><name>ck_pr_add_uint</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>record</name><operator>-&gt;</operator><name>n_dispatch</name></name></expr></argument>, <argument><expr><name>i</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>ck_pr_sub_uint</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>record</name><operator>-&gt;</operator><name>n_pending</name></name></expr></argument>, <argument><expr><name>i</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<return>return;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Reclaim all objects associated with a record.
+ */</comment>
+<function><type><name>void</name></type>
+<name>ck_epoch_reclaim</name><parameter_list>(<parameter><decl><type><name><name>struct</name> <name>ck_epoch_record</name></name> <modifier>*</modifier></type><name>record</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>unsigned</name> <name>int</name></type> <name>epoch</name></decl>;</decl_stmt>
+
+	<for>for <control>(<init><expr><name>epoch</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>epoch</name> <operator>&lt;</operator> <name>CK_EPOCH_LENGTH</name></expr>;</condition> <incr><expr><name>epoch</name><operator>++</operator></expr></incr>)</control><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ck_epoch_dispatch</name><argument_list>(<argument><expr><name>record</name></expr></argument>, <argument><expr><name>epoch</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></for>
+
+	<return>return;</return>
+</block_content>}</block></function>
+
+<function><type><name>CK_CC_FORCE_INLINE</name> <specifier>static</specifier> <name>void</name></type>
+<name>epoch_block</name><parameter_list>(<parameter><decl><type><name><name>struct</name> <name>ck_epoch</name></name> <modifier>*</modifier></type><name>global</name></decl></parameter>, <parameter><decl><type><name><name>struct</name> <name>ck_epoch_record</name></name> <modifier>*</modifier></type><name>cr</name></decl></parameter>,
+    <parameter><decl><type><name>ck_epoch_wait_cb_t</name> <modifier>*</modifier></type><name>cb</name></decl></parameter>, <parameter><decl><type><name>void</name> <modifier>*</modifier></type><name>ct</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+
+	<if_stmt><if>if <condition>(<expr><name>cb</name> <operator>!=</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>cb</name><argument_list>(<argument><expr><name>global</name></expr></argument>, <argument><expr><name>cr</name></expr></argument>, <argument><expr><name>ct</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<return>return;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * This function must not be called with-in read section.
+ */</comment>
+<function><type><name>void</name></type>
+<name>ck_epoch_synchronize_wait</name><parameter_list>(<parameter><decl><type><name><name>struct</name> <name>ck_epoch</name></name> <modifier>*</modifier></type><name>global</name></decl></parameter>,
+    <parameter><decl><type><name>ck_epoch_wait_cb_t</name> <modifier>*</modifier></type><name>cb</name></decl></parameter>, <parameter><decl><type><name>void</name> <modifier>*</modifier></type><name>ct</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name><name>struct</name> <name>ck_epoch_record</name></name> <modifier>*</modifier></type><name>cr</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>unsigned</name> <name>int</name></type> <name>delta</name></decl>, <decl><type ref="prev"/><name>epoch</name></decl>, <decl><type ref="prev"/><name>goal</name></decl>, <decl><type ref="prev"/><name>i</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type> <name>active</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>ck_pr_fence_memory</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * The observation of the global epoch must be ordered with respect to
+	 * all prior operations. The re-ordering of loads is permitted given
+	 * monoticity of global epoch counter.
+	 *
+	 * If UINT_MAX concurrent mutations were to occur then it is possible
+	 * to encounter an ABA-issue. If this is a concern, consider tuning
+	 * write-side concurrency.
+	 */</comment>
+	<expr_stmt><expr><name>delta</name> <operator>=</operator> <name>epoch</name> <operator>=</operator> <call><name>ck_pr_load_uint</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>global</name><operator>-&gt;</operator><name>epoch</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>goal</name> <operator>=</operator> <name>epoch</name> <operator>+</operator> <name>CK_EPOCH_GRACE</name></expr>;</expr_stmt>
+
+	<for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr><operator>,</operator> <expr><name>cr</name> <operator>=</operator> <name>NULL</name></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name>CK_EPOCH_GRACE</name> <operator>-</operator> <literal type="number">1</literal></expr>;</condition> <incr><expr><name>cr</name> <operator>=</operator> <name>NULL</name></expr><operator>,</operator> <expr><name>i</name><operator>++</operator></expr></incr>)</control> <block>{<block_content>
+		<decl_stmt><decl><type><name>bool</name></type> <name>r</name></decl>;</decl_stmt>
+
+		<comment type="block">/*
+		 * Determine whether all threads have observed the current
+		 * epoch with respect to the updates on invocation.
+		 */</comment>
+		<while>while <condition>(<expr><name>cr</name> <operator>=</operator> <call><name>ck_epoch_scan</name><argument_list>(<argument><expr><name>global</name></expr></argument>, <argument><expr><name>cr</name></expr></argument>, <argument><expr><name>delta</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>active</name></expr></argument>)</argument_list></call></expr><operator>,</operator>
+		    <expr><name>cr</name> <operator>!=</operator> <name>NULL</name></expr>)</condition> <block>{<block_content>
+			<decl_stmt><decl><type><name>unsigned</name> <name>int</name></type> <name>e_d</name></decl>;</decl_stmt>
+
+			<expr_stmt><expr><call><name>ck_pr_stall</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+			<comment type="block">/*
+			 * Another writer may have already observed a grace
+			 * period.
+			 */</comment>
+			<expr_stmt><expr><name>e_d</name> <operator>=</operator> <call><name>ck_pr_load_uint</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>global</name><operator>-&gt;</operator><name>epoch</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<if_stmt><if>if <condition>(<expr><name>e_d</name> <operator>==</operator> <name>delta</name></expr>)</condition> <block>{<block_content>
+				<expr_stmt><expr><call><name>epoch_block</name><argument_list>(<argument><expr><name>global</name></expr></argument>, <argument><expr><name>cr</name></expr></argument>, <argument><expr><name>cb</name></expr></argument>, <argument><expr><name>ct</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<continue>continue;</continue>
+			</block_content>}</block></if></if_stmt>
+
+			<comment type="block">/*
+			 * If the epoch has been updated, we may have already
+			 * met our goal.
+			 */</comment>
+			<expr_stmt><expr><name>delta</name> <operator>=</operator> <name>e_d</name></expr>;</expr_stmt>
+			<if_stmt><if>if <condition>(<expr><operator>(</operator><name>goal</name> <operator>&gt;</operator> <name>epoch</name><operator>)</operator> <operator>&amp;</operator> <operator>(</operator><name>delta</name> <operator>&gt;=</operator> <name>goal</name><operator>)</operator></expr>)</condition><block type="pseudo"><block_content>
+				<goto>goto <name>leave</name>;</goto></block_content></block></if></if_stmt>
+
+			<expr_stmt><expr><call><name>epoch_block</name><argument_list>(<argument><expr><name>global</name></expr></argument>, <argument><expr><name>cr</name></expr></argument>, <argument><expr><name>cb</name></expr></argument>, <argument><expr><name>ct</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+			<comment type="block">/*
+			 * If the epoch has been updated, then a grace period
+			 * requires that all threads are observed idle at the
+			 * same epoch.
+			 */</comment>
+			<expr_stmt><expr><name>cr</name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+		</block_content>}</block></while>
+
+		<comment type="block">/*
+		 * If we have observed all threads as inactive, then we assume
+		 * we are at a grace period.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><name>active</name> <operator>==</operator> <name>false</name></expr>)</condition><block type="pseudo"><block_content>
+			<break>break;</break></block_content></block></if></if_stmt>
+
+		<comment type="block">/*
+		 * Increment current epoch. CAS semantics are used to eliminate
+		 * increment operations for synchronization that occurs for the
+		 * same global epoch value snapshot.
+		 *
+		 * If we can guarantee there will only be one active barrier or
+		 * epoch tick at a given time, then it is sufficient to use an
+		 * increment operation. In a multi-barrier workload, however,
+		 * it is possible to overflow the epoch value if we apply
+		 * modulo-3 arithmetic.
+		 */</comment>
+		<expr_stmt><expr><name>r</name> <operator>=</operator> <call><name>ck_pr_cas_uint_value</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>global</name><operator>-&gt;</operator><name>epoch</name></name></expr></argument>, <argument><expr><name>delta</name></expr></argument>, <argument><expr><name>delta</name> <operator>+</operator> <literal type="number">1</literal></expr></argument>,
+		    <argument><expr><operator>&amp;</operator><name>delta</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/* Order subsequent thread active checks. */</comment>
+		<expr_stmt><expr><call><name>ck_pr_fence_atomic_load</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/*
+		 * If CAS has succeeded, then set delta to latest snapshot.
+		 * Otherwise, we have just acquired latest snapshot.
+		 */</comment>
+		<expr_stmt><expr><name>delta</name> <operator>=</operator> <name>delta</name> <operator>+</operator> <name>r</name></expr>;</expr_stmt>
+	</block_content>}</block></for>
+
+	<comment type="block">/*
+	 * A majority of use-cases will not require full barrier semantics.
+	 * However, if non-temporal instructions are used, full barrier
+	 * semantics are necessary.
+	 */</comment>
+<label><name>leave</name>:</label>
+	<expr_stmt><expr><call><name>ck_pr_fence_memory</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+	<return>return;</return>
+</block_content>}</block></function>
+
+<function><type><name>void</name></type>
+<name>ck_epoch_synchronize</name><parameter_list>(<parameter><decl><type><name><name>struct</name> <name>ck_epoch_record</name></name> <modifier>*</modifier></type><name>record</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+
+	<expr_stmt><expr><call><name>ck_epoch_synchronize_wait</name><argument_list>(<argument><expr><name><name>record</name><operator>-&gt;</operator><name>global</name></name></expr></argument>, <argument><expr><name>NULL</name></expr></argument>, <argument><expr><name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<return>return;</return>
+</block_content>}</block></function>
+
+<function><type><name>void</name></type>
+<name>ck_epoch_barrier</name><parameter_list>(<parameter><decl><type><name><name>struct</name> <name>ck_epoch_record</name></name> <modifier>*</modifier></type><name>record</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+
+	<expr_stmt><expr><call><name>ck_epoch_synchronize</name><argument_list>(<argument><expr><name>record</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>ck_epoch_reclaim</name><argument_list>(<argument><expr><name>record</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<return>return;</return>
+</block_content>}</block></function>
+
+<function><type><name>void</name></type>
+<name>ck_epoch_barrier_wait</name><parameter_list>(<parameter><decl><type><name><name>struct</name> <name>ck_epoch_record</name></name> <modifier>*</modifier></type><name>record</name></decl></parameter>, <parameter><decl><type><name>ck_epoch_wait_cb_t</name> <modifier>*</modifier></type><name>cb</name></decl></parameter>,
+    <parameter><decl><type><name>void</name> <modifier>*</modifier></type><name>ct</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+
+	<expr_stmt><expr><call><name>ck_epoch_synchronize_wait</name><argument_list>(<argument><expr><name><name>record</name><operator>-&gt;</operator><name>global</name></name></expr></argument>, <argument><expr><name>cb</name></expr></argument>, <argument><expr><name>ct</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>ck_epoch_reclaim</name><argument_list>(<argument><expr><name>record</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<return>return;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * It may be worth it to actually apply these deferral semantics to an epoch
+ * that was observed at ck_epoch_call time. The problem is that the latter
+ * would require a full fence.
+ *
+ * ck_epoch_call will dispatch to the latest epoch snapshot that was observed.
+ * There are cases where it will fail to reclaim as early as it could. If this
+ * becomes a problem, we could actually use a heap for epoch buckets but that
+ * is far from ideal too.
+ */</comment>
+<function><type><name>bool</name></type>
+<name>ck_epoch_poll</name><parameter_list>(<parameter><decl><type><name><name>struct</name> <name>ck_epoch_record</name></name> <modifier>*</modifier></type><name>record</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>bool</name></type> <name>active</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>unsigned</name> <name>int</name></type> <name>epoch</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name><name>struct</name> <name>ck_epoch_record</name></name> <modifier>*</modifier></type><name>cr</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name><name>struct</name> <name>ck_epoch</name></name> <modifier>*</modifier></type><name>global</name> <init>= <expr><name><name>record</name><operator>-&gt;</operator><name>global</name></name></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name>epoch</name> <operator>=</operator> <call><name>ck_pr_load_uint</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>global</name><operator>-&gt;</operator><name>epoch</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Serialize epoch snapshots with respect to global epoch. */</comment>
+	<expr_stmt><expr><call><name>ck_pr_fence_memory</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>cr</name> <operator>=</operator> <call><name>ck_epoch_scan</name><argument_list>(<argument><expr><name>global</name></expr></argument>, <argument><expr><name>cr</name></expr></argument>, <argument><expr><name>epoch</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>active</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><name>cr</name> <operator>!=</operator> <name>NULL</name></expr>)</condition> <block>{<block_content>
+		<expr_stmt><expr><name><name>record</name><operator>-&gt;</operator><name>epoch</name></name> <operator>=</operator> <name>epoch</name></expr>;</expr_stmt>
+		<return>return <expr><name>false</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/* We are at a grace period if all threads are inactive. */</comment>
+	<if_stmt><if>if <condition>(<expr><name>active</name> <operator>==</operator> <name>false</name></expr>)</condition> <block>{<block_content>
+		<expr_stmt><expr><name><name>record</name><operator>-&gt;</operator><name>epoch</name></name> <operator>=</operator> <name>epoch</name></expr>;</expr_stmt>
+		<for>for <control>(<init><expr><name>epoch</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>epoch</name> <operator>&lt;</operator> <name>CK_EPOCH_LENGTH</name></expr>;</condition> <incr><expr><name>epoch</name><operator>++</operator></expr></incr>)</control><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>ck_epoch_dispatch</name><argument_list>(<argument><expr><name>record</name></expr></argument>, <argument><expr><name>epoch</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></for>
+
+		<return>return <expr><name>true</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/* If an active thread exists, rely on epoch observation. */</comment>
+	<expr_stmt><expr><operator>(</operator><name>void</name><operator>)</operator><call><name>ck_pr_cas_uint</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>global</name><operator>-&gt;</operator><name>epoch</name></name></expr></argument>, <argument><expr><name>epoch</name></expr></argument>, <argument><expr><name>epoch</name> <operator>+</operator> <literal type="number">1</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>ck_epoch_dispatch</name><argument_list>(<argument><expr><name>record</name></expr></argument>, <argument><expr><name>epoch</name> <operator>+</operator> <literal type="number">1</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<return>return <expr><name>true</name></expr>;</return>
+</block_content>}</block></function>
+</unit>

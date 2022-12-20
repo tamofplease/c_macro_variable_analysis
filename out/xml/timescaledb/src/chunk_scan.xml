@@ -1,0 +1,307 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<unit xmlns="http://www.srcML.org/srcML/src" xmlns:cpp="http://www.srcML.org/srcML/cpp" revision="1.0.0" language="C" filename="/cloned_projects/timescaledb/src/chunk_scan.c"><comment type="block">/*
+ * This file and its contents are licensed under the Apache License 2.0.
+ * Please see the included NOTICE for copyright information and
+ * LICENSE-APACHE for a copy of the license.
+ */</comment>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;postgres.h&gt;</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;catalog/namespace.h&gt;</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;storage/lmgr.h&gt;</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;utils/syscache.h&gt;</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;utils/builtins.h&gt;</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"debug_point.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"dimension_vector.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"hypertable.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"hypercube.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"scan_iterator.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"chunk_scan.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"chunk.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"chunk_constraint.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"ts_catalog/chunk_data_node.h"</cpp:file></cpp:include>
+
+<comment type="block">/*
+ * Scan for chunks matching a query.
+ *
+ * Given a number of dimension slices that match a query (a vector of slices
+ * is given for each dimension), find the chunks that reference one slice in
+ * each of the given dimensions. The matching chunks are built across multiple
+ * scans:
+ *
+ * 1. Dimensional chunk constraints
+ * 2. Chunk metadata
+ * 3. Additional chunk constraints
+ * 4. Chunk data nodes
+ *
+ * For performance, try not to interleave scans of different metadata tables
+ * in order to maintain data locality while scanning. Also, keep scanned
+ * tables and indexes open until all the metadata is scanned for all chunks.
+ */</comment>
+<function><type><name>Chunk</name> <modifier>*</modifier><modifier>*</modifier></type>
+<name>ts_chunk_scan_by_chunk_ids</name><parameter_list>(<parameter><decl><type><specifier>const</specifier> <name>Hyperspace</name> <modifier>*</modifier></type><name>hs</name></decl></parameter>, <parameter><decl><type><specifier>const</specifier> <name>List</name> <modifier>*</modifier></type><name>chunk_ids</name></decl></parameter>, <parameter><decl><type><name>unsigned</name> <name>int</name> <modifier>*</modifier></type><name>num_chunks</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>MemoryContext</name></type> <name>work_mcxt</name> <init>=
+		<expr><call><name>AllocSetContextCreate</name><argument_list>(<argument><expr><name>CurrentMemoryContext</name></expr></argument>, <argument><expr><literal type="string">"chunk-scan-work"</literal></expr></argument>, <argument><expr><name>ALLOCSET_DEFAULT_SIZES</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>MemoryContext</name></type> <name>per_tuple_mcxt</name> <init>=
+		<expr><call><name>AllocSetContextCreate</name><argument_list>(<argument><expr><name>work_mcxt</name></expr></argument>, <argument><expr><literal type="string">"chunk-scan-per-tuple"</literal></expr></argument>, <argument><expr><name>ALLOCSET_SMALL_SIZES</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>MemoryContext</name></type> <name>orig_mcxt</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Chunk</name> <modifier>*</modifier><modifier>*</modifier></type><name>locked_chunks</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Chunk</name> <modifier>*</modifier><modifier>*</modifier></type><name>unlocked_chunks</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type> <name>locked_chunk_count</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type> <name>unlocked_chunk_count</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>ListCell</name> <modifier>*</modifier></type><name>lc</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type> <name>remote_chunk_count</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>OidIsValid</name><argument_list>(<argument><expr><name><name>hs</name><operator>-&gt;</operator><name>main_table_relid</name></name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>orig_mcxt</name> <operator>=</operator> <call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>work_mcxt</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * For each matching chunk, fill in the metadata from the "chunk" table.
+	 * Make sure to filter out "dropped" chunks.
+	 */</comment>
+	<decl_stmt><decl><type><name>ScanIterator</name></type> <name>chunk_it</name> <init>= <expr><call><name>ts_chunk_scan_iterator_create</name><argument_list>(<argument><expr><name>orig_mcxt</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<expr_stmt><expr><name>unlocked_chunks</name> <operator>=</operator> <call><name>MemoryContextAlloc</name><argument_list>(<argument><expr><name>work_mcxt</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>Chunk</name> <operator>*</operator></expr></argument>)</argument_list></sizeof> <operator>*</operator> <call><name>list_length</name><argument_list>(<argument><expr><name>chunk_ids</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<macro><name>foreach</name> <argument_list>(<argument>lc</argument>, <argument>chunk_ids</argument>)</argument_list></macro>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>int</name></type> <name>chunk_id</name> <init>= <expr><call><name>lfirst_int</name><argument_list>(<argument><expr><name>lc</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>TupleInfo</name> <modifier>*</modifier></type><name>ti</name></decl>;</decl_stmt>
+
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>CurrentMemoryContext</name> <operator>==</operator> <name>work_mcxt</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><call><name>ts_chunk_scan_iterator_set_chunk_id</name><argument_list>(<argument><expr><operator>&amp;</operator><name>chunk_it</name></expr></argument>, <argument><expr><name>chunk_id</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>ts_scan_iterator_start_or_restart_scan</name><argument_list>(<argument><expr><operator>&amp;</operator><name>chunk_it</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name>ti</name> <operator>=</operator> <call><name>ts_scan_iterator_next</name><argument_list>(<argument><expr><operator>&amp;</operator><name>chunk_it</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name>ti</name></expr>)</condition>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>bool</name></type> <name>isnull</name></decl>;</decl_stmt>
+			<decl_stmt><decl><type><name>Datum</name></type> <name>datum</name> <init>= <expr><call><name>slot_getattr</name><argument_list>(<argument><expr><name><name>ti</name><operator>-&gt;</operator><name>slot</name></name></expr></argument>, <argument><expr><name>Anum_chunk_dropped</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>isnull</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+			<decl_stmt><decl><type><name>bool</name></type> <name>is_dropped</name> <init>= <expr><ternary><condition><expr><name>isnull</name></expr> ?</condition><then> <expr><name>false</name></expr> </then><else>: <expr><call><name>DatumGetBool</name><argument_list>(<argument><expr><name>datum</name></expr></argument>)</argument_list></call></expr></else></ternary></expr></init></decl>;</decl_stmt>
+
+			<expr_stmt><expr><call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>per_tuple_mcxt</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>MemoryContextReset</name><argument_list>(<argument><expr><name>per_tuple_mcxt</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+			<if_stmt><if>if <condition>(<expr><operator>!</operator><name>is_dropped</name></expr>)</condition>
+			<block>{<block_content>
+				<decl_stmt><decl><type><name>Chunk</name> <modifier>*</modifier></type><name>chunk</name> <init>= <expr><call><name>MemoryContextAllocZero</name><argument_list>(<argument><expr><name>orig_mcxt</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>Chunk</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+				<decl_stmt><decl><type><name>MemoryContext</name></type> <name>old_mcxt</name> <init>= <expr><call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name><name>ti</name><operator>-&gt;</operator><name>mctx</name></name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+				<expr_stmt><expr><call><name>ts_chunk_formdata_fill</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>chunk</name><operator>-&gt;</operator><name>fd</name></name></expr></argument>, <argument><expr><name>ti</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<expr_stmt><expr><call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>old_mcxt</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+				<expr_stmt><expr><name><name>chunk</name><operator>-&gt;</operator><name>constraints</name></name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+				<expr_stmt><expr><name><name>chunk</name><operator>-&gt;</operator><name>cube</name></name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+				<expr_stmt><expr><name><name>chunk</name><operator>-&gt;</operator><name>hypertable_relid</name></name> <operator>=</operator> <name><name>hs</name><operator>-&gt;</operator><name>main_table_relid</name></name></expr>;</expr_stmt>
+
+				<expr_stmt><expr><name><name>unlocked_chunks</name><index>[<expr><name>unlocked_chunk_count</name></expr>]</index></name> <operator>=</operator> <name>chunk</name></expr>;</expr_stmt>
+				<expr_stmt><expr><name>unlocked_chunk_count</name><operator>++</operator></expr>;</expr_stmt>
+			</block_content>}</block></if></if_stmt>
+
+			<expr_stmt><expr><call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>work_mcxt</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<comment type="block">/* Only one chunk should match */</comment>
+			<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>ts_scan_iterator_next</name><argument_list>(<argument><expr><operator>&amp;</operator><name>chunk_it</name></expr></argument>)</argument_list></call> <operator>==</operator> <name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+	</block_content>}</block>
+
+	<expr_stmt><expr><call><name>ts_scan_iterator_close</name><argument_list>(<argument><expr><operator>&amp;</operator><name>chunk_it</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>unlocked_chunk_count</name> <operator>==</operator> <literal type="number">0</literal> <operator>||</operator> <name>unlocked_chunks</name> <operator>!=</operator> <name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>unlocked_chunk_count</name> <operator>&lt;=</operator> <call><name>list_length</name><argument_list>(<argument><expr><name>chunk_ids</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>CurrentMemoryContext</name> <operator>==</operator> <name>work_mcxt</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>DEBUG_WAITPOINT</name><argument_list>(<argument><expr><literal type="string">"expanded_chunks"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Batch the lookups to each catalog cache to have more favorable access
+	 * patterns.
+	 * Schema oid isn't likely to change, so cache it.
+	 */</comment>
+	<decl_stmt><decl><type><name>char</name> <modifier>*</modifier></type><name>last_schema_name</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Oid</name></type> <name>last_schema_oid</name> <init>= <expr><name>InvalidOid</name></expr></init></decl>;</decl_stmt>
+	<for>for <control>(<init><decl><type><name>int</name></type> <name>i</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name>unlocked_chunk_count</name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>Chunk</name> <modifier>*</modifier></type><name>chunk</name> <init>= <expr><name><name>unlocked_chunks</name><index>[<expr><name>i</name></expr>]</index></name></expr></init></decl>;</decl_stmt>
+
+		<decl_stmt><decl><type><name>char</name> <modifier>*</modifier></type><name>current_schema_name</name> <init>= <expr><call><name>NameStr</name><argument_list>(<argument><expr><name><name>chunk</name><operator>-&gt;</operator><name>fd</name><operator>.</operator><name>schema_name</name></name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+		<if_stmt><if>if <condition>(<expr><name>last_schema_name</name> <operator>==</operator> <name>NULL</name> <operator>||</operator> <call><name>strcmp</name><argument_list>(<argument><expr><name>last_schema_name</name></expr></argument>, <argument><expr><name>current_schema_name</name></expr></argument>)</argument_list></call> <operator>!=</operator> <literal type="number">0</literal></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><name>last_schema_name</name> <operator>=</operator> <name>current_schema_name</name></expr>;</expr_stmt>
+			<expr_stmt><expr><name>last_schema_oid</name> <operator>=</operator> <call><name>get_namespace_oid</name><argument_list>(<argument><expr><name>current_schema_name</name></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+
+		<expr_stmt><expr><name><name>chunk</name><operator>-&gt;</operator><name>table_id</name></name> <operator>=</operator> <call><name>get_relname_relid</name><argument_list>(<argument><expr><call><name>NameStr</name><argument_list>(<argument><expr><name><name>chunk</name><operator>-&gt;</operator><name>fd</name><operator>.</operator><name>table_name</name></name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>last_schema_oid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>OidIsValid</name><argument_list>(<argument><expr><name><name>chunk</name><operator>-&gt;</operator><name>table_id</name></name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></for>
+
+	<for>for <control>(<init><decl><type><name>int</name></type> <name>i</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name>unlocked_chunk_count</name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>Chunk</name> <modifier>*</modifier></type><name>chunk</name> <init>= <expr><name><name>unlocked_chunks</name><index>[<expr><name>i</name></expr>]</index></name></expr></init></decl>;</decl_stmt>
+		<expr_stmt><expr><name><name>chunk</name><operator>-&gt;</operator><name>relkind</name></name> <operator>=</operator> <call><name>get_rel_relkind</name><argument_list>(<argument><expr><name><name>chunk</name><operator>-&gt;</operator><name>table_id</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></for>
+
+	<comment type="block">/*
+	 * Lock the chunks.
+	 */</comment>
+	<for>for <control>(<init><decl><type><name>int</name></type> <name>i</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name>unlocked_chunk_count</name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>Chunk</name> <modifier>*</modifier></type><name>chunk</name> <init>= <expr><name><name>unlocked_chunks</name><index>[<expr><name>i</name></expr>]</index></name></expr></init></decl>;</decl_stmt>
+
+		<if_stmt><if>if <condition>(<expr><call><name>ts_chunk_lock_if_exists</name><argument_list>(<argument><expr><name><name>chunk</name><operator>-&gt;</operator><name>table_id</name></name></expr></argument>, <argument><expr><name>AccessShareLock</name></expr></argument>)</argument_list></call></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/* Lazy initialize the chunks array */</comment>
+			<if_stmt><if>if <condition>(<expr><name>NULL</name> <operator>==</operator> <name>locked_chunks</name></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><name>locked_chunks</name> <operator>=</operator>
+					<call><name>MemoryContextAlloc</name><argument_list>(<argument><expr><name>orig_mcxt</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>Chunk</name> <operator>*</operator></expr></argument>)</argument_list></sizeof> <operator>*</operator> <name>unlocked_chunk_count</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+			<expr_stmt><expr><name><name>locked_chunks</name><index>[<expr><name>locked_chunk_count</name></expr>]</index></name> <operator>=</operator> <name>chunk</name></expr>;</expr_stmt>
+
+			<if_stmt><if>if <condition>(<expr><name><name>chunk</name><operator>-&gt;</operator><name>relkind</name></name> <operator>==</operator> <name>RELKIND_FOREIGN_TABLE</name></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><name>remote_chunk_count</name><operator>++</operator></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+			<expr_stmt><expr><name>locked_chunk_count</name><operator>++</operator></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+	</block_content>}</block></for>
+
+	<comment type="block">/*
+	 * Fetch the chunk constraints.
+	 */</comment>
+	<decl_stmt><decl><type><name>ScanIterator</name></type> <name>constr_it</name> <init>= <expr><call><name>ts_chunk_constraint_scan_iterator_create</name><argument_list>(<argument><expr><name>orig_mcxt</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<for>for <control>(<init><decl><type><name>int</name></type> <name>i</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name>locked_chunk_count</name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>Chunk</name> <modifier>*</modifier></type><name>chunk</name> <init>= <expr><name><name>locked_chunks</name><index>[<expr><name>i</name></expr>]</index></name></expr></init></decl>;</decl_stmt>
+		<expr_stmt><expr><name><name>chunk</name><operator>-&gt;</operator><name>constraints</name></name> <operator>=</operator> <call><name>ts_chunk_constraints_alloc</name><argument_list>(<comment type="block">/* size_hint = */</comment> <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><name>orig_mcxt</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><call><name>ts_chunk_constraint_scan_iterator_set_chunk_id</name><argument_list>(<argument><expr><operator>&amp;</operator><name>constr_it</name></expr></argument>, <argument><expr><name><name>chunk</name><operator>-&gt;</operator><name>fd</name><operator>.</operator><name>id</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>ts_scan_iterator_start_or_restart_scan</name><argument_list>(<argument><expr><operator>&amp;</operator><name>constr_it</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<while>while <condition>(<expr><call><name>ts_scan_iterator_next</name><argument_list>(<argument><expr><operator>&amp;</operator><name>constr_it</name></expr></argument>)</argument_list></call> <operator>!=</operator> <name>NULL</name></expr>)</condition>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>TupleInfo</name> <modifier>*</modifier></type><name>constr_ti</name> <init>= <expr><call><name>ts_scan_iterator_tuple_info</name><argument_list>(<argument><expr><operator>&amp;</operator><name>constr_it</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+			<expr_stmt><expr><call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>per_tuple_mcxt</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>ts_chunk_constraints_add_from_tuple</name><argument_list>(<argument><expr><name><name>chunk</name><operator>-&gt;</operator><name>constraints</name></name></expr></argument>, <argument><expr><name>constr_ti</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>work_mcxt</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></while>
+	</block_content>}</block></for>
+	<expr_stmt><expr><call><name>ts_scan_iterator_close</name><argument_list>(<argument><expr><operator>&amp;</operator><name>constr_it</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Build hypercubes for the chunks by finding and combining the dimension
+	 * slices that match the chunk constraints.
+	 */</comment>
+	<decl_stmt><decl><type><name>ScanIterator</name></type> <name>slice_iterator</name> <init>= <expr><call><name>ts_dimension_slice_scan_iterator_create</name><argument_list>(<argument><expr><name>NULL</name></expr></argument>, <argument><expr><name>orig_mcxt</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<for>for <control>(<init><decl><type><name>int</name></type> <name>chunk_index</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</init> <condition><expr><name>chunk_index</name> <operator>&lt;</operator> <name>locked_chunk_count</name></expr>;</condition> <incr><expr><name>chunk_index</name><operator>++</operator></expr></incr>)</control>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>Chunk</name> <modifier>*</modifier></type><name>chunk</name> <init>= <expr><name><name>locked_chunks</name><index>[<expr><name>chunk_index</name></expr>]</index></name></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>ChunkConstraints</name> <modifier>*</modifier></type><name>constraints</name> <init>= <expr><name><name>chunk</name><operator>-&gt;</operator><name>constraints</name></name></expr></init></decl>;</decl_stmt>
+		<expr_stmt><expr><call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>orig_mcxt</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<decl_stmt><decl><type><name>Hypercube</name> <modifier>*</modifier></type><name>cube</name> <init>= <expr><call><name>ts_hypercube_alloc</name><argument_list>(<argument><expr><name><name>constraints</name><operator>-&gt;</operator><name>num_dimension_constraints</name></name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+		<expr_stmt><expr><call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>work_mcxt</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<for>for <control>(<init><decl><type><name>int</name></type> <name>constraint_index</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</init> <condition><expr><name>constraint_index</name> <operator>&lt;</operator> <name><name>constraints</name><operator>-&gt;</operator><name>num_constraints</name></name></expr>;</condition>
+			 <incr><expr><name>constraint_index</name><operator>++</operator></expr></incr>)</control>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>ChunkConstraint</name> <modifier>*</modifier></type><name>constraint</name> <init>= <expr><operator>&amp;</operator><name><name>constraints</name><operator>-&gt;</operator><name>constraints</name><index>[<expr><name>constraint_index</name></expr>]</index></name></expr></init></decl>;</decl_stmt>
+			<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>is_dimension_constraint</name><argument_list>(<argument><expr><name>constraint</name></expr></argument>)</argument_list></call></expr>)</condition>
+			<block>{<block_content>
+				<continue>continue;</continue>
+			</block_content>}</block></if></if_stmt>
+
+			<comment type="block">/*
+			 * Find the slice by id. Don't have to lock it because the chunk is
+			 * locked.
+			 */</comment>
+			<decl_stmt><decl><type><specifier>const</specifier> <name>int</name></type> <name>slice_id</name> <init>= <expr><name><name>constraint</name><operator>-&gt;</operator><name>fd</name><operator>.</operator><name>dimension_slice_id</name></name></expr></init></decl>;</decl_stmt>
+			<decl_stmt><decl><type><name>DimensionSlice</name> <modifier>*</modifier></type><name>slice_ptr</name> <init>=
+				<expr><call><name>ts_dimension_slice_scan_iterator_get_by_id</name><argument_list>(<argument><expr><operator>&amp;</operator><name>slice_iterator</name></expr></argument>,
+														   <argument><expr><name>slice_id</name></expr></argument>,
+														   <comment type="block">/* tuplock = */</comment> <argument><expr><name>NULL</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+			<if_stmt><if>if <condition>(<expr><name>slice_ptr</name> <operator>==</operator> <name>NULL</name></expr>)</condition>
+			<block>{<block_content>
+				<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"dimension slice %d is not found"</literal></expr></argument>, <argument><expr><name>slice_id</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			</block_content>}</block></if></if_stmt>
+			<expr_stmt><expr><call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>orig_mcxt</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<decl_stmt><decl><type><name>DimensionSlice</name> <modifier>*</modifier></type><name>slice_copy</name> <init>= <expr><call><name>ts_dimension_slice_create</name><argument_list>(<argument><expr><name><name>slice_ptr</name><operator>-&gt;</operator><name>fd</name><operator>.</operator><name>dimension_id</name></name></expr></argument>,
+																   <argument><expr><name><name>slice_ptr</name><operator>-&gt;</operator><name>fd</name><operator>.</operator><name>range_start</name></name></expr></argument>,
+																   <argument><expr><name><name>slice_ptr</name><operator>-&gt;</operator><name>fd</name><operator>.</operator><name>range_end</name></name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+			<expr_stmt><expr><name><name>slice_copy</name><operator>-&gt;</operator><name>fd</name><operator>.</operator><name>id</name></name> <operator>=</operator> <name><name>slice_ptr</name><operator>-&gt;</operator><name>fd</name><operator>.</operator><name>id</name></name></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>work_mcxt</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>cube</name><operator>-&gt;</operator><name>capacity</name></name> <operator>&gt;</operator> <name><name>cube</name><operator>-&gt;</operator><name>num_slices</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><name><name>cube</name><operator>-&gt;</operator><name>slices</name><index>[<expr><name><name>cube</name><operator>-&gt;</operator><name>num_slices</name></name><operator>++</operator></expr>]</index></name> <operator>=</operator> <name>slice_copy</name></expr>;</expr_stmt>
+		</block_content>}</block></for>
+		<expr_stmt><expr><call><name>ts_hypercube_slice_sort</name><argument_list>(<argument><expr><name>cube</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>chunk</name><operator>-&gt;</operator><name>cube</name></name> <operator>=</operator> <name>cube</name></expr>;</expr_stmt>
+	</block_content>}</block></for>
+	<expr_stmt><expr><call><name>ts_scan_iterator_close</name><argument_list>(<argument><expr><operator>&amp;</operator><name>slice_iterator</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>CurrentMemoryContext</name> <operator>==</operator> <name>work_mcxt</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Fill in data nodes for remote chunks.
+	 *
+	 * Avoid the loop if there are no remote chunks. (Typically, either all
+	 * chunks are remote chunks or none are.)
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name>remote_chunk_count</name> <operator>&gt;</operator> <literal type="number">0</literal></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>ScanIterator</name></type> <name>data_node_it</name> <init>= <expr><call><name>ts_chunk_data_nodes_scan_iterator_create</name><argument_list>(<argument><expr><name>orig_mcxt</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+		<for>for <control>(<init><decl><type><name>int</name></type> <name>i</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name>locked_chunk_count</name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>Chunk</name> <modifier>*</modifier></type><name>chunk</name> <init>= <expr><name><name>locked_chunks</name><index>[<expr><name>i</name></expr>]</index></name></expr></init></decl>;</decl_stmt>
+
+			<if_stmt><if>if <condition>(<expr><name><name>chunk</name><operator>-&gt;</operator><name>relkind</name></name> <operator>==</operator> <name>RELKIND_FOREIGN_TABLE</name></expr>)</condition>
+			<block>{<block_content>
+				<comment type="block">/* Must start or restart the scan on the longer-lived context */</comment>
+				<expr_stmt><expr><call><name>ts_chunk_data_nodes_scan_iterator_set_chunk_id</name><argument_list>(<argument><expr><operator>&amp;</operator><name>data_node_it</name></expr></argument>, <argument><expr><name><name>chunk</name><operator>-&gt;</operator><name>fd</name><operator>.</operator><name>id</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<expr_stmt><expr><call><name>ts_scan_iterator_start_or_restart_scan</name><argument_list>(<argument><expr><operator>&amp;</operator><name>data_node_it</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+				<while>while <condition>(<expr><call><name>ts_scan_iterator_next</name><argument_list>(<argument><expr><operator>&amp;</operator><name>data_node_it</name></expr></argument>)</argument_list></call> <operator>!=</operator> <name>NULL</name></expr>)</condition>
+				<block>{<block_content>
+					<decl_stmt><decl><type><name>bool</name></type> <name>should_free</name></decl>;</decl_stmt>
+					<decl_stmt><decl><type><name>TupleInfo</name> <modifier>*</modifier></type><name>ti</name> <init>= <expr><call><name>ts_scan_iterator_tuple_info</name><argument_list>(<argument><expr><operator>&amp;</operator><name>data_node_it</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+					<decl_stmt><decl><type><name>ChunkDataNode</name> <modifier>*</modifier></type><name>chunk_data_node</name></decl>;</decl_stmt>
+					<decl_stmt><decl><type><name>Form_chunk_data_node</name></type> <name>form</name></decl>;</decl_stmt>
+					<decl_stmt><decl><type><name>MemoryContext</name></type> <name>old_mcxt</name></decl>;</decl_stmt>
+					<decl_stmt><decl><type><name>HeapTuple</name></type> <name>tuple</name></decl>;</decl_stmt>
+
+					<expr_stmt><expr><call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>per_tuple_mcxt</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+					<expr_stmt><expr><call><name>MemoryContextReset</name><argument_list>(<argument><expr><name>per_tuple_mcxt</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+					<expr_stmt><expr><name>tuple</name> <operator>=</operator> <call><name>ts_scanner_fetch_heap_tuple</name><argument_list>(<argument><expr><name>ti</name></expr></argument>, <argument><expr><name>false</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>should_free</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+					<expr_stmt><expr><name>form</name> <operator>=</operator> <operator>(</operator><name>Form_chunk_data_node</name><operator>)</operator> <call><name>GETSTRUCT</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+					<expr_stmt><expr><name>old_mcxt</name> <operator>=</operator> <call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name><name>ti</name><operator>-&gt;</operator><name>mctx</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+					<expr_stmt><expr><name>chunk_data_node</name> <operator>=</operator> <call><name>palloc</name><argument_list>(<argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>ChunkDataNode</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+					<expr_stmt><expr><call><name>memcpy</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>chunk_data_node</name><operator>-&gt;</operator><name>fd</name></name></expr></argument>, <argument><expr><name>form</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>FormData_chunk_data_node</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+					<expr_stmt><expr><name><name>chunk_data_node</name><operator>-&gt;</operator><name>foreign_server_oid</name></name> <operator>=</operator>
+						<call><name>get_foreign_server_oid</name><argument_list>(<argument><expr><call><name>NameStr</name><argument_list>(<argument><expr><name><name>form</name><operator>-&gt;</operator><name>node_name</name></name></expr></argument>)</argument_list></call></expr></argument>,
+											   <comment type="block">/* missing_ok = */</comment> <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+					<expr_stmt><expr><name><name>chunk</name><operator>-&gt;</operator><name>data_nodes</name></name> <operator>=</operator> <call><name>lappend</name><argument_list>(<argument><expr><name><name>chunk</name><operator>-&gt;</operator><name>data_nodes</name></name></expr></argument>, <argument><expr><name>chunk_data_node</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+					<expr_stmt><expr><call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>old_mcxt</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+					<if_stmt><if>if <condition>(<expr><name>should_free</name></expr>)</condition><block type="pseudo"><block_content>
+						<expr_stmt><expr><call><name>heap_freetuple</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+					<expr_stmt><expr><call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>work_mcxt</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				</block_content>}</block></while>
+			</block_content>}</block></if></if_stmt>
+		</block_content>}</block></for>
+
+		<expr_stmt><expr><call><name>ts_scan_iterator_close</name><argument_list>(<argument><expr><operator>&amp;</operator><name>data_node_it</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>orig_mcxt</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>MemoryContextDelete</name><argument_list>(<argument><expr><name>work_mcxt</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>USE_ASSERT_CHECKING</name></cpp:ifdef>
+	<comment type="block">/* Assert that we always return valid chunks */</comment>
+	<for>for <control>(<init><decl><type><name>int</name></type> <name>i</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name>locked_chunk_count</name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>ASSERT_IS_VALID_CHUNK</name><argument_list>(<argument><expr><name><name>locked_chunks</name><index>[<expr><name>i</name></expr>]</index></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></for>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+	<expr_stmt><expr><operator>*</operator><name>num_chunks</name> <operator>=</operator> <name>locked_chunk_count</name></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><operator>*</operator><name>num_chunks</name> <operator>==</operator> <literal type="number">0</literal> <operator>||</operator> <name>locked_chunks</name> <operator>!=</operator> <name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<return>return <expr><name>locked_chunks</name></expr>;</return>
+</block_content>}</block></function>
+</unit>

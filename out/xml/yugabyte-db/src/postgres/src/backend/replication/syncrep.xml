@@ -1,0 +1,1224 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<unit xmlns="http://www.srcML.org/srcML/src" xmlns:cpp="http://www.srcML.org/srcML/cpp" revision="1.0.0" language="C" filename="/cloned_projects/yugabyte-db/src/postgres/src/backend/replication/syncrep.c"><comment type="block">/*-------------------------------------------------------------------------
+ *
+ * syncrep.c
+ *
+ * Synchronous replication is new as of PostgreSQL 9.1.
+ *
+ * If requested, transaction commits wait until their commit LSN are
+ * acknowledged by the synchronous standbys.
+ *
+ * This module contains the code for waiting and release of backends.
+ * All code in this module executes on the primary. The core streaming
+ * replication transport remains within WALreceiver/WALsender modules.
+ *
+ * The essence of this design is that it isolates all logic about
+ * waiting/releasing onto the primary. The primary defines which standbys
+ * it wishes to wait for. The standbys are completely unaware of the
+ * durability requirements of transactions on the primary, reducing the
+ * complexity of the code and streamlining both standby operations and
+ * network bandwidth because there is no requirement to ship
+ * per-transaction state information.
+ *
+ * Replication is either synchronous or not synchronous (async). If it is
+ * async, we just fastpath out of here. If it is sync, then we wait for
+ * the write, flush or apply location on the standby before releasing
+ * the waiting backend. Further complexity in that interaction is
+ * expected in later releases.
+ *
+ * The best performing way to manage the waiting backends is to have a
+ * single ordered queue of waiting backends, so that we can avoid
+ * searching the through all waiters each time we receive a reply.
+ *
+ * In 9.5 or before only a single standby could be considered as
+ * synchronous. In 9.6 we support a priority-based multiple synchronous
+ * standbys. In 10.0 a quorum-based multiple synchronous standbys is also
+ * supported. The number of synchronous standbys that transactions
+ * must wait for replies from is specified in synchronous_standby_names.
+ * This parameter also specifies a list of standby names and the method
+ * (FIRST and ANY) to choose synchronous standbys from the listed ones.
+ *
+ * The method FIRST specifies a priority-based synchronous replication
+ * and makes transaction commits wait until their WAL records are
+ * replicated to the requested number of synchronous standbys chosen based
+ * on their priorities. The standbys whose names appear earlier in the list
+ * are given higher priority and will be considered as synchronous.
+ * Other standby servers appearing later in this list represent potential
+ * synchronous standbys. If any of the current synchronous standbys
+ * disconnects for whatever reason, it will be replaced immediately with
+ * the next-highest-priority standby.
+ *
+ * The method ANY specifies a quorum-based synchronous replication
+ * and makes transaction commits wait until their WAL records are
+ * replicated to at least the requested number of synchronous standbys
+ * in the list. All the standbys appearing in the list are considered as
+ * candidates for quorum synchronous standbys.
+ *
+ * If neither FIRST nor ANY is specified, FIRST is used as the method.
+ * This is for backward compatibility with 9.6 or before where only a
+ * priority-based sync replication was supported.
+ *
+ * Before the standbys chosen from synchronous_standby_names can
+ * become the synchronous standbys they must have caught up with
+ * the primary; that may take some time. Once caught up,
+ * the standbys which are considered as synchronous at that moment
+ * will release waiters from the queue.
+ *
+ * Portions Copyright (c) 2010-2018, PostgreSQL Global Development Group
+ *
+ * IDENTIFICATION
+ *	  src/backend/replication/syncrep.c
+ *
+ *-------------------------------------------------------------------------
+ */</comment>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"postgres.h"</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;unistd.h&gt;</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/xact.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"miscadmin.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"pgstat.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"replication/syncrep.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"replication/walsender.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"replication/walsender_private.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/pmsignal.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/proc.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"tcop/tcopprot.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/builtins.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/ps_status.h"</cpp:file></cpp:include>
+
+<comment type="block">/* User-settable parameters for sync rep */</comment>
+<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>SyncRepStandbyNames</name></decl>;</decl_stmt>
+
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>SyncStandbysDefined</name><parameter_list>()</parameter_list></cpp:macro> \
+	<cpp:value>(SyncRepStandbyNames != NULL &amp;&amp; SyncRepStandbyNames[0] != '\0')</cpp:value></cpp:define>
+
+<decl_stmt><decl><type><specifier>static</specifier> <name>bool</name></type> <name>announce_next_takeover</name> <init>= <expr><name>true</name></expr></init></decl>;</decl_stmt>
+
+<decl_stmt><decl><type><name>SyncRepConfigData</name> <modifier>*</modifier></type><name>SyncRepConfig</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+<decl_stmt><decl><type><specifier>static</specifier> <name>int</name></type>	<name>SyncRepWaitMode</name> <init>= <expr><name>SYNC_REP_NO_WAIT</name></expr></init></decl>;</decl_stmt>
+
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>SyncRepQueueInsert</name><parameter_list>(<parameter><decl><type><name>int</name></type> <name>mode</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>SyncRepCancelWait</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>int</name></type>	<name>SyncRepWakeQueue</name><parameter_list>(<parameter><decl><type><name>bool</name></type> <name>all</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>mode</name></decl></parameter>)</parameter_list>;</function_decl>
+
+<function_decl><type><specifier>static</specifier> <name>bool</name></type> <name>SyncRepGetSyncRecPtr</name><parameter_list>(<parameter><decl><type><name>XLogRecPtr</name> <modifier>*</modifier></type><name>writePtr</name></decl></parameter>,
+					 <parameter><decl><type><name>XLogRecPtr</name> <modifier>*</modifier></type><name>flushPtr</name></decl></parameter>,
+					 <parameter><decl><type><name>XLogRecPtr</name> <modifier>*</modifier></type><name>applyPtr</name></decl></parameter>,
+					 <parameter><decl><type><name>bool</name> <modifier>*</modifier></type><name>am_sync</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>SyncRepGetOldestSyncRecPtr</name><parameter_list>(<parameter><decl><type><name>XLogRecPtr</name> <modifier>*</modifier></type><name>writePtr</name></decl></parameter>,
+						   <parameter><decl><type><name>XLogRecPtr</name> <modifier>*</modifier></type><name>flushPtr</name></decl></parameter>,
+						   <parameter><decl><type><name>XLogRecPtr</name> <modifier>*</modifier></type><name>applyPtr</name></decl></parameter>,
+						   <parameter><decl><type><name>List</name> <modifier>*</modifier></type><name>sync_standbys</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>SyncRepGetNthLatestSyncRecPtr</name><parameter_list>(<parameter><decl><type><name>XLogRecPtr</name> <modifier>*</modifier></type><name>writePtr</name></decl></parameter>,
+							  <parameter><decl><type><name>XLogRecPtr</name> <modifier>*</modifier></type><name>flushPtr</name></decl></parameter>,
+							  <parameter><decl><type><name>XLogRecPtr</name> <modifier>*</modifier></type><name>applyPtr</name></decl></parameter>,
+							  <parameter><decl><type><name>List</name> <modifier>*</modifier></type><name>sync_standbys</name></decl></parameter>, <parameter><decl><type><name>uint8</name></type> <name>nth</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>int</name></type>	<name>SyncRepGetStandbyPriority</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>List</name> <modifier>*</modifier></type><name>SyncRepGetSyncStandbysPriority</name><parameter_list>(<parameter><decl><type><name>bool</name> <modifier>*</modifier></type><name>am_sync</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>List</name> <modifier>*</modifier></type><name>SyncRepGetSyncStandbysQuorum</name><parameter_list>(<parameter><decl><type><name>bool</name> <modifier>*</modifier></type><name>am_sync</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>int</name></type>	<name>cmp_lsn</name><parameter_list>(<parameter><decl><type><specifier>const</specifier> <name>void</name> <modifier>*</modifier></type><name>a</name></decl></parameter>, <parameter><decl><type><specifier>const</specifier> <name>void</name> <modifier>*</modifier></type><name>b</name></decl></parameter>)</parameter_list>;</function_decl>
+
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>USE_ASSERT_CHECKING</name></cpp:ifdef>
+<function_decl><type><specifier>static</specifier> <name>bool</name></type> <name>SyncRepQueueIsOrderedByLSN</name><parameter_list>(<parameter><decl><type><name>int</name></type> <name>mode</name></decl></parameter>)</parameter_list>;</function_decl>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+<comment type="block">/*
+ * ===========================================================
+ * Synchronous Replication functions for normal user backends
+ * ===========================================================
+ */</comment>
+
+<comment type="block">/*
+ * Wait for synchronous replication, if requested by user.
+ *
+ * Initially backends start in state SYNC_REP_NOT_WAITING and then
+ * change that state to SYNC_REP_WAITING before adding ourselves
+ * to the wait queue. During SyncRepWakeQueue() a WALSender changes
+ * the state to SYNC_REP_WAIT_COMPLETE once replication is confirmed.
+ * This backend then resets its state to SYNC_REP_NOT_WAITING.
+ *
+ * 'lsn' represents the LSN to wait for.  'commit' indicates whether this LSN
+ * represents a commit record.  If it doesn't, then we wait only for the WAL
+ * to be flushed if synchronous_commit is set to the higher level of
+ * remote_apply, because only commit records provide apply feedback.
+ */</comment>
+<function><type><name>void</name></type>
+<name>SyncRepWaitForLSN</name><parameter_list>(<parameter><decl><type><name>XLogRecPtr</name></type> <name>lsn</name></decl></parameter>, <parameter><decl><type><name>bool</name></type> <name>commit</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>new_status</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>old_status</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>mode</name></decl>;</decl_stmt>
+
+	<comment type="block">/* Cap the level for anything other than commit to remote flush only. */</comment>
+	<if_stmt><if>if <condition>(<expr><name>commit</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name>mode</name> <operator>=</operator> <name>SyncRepWaitMode</name></expr>;</expr_stmt></block_content></block></if>
+	<else>else<block type="pseudo"><block_content>
+		<expr_stmt><expr><name>mode</name> <operator>=</operator> <call><name>Min</name><argument_list>(<argument><expr><name>SyncRepWaitMode</name></expr></argument>, <argument><expr><name>SYNC_REP_WAIT_FLUSH</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></else></if_stmt>
+
+	<comment type="block">/*
+	 * Fast exit if user has not requested sync replication.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>SyncRepRequested</name><argument_list>()</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<return>return;</return></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>SHMQueueIsDetached</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>MyProc</name><operator>-&gt;</operator><name>syncRepLinks</name></name><operator>)</operator></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>WalSndCtl</name> <operator>!=</operator> <name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>LWLockAcquire</name><argument_list>(<argument><expr><name>SyncRepLock</name></expr></argument>, <argument><expr><name>LW_EXCLUSIVE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>MyProc</name><operator>-&gt;</operator><name>syncRepState</name></name> <operator>==</operator> <name>SYNC_REP_NOT_WAITING</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * We don't wait for sync rep if WalSndCtl-&gt;sync_standbys_defined is not
+	 * set.  See SyncRepUpdateSyncStandbysDefined.
+	 *
+	 * Also check that the standby hasn't already replied. Unlikely race
+	 * condition but we'll be fetching that cache line anyway so it's likely
+	 * to be a low cost check.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><name><name>WalSndCtl</name><operator>-&gt;</operator><name>sync_standbys_defined</name></name> <operator>||</operator>
+		<name>lsn</name> <operator>&lt;=</operator> <name><name>WalSndCtl</name><operator>-&gt;</operator><name>lsn</name><index>[<expr><name>mode</name></expr>]</index></name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><name>SyncRepLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<return>return;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/*
+	 * Set our waitLSN so WALSender will know when to wake us, and add
+	 * ourselves to the queue.
+	 */</comment>
+	<expr_stmt><expr><name><name>MyProc</name><operator>-&gt;</operator><name>waitLSN</name></name> <operator>=</operator> <name>lsn</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>MyProc</name><operator>-&gt;</operator><name>syncRepState</name></name> <operator>=</operator> <name>SYNC_REP_WAITING</name></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>SyncRepQueueInsert</name><argument_list>(<argument><expr><name>mode</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>SyncRepQueueIsOrderedByLSN</name><argument_list>(<argument><expr><name>mode</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><name>SyncRepLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Alter ps display to show waiting for sync rep. */</comment>
+	<if_stmt><if>if <condition>(<expr><name>update_process_title</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>int</name></type>			<name>len</name></decl>;</decl_stmt>
+
+		<expr_stmt><expr><name>old_status</name> <operator>=</operator> <call><name>get_ps_display</name><argument_list>(<argument><expr><operator>&amp;</operator><name>len</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name>new_status</name> <operator>=</operator> <operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <call><name>palloc</name><argument_list>(<argument><expr><name>len</name> <operator>+</operator> <literal type="number">32</literal> <operator>+</operator> <literal type="number">1</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>memcpy</name><argument_list>(<argument><expr><name>new_status</name></expr></argument>, <argument><expr><name>old_status</name></expr></argument>, <argument><expr><name>len</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>sprintf</name><argument_list>(<argument><expr><name>new_status</name> <operator>+</operator> <name>len</name></expr></argument>, <argument><expr><literal type="string">" waiting for %X/%X"</literal></expr></argument>,
+				<argument><expr><operator>(</operator><name>uint32</name><operator>)</operator> <operator>(</operator><name>lsn</name> <operator>&gt;&gt;</operator> <literal type="number">32</literal><operator>)</operator></expr></argument>, <argument><expr><operator>(</operator><name>uint32</name><operator>)</operator> <name>lsn</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>set_ps_display</name><argument_list>(<argument><expr><name>new_status</name></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>new_status</name><index>[<expr><name>len</name></expr>]</index></name> <operator>=</operator> <literal type="char">'\0'</literal></expr>;</expr_stmt> <comment type="block">/* truncate off " waiting ..." */</comment>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/*
+	 * Wait for specified LSN to be confirmed.
+	 *
+	 * Each proc has its own wait latch, so we perform a normal latch
+	 * check/wait loop here.
+	 */</comment>
+	<for>for <control>(<init>;</init><condition>;</condition><incr/>)</control>
+	<block>{<block_content>
+		<comment type="block">/* Must reset the latch before testing state. */</comment>
+		<expr_stmt><expr><call><name>ResetLatch</name><argument_list>(<argument><expr><name>MyLatch</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/*
+		 * Acquiring the lock is not needed, the latch ensures proper
+		 * barriers. If it looks like we're done, we must really be done,
+		 * because once walsender changes the state to SYNC_REP_WAIT_COMPLETE,
+		 * it will never update it again, so we can't be seeing a stale value
+		 * in that case.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><name><name>MyProc</name><operator>-&gt;</operator><name>syncRepState</name></name> <operator>==</operator> <name>SYNC_REP_WAIT_COMPLETE</name></expr>)</condition><block type="pseudo"><block_content>
+			<break>break;</break></block_content></block></if></if_stmt>
+
+		<comment type="block">/*
+		 * If a wait for synchronous replication is pending, we can neither
+		 * acknowledge the commit nor raise ERROR or FATAL.  The latter would
+		 * lead the client to believe that the transaction aborted, which is
+		 * not true: it's already committed locally. The former is no good
+		 * either: the client has requested synchronous replication, and is
+		 * entitled to assume that an acknowledged commit is also replicated,
+		 * which might not be true. So in this case we issue a WARNING (which
+		 * some clients may be able to interpret) and shut off further output.
+		 * We do NOT reset ProcDiePending, so that the process will die after
+		 * the commit is cleaned up.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><name>ProcDiePending</name></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>WARNING</name></expr></argument>,
+					<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_ADMIN_SHUTDOWN</name></expr></argument>)</argument_list></call><operator>,</operator>
+					 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"canceling the wait for synchronous replication and terminating connection due to administrator command"</literal></expr></argument>)</argument_list></call><operator>,</operator>
+					 <call><name>errdetail</name><argument_list>(<argument><expr><literal type="string">"The transaction has already committed locally, but might not have been replicated to the standby."</literal></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><name>whereToSendOutput</name> <operator>=</operator> <name>DestNone</name></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>SyncRepCancelWait</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+			<break>break;</break>
+		</block_content>}</block></if></if_stmt>
+
+		<comment type="block">/*
+		 * It's unclear what to do if a query cancel interrupt arrives.  We
+		 * can't actually abort at this point, but ignoring the interrupt
+		 * altogether is not helpful, so we just terminate the wait with a
+		 * suitable warning.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><name>QueryCancelPending</name></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><name>QueryCancelPending</name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>WARNING</name></expr></argument>,
+					<argument><expr><operator>(</operator><call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"canceling wait for synchronous replication due to user request"</literal></expr></argument>)</argument_list></call><operator>,</operator>
+					 <call><name>errdetail</name><argument_list>(<argument><expr><literal type="string">"The transaction has already committed locally, but might not have been replicated to the standby."</literal></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>SyncRepCancelWait</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+			<break>break;</break>
+		</block_content>}</block></if></if_stmt>
+
+		<comment type="block">/*
+		 * If the postmaster dies, we'll probably never get an
+		 * acknowledgement, because all the wal sender processes will exit. So
+		 * just bail out.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>PostmasterIsAlive</name><argument_list>()</argument_list></call></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><name>ProcDiePending</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+			<expr_stmt><expr><name>whereToSendOutput</name> <operator>=</operator> <name>DestNone</name></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>SyncRepCancelWait</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+			<break>break;</break>
+		</block_content>}</block></if></if_stmt>
+
+		<comment type="block">/*
+		 * Wait on latch.  Any condition that should wake us up will set the
+		 * latch, so no need for timeout.
+		 */</comment>
+		<expr_stmt><expr><call><name>WaitLatch</name><argument_list>(<argument><expr><name>MyLatch</name></expr></argument>, <argument><expr><name>WL_LATCH_SET</name> <operator>|</operator> <name>WL_POSTMASTER_DEATH</name></expr></argument>, <argument><expr><operator>-</operator><literal type="number">1</literal></expr></argument>,
+				  <argument><expr><name>WAIT_EVENT_SYNC_REP</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></for>
+
+	<comment type="block">/*
+	 * WalSender has checked our LSN and has removed us from queue. Clean up
+	 * state and leave.  It's OK to reset these shared memory fields without
+	 * holding SyncRepLock, because any walsenders will ignore us anyway when
+	 * we're not on the queue.  We need a read barrier to make sure we see the
+	 * changes to the queue link (this might be unnecessary without
+	 * assertions, but better safe than sorry).
+	 */</comment>
+	<expr_stmt><expr><call><name>pg_read_barrier</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>SHMQueueIsDetached</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>MyProc</name><operator>-&gt;</operator><name>syncRepLinks</name></name><operator>)</operator></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>MyProc</name><operator>-&gt;</operator><name>syncRepState</name></name> <operator>=</operator> <name>SYNC_REP_NOT_WAITING</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>MyProc</name><operator>-&gt;</operator><name>waitLSN</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>new_status</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* Reset ps display */</comment>
+		<expr_stmt><expr><call><name>set_ps_display</name><argument_list>(<argument><expr><name>new_status</name></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>pfree</name><argument_list>(<argument><expr><name>new_status</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Insert MyProc into the specified SyncRepQueue, maintaining sorted invariant.
+ *
+ * Usually we will go at tail of queue, though it's possible that we arrive
+ * here out of order, so start at tail and work back to insertion point.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>SyncRepQueueInsert</name><parameter_list>(<parameter><decl><type><name>int</name></type> <name>mode</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>PGPROC</name>	   <modifier>*</modifier></type><name>proc</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>mode</name> <operator>&gt;=</operator> <literal type="number">0</literal> <operator>&amp;&amp;</operator> <name>mode</name> <operator>&lt;</operator> <name>NUM_SYNC_REP_WAIT_MODE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>proc</name> <operator>=</operator> <operator>(</operator><name>PGPROC</name> <operator>*</operator><operator>)</operator> <call><name>SHMQueuePrev</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>WalSndCtl</name><operator>-&gt;</operator><name>SyncRepQueue</name><index>[<expr><name>mode</name></expr>]</index></name><operator>)</operator></expr></argument>,
+								   <argument><expr><operator>&amp;</operator><operator>(</operator><name><name>WalSndCtl</name><operator>-&gt;</operator><name>SyncRepQueue</name><index>[<expr><name>mode</name></expr>]</index></name><operator>)</operator></expr></argument>,
+								   <argument><expr><call><name>offsetof</name><argument_list>(<argument><expr><name>PGPROC</name></expr></argument>, <argument><expr><name>syncRepLinks</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<while>while <condition>(<expr><name>proc</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/*
+		 * Stop at the queue element that we should after to ensure the queue
+		 * is ordered by LSN.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><name><name>proc</name><operator>-&gt;</operator><name>waitLSN</name></name> <operator>&lt;</operator> <name><name>MyProc</name><operator>-&gt;</operator><name>waitLSN</name></name></expr>)</condition><block type="pseudo"><block_content>
+			<break>break;</break></block_content></block></if></if_stmt>
+
+		<expr_stmt><expr><name>proc</name> <operator>=</operator> <operator>(</operator><name>PGPROC</name> <operator>*</operator><operator>)</operator> <call><name>SHMQueuePrev</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>WalSndCtl</name><operator>-&gt;</operator><name>SyncRepQueue</name><index>[<expr><name>mode</name></expr>]</index></name><operator>)</operator></expr></argument>,
+									   <argument><expr><operator>&amp;</operator><operator>(</operator><name><name>proc</name><operator>-&gt;</operator><name>syncRepLinks</name></name><operator>)</operator></expr></argument>,
+									   <argument><expr><call><name>offsetof</name><argument_list>(<argument><expr><name>PGPROC</name></expr></argument>, <argument><expr><name>syncRepLinks</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></while>
+
+	<if_stmt><if>if <condition>(<expr><name>proc</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>SHMQueueInsertAfter</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>proc</name><operator>-&gt;</operator><name>syncRepLinks</name></name><operator>)</operator></expr></argument>, <argument><expr><operator>&amp;</operator><operator>(</operator><name><name>MyProc</name><operator>-&gt;</operator><name>syncRepLinks</name></name><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if>
+	<else>else<block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>SHMQueueInsertAfter</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>WalSndCtl</name><operator>-&gt;</operator><name>SyncRepQueue</name><index>[<expr><name>mode</name></expr>]</index></name><operator>)</operator></expr></argument>, <argument><expr><operator>&amp;</operator><operator>(</operator><name><name>MyProc</name><operator>-&gt;</operator><name>syncRepLinks</name></name><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></else></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Acquire SyncRepLock and cancel any wait currently in progress.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>SyncRepCancelWait</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>LWLockAcquire</name><argument_list>(<argument><expr><name>SyncRepLock</name></expr></argument>, <argument><expr><name>LW_EXCLUSIVE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>SHMQueueIsDetached</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>MyProc</name><operator>-&gt;</operator><name>syncRepLinks</name></name><operator>)</operator></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>SHMQueueDelete</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>MyProc</name><operator>-&gt;</operator><name>syncRepLinks</name></name><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	<expr_stmt><expr><name><name>MyProc</name><operator>-&gt;</operator><name>syncRepState</name></name> <operator>=</operator> <name>SYNC_REP_NOT_WAITING</name></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><name>SyncRepLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<function><type><name>void</name></type>
+<name>SyncRepCleanupAtProcExit</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>SHMQueueIsDetached</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>MyProc</name><operator>-&gt;</operator><name>syncRepLinks</name></name><operator>)</operator></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>LWLockAcquire</name><argument_list>(<argument><expr><name>SyncRepLock</name></expr></argument>, <argument><expr><name>LW_EXCLUSIVE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>SHMQueueDelete</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>MyProc</name><operator>-&gt;</operator><name>syncRepLinks</name></name><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><name>SyncRepLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * ===========================================================
+ * Synchronous Replication functions for wal sender processes
+ * ===========================================================
+ */</comment>
+
+<comment type="block">/*
+ * Take any action required to initialise sync rep state from config
+ * data. Called at WALSender startup and after each SIGHUP.
+ */</comment>
+<function><type><name>void</name></type>
+<name>SyncRepInitConfig</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>int</name></type>			<name>priority</name></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * Determine if we are a potential sync standby and remember the result
+	 * for handling replies from standby.
+	 */</comment>
+	<expr_stmt><expr><name>priority</name> <operator>=</operator> <call><name>SyncRepGetStandbyPriority</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><name><name>MyWalSnd</name><operator>-&gt;</operator><name>sync_standby_priority</name></name> <operator>!=</operator> <name>priority</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>LWLockAcquire</name><argument_list>(<argument><expr><name>SyncRepLock</name></expr></argument>, <argument><expr><name>LW_EXCLUSIVE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>MyWalSnd</name><operator>-&gt;</operator><name>sync_standby_priority</name></name> <operator>=</operator> <name>priority</name></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><name>SyncRepLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>DEBUG1</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"standby \"%s\" now has synchronous standby priority %u"</literal></expr></argument>,
+						<argument><expr><name>application_name</name></expr></argument>, <argument><expr><name>priority</name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Update the LSNs on each queue based upon our latest state. This
+ * implements a simple policy of first-valid-sync-standby-releases-waiter.
+ *
+ * Other policies are possible, which would change what we do here and
+ * perhaps also which information we store as well.
+ */</comment>
+<function><type><name>void</name></type>
+<name>SyncRepReleaseWaiters</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><specifier>volatile</specifier> <name>WalSndCtlData</name> <modifier>*</modifier></type><name>walsndctl</name> <init>= <expr><name>WalSndCtl</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>XLogRecPtr</name></type>	<name>writePtr</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>XLogRecPtr</name></type>	<name>flushPtr</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>XLogRecPtr</name></type>	<name>applyPtr</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type>		<name>got_recptr</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type>		<name>am_sync</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>numwrite</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>numflush</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>numapply</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * If this WALSender is serving a standby that is not on the list of
+	 * potential sync standbys then we have nothing to do. If we are still
+	 * starting up, still running base backup or the current flush position is
+	 * still invalid, then leave quickly also.  Streaming or stopping WAL
+	 * senders are allowed to release waiters.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>MyWalSnd</name><operator>-&gt;</operator><name>sync_standby_priority</name></name> <operator>==</operator> <literal type="number">0</literal> <operator>||</operator>
+		<operator>(</operator><name><name>MyWalSnd</name><operator>-&gt;</operator><name>state</name></name> <operator>!=</operator> <name>WALSNDSTATE_STREAMING</name> <operator>&amp;&amp;</operator>
+		 <name><name>MyWalSnd</name><operator>-&gt;</operator><name>state</name></name> <operator>!=</operator> <name>WALSNDSTATE_STOPPING</name><operator>)</operator> <operator>||</operator>
+		<call><name>XLogRecPtrIsInvalid</name><argument_list>(<argument><expr><name><name>MyWalSnd</name><operator>-&gt;</operator><name>flush</name></name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name>announce_next_takeover</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+		<return>return;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/*
+	 * We're a potential sync standby. Release waiters if there are enough
+	 * sync standbys and we are considered as sync.
+	 */</comment>
+	<expr_stmt><expr><call><name>LWLockAcquire</name><argument_list>(<argument><expr><name>SyncRepLock</name></expr></argument>, <argument><expr><name>LW_EXCLUSIVE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Check whether we are a sync standby or not, and calculate the synced
+	 * positions among all sync standbys.
+	 */</comment>
+	<expr_stmt><expr><name>got_recptr</name> <operator>=</operator> <call><name>SyncRepGetSyncRecPtr</name><argument_list>(<argument><expr><operator>&amp;</operator><name>writePtr</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>flushPtr</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>applyPtr</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>am_sync</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * If we are managing a sync standby, though we weren't prior to this,
+	 * then announce we are now a sync standby.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name>announce_next_takeover</name> <operator>&amp;&amp;</operator> <name>am_sync</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name>announce_next_takeover</name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name><name>SyncRepConfig</name><operator>-&gt;</operator><name>syncrep_method</name></name> <operator>==</operator> <name>SYNC_REP_PRIORITY</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>LOG</name></expr></argument>,
+					<argument><expr><operator>(</operator><call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"standby \"%s\" is now a synchronous standby with priority %u"</literal></expr></argument>,
+							<argument><expr><name>application_name</name></expr></argument>, <argument><expr><name><name>MyWalSnd</name><operator>-&gt;</operator><name>sync_standby_priority</name></name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if>
+		<else>else<block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>LOG</name></expr></argument>,
+					<argument><expr><operator>(</operator><call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"standby \"%s\" is now a candidate for quorum synchronous standby"</literal></expr></argument>,
+							<argument><expr><name>application_name</name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></else></if_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/*
+	 * If the number of sync standbys is less than requested or we aren't
+	 * managing a sync standby then just leave.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><name>got_recptr</name> <operator>||</operator> <operator>!</operator><name>am_sync</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><name>SyncRepLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name>announce_next_takeover</name> <operator>=</operator> <operator>!</operator><name>am_sync</name></expr>;</expr_stmt>
+		<return>return;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/*
+	 * Set the lsn first so that when we wake backends they will release up to
+	 * this location.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>walsndctl</name><operator>-&gt;</operator><name>lsn</name><index>[<expr><name>SYNC_REP_WAIT_WRITE</name></expr>]</index></name> <operator>&lt;</operator> <name>writePtr</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name><name>walsndctl</name><operator>-&gt;</operator><name>lsn</name><index>[<expr><name>SYNC_REP_WAIT_WRITE</name></expr>]</index></name> <operator>=</operator> <name>writePtr</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name>numwrite</name> <operator>=</operator> <call><name>SyncRepWakeQueue</name><argument_list>(<argument><expr><name>false</name></expr></argument>, <argument><expr><name>SYNC_REP_WAIT_WRITE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+	<if_stmt><if>if <condition>(<expr><name><name>walsndctl</name><operator>-&gt;</operator><name>lsn</name><index>[<expr><name>SYNC_REP_WAIT_FLUSH</name></expr>]</index></name> <operator>&lt;</operator> <name>flushPtr</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name><name>walsndctl</name><operator>-&gt;</operator><name>lsn</name><index>[<expr><name>SYNC_REP_WAIT_FLUSH</name></expr>]</index></name> <operator>=</operator> <name>flushPtr</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name>numflush</name> <operator>=</operator> <call><name>SyncRepWakeQueue</name><argument_list>(<argument><expr><name>false</name></expr></argument>, <argument><expr><name>SYNC_REP_WAIT_FLUSH</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+	<if_stmt><if>if <condition>(<expr><name><name>walsndctl</name><operator>-&gt;</operator><name>lsn</name><index>[<expr><name>SYNC_REP_WAIT_APPLY</name></expr>]</index></name> <operator>&lt;</operator> <name>applyPtr</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name><name>walsndctl</name><operator>-&gt;</operator><name>lsn</name><index>[<expr><name>SYNC_REP_WAIT_APPLY</name></expr>]</index></name> <operator>=</operator> <name>applyPtr</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name>numapply</name> <operator>=</operator> <call><name>SyncRepWakeQueue</name><argument_list>(<argument><expr><name>false</name></expr></argument>, <argument><expr><name>SYNC_REP_WAIT_APPLY</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><name>SyncRepLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>DEBUG3</name></expr></argument>, <argument><expr><literal type="string">"released %d procs up to write %X/%X, %d procs up to flush %X/%X, %d procs up to apply %X/%X"</literal></expr></argument>,
+		 <argument><expr><name>numwrite</name></expr></argument>, <argument><expr><operator>(</operator><name>uint32</name><operator>)</operator> <operator>(</operator><name>writePtr</name> <operator>&gt;&gt;</operator> <literal type="number">32</literal><operator>)</operator></expr></argument>, <argument><expr><operator>(</operator><name>uint32</name><operator>)</operator> <name>writePtr</name></expr></argument>,
+		 <argument><expr><name>numflush</name></expr></argument>, <argument><expr><operator>(</operator><name>uint32</name><operator>)</operator> <operator>(</operator><name>flushPtr</name> <operator>&gt;&gt;</operator> <literal type="number">32</literal><operator>)</operator></expr></argument>, <argument><expr><operator>(</operator><name>uint32</name><operator>)</operator> <name>flushPtr</name></expr></argument>,
+		 <argument><expr><name>numapply</name></expr></argument>, <argument><expr><operator>(</operator><name>uint32</name><operator>)</operator> <operator>(</operator><name>applyPtr</name> <operator>&gt;&gt;</operator> <literal type="number">32</literal><operator>)</operator></expr></argument>, <argument><expr><operator>(</operator><name>uint32</name><operator>)</operator> <name>applyPtr</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Calculate the synced Write, Flush and Apply positions among sync standbys.
+ *
+ * Return false if the number of sync standbys is less than
+ * synchronous_standby_names specifies. Otherwise return true and
+ * store the positions into *writePtr, *flushPtr and *applyPtr.
+ *
+ * On return, *am_sync is set to true if this walsender is connecting to
+ * sync standby. Otherwise it's set to false.
+ */</comment>
+<function><type><specifier>static</specifier> <name>bool</name></type>
+<name>SyncRepGetSyncRecPtr</name><parameter_list>(<parameter><decl><type><name>XLogRecPtr</name> <modifier>*</modifier></type><name>writePtr</name></decl></parameter>, <parameter><decl><type><name>XLogRecPtr</name> <modifier>*</modifier></type><name>flushPtr</name></decl></parameter>,
+					 <parameter><decl><type><name>XLogRecPtr</name> <modifier>*</modifier></type><name>applyPtr</name></decl></parameter>, <parameter><decl><type><name>bool</name> <modifier>*</modifier></type><name>am_sync</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>List</name>	   <modifier>*</modifier></type><name>sync_standbys</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><operator>*</operator><name>writePtr</name> <operator>=</operator> <name>InvalidXLogRecPtr</name></expr>;</expr_stmt>
+	<expr_stmt><expr><operator>*</operator><name>flushPtr</name> <operator>=</operator> <name>InvalidXLogRecPtr</name></expr>;</expr_stmt>
+	<expr_stmt><expr><operator>*</operator><name>applyPtr</name> <operator>=</operator> <name>InvalidXLogRecPtr</name></expr>;</expr_stmt>
+	<expr_stmt><expr><operator>*</operator><name>am_sync</name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+
+	<comment type="block">/* Get standbys that are considered as synchronous at this moment */</comment>
+	<expr_stmt><expr><name>sync_standbys</name> <operator>=</operator> <call><name>SyncRepGetSyncStandbys</name><argument_list>(<argument><expr><name>am_sync</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Quick exit if we are not managing a sync standby or there are not
+	 * enough synchronous standbys.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><operator>(</operator><operator>*</operator><name>am_sync</name><operator>)</operator> <operator>||</operator>
+		<name>SyncRepConfig</name> <operator>==</operator> <name>NULL</name> <operator>||</operator>
+		<call><name>list_length</name><argument_list>(<argument><expr><name>sync_standbys</name></expr></argument>)</argument_list></call> <operator>&lt;</operator> <name><name>SyncRepConfig</name><operator>-&gt;</operator><name>num_sync</name></name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>list_free</name><argument_list>(<argument><expr><name>sync_standbys</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<return>return <expr><name>false</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/*
+	 * In a priority-based sync replication, the synced positions are the
+	 * oldest ones among sync standbys. In a quorum-based, they are the Nth
+	 * latest ones.
+	 *
+	 * SyncRepGetNthLatestSyncRecPtr() also can calculate the oldest
+	 * positions. But we use SyncRepGetOldestSyncRecPtr() for that calculation
+	 * because it's a bit more efficient.
+	 *
+	 * XXX If the numbers of current and requested sync standbys are the same,
+	 * we can use SyncRepGetOldestSyncRecPtr() to calculate the synced
+	 * positions even in a quorum-based sync replication.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>SyncRepConfig</name><operator>-&gt;</operator><name>syncrep_method</name></name> <operator>==</operator> <name>SYNC_REP_PRIORITY</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>SyncRepGetOldestSyncRecPtr</name><argument_list>(<argument><expr><name>writePtr</name></expr></argument>, <argument><expr><name>flushPtr</name></expr></argument>, <argument><expr><name>applyPtr</name></expr></argument>,
+								   <argument><expr><name>sync_standbys</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<else>else
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>SyncRepGetNthLatestSyncRecPtr</name><argument_list>(<argument><expr><name>writePtr</name></expr></argument>, <argument><expr><name>flushPtr</name></expr></argument>, <argument><expr><name>applyPtr</name></expr></argument>,
+									  <argument><expr><name>sync_standbys</name></expr></argument>, <argument><expr><name><name>SyncRepConfig</name><operator>-&gt;</operator><name>num_sync</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></else></if_stmt>
+
+	<expr_stmt><expr><call><name>list_free</name><argument_list>(<argument><expr><name>sync_standbys</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<return>return <expr><name>true</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Calculate the oldest Write, Flush and Apply positions among sync standbys.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>SyncRepGetOldestSyncRecPtr</name><parameter_list>(<parameter><decl><type><name>XLogRecPtr</name> <modifier>*</modifier></type><name>writePtr</name></decl></parameter>, <parameter><decl><type><name>XLogRecPtr</name> <modifier>*</modifier></type><name>flushPtr</name></decl></parameter>,
+						   <parameter><decl><type><name>XLogRecPtr</name> <modifier>*</modifier></type><name>applyPtr</name></decl></parameter>, <parameter><decl><type><name>List</name> <modifier>*</modifier></type><name>sync_standbys</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>ListCell</name>   <modifier>*</modifier></type><name>cell</name></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * Scan through all sync standbys and calculate the oldest Write, Flush
+	 * and Apply positions.
+	 */</comment>
+	<macro><name>foreach</name><argument_list>(<argument>cell</argument>, <argument>sync_standbys</argument>)</argument_list></macro>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>WalSnd</name>	   <modifier>*</modifier></type><name>walsnd</name> <init>= <expr><operator>&amp;</operator><name><name>WalSndCtl</name><operator>-&gt;</operator><name>walsnds</name><index>[<expr><call><name>lfirst_int</name><argument_list>(<argument><expr><name>cell</name></expr></argument>)</argument_list></call></expr>]</index></name></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>XLogRecPtr</name></type>	<name>write</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>XLogRecPtr</name></type>	<name>flush</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>XLogRecPtr</name></type>	<name>apply</name></decl>;</decl_stmt>
+
+		<expr_stmt><expr><call><name>SpinLockAcquire</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>walsnd</name><operator>-&gt;</operator><name>mutex</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name>write</name> <operator>=</operator> <name><name>walsnd</name><operator>-&gt;</operator><name>write</name></name></expr>;</expr_stmt>
+		<expr_stmt><expr><name>flush</name> <operator>=</operator> <name><name>walsnd</name><operator>-&gt;</operator><name>flush</name></name></expr>;</expr_stmt>
+		<expr_stmt><expr><name>apply</name> <operator>=</operator> <name><name>walsnd</name><operator>-&gt;</operator><name>apply</name></name></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>SpinLockRelease</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>walsnd</name><operator>-&gt;</operator><name>mutex</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<if_stmt><if>if <condition>(<expr><call><name>XLogRecPtrIsInvalid</name><argument_list>(<argument><expr><operator>*</operator><name>writePtr</name></expr></argument>)</argument_list></call> <operator>||</operator> <operator>*</operator><name>writePtr</name> <operator>&gt;</operator> <name>write</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><operator>*</operator><name>writePtr</name> <operator>=</operator> <name>write</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+		<if_stmt><if>if <condition>(<expr><call><name>XLogRecPtrIsInvalid</name><argument_list>(<argument><expr><operator>*</operator><name>flushPtr</name></expr></argument>)</argument_list></call> <operator>||</operator> <operator>*</operator><name>flushPtr</name> <operator>&gt;</operator> <name>flush</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><operator>*</operator><name>flushPtr</name> <operator>=</operator> <name>flush</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+		<if_stmt><if>if <condition>(<expr><call><name>XLogRecPtrIsInvalid</name><argument_list>(<argument><expr><operator>*</operator><name>applyPtr</name></expr></argument>)</argument_list></call> <operator>||</operator> <operator>*</operator><name>applyPtr</name> <operator>&gt;</operator> <name>apply</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><operator>*</operator><name>applyPtr</name> <operator>=</operator> <name>apply</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	</block_content>}</block>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Calculate the Nth latest Write, Flush and Apply positions among sync
+ * standbys.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>SyncRepGetNthLatestSyncRecPtr</name><parameter_list>(<parameter><decl><type><name>XLogRecPtr</name> <modifier>*</modifier></type><name>writePtr</name></decl></parameter>, <parameter><decl><type><name>XLogRecPtr</name> <modifier>*</modifier></type><name>flushPtr</name></decl></parameter>,
+							  <parameter><decl><type><name>XLogRecPtr</name> <modifier>*</modifier></type><name>applyPtr</name></decl></parameter>, <parameter><decl><type><name>List</name> <modifier>*</modifier></type><name>sync_standbys</name></decl></parameter>, <parameter><decl><type><name>uint8</name></type> <name>nth</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>ListCell</name>   <modifier>*</modifier></type><name>cell</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>XLogRecPtr</name> <modifier>*</modifier></type><name>write_array</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>XLogRecPtr</name> <modifier>*</modifier></type><name>flush_array</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>XLogRecPtr</name> <modifier>*</modifier></type><name>apply_array</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>len</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>i</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name>len</name> <operator>=</operator> <call><name>list_length</name><argument_list>(<argument><expr><name>sync_standbys</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>write_array</name> <operator>=</operator> <operator>(</operator><name>XLogRecPtr</name> <operator>*</operator><operator>)</operator> <call><name>palloc</name><argument_list>(<argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>XLogRecPtr</name></expr></argument>)</argument_list></sizeof> <operator>*</operator> <name>len</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>flush_array</name> <operator>=</operator> <operator>(</operator><name>XLogRecPtr</name> <operator>*</operator><operator>)</operator> <call><name>palloc</name><argument_list>(<argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>XLogRecPtr</name></expr></argument>)</argument_list></sizeof> <operator>*</operator> <name>len</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>apply_array</name> <operator>=</operator> <operator>(</operator><name>XLogRecPtr</name> <operator>*</operator><operator>)</operator> <call><name>palloc</name><argument_list>(<argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>XLogRecPtr</name></expr></argument>)</argument_list></sizeof> <operator>*</operator> <name>len</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<macro><name>foreach</name><argument_list>(<argument>cell</argument>, <argument>sync_standbys</argument>)</argument_list></macro>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>WalSnd</name>	   <modifier>*</modifier></type><name>walsnd</name> <init>= <expr><operator>&amp;</operator><name><name>WalSndCtl</name><operator>-&gt;</operator><name>walsnds</name><index>[<expr><call><name>lfirst_int</name><argument_list>(<argument><expr><name>cell</name></expr></argument>)</argument_list></call></expr>]</index></name></expr></init></decl>;</decl_stmt>
+
+		<expr_stmt><expr><call><name>SpinLockAcquire</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>walsnd</name><operator>-&gt;</operator><name>mutex</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>write_array</name><index>[<expr><name>i</name></expr>]</index></name> <operator>=</operator> <name><name>walsnd</name><operator>-&gt;</operator><name>write</name></name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>flush_array</name><index>[<expr><name>i</name></expr>]</index></name> <operator>=</operator> <name><name>walsnd</name><operator>-&gt;</operator><name>flush</name></name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>apply_array</name><index>[<expr><name>i</name></expr>]</index></name> <operator>=</operator> <name><name>walsnd</name><operator>-&gt;</operator><name>apply</name></name></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>SpinLockRelease</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>walsnd</name><operator>-&gt;</operator><name>mutex</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><name>i</name><operator>++</operator></expr>;</expr_stmt>
+	</block_content>}</block>
+
+	<comment type="block">/* Sort each array in descending order */</comment>
+	<expr_stmt><expr><call><name>qsort</name><argument_list>(<argument><expr><name>write_array</name></expr></argument>, <argument><expr><name>len</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>XLogRecPtr</name></expr></argument>)</argument_list></sizeof></expr></argument>, <argument><expr><name>cmp_lsn</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>qsort</name><argument_list>(<argument><expr><name>flush_array</name></expr></argument>, <argument><expr><name>len</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>XLogRecPtr</name></expr></argument>)</argument_list></sizeof></expr></argument>, <argument><expr><name>cmp_lsn</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>qsort</name><argument_list>(<argument><expr><name>apply_array</name></expr></argument>, <argument><expr><name>len</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>XLogRecPtr</name></expr></argument>)</argument_list></sizeof></expr></argument>, <argument><expr><name>cmp_lsn</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Get Nth latest Write, Flush, Apply positions */</comment>
+	<expr_stmt><expr><operator>*</operator><name>writePtr</name> <operator>=</operator> <name><name>write_array</name><index>[<expr><name>nth</name> <operator>-</operator> <literal type="number">1</literal></expr>]</index></name></expr>;</expr_stmt>
+	<expr_stmt><expr><operator>*</operator><name>flushPtr</name> <operator>=</operator> <name><name>flush_array</name><index>[<expr><name>nth</name> <operator>-</operator> <literal type="number">1</literal></expr>]</index></name></expr>;</expr_stmt>
+	<expr_stmt><expr><operator>*</operator><name>applyPtr</name> <operator>=</operator> <name><name>apply_array</name><index>[<expr><name>nth</name> <operator>-</operator> <literal type="number">1</literal></expr>]</index></name></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>pfree</name><argument_list>(<argument><expr><name>write_array</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>pfree</name><argument_list>(<argument><expr><name>flush_array</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>pfree</name><argument_list>(<argument><expr><name>apply_array</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Compare lsn in order to sort array in descending order.
+ */</comment>
+<function><type><specifier>static</specifier> <name>int</name></type>
+<name>cmp_lsn</name><parameter_list>(<parameter><decl><type><specifier>const</specifier> <name>void</name> <modifier>*</modifier></type><name>a</name></decl></parameter>, <parameter><decl><type><specifier>const</specifier> <name>void</name> <modifier>*</modifier></type><name>b</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>XLogRecPtr</name></type>	<name>lsn1</name> <init>= <expr><operator>*</operator><operator>(</operator><operator>(</operator><specifier>const</specifier> <name>XLogRecPtr</name> <operator>*</operator><operator>)</operator> <name>a</name><operator>)</operator></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>XLogRecPtr</name></type>	<name>lsn2</name> <init>= <expr><operator>*</operator><operator>(</operator><operator>(</operator><specifier>const</specifier> <name>XLogRecPtr</name> <operator>*</operator><operator>)</operator> <name>b</name><operator>)</operator></expr></init></decl>;</decl_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>lsn1</name> <operator>&gt;</operator> <name>lsn2</name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><operator>-</operator><literal type="number">1</literal></expr>;</return></block_content></block></if>
+	<if type="elseif">else if <condition>(<expr><name>lsn1</name> <operator>==</operator> <name>lsn2</name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><literal type="number">0</literal></expr>;</return></block_content></block></if>
+	<else>else<block type="pseudo"><block_content>
+		<return>return <expr><literal type="number">1</literal></expr>;</return></block_content></block></else></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Return the list of sync standbys, or NIL if no sync standby is connected.
+ *
+ * The caller must hold SyncRepLock.
+ *
+ * On return, *am_sync is set to true if this walsender is connecting to
+ * sync standby. Otherwise it's set to false.
+ */</comment>
+<function><type><name>List</name> <modifier>*</modifier></type>
+<name>SyncRepGetSyncStandbys</name><parameter_list>(<parameter><decl><type><name>bool</name> <modifier>*</modifier></type><name>am_sync</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<comment type="block">/* Set default result */</comment>
+	<if_stmt><if>if <condition>(<expr><name>am_sync</name> <operator>!=</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><operator>*</operator><name>am_sync</name> <operator>=</operator> <name>false</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<comment type="block">/* Quick exit if sync replication is not requested */</comment>
+	<if_stmt><if>if <condition>(<expr><name>SyncRepConfig</name> <operator>==</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>NIL</name></expr>;</return></block_content></block></if></if_stmt>
+
+	<return>return <expr><ternary><condition><expr><operator>(</operator><name><name>SyncRepConfig</name><operator>-&gt;</operator><name>syncrep_method</name></name> <operator>==</operator> <name>SYNC_REP_PRIORITY</name><operator>)</operator></expr> ?</condition><then>
+		<expr><call><name>SyncRepGetSyncStandbysPriority</name><argument_list>(<argument><expr><name>am_sync</name></expr></argument>)</argument_list></call></expr> </then><else>:
+		<expr><call><name>SyncRepGetSyncStandbysQuorum</name><argument_list>(<argument><expr><name>am_sync</name></expr></argument>)</argument_list></call></expr></else></ternary></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Return the list of all the candidates for quorum sync standbys,
+ * or NIL if no such standby is connected.
+ *
+ * The caller must hold SyncRepLock. This function must be called only in
+ * a quorum-based sync replication.
+ *
+ * On return, *am_sync is set to true if this walsender is connecting to
+ * sync standby. Otherwise it's set to false.
+ */</comment>
+<function><type><specifier>static</specifier> <name>List</name> <modifier>*</modifier></type>
+<name>SyncRepGetSyncStandbysQuorum</name><parameter_list>(<parameter><decl><type><name>bool</name> <modifier>*</modifier></type><name>am_sync</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>List</name>	   <modifier>*</modifier></type><name>result</name> <init>= <expr><name>NIL</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>i</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><specifier>volatile</specifier> <name>WalSnd</name> <modifier>*</modifier></type><name>walsnd</name></decl>;</decl_stmt>	<comment type="block">/* Use volatile pointer to prevent code
+								 * rearrangement */</comment>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>SyncRepConfig</name><operator>-&gt;</operator><name>syncrep_method</name></name> <operator>==</operator> <name>SYNC_REP_QUORUM</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name>max_wal_senders</name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>XLogRecPtr</name></type>	<name>flush</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>WalSndState</name></type> <name>state</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>int</name></type>			<name>pid</name></decl>;</decl_stmt>
+
+		<expr_stmt><expr><name>walsnd</name> <operator>=</operator> <operator>&amp;</operator><name><name>WalSndCtl</name><operator>-&gt;</operator><name>walsnds</name><index>[<expr><name>i</name></expr>]</index></name></expr>;</expr_stmt>
+
+		<expr_stmt><expr><call><name>SpinLockAcquire</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>walsnd</name><operator>-&gt;</operator><name>mutex</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name>pid</name> <operator>=</operator> <name><name>walsnd</name><operator>-&gt;</operator><name>pid</name></name></expr>;</expr_stmt>
+		<expr_stmt><expr><name>flush</name> <operator>=</operator> <name><name>walsnd</name><operator>-&gt;</operator><name>flush</name></name></expr>;</expr_stmt>
+		<expr_stmt><expr><name>state</name> <operator>=</operator> <name><name>walsnd</name><operator>-&gt;</operator><name>state</name></name></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>SpinLockRelease</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>walsnd</name><operator>-&gt;</operator><name>mutex</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/* Must be active */</comment>
+		<if_stmt><if>if <condition>(<expr><name>pid</name> <operator>==</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+			<continue>continue;</continue></block_content></block></if></if_stmt>
+
+		<comment type="block">/* Must be streaming or stopping */</comment>
+		<if_stmt><if>if <condition>(<expr><name>state</name> <operator>!=</operator> <name>WALSNDSTATE_STREAMING</name> <operator>&amp;&amp;</operator>
+			<name>state</name> <operator>!=</operator> <name>WALSNDSTATE_STOPPING</name></expr>)</condition><block type="pseudo"><block_content>
+			<continue>continue;</continue></block_content></block></if></if_stmt>
+
+		<comment type="block">/* Must be synchronous */</comment>
+		<if_stmt><if>if <condition>(<expr><name><name>walsnd</name><operator>-&gt;</operator><name>sync_standby_priority</name></name> <operator>==</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+			<continue>continue;</continue></block_content></block></if></if_stmt>
+
+		<comment type="block">/* Must have a valid flush position */</comment>
+		<if_stmt><if>if <condition>(<expr><call><name>XLogRecPtrIsInvalid</name><argument_list>(<argument><expr><name>flush</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<continue>continue;</continue></block_content></block></if></if_stmt>
+
+		<comment type="block">/*
+		 * Consider this standby as a candidate for quorum sync standbys and
+		 * append it to the result.
+		 */</comment>
+		<expr_stmt><expr><name>result</name> <operator>=</operator> <call><name>lappend_int</name><argument_list>(<argument><expr><name>result</name></expr></argument>, <argument><expr><name>i</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<if_stmt><if>if <condition>(<expr><name>am_sync</name> <operator>!=</operator> <name>NULL</name> <operator>&amp;&amp;</operator> <name>walsnd</name> <operator>==</operator> <name>MyWalSnd</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><operator>*</operator><name>am_sync</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	</block_content>}</block></for>
+
+	<return>return <expr><name>result</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Return the list of sync standbys chosen based on their priorities,
+ * or NIL if no sync standby is connected.
+ *
+ * If there are multiple standbys with the same priority,
+ * the first one found is selected preferentially.
+ *
+ * The caller must hold SyncRepLock. This function must be called only in
+ * a priority-based sync replication.
+ *
+ * On return, *am_sync is set to true if this walsender is connecting to
+ * sync standby. Otherwise it's set to false.
+ */</comment>
+<function><type><specifier>static</specifier> <name>List</name> <modifier>*</modifier></type>
+<name>SyncRepGetSyncStandbysPriority</name><parameter_list>(<parameter><decl><type><name>bool</name> <modifier>*</modifier></type><name>am_sync</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>List</name>	   <modifier>*</modifier></type><name>result</name> <init>= <expr><name>NIL</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>List</name>	   <modifier>*</modifier></type><name>pending</name> <init>= <expr><name>NIL</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>lowest_priority</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>next_highest_priority</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>this_priority</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>priority</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>i</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type>		<name>am_in_pending</name> <init>= <expr><name>false</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><specifier>volatile</specifier> <name>WalSnd</name> <modifier>*</modifier></type><name>walsnd</name></decl>;</decl_stmt>	<comment type="block">/* Use volatile pointer to prevent code
+								 * rearrangement */</comment>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>SyncRepConfig</name><operator>-&gt;</operator><name>syncrep_method</name></name> <operator>==</operator> <name>SYNC_REP_PRIORITY</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>lowest_priority</name> <operator>=</operator> <name><name>SyncRepConfig</name><operator>-&gt;</operator><name>nmembers</name></name></expr>;</expr_stmt>
+	<expr_stmt><expr><name>next_highest_priority</name> <operator>=</operator> <name>lowest_priority</name> <operator>+</operator> <literal type="number">1</literal></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Find the sync standbys which have the highest priority (i.e, 1). Also
+	 * store all the other potential sync standbys into the pending list, in
+	 * order to scan it later and find other sync standbys from it quickly.
+	 */</comment>
+	<for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name>max_wal_senders</name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>XLogRecPtr</name></type>	<name>flush</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>WalSndState</name></type> <name>state</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>int</name></type>			<name>pid</name></decl>;</decl_stmt>
+
+		<expr_stmt><expr><name>walsnd</name> <operator>=</operator> <operator>&amp;</operator><name><name>WalSndCtl</name><operator>-&gt;</operator><name>walsnds</name><index>[<expr><name>i</name></expr>]</index></name></expr>;</expr_stmt>
+
+		<expr_stmt><expr><call><name>SpinLockAcquire</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>walsnd</name><operator>-&gt;</operator><name>mutex</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name>pid</name> <operator>=</operator> <name><name>walsnd</name><operator>-&gt;</operator><name>pid</name></name></expr>;</expr_stmt>
+		<expr_stmt><expr><name>flush</name> <operator>=</operator> <name><name>walsnd</name><operator>-&gt;</operator><name>flush</name></name></expr>;</expr_stmt>
+		<expr_stmt><expr><name>state</name> <operator>=</operator> <name><name>walsnd</name><operator>-&gt;</operator><name>state</name></name></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>SpinLockRelease</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>walsnd</name><operator>-&gt;</operator><name>mutex</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/* Must be active */</comment>
+		<if_stmt><if>if <condition>(<expr><name>pid</name> <operator>==</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+			<continue>continue;</continue></block_content></block></if></if_stmt>
+
+		<comment type="block">/* Must be streaming or stopping */</comment>
+		<if_stmt><if>if <condition>(<expr><name>state</name> <operator>!=</operator> <name>WALSNDSTATE_STREAMING</name> <operator>&amp;&amp;</operator>
+			<name>state</name> <operator>!=</operator> <name>WALSNDSTATE_STOPPING</name></expr>)</condition><block type="pseudo"><block_content>
+			<continue>continue;</continue></block_content></block></if></if_stmt>
+
+		<comment type="block">/* Must be synchronous */</comment>
+		<expr_stmt><expr><name>this_priority</name> <operator>=</operator> <name><name>walsnd</name><operator>-&gt;</operator><name>sync_standby_priority</name></name></expr>;</expr_stmt>
+		<if_stmt><if>if <condition>(<expr><name>this_priority</name> <operator>==</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+			<continue>continue;</continue></block_content></block></if></if_stmt>
+
+		<comment type="block">/* Must have a valid flush position */</comment>
+		<if_stmt><if>if <condition>(<expr><call><name>XLogRecPtrIsInvalid</name><argument_list>(<argument><expr><name>flush</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<continue>continue;</continue></block_content></block></if></if_stmt>
+
+		<comment type="block">/*
+		 * If the priority is equal to 1, consider this standby as sync and
+		 * append it to the result. Otherwise append this standby to the
+		 * pending list to check if it's actually sync or not later.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><name>this_priority</name> <operator>==</operator> <literal type="number">1</literal></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><name>result</name> <operator>=</operator> <call><name>lappend_int</name><argument_list>(<argument><expr><name>result</name></expr></argument>, <argument><expr><name>i</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<if_stmt><if>if <condition>(<expr><name>am_sync</name> <operator>!=</operator> <name>NULL</name> <operator>&amp;&amp;</operator> <name>walsnd</name> <operator>==</operator> <name>MyWalSnd</name></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><operator>*</operator><name>am_sync</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+			<if_stmt><if>if <condition>(<expr><call><name>list_length</name><argument_list>(<argument><expr><name>result</name></expr></argument>)</argument_list></call> <operator>==</operator> <name><name>SyncRepConfig</name><operator>-&gt;</operator><name>num_sync</name></name></expr>)</condition>
+			<block>{<block_content>
+				<expr_stmt><expr><call><name>list_free</name><argument_list>(<argument><expr><name>pending</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<return>return <expr><name>result</name></expr>;</return>	<comment type="block">/* Exit if got enough sync standbys */</comment>
+			</block_content>}</block></if></if_stmt>
+		</block_content>}</block></if>
+		<else>else
+		<block>{<block_content>
+			<expr_stmt><expr><name>pending</name> <operator>=</operator> <call><name>lappend_int</name><argument_list>(<argument><expr><name>pending</name></expr></argument>, <argument><expr><name>i</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<if_stmt><if>if <condition>(<expr><name>am_sync</name> <operator>!=</operator> <name>NULL</name> <operator>&amp;&amp;</operator> <name>walsnd</name> <operator>==</operator> <name>MyWalSnd</name></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><name>am_in_pending</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+			<comment type="block">/*
+			 * Track the highest priority among the standbys in the pending
+			 * list, in order to use it as the starting priority for later
+			 * scan of the list. This is useful to find quickly the sync
+			 * standbys from the pending list later because we can skip
+			 * unnecessary scans for the unused priorities.
+			 */</comment>
+			<if_stmt><if>if <condition>(<expr><name>this_priority</name> <operator>&lt;</operator> <name>next_highest_priority</name></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><name>next_highest_priority</name> <operator>=</operator> <name>this_priority</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+		</block_content>}</block></else></if_stmt>
+	</block_content>}</block></for>
+
+	<comment type="block">/*
+	 * Consider all pending standbys as sync if the number of them plus
+	 * already-found sync ones is lower than the configuration requests.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><call><name>list_length</name><argument_list>(<argument><expr><name>result</name></expr></argument>)</argument_list></call> <operator>+</operator> <call><name>list_length</name><argument_list>(<argument><expr><name>pending</name></expr></argument>)</argument_list></call> <operator>&lt;=</operator> <name><name>SyncRepConfig</name><operator>-&gt;</operator><name>num_sync</name></name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>bool</name></type>		<name>needfree</name> <init>= <expr><operator>(</operator><name>result</name> <operator>!=</operator> <name>NIL</name> <operator>&amp;&amp;</operator> <name>pending</name> <operator>!=</operator> <name>NIL</name><operator>)</operator></expr></init></decl>;</decl_stmt>
+
+		<comment type="block">/*
+		 * Set *am_sync to true if this walsender is in the pending list
+		 * because all pending standbys are considered as sync.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><name>am_sync</name> <operator>!=</operator> <name>NULL</name> <operator>&amp;&amp;</operator> <operator>!</operator><operator>(</operator><operator>*</operator><name>am_sync</name><operator>)</operator></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><operator>*</operator><name>am_sync</name> <operator>=</operator> <name>am_in_pending</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+		<expr_stmt><expr><name>result</name> <operator>=</operator> <call><name>list_concat</name><argument_list>(<argument><expr><name>result</name></expr></argument>, <argument><expr><name>pending</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<if_stmt><if>if <condition>(<expr><name>needfree</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>pfree</name><argument_list>(<argument><expr><name>pending</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+		<return>return <expr><name>result</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/*
+	 * Find the sync standbys from the pending list.
+	 */</comment>
+	<expr_stmt><expr><name>priority</name> <operator>=</operator> <name>next_highest_priority</name></expr>;</expr_stmt>
+	<while>while <condition>(<expr><name>priority</name> <operator>&lt;=</operator> <name>lowest_priority</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>ListCell</name>   <modifier>*</modifier></type><name>cell</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>ListCell</name>   <modifier>*</modifier></type><name>prev</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>ListCell</name>   <modifier>*</modifier></type><name>next</name></decl>;</decl_stmt>
+
+		<expr_stmt><expr><name>next_highest_priority</name> <operator>=</operator> <name>lowest_priority</name> <operator>+</operator> <literal type="number">1</literal></expr>;</expr_stmt>
+
+		<for>for <control>(<init><expr><name>cell</name> <operator>=</operator> <call><name>list_head</name><argument_list>(<argument><expr><name>pending</name></expr></argument>)</argument_list></call></expr>;</init> <condition><expr><name>cell</name> <operator>!=</operator> <name>NULL</name></expr>;</condition> <incr><expr><name>cell</name> <operator>=</operator> <name>next</name></expr></incr>)</control>
+		<block>{<block_content>
+			<expr_stmt><expr><name>i</name> <operator>=</operator> <call><name>lfirst_int</name><argument_list>(<argument><expr><name>cell</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><name>walsnd</name> <operator>=</operator> <operator>&amp;</operator><name><name>WalSndCtl</name><operator>-&gt;</operator><name>walsnds</name><index>[<expr><name>i</name></expr>]</index></name></expr>;</expr_stmt>
+
+			<expr_stmt><expr><name>next</name> <operator>=</operator> <call><name>lnext</name><argument_list>(<argument><expr><name>cell</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+			<expr_stmt><expr><name>this_priority</name> <operator>=</operator> <name><name>walsnd</name><operator>-&gt;</operator><name>sync_standby_priority</name></name></expr>;</expr_stmt>
+			<if_stmt><if>if <condition>(<expr><name>this_priority</name> <operator>==</operator> <name>priority</name></expr>)</condition>
+			<block>{<block_content>
+				<expr_stmt><expr><name>result</name> <operator>=</operator> <call><name>lappend_int</name><argument_list>(<argument><expr><name>result</name></expr></argument>, <argument><expr><name>i</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<if_stmt><if>if <condition>(<expr><name>am_sync</name> <operator>!=</operator> <name>NULL</name> <operator>&amp;&amp;</operator> <name>walsnd</name> <operator>==</operator> <name>MyWalSnd</name></expr>)</condition><block type="pseudo"><block_content>
+					<expr_stmt><expr><operator>*</operator><name>am_sync</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+				<comment type="block">/*
+				 * We should always exit here after the scan of pending list
+				 * starts because we know that the list has enough elements to
+				 * reach SyncRepConfig-&gt;num_sync.
+				 */</comment>
+				<if_stmt><if>if <condition>(<expr><call><name>list_length</name><argument_list>(<argument><expr><name>result</name></expr></argument>)</argument_list></call> <operator>==</operator> <name><name>SyncRepConfig</name><operator>-&gt;</operator><name>num_sync</name></name></expr>)</condition>
+				<block>{<block_content>
+					<expr_stmt><expr><call><name>list_free</name><argument_list>(<argument><expr><name>pending</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+					<return>return <expr><name>result</name></expr>;</return>	<comment type="block">/* Exit if got enough sync standbys */</comment>
+				</block_content>}</block></if></if_stmt>
+
+				<comment type="block">/*
+				 * Remove the entry for this sync standby from the list to
+				 * prevent us from looking at the same entry again.
+				 */</comment>
+				<expr_stmt><expr><name>pending</name> <operator>=</operator> <call><name>list_delete_cell</name><argument_list>(<argument><expr><name>pending</name></expr></argument>, <argument><expr><name>cell</name></expr></argument>, <argument><expr><name>prev</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+				<continue>continue;</continue>
+			</block_content>}</block></if></if_stmt>
+
+			<if_stmt><if>if <condition>(<expr><name>this_priority</name> <operator>&lt;</operator> <name>next_highest_priority</name></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><name>next_highest_priority</name> <operator>=</operator> <name>this_priority</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+			<expr_stmt><expr><name>prev</name> <operator>=</operator> <name>cell</name></expr>;</expr_stmt>
+		</block_content>}</block></for>
+
+		<expr_stmt><expr><name>priority</name> <operator>=</operator> <name>next_highest_priority</name></expr>;</expr_stmt>
+	</block_content>}</block></while>
+
+	<comment type="block">/* never reached, but keep compiler quiet */</comment>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<return>return <expr><name>result</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Check if we are in the list of sync standbys, and if so, determine
+ * priority sequence. Return priority if set, or zero to indicate that
+ * we are not a potential sync standby.
+ *
+ * Compare the parameter SyncRepStandbyNames against the application_name
+ * for this WALSender, or allow any name if we find a wildcard "*".
+ */</comment>
+<function><type><specifier>static</specifier> <name>int</name></type>
+<name>SyncRepGetStandbyPriority</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>standby_name</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>priority</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type>		<name>found</name> <init>= <expr><name>false</name></expr></init></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * Since synchronous cascade replication is not allowed, we always set the
+	 * priority of cascading walsender to zero.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name>am_cascading_walsender</name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><literal type="number">0</literal></expr>;</return></block_content></block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>SyncStandbysDefined</name><argument_list>()</argument_list></call> <operator>||</operator> <name>SyncRepConfig</name> <operator>==</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><literal type="number">0</literal></expr>;</return></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><name>standby_name</name> <operator>=</operator> <name><name>SyncRepConfig</name><operator>-&gt;</operator><name>member_names</name></name></expr>;</expr_stmt>
+	<for>for <control>(<init><expr><name>priority</name> <operator>=</operator> <literal type="number">1</literal></expr>;</init> <condition><expr><name>priority</name> <operator>&lt;=</operator> <name><name>SyncRepConfig</name><operator>-&gt;</operator><name>nmembers</name></name></expr>;</condition> <incr><expr><name>priority</name><operator>++</operator></expr></incr>)</control>
+	<block>{<block_content>
+		<if_stmt><if>if <condition>(<expr><call><name>pg_strcasecmp</name><argument_list>(<argument><expr><name>standby_name</name></expr></argument>, <argument><expr><name>application_name</name></expr></argument>)</argument_list></call> <operator>==</operator> <literal type="number">0</literal> <operator>||</operator>
+			<call><name>strcmp</name><argument_list>(<argument><expr><name>standby_name</name></expr></argument>, <argument><expr><literal type="string">"*"</literal></expr></argument>)</argument_list></call> <operator>==</operator> <literal type="number">0</literal></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><name>found</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+			<break>break;</break>
+		</block_content>}</block></if></if_stmt>
+		<expr_stmt><expr><name>standby_name</name> <operator>+=</operator> <call><name>strlen</name><argument_list>(<argument><expr><name>standby_name</name></expr></argument>)</argument_list></call> <operator>+</operator> <literal type="number">1</literal></expr>;</expr_stmt>
+	</block_content>}</block></for>
+
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><name>found</name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><literal type="number">0</literal></expr>;</return></block_content></block></if></if_stmt>
+
+	<comment type="block">/*
+	 * In quorum-based sync replication, all the standbys in the list have the
+	 * same priority, one.
+	 */</comment>
+	<return>return <expr><ternary><condition><expr><operator>(</operator><name><name>SyncRepConfig</name><operator>-&gt;</operator><name>syncrep_method</name></name> <operator>==</operator> <name>SYNC_REP_PRIORITY</name><operator>)</operator></expr> ?</condition><then> <expr><name>priority</name></expr> </then><else>: <expr><literal type="number">1</literal></expr></else></ternary></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Walk the specified queue from head.  Set the state of any backends that
+ * need to be woken, remove them from the queue, and then wake them.
+ * Pass all = true to wake whole queue; otherwise, just wake up to
+ * the walsender's LSN.
+ *
+ * Must hold SyncRepLock.
+ */</comment>
+<function><type><specifier>static</specifier> <name>int</name></type>
+<name>SyncRepWakeQueue</name><parameter_list>(<parameter><decl><type><name>bool</name></type> <name>all</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>mode</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><specifier>volatile</specifier> <name>WalSndCtlData</name> <modifier>*</modifier></type><name>walsndctl</name> <init>= <expr><name>WalSndCtl</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>PGPROC</name>	   <modifier>*</modifier></type><name>proc</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>PGPROC</name>	   <modifier>*</modifier></type><name>thisproc</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>numprocs</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>mode</name> <operator>&gt;=</operator> <literal type="number">0</literal> <operator>&amp;&amp;</operator> <name>mode</name> <operator>&lt;</operator> <name>NUM_SYNC_REP_WAIT_MODE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>SyncRepQueueIsOrderedByLSN</name><argument_list>(<argument><expr><name>mode</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>proc</name> <operator>=</operator> <operator>(</operator><name>PGPROC</name> <operator>*</operator><operator>)</operator> <call><name>SHMQueueNext</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>WalSndCtl</name><operator>-&gt;</operator><name>SyncRepQueue</name><index>[<expr><name>mode</name></expr>]</index></name><operator>)</operator></expr></argument>,
+								   <argument><expr><operator>&amp;</operator><operator>(</operator><name><name>WalSndCtl</name><operator>-&gt;</operator><name>SyncRepQueue</name><index>[<expr><name>mode</name></expr>]</index></name><operator>)</operator></expr></argument>,
+								   <argument><expr><call><name>offsetof</name><argument_list>(<argument><expr><name>PGPROC</name></expr></argument>, <argument><expr><name>syncRepLinks</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<while>while <condition>(<expr><name>proc</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/*
+		 * Assume the queue is ordered by LSN
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><name>all</name> <operator>&amp;&amp;</operator> <name><name>walsndctl</name><operator>-&gt;</operator><name>lsn</name><index>[<expr><name>mode</name></expr>]</index></name> <operator>&lt;</operator> <name><name>proc</name><operator>-&gt;</operator><name>waitLSN</name></name></expr>)</condition><block type="pseudo"><block_content>
+			<return>return <expr><name>numprocs</name></expr>;</return></block_content></block></if></if_stmt>
+
+		<comment type="block">/*
+		 * Move to next proc, so we can delete thisproc from the queue.
+		 * thisproc is valid, proc may be NULL after this.
+		 */</comment>
+		<expr_stmt><expr><name>thisproc</name> <operator>=</operator> <name>proc</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name>proc</name> <operator>=</operator> <operator>(</operator><name>PGPROC</name> <operator>*</operator><operator>)</operator> <call><name>SHMQueueNext</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>WalSndCtl</name><operator>-&gt;</operator><name>SyncRepQueue</name><index>[<expr><name>mode</name></expr>]</index></name><operator>)</operator></expr></argument>,
+									   <argument><expr><operator>&amp;</operator><operator>(</operator><name><name>proc</name><operator>-&gt;</operator><name>syncRepLinks</name></name><operator>)</operator></expr></argument>,
+									   <argument><expr><call><name>offsetof</name><argument_list>(<argument><expr><name>PGPROC</name></expr></argument>, <argument><expr><name>syncRepLinks</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/*
+		 * Remove thisproc from queue.
+		 */</comment>
+		<expr_stmt><expr><call><name>SHMQueueDelete</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>thisproc</name><operator>-&gt;</operator><name>syncRepLinks</name></name><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/*
+		 * SyncRepWaitForLSN() reads syncRepState without holding the lock, so
+		 * make sure that it sees the queue link being removed before the
+		 * syncRepState change.
+		 */</comment>
+		<expr_stmt><expr><call><name>pg_write_barrier</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/*
+		 * Set state to complete; see SyncRepWaitForLSN() for discussion of
+		 * the various states.
+		 */</comment>
+		<expr_stmt><expr><name><name>thisproc</name><operator>-&gt;</operator><name>syncRepState</name></name> <operator>=</operator> <name>SYNC_REP_WAIT_COMPLETE</name></expr>;</expr_stmt>
+
+		<comment type="block">/*
+		 * Wake only when we have set state and removed from queue.
+		 */</comment>
+		<expr_stmt><expr><call><name>SetLatch</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>thisproc</name><operator>-&gt;</operator><name>procLatch</name></name><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><name>numprocs</name><operator>++</operator></expr>;</expr_stmt>
+	</block_content>}</block></while>
+
+	<return>return <expr><name>numprocs</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * The checkpointer calls this as needed to update the shared
+ * sync_standbys_defined flag, so that backends don't remain permanently wedged
+ * if synchronous_standby_names is unset.  It's safe to check the current value
+ * without the lock, because it's only ever updated by one process.  But we
+ * must take the lock to change it.
+ */</comment>
+<function><type><name>void</name></type>
+<name>SyncRepUpdateSyncStandbysDefined</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>bool</name></type>		<name>sync_standbys_defined</name> <init>= <expr><call><name>SyncStandbysDefined</name><argument_list>()</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>sync_standbys_defined</name> <operator>!=</operator> <name><name>WalSndCtl</name><operator>-&gt;</operator><name>sync_standbys_defined</name></name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>LWLockAcquire</name><argument_list>(<argument><expr><name>SyncRepLock</name></expr></argument>, <argument><expr><name>LW_EXCLUSIVE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/*
+		 * If synchronous_standby_names has been reset to empty, it's futile
+		 * for backends to continue to waiting.  Since the user no longer
+		 * wants synchronous replication, we'd better wake them up.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><name>sync_standbys_defined</name></expr>)</condition>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>int</name></type>			<name>i</name></decl>;</decl_stmt>
+
+			<for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name>NUM_SYNC_REP_WAIT_MODE</name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control><block type="pseudo"><block_content>
+				<expr_stmt><expr><call><name>SyncRepWakeQueue</name><argument_list>(<argument><expr><name>true</name></expr></argument>, <argument><expr><name>i</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></for>
+		</block_content>}</block></if></if_stmt>
+
+		<comment type="block">/*
+		 * Only allow people to join the queue when there are synchronous
+		 * standbys defined.  Without this interlock, there's a race
+		 * condition: we might wake up all the current waiters; then, some
+		 * backend that hasn't yet reloaded its config might go to sleep on
+		 * the queue (and never wake up).  This prevents that.
+		 */</comment>
+		<expr_stmt><expr><name><name>WalSndCtl</name><operator>-&gt;</operator><name>sync_standbys_defined</name></name> <operator>=</operator> <name>sync_standbys_defined</name></expr>;</expr_stmt>
+
+		<expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><name>SyncRepLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+</block_content>}</block></function>
+
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>USE_ASSERT_CHECKING</name></cpp:ifdef>
+<function><type><specifier>static</specifier> <name>bool</name></type>
+<name>SyncRepQueueIsOrderedByLSN</name><parameter_list>(<parameter><decl><type><name>int</name></type> <name>mode</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>PGPROC</name>	   <modifier>*</modifier></type><name>proc</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>XLogRecPtr</name></type>	<name>lastLSN</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>mode</name> <operator>&gt;=</operator> <literal type="number">0</literal> <operator>&amp;&amp;</operator> <name>mode</name> <operator>&lt;</operator> <name>NUM_SYNC_REP_WAIT_MODE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>lastLSN</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>proc</name> <operator>=</operator> <operator>(</operator><name>PGPROC</name> <operator>*</operator><operator>)</operator> <call><name>SHMQueueNext</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>WalSndCtl</name><operator>-&gt;</operator><name>SyncRepQueue</name><index>[<expr><name>mode</name></expr>]</index></name><operator>)</operator></expr></argument>,
+								   <argument><expr><operator>&amp;</operator><operator>(</operator><name><name>WalSndCtl</name><operator>-&gt;</operator><name>SyncRepQueue</name><index>[<expr><name>mode</name></expr>]</index></name><operator>)</operator></expr></argument>,
+								   <argument><expr><call><name>offsetof</name><argument_list>(<argument><expr><name>PGPROC</name></expr></argument>, <argument><expr><name>syncRepLinks</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<while>while <condition>(<expr><name>proc</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/*
+		 * Check the queue is ordered by LSN and that multiple procs don't
+		 * have matching LSNs
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><name><name>proc</name><operator>-&gt;</operator><name>waitLSN</name></name> <operator>&lt;=</operator> <name>lastLSN</name></expr>)</condition><block type="pseudo"><block_content>
+			<return>return <expr><name>false</name></expr>;</return></block_content></block></if></if_stmt>
+
+		<expr_stmt><expr><name>lastLSN</name> <operator>=</operator> <name><name>proc</name><operator>-&gt;</operator><name>waitLSN</name></name></expr>;</expr_stmt>
+
+		<expr_stmt><expr><name>proc</name> <operator>=</operator> <operator>(</operator><name>PGPROC</name> <operator>*</operator><operator>)</operator> <call><name>SHMQueueNext</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>WalSndCtl</name><operator>-&gt;</operator><name>SyncRepQueue</name><index>[<expr><name>mode</name></expr>]</index></name><operator>)</operator></expr></argument>,
+									   <argument><expr><operator>&amp;</operator><operator>(</operator><name><name>proc</name><operator>-&gt;</operator><name>syncRepLinks</name></name><operator>)</operator></expr></argument>,
+									   <argument><expr><call><name>offsetof</name><argument_list>(<argument><expr><name>PGPROC</name></expr></argument>, <argument><expr><name>syncRepLinks</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></while>
+
+	<return>return <expr><name>true</name></expr>;</return>
+</block_content>}</block></function>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+<comment type="block">/*
+ * ===========================================================
+ * Synchronous Replication functions executed by any process
+ * ===========================================================
+ */</comment>
+
+<function><type><name>bool</name></type>
+<name>check_synchronous_standby_names</name><parameter_list>(<parameter><decl><type><name>char</name> <modifier>*</modifier><modifier>*</modifier></type><name>newval</name></decl></parameter>, <parameter><decl><type><name>void</name> <modifier>*</modifier><modifier>*</modifier></type><name>extra</name></decl></parameter>, <parameter><decl><type><name>GucSource</name></type> <name>source</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<if_stmt><if>if <condition>(<expr><operator>*</operator><name>newval</name> <operator>!=</operator> <name>NULL</name> <operator>&amp;&amp;</operator> <operator>(</operator><operator>*</operator><name>newval</name><operator>)</operator><index>[<expr><literal type="number">0</literal></expr>]</index> <operator>!=</operator> <literal type="char">'\0'</literal></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>int</name></type>			<name>parse_rc</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>SyncRepConfigData</name> <modifier>*</modifier></type><name>pconf</name></decl>;</decl_stmt>
+
+		<comment type="block">/* Reset communication variables to ensure a fresh start */</comment>
+		<expr_stmt><expr><name>syncrep_parse_result</name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name>syncrep_parse_error_msg</name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+
+		<comment type="block">/* Parse the synchronous_standby_names string */</comment>
+		<expr_stmt><expr><call><name>syncrep_scanner_init</name><argument_list>(<argument><expr><operator>*</operator><name>newval</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name>parse_rc</name> <operator>=</operator> <call><name>syncrep_yyparse</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>syncrep_scanner_finish</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name>parse_rc</name> <operator>!=</operator> <literal type="number">0</literal> <operator>||</operator> <name>syncrep_parse_result</name> <operator>==</operator> <name>NULL</name></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><call><name>GUC_check_errcode</name><argument_list>(<argument><expr><name>ERRCODE_SYNTAX_ERROR</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<if_stmt><if>if <condition>(<expr><name>syncrep_parse_error_msg</name></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><call><name>GUC_check_errdetail</name><argument_list>(<argument><expr><literal type="string">"%s"</literal></expr></argument>, <argument><expr><name>syncrep_parse_error_msg</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if>
+			<else>else<block type="pseudo"><block_content>
+				<expr_stmt><expr><call><name>GUC_check_errdetail</name><argument_list>(<argument><expr><literal type="string">"synchronous_standby_names parser failed"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></else></if_stmt>
+			<return>return <expr><name>false</name></expr>;</return>
+		</block_content>}</block></if></if_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name><name>syncrep_parse_result</name><operator>-&gt;</operator><name>num_sync</name></name> <operator>&lt;=</operator> <literal type="number">0</literal></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><call><name>GUC_check_errmsg</name><argument_list>(<argument><expr><literal type="string">"number of synchronous standbys (%d) must be greater than zero"</literal></expr></argument>,
+							 <argument><expr><name><name>syncrep_parse_result</name><operator>-&gt;</operator><name>num_sync</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<return>return <expr><name>false</name></expr>;</return>
+		</block_content>}</block></if></if_stmt>
+
+		<comment type="block">/* GUC extra value must be malloc'd, not palloc'd */</comment>
+		<expr_stmt><expr><name>pconf</name> <operator>=</operator> <operator>(</operator><name>SyncRepConfigData</name> <operator>*</operator><operator>)</operator>
+			<call><name>malloc</name><argument_list>(<argument><expr><name><name>syncrep_parse_result</name><operator>-&gt;</operator><name>config_size</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<if_stmt><if>if <condition>(<expr><name>pconf</name> <operator>==</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+			<return>return <expr><name>false</name></expr>;</return></block_content></block></if></if_stmt>
+		<expr_stmt><expr><call><name>memcpy</name><argument_list>(<argument><expr><name>pconf</name></expr></argument>, <argument><expr><name>syncrep_parse_result</name></expr></argument>, <argument><expr><name><name>syncrep_parse_result</name><operator>-&gt;</operator><name>config_size</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><operator>*</operator><name>extra</name> <operator>=</operator> <operator>(</operator><name>void</name> <operator>*</operator><operator>)</operator> <name>pconf</name></expr>;</expr_stmt>
+
+		<comment type="block">/*
+		 * We need not explicitly clean up syncrep_parse_result.  It, and any
+		 * other cruft generated during parsing, will be freed when the
+		 * current memory context is deleted.  (This code is generally run in
+		 * a short-lived context used for config file processing, so that will
+		 * not be very long.)
+		 */</comment>
+	</block_content>}</block></if>
+	<else>else<block type="pseudo"><block_content>
+		<expr_stmt><expr><operator>*</operator><name>extra</name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt></block_content></block></else></if_stmt>
+
+	<return>return <expr><name>true</name></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><name>void</name></type>
+<name>assign_synchronous_standby_names</name><parameter_list>(<parameter><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>newval</name></decl></parameter>, <parameter><decl><type><name>void</name> <modifier>*</modifier></type><name>extra</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><name>SyncRepConfig</name> <operator>=</operator> <operator>(</operator><name>SyncRepConfigData</name> <operator>*</operator><operator>)</operator> <name>extra</name></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<function><type><name>void</name></type>
+<name>assign_synchronous_commit</name><parameter_list>(<parameter><decl><type><name>int</name></type> <name>newval</name></decl></parameter>, <parameter><decl><type><name>void</name> <modifier>*</modifier></type><name>extra</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<switch>switch <condition>(<expr><name>newval</name></expr>)</condition>
+	<block>{<block_content>
+		<case>case <expr><name>SYNCHRONOUS_COMMIT_REMOTE_WRITE</name></expr>:</case>
+			<expr_stmt><expr><name>SyncRepWaitMode</name> <operator>=</operator> <name>SYNC_REP_WAIT_WRITE</name></expr>;</expr_stmt>
+			<break>break;</break>
+		<case>case <expr><name>SYNCHRONOUS_COMMIT_REMOTE_FLUSH</name></expr>:</case>
+			<expr_stmt><expr><name>SyncRepWaitMode</name> <operator>=</operator> <name>SYNC_REP_WAIT_FLUSH</name></expr>;</expr_stmt>
+			<break>break;</break>
+		<case>case <expr><name>SYNCHRONOUS_COMMIT_REMOTE_APPLY</name></expr>:</case>
+			<expr_stmt><expr><name>SyncRepWaitMode</name> <operator>=</operator> <name>SYNC_REP_WAIT_APPLY</name></expr>;</expr_stmt>
+			<break>break;</break>
+		<default>default:</default>
+			<expr_stmt><expr><name>SyncRepWaitMode</name> <operator>=</operator> <name>SYNC_REP_NO_WAIT</name></expr>;</expr_stmt>
+			<break>break;</break>
+	</block_content>}</block></switch>
+</block_content>}</block></function>
+</unit>

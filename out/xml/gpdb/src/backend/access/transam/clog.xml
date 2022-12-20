@@ -1,0 +1,1155 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<unit xmlns="http://www.srcML.org/srcML/src" xmlns:cpp="http://www.srcML.org/srcML/cpp" revision="1.0.0" language="C" filename="/cloned_projects/gpdb/src/backend/access/transam/clog.c"><comment type="block">/*-------------------------------------------------------------------------
+ *
+ * clog.c
+ *		PostgreSQL transaction-commit-log manager
+ *
+ * This module replaces the old "pg_log" access code, which treated pg_log
+ * essentially like a relation, in that it went through the regular buffer
+ * manager.  The problem with that was that there wasn't any good way to
+ * recycle storage space for transactions so old that they'll never be
+ * looked up again.  Now we use specialized access code so that the commit
+ * log can be broken into relatively small, independent segments.
+ *
+ * XLOG interactions: this module generates an XLOG record whenever a new
+ * CLOG page is initialized to zeroes.  Other writes of CLOG come from
+ * recording of transaction commit or abort in xact.c, which generates its
+ * own XLOG records for these events and will re-perform the status update
+ * on redo; so we need make no additional XLOG entry here.  For synchronous
+ * transaction commits, the XLOG is guaranteed flushed through the XLOG commit
+ * record before we are called to log a commit, so the WAL rule "write xlog
+ * before data" is satisfied automatically.  However, for async commits we
+ * must track the latest LSN affecting each CLOG page, so that we can flush
+ * XLOG that far and satisfy the WAL rule.  We don't have to worry about this
+ * for aborts (whether sync or async), since the post-crash assumption would
+ * be that such transactions failed anyway.
+ *
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1994, Regents of the University of California
+ *
+ * src/backend/access/transam/clog.c
+ *
+ *-------------------------------------------------------------------------
+ */</comment>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"postgres.h"</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/clog.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/slru.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/transam.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/xlog.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/xloginsert.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/xlogutils.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"miscadmin.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"pgstat.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"pg_trace.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/proc.h"</cpp:file></cpp:include>
+
+<comment type="block">/*
+ * Defines for CLOG page sizes.  A page is the same BLCKSZ as is used
+ * everywhere else in Postgres.
+ *
+ * Note: because TransactionIds are 32 bits and wrap around at 0xFFFFFFFF,
+ * CLOG page numbering also wraps around at 0xFFFFFFFF/CLOG_XACTS_PER_PAGE,
+ * and CLOG segment numbering at
+ * 0xFFFFFFFF/CLOG_XACTS_PER_PAGE/SLRU_PAGES_PER_SEGMENT.  We need take no
+ * explicit notice of that fact in this module, except when comparing segment
+ * and page numbers in TruncateCLOG (see CLOGPagePrecedes).
+ */</comment>
+
+<comment type="block">/* We need two bits per xact, so four xacts fit in a byte */</comment>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>CLOG_BITS_PER_XACT</name></cpp:macro>	<cpp:value>2</cpp:value></cpp:define>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>CLOG_XACTS_PER_BYTE</name></cpp:macro> <cpp:value>4</cpp:value></cpp:define>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>CLOG_XACTS_PER_PAGE</name></cpp:macro> <cpp:value>(BLCKSZ * CLOG_XACTS_PER_BYTE)</cpp:value></cpp:define>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>CLOG_XACT_BITMASK</name></cpp:macro>	<cpp:value>((1 &lt;&lt; CLOG_BITS_PER_XACT) - 1)</cpp:value></cpp:define>
+
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>TransactionIdToPage</name><parameter_list>(<parameter><type><name>xid</name></type></parameter>)</parameter_list></cpp:macro>	<cpp:value>((xid) / (TransactionId) CLOG_XACTS_PER_PAGE)</cpp:value></cpp:define>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>TransactionIdToPgIndex</name><parameter_list>(<parameter><type><name>xid</name></type></parameter>)</parameter_list></cpp:macro> <cpp:value>((xid) % (TransactionId) CLOG_XACTS_PER_PAGE)</cpp:value></cpp:define>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>TransactionIdToByte</name><parameter_list>(<parameter><type><name>xid</name></type></parameter>)</parameter_list></cpp:macro>	<cpp:value>(TransactionIdToPgIndex(xid) / CLOG_XACTS_PER_BYTE)</cpp:value></cpp:define>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>TransactionIdToBIndex</name><parameter_list>(<parameter><type><name>xid</name></type></parameter>)</parameter_list></cpp:macro>	<cpp:value>((xid) % (TransactionId) CLOG_XACTS_PER_BYTE)</cpp:value></cpp:define>
+
+<comment type="block">/* We store the latest async LSN for each group of transactions */</comment>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>CLOG_XACTS_PER_LSN_GROUP</name></cpp:macro>	<cpp:value>32</cpp:value></cpp:define>	<comment type="block">/* keep this a power of 2 */</comment>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>CLOG_LSNS_PER_PAGE</name></cpp:macro>	<cpp:value>(CLOG_XACTS_PER_PAGE / CLOG_XACTS_PER_LSN_GROUP)</cpp:value></cpp:define>
+
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>GetLSNIndex</name><parameter_list>(<parameter><type><name>slotno</name></type></parameter>, <parameter><type><name>xid</name></type></parameter>)</parameter_list></cpp:macro>	<cpp:value>((slotno) * CLOG_LSNS_PER_PAGE + \
+	((xid) % (TransactionId) CLOG_XACTS_PER_PAGE) / CLOG_XACTS_PER_LSN_GROUP)</cpp:value></cpp:define>
+
+<comment type="block">/*
+ * The number of subtransactions below which we consider to apply clog group
+ * update optimization.  Testing reveals that the number higher than this can
+ * hurt performance.
+ */</comment>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>THRESHOLD_SUBTRANS_CLOG_OPT</name></cpp:macro>	<cpp:value>5</cpp:value></cpp:define>
+
+<comment type="block">/*
+ * Link to shared-memory data structures for CLOG control
+ */</comment>
+<decl_stmt><decl><type><specifier>static</specifier> <name>SlruCtlData</name></type> <name>ClogCtlData</name></decl>;</decl_stmt>
+
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>ClogCtl</name></cpp:macro> <cpp:value>(&amp;ClogCtlData)</cpp:value></cpp:define>
+
+
+<function_decl><type><specifier>static</specifier> <name>int</name></type>	<name>ZeroCLOGPage</name><parameter_list>(<parameter><decl><type><name>int</name></type> <name>pageno</name></decl></parameter>, <parameter><decl><type><name>bool</name></type> <name>writeXlog</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>bool</name></type> <name>CLOGPagePrecedes</name><parameter_list>(<parameter><decl><type><name>int</name></type> <name>page1</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>page2</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>WriteZeroPageXlogRec</name><parameter_list>(<parameter><decl><type><name>int</name></type> <name>pageno</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>WriteTruncateXlogRec</name><parameter_list>(<parameter><decl><type><name>int</name></type> <name>pageno</name></decl></parameter>, <parameter><decl><type><name>TransactionId</name></type> <name>oldestXact</name></decl></parameter>,
+								 <parameter><decl><type><name>Oid</name></type> <name>oldestXidDb</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>TransactionIdSetPageStatus</name><parameter_list>(<parameter><decl><type><name>TransactionId</name></type> <name>xid</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>nsubxids</name></decl></parameter>,
+									   <parameter><decl><type><name>TransactionId</name> <modifier>*</modifier></type><name>subxids</name></decl></parameter>, <parameter><decl><type><name>XidStatus</name></type> <name>status</name></decl></parameter>,
+									   <parameter><decl><type><name>XLogRecPtr</name></type> <name>lsn</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>pageno</name></decl></parameter>,
+									   <parameter><decl><type><name>bool</name></type> <name>all_xact_same_page</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>TransactionIdSetStatusBit</name><parameter_list>(<parameter><decl><type><name>TransactionId</name></type> <name>xid</name></decl></parameter>, <parameter><decl><type><name>XidStatus</name></type> <name>status</name></decl></parameter>,
+									  <parameter><decl><type><name>XLogRecPtr</name></type> <name>lsn</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>slotno</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>set_status_by_pages</name><parameter_list>(<parameter><decl><type><name>int</name></type> <name>nsubxids</name></decl></parameter>, <parameter><decl><type><name>TransactionId</name> <modifier>*</modifier></type><name>subxids</name></decl></parameter>,
+								<parameter><decl><type><name>XidStatus</name></type> <name>status</name></decl></parameter>, <parameter><decl><type><name>XLogRecPtr</name></type> <name>lsn</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>bool</name></type> <name>TransactionGroupUpdateXidStatus</name><parameter_list>(<parameter><decl><type><name>TransactionId</name></type> <name>xid</name></decl></parameter>,
+											<parameter><decl><type><name>XidStatus</name></type> <name>status</name></decl></parameter>, <parameter><decl><type><name>XLogRecPtr</name></type> <name>lsn</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>pageno</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>TransactionIdSetPageStatusInternal</name><parameter_list>(<parameter><decl><type><name>TransactionId</name></type> <name>xid</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>nsubxids</name></decl></parameter>,
+											   <parameter><decl><type><name>TransactionId</name> <modifier>*</modifier></type><name>subxids</name></decl></parameter>, <parameter><decl><type><name>XidStatus</name></type> <name>status</name></decl></parameter>,
+											   <parameter><decl><type><name>XLogRecPtr</name></type> <name>lsn</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>pageno</name></decl></parameter>)</parameter_list>;</function_decl>
+
+
+<comment type="block">/*
+ * TransactionIdSetTreeStatus
+ *
+ * Record the final state of transaction entries in the commit log for
+ * a transaction and its subtransaction tree. Take care to ensure this is
+ * efficient, and as atomic as possible.
+ *
+ * xid is a single xid to set status for. This will typically be
+ * the top level transactionid for a top level commit or abort. It can
+ * also be a subtransaction when we record transaction aborts.
+ *
+ * subxids is an array of xids of length nsubxids, representing subtransactions
+ * in the tree of xid. In various cases nsubxids may be zero.
+ *
+ * lsn must be the WAL location of the commit record when recording an async
+ * commit.  For a synchronous commit it can be InvalidXLogRecPtr, since the
+ * caller guarantees the commit record is already flushed in that case.  It
+ * should be InvalidXLogRecPtr for abort cases, too.
+ *
+ * In the commit case, atomicity is limited by whether all the subxids are in
+ * the same CLOG page as xid.  If they all are, then the lock will be grabbed
+ * only once, and the status will be set to committed directly.  Otherwise
+ * we must
+ *	 1. set sub-committed all subxids that are not on the same page as the
+ *		main xid
+ *	 2. atomically set committed the main xid and the subxids on the same page
+ *	 3. go over the first bunch again and set them committed
+ * Note that as far as concurrent checkers are concerned, main transaction
+ * commit as a whole is still atomic.
+ *
+ * Example:
+ *		TransactionId t commits and has subxids t1, t2, t3, t4
+ *		t is on page p1, t1 is also on p1, t2 and t3 are on p2, t4 is on p3
+ *		1. update pages2-3:
+ *					page2: set t2,t3 as sub-committed
+ *					page3: set t4 as sub-committed
+ *		2. update page1:
+ *					set t1 as sub-committed,
+ *					then set t as committed,
+					then set t1 as committed
+ *		3. update pages2-3:
+ *					page2: set t2,t3 as committed
+ *					page3: set t4 as committed
+ *
+ * NB: this is a low-level routine and is NOT the preferred entry point
+ * for most uses; functions in transam.c are the intended callers.
+ *
+ * XXX Think about issuing FADVISE_WILLNEED on pages that we will need,
+ * but aren't yet in cache, as well as hinting pages not to fall out of
+ * cache yet.
+ */</comment>
+<function><type><name>void</name></type>
+<name>TransactionIdSetTreeStatus</name><parameter_list>(<parameter><decl><type><name>TransactionId</name></type> <name>xid</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>nsubxids</name></decl></parameter>,
+						   <parameter><decl><type><name>TransactionId</name> <modifier>*</modifier></type><name>subxids</name></decl></parameter>, <parameter><decl><type><name>XidStatus</name></type> <name>status</name></decl></parameter>, <parameter><decl><type><name>XLogRecPtr</name></type> <name>lsn</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>int</name></type>			<name>pageno</name> <init>= <expr><call><name>TransactionIdToPage</name><argument_list>(<argument><expr><name>xid</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>	<comment type="block">/* get page of parent */</comment>
+	<decl_stmt><decl><type><name>int</name></type>			<name>i</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>status</name> <operator>==</operator> <name>TRANSACTION_STATUS_COMMITTED</name> <operator>||</operator>
+		   <name>status</name> <operator>==</operator> <name>TRANSACTION_STATUS_ABORTED</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * See how many subxids, if any, are on the same page as the parent, if
+	 * any.
+	 */</comment>
+	<for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name>nsubxids</name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control>
+	<block>{<block_content>
+		<if_stmt><if>if <condition>(<expr><call><name>TransactionIdToPage</name><argument_list>(<argument><expr><name><name>subxids</name><index>[<expr><name>i</name></expr>]</index></name></expr></argument>)</argument_list></call> <operator>!=</operator> <name>pageno</name></expr>)</condition><block type="pseudo"><block_content>
+			<break>break;</break></block_content></block></if></if_stmt>
+	</block_content>}</block></for>
+
+	<comment type="block">/*
+	 * Do all items fit on a single page?
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name>i</name> <operator>==</operator> <name>nsubxids</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/*
+		 * Set the parent and all subtransactions in a single call
+		 */</comment>
+		<expr_stmt><expr><call><name>TransactionIdSetPageStatus</name><argument_list>(<argument><expr><name>xid</name></expr></argument>, <argument><expr><name>nsubxids</name></expr></argument>, <argument><expr><name>subxids</name></expr></argument>, <argument><expr><name>status</name></expr></argument>, <argument><expr><name>lsn</name></expr></argument>,
+								   <argument><expr><name>pageno</name></expr></argument>, <argument><expr><name>true</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<else>else
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>int</name></type>			<name>nsubxids_on_first_page</name> <init>= <expr><name>i</name></expr></init></decl>;</decl_stmt>
+
+		<comment type="block">/*
+		 * If this is a commit then we care about doing this correctly (i.e.
+		 * using the subcommitted intermediate status).  By here, we know
+		 * we're updating more than one page of clog, so we must mark entries
+		 * that are *not* on the first page so that they show as subcommitted
+		 * before we then return to update the status to fully committed.
+		 *
+		 * To avoid touching the first page twice, skip marking subcommitted
+		 * for the subxids on that first page.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><name>status</name> <operator>==</operator> <name>TRANSACTION_STATUS_COMMITTED</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>set_status_by_pages</name><argument_list>(<argument><expr><name>nsubxids</name> <operator>-</operator> <name>nsubxids_on_first_page</name></expr></argument>,
+								<argument><expr><name>subxids</name> <operator>+</operator> <name>nsubxids_on_first_page</name></expr></argument>,
+								<argument><expr><name>TRANSACTION_STATUS_SUB_COMMITTED</name></expr></argument>, <argument><expr><name>lsn</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+		<comment type="block">/*
+		 * Now set the parent and subtransactions on same page as the parent,
+		 * if any
+		 */</comment>
+		<expr_stmt><expr><name>pageno</name> <operator>=</operator> <call><name>TransactionIdToPage</name><argument_list>(<argument><expr><name>xid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>TransactionIdSetPageStatus</name><argument_list>(<argument><expr><name>xid</name></expr></argument>, <argument><expr><name>nsubxids_on_first_page</name></expr></argument>, <argument><expr><name>subxids</name></expr></argument>, <argument><expr><name>status</name></expr></argument>,
+								   <argument><expr><name>lsn</name></expr></argument>, <argument><expr><name>pageno</name></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/*
+		 * Now work through the rest of the subxids one clog page at a time,
+		 * starting from the second page onwards, like we did above.
+		 */</comment>
+		<expr_stmt><expr><call><name>set_status_by_pages</name><argument_list>(<argument><expr><name>nsubxids</name> <operator>-</operator> <name>nsubxids_on_first_page</name></expr></argument>,
+							<argument><expr><name>subxids</name> <operator>+</operator> <name>nsubxids_on_first_page</name></expr></argument>,
+							<argument><expr><name>status</name></expr></argument>, <argument><expr><name>lsn</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></else></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Helper for TransactionIdSetTreeStatus: set the status for a bunch of
+ * transactions, chunking in the separate CLOG pages involved. We never
+ * pass the whole transaction tree to this function, only subtransactions
+ * that are on different pages to the top level transaction id.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>set_status_by_pages</name><parameter_list>(<parameter><decl><type><name>int</name></type> <name>nsubxids</name></decl></parameter>, <parameter><decl><type><name>TransactionId</name> <modifier>*</modifier></type><name>subxids</name></decl></parameter>,
+					<parameter><decl><type><name>XidStatus</name></type> <name>status</name></decl></parameter>, <parameter><decl><type><name>XLogRecPtr</name></type> <name>lsn</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>int</name></type>			<name>pageno</name> <init>= <expr><call><name>TransactionIdToPage</name><argument_list>(<argument><expr><name><name>subxids</name><index>[<expr><literal type="number">0</literal></expr>]</index></name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>offset</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>i</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>nsubxids</name> <operator>&gt;</operator> <literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>		<comment type="block">/* else the pageno fetch above is unsafe */</comment>
+
+	<while>while <condition>(<expr><name>i</name> <operator>&lt;</operator> <name>nsubxids</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>int</name></type>			<name>num_on_page</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>int</name></type>			<name>nextpageno</name></decl>;</decl_stmt>
+
+		<do>do
+		<block>{<block_content>
+			<expr_stmt><expr><name>nextpageno</name> <operator>=</operator> <call><name>TransactionIdToPage</name><argument_list>(<argument><expr><name><name>subxids</name><index>[<expr><name>i</name></expr>]</index></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<if_stmt><if>if <condition>(<expr><name>nextpageno</name> <operator>!=</operator> <name>pageno</name></expr>)</condition><block type="pseudo"><block_content>
+				<break>break;</break></block_content></block></if></if_stmt>
+			<expr_stmt><expr><name>num_on_page</name><operator>++</operator></expr>;</expr_stmt>
+			<expr_stmt><expr><name>i</name><operator>++</operator></expr>;</expr_stmt>
+		</block_content>}</block> while <condition>(<expr><name>i</name> <operator>&lt;</operator> <name>nsubxids</name></expr>)</condition>;</do>
+
+		<expr_stmt><expr><call><name>TransactionIdSetPageStatus</name><argument_list>(<argument><expr><name>InvalidTransactionId</name></expr></argument>,
+								   <argument><expr><name>num_on_page</name></expr></argument>, <argument><expr><name>subxids</name> <operator>+</operator> <name>offset</name></expr></argument>,
+								   <argument><expr><name>status</name></expr></argument>, <argument><expr><name>lsn</name></expr></argument>, <argument><expr><name>pageno</name></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name>offset</name> <operator>=</operator> <name>i</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name>pageno</name> <operator>=</operator> <name>nextpageno</name></expr>;</expr_stmt>
+	</block_content>}</block></while>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Record the final state of transaction entries in the commit log for all
+ * entries on a single page.  Atomic only on this page.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>TransactionIdSetPageStatus</name><parameter_list>(<parameter><decl><type><name>TransactionId</name></type> <name>xid</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>nsubxids</name></decl></parameter>,
+						   <parameter><decl><type><name>TransactionId</name> <modifier>*</modifier></type><name>subxids</name></decl></parameter>, <parameter><decl><type><name>XidStatus</name></type> <name>status</name></decl></parameter>,
+						   <parameter><decl><type><name>XLogRecPtr</name></type> <name>lsn</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>pageno</name></decl></parameter>,
+						   <parameter><decl><type><name>bool</name></type> <name>all_xact_same_page</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<comment type="block">/* Can't use group update when PGPROC overflows. */</comment>
+	<expr_stmt><expr><call><name>StaticAssertStmt</name><argument_list>(<argument><expr><name>THRESHOLD_SUBTRANS_CLOG_OPT</name> <operator>&lt;=</operator> <name>PGPROC_MAX_CACHED_SUBXIDS</name></expr></argument>,
+					 <argument><expr><literal type="string">"group clog threshold less than PGPROC cached subxids"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * When there is contention on CLogControlLock, we try to group multiple
+	 * updates; a single leader process will perform transaction status
+	 * updates for multiple backends so that the number of times
+	 * CLogControlLock needs to be acquired is reduced.
+	 *
+	 * For this optimization to be safe, the XID in MyPgXact and the subxids
+	 * in MyProc must be the same as the ones for which we're setting the
+	 * status.  Check that this is the case.
+	 *
+	 * For this optimization to be efficient, we shouldn't have too many
+	 * sub-XIDs and all of the XIDs for which we're adjusting clog should be
+	 * on the same page.  Check those conditions, too.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name>all_xact_same_page</name> <operator>&amp;&amp;</operator> <name>xid</name> <operator>==</operator> <name><name>MyPgXact</name><operator>-&gt;</operator><name>xid</name></name> <operator>&amp;&amp;</operator>
+		<name>nsubxids</name> <operator>&lt;=</operator> <name>THRESHOLD_SUBTRANS_CLOG_OPT</name> <operator>&amp;&amp;</operator>
+		<name>nsubxids</name> <operator>==</operator> <name><name>MyPgXact</name><operator>-&gt;</operator><name>nxids</name></name> <operator>&amp;&amp;</operator>
+		<call><name>memcmp</name><argument_list>(<argument><expr><name>subxids</name></expr></argument>, <argument><expr><name><name>MyProc</name><operator>-&gt;</operator><name>subxids</name><operator>.</operator><name>xids</name></name></expr></argument>,
+			   <argument><expr><name>nsubxids</name> <operator>*</operator> <sizeof>sizeof<argument_list>(<argument><expr><name>TransactionId</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call> <operator>==</operator> <literal type="number">0</literal></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/*
+		 * We don't try to do group update optimization if a process has
+		 * overflowed the subxids array in its PGPROC, since in that case we
+		 * don't have a complete list of XIDs for it.
+		 */</comment>
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>THRESHOLD_SUBTRANS_CLOG_OPT</name> <operator>&lt;=</operator> <name>PGPROC_MAX_CACHED_SUBXIDS</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/*
+		 * If we can immediately acquire CLogControlLock, we update the status
+		 * of our own XID and release the lock.  If not, try use group XID
+		 * update.  If that doesn't work out, fall back to waiting for the
+		 * lock to perform an update for this transaction only.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><call><name>LWLockConditionalAcquire</name><argument_list>(<argument><expr><name>CLogControlLock</name></expr></argument>, <argument><expr><name>LW_EXCLUSIVE</name></expr></argument>)</argument_list></call></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/* Got the lock without waiting!  Do the update. */</comment>
+			<expr_stmt><expr><call><name>TransactionIdSetPageStatusInternal</name><argument_list>(<argument><expr><name>xid</name></expr></argument>, <argument><expr><name>nsubxids</name></expr></argument>, <argument><expr><name>subxids</name></expr></argument>, <argument><expr><name>status</name></expr></argument>,
+											   <argument><expr><name>lsn</name></expr></argument>, <argument><expr><name>pageno</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><name>CLogControlLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<return>return;</return>
+		</block_content>}</block></if>
+		<if type="elseif">else if <condition>(<expr><call><name>TransactionGroupUpdateXidStatus</name><argument_list>(<argument><expr><name>xid</name></expr></argument>, <argument><expr><name>status</name></expr></argument>, <argument><expr><name>lsn</name></expr></argument>, <argument><expr><name>pageno</name></expr></argument>)</argument_list></call></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/* Group update mechanism has done the work. */</comment>
+			<return>return;</return>
+		</block_content>}</block></if></if_stmt>
+
+		<comment type="block">/* Fall through only if update isn't done yet. */</comment>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/* Group update not applicable, or couldn't accept this page number. */</comment>
+	<expr_stmt><expr><call><name>LWLockAcquire</name><argument_list>(<argument><expr><name>CLogControlLock</name></expr></argument>, <argument><expr><name>LW_EXCLUSIVE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>TransactionIdSetPageStatusInternal</name><argument_list>(<argument><expr><name>xid</name></expr></argument>, <argument><expr><name>nsubxids</name></expr></argument>, <argument><expr><name>subxids</name></expr></argument>, <argument><expr><name>status</name></expr></argument>,
+									   <argument><expr><name>lsn</name></expr></argument>, <argument><expr><name>pageno</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><name>CLogControlLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Record the final state of transaction entry in the commit log
+ *
+ * We don't do any locking here; caller must handle that.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>TransactionIdSetPageStatusInternal</name><parameter_list>(<parameter><decl><type><name>TransactionId</name></type> <name>xid</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>nsubxids</name></decl></parameter>,
+								   <parameter><decl><type><name>TransactionId</name> <modifier>*</modifier></type><name>subxids</name></decl></parameter>, <parameter><decl><type><name>XidStatus</name></type> <name>status</name></decl></parameter>,
+								   <parameter><decl><type><name>XLogRecPtr</name></type> <name>lsn</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>pageno</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>int</name></type>			<name>slotno</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>i</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>status</name> <operator>==</operator> <name>TRANSACTION_STATUS_COMMITTED</name> <operator>||</operator>
+		   <name>status</name> <operator>==</operator> <name>TRANSACTION_STATUS_ABORTED</name> <operator>||</operator>
+		   <operator>(</operator><name>status</name> <operator>==</operator> <name>TRANSACTION_STATUS_SUB_COMMITTED</name> <operator>&amp;&amp;</operator> <operator>!</operator><call><name>TransactionIdIsValid</name><argument_list>(<argument><expr><name>xid</name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>LWLockHeldByMeInMode</name><argument_list>(<argument><expr><name>CLogControlLock</name></expr></argument>, <argument><expr><name>LW_EXCLUSIVE</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * If we're doing an async commit (ie, lsn is valid), then we must wait
+	 * for any active write on the page slot to complete.  Otherwise our
+	 * update could reach disk in that write, which will not do since we
+	 * mustn't let it reach disk until we've done the appropriate WAL flush.
+	 * But when lsn is invalid, it's OK to scribble on a page while it is
+	 * write-busy, since we don't care if the update reaches disk sooner than
+	 * we think.
+	 */</comment>
+	<expr_stmt><expr><name>slotno</name> <operator>=</operator> <call><name>SimpleLruReadPage</name><argument_list>(<argument><expr><name>ClogCtl</name></expr></argument>, <argument><expr><name>pageno</name></expr></argument>, <argument><expr><call><name>XLogRecPtrIsInvalid</name><argument_list>(<argument><expr><name>lsn</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>xid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Set the main transaction id, if any.
+	 *
+	 * If we update more than one xid on this page while it is being written
+	 * out, we might find that some of the bits go to disk and others don't.
+	 * If we are updating commits on the page with the top-level xid that
+	 * could break atomicity, so we subcommit the subxids first before we mark
+	 * the top-level commit.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><call><name>TransactionIdIsValid</name><argument_list>(<argument><expr><name>xid</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* Subtransactions first, if needed ... */</comment>
+		<if_stmt><if>if <condition>(<expr><name>status</name> <operator>==</operator> <name>TRANSACTION_STATUS_COMMITTED</name></expr>)</condition>
+		<block>{<block_content>
+			<for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name>nsubxids</name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control>
+			<block>{<block_content>
+				<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>ClogCtl</name><operator>-&gt;</operator><name>shared</name><operator>-&gt;</operator><name>page_number</name><index>[<expr><name>slotno</name></expr>]</index></name> <operator>==</operator> <call><name>TransactionIdToPage</name><argument_list>(<argument><expr><name><name>subxids</name><index>[<expr><name>i</name></expr>]</index></name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<expr_stmt><expr><call><name>TransactionIdSetStatusBit</name><argument_list>(<argument><expr><name><name>subxids</name><index>[<expr><name>i</name></expr>]</index></name></expr></argument>,
+										  <argument><expr><name>TRANSACTION_STATUS_SUB_COMMITTED</name></expr></argument>,
+										  <argument><expr><name>lsn</name></expr></argument>, <argument><expr><name>slotno</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			</block_content>}</block></for>
+		</block_content>}</block></if></if_stmt>
+
+		<comment type="block">/* ... then the main transaction */</comment>
+		<expr_stmt><expr><call><name>TransactionIdSetStatusBit</name><argument_list>(<argument><expr><name>xid</name></expr></argument>, <argument><expr><name>status</name></expr></argument>, <argument><expr><name>lsn</name></expr></argument>, <argument><expr><name>slotno</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/* Set the subtransactions */</comment>
+	<for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name>nsubxids</name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>ClogCtl</name><operator>-&gt;</operator><name>shared</name><operator>-&gt;</operator><name>page_number</name><index>[<expr><name>slotno</name></expr>]</index></name> <operator>==</operator> <call><name>TransactionIdToPage</name><argument_list>(<argument><expr><name><name>subxids</name><index>[<expr><name>i</name></expr>]</index></name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>TransactionIdSetStatusBit</name><argument_list>(<argument><expr><name><name>subxids</name><index>[<expr><name>i</name></expr>]</index></name></expr></argument>, <argument><expr><name>status</name></expr></argument>, <argument><expr><name>lsn</name></expr></argument>, <argument><expr><name>slotno</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></for>
+
+	<expr_stmt><expr><name><name>ClogCtl</name><operator>-&gt;</operator><name>shared</name><operator>-&gt;</operator><name>page_dirty</name><index>[<expr><name>slotno</name></expr>]</index></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * When we cannot immediately acquire CLogControlLock in exclusive mode at
+ * commit time, add ourselves to a list of processes that need their XIDs
+ * status update.  The first process to add itself to the list will acquire
+ * CLogControlLock in exclusive mode and set transaction status as required
+ * on behalf of all group members.  This avoids a great deal of contention
+ * around CLogControlLock when many processes are trying to commit at once,
+ * since the lock need not be repeatedly handed off from one committing
+ * process to the next.
+ *
+ * Returns true when transaction status has been updated in clog; returns
+ * false if we decided against applying the optimization because the page
+ * number we need to update differs from those processes already waiting.
+ */</comment>
+<function><type><specifier>static</specifier> <name>bool</name></type>
+<name>TransactionGroupUpdateXidStatus</name><parameter_list>(<parameter><decl><type><name>TransactionId</name></type> <name>xid</name></decl></parameter>, <parameter><decl><type><name>XidStatus</name></type> <name>status</name></decl></parameter>,
+								<parameter><decl><type><name>XLogRecPtr</name></type> <name>lsn</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>pageno</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><specifier>volatile</specifier> <name>PROC_HDR</name> <modifier>*</modifier></type><name>procglobal</name> <init>= <expr><name>ProcGlobal</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>PGPROC</name>	   <modifier>*</modifier></type><name>proc</name> <init>= <expr><name>MyProc</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>uint32</name></type>		<name>nextidx</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>uint32</name></type>		<name>wakeidx</name></decl>;</decl_stmt>
+
+	<comment type="block">/* We should definitely have an XID whose status needs to be updated. */</comment>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>TransactionIdIsValid</name><argument_list>(<argument><expr><name>xid</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Add ourselves to the list of processes needing a group XID status
+	 * update.
+	 */</comment>
+	<expr_stmt><expr><name><name>proc</name><operator>-&gt;</operator><name>clogGroupMember</name></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>proc</name><operator>-&gt;</operator><name>clogGroupMemberXid</name></name> <operator>=</operator> <name>xid</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>proc</name><operator>-&gt;</operator><name>clogGroupMemberXidStatus</name></name> <operator>=</operator> <name>status</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>proc</name><operator>-&gt;</operator><name>clogGroupMemberPage</name></name> <operator>=</operator> <name>pageno</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>proc</name><operator>-&gt;</operator><name>clogGroupMemberLsn</name></name> <operator>=</operator> <name>lsn</name></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>nextidx</name> <operator>=</operator> <call><name>pg_atomic_read_u32</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>procglobal</name><operator>-&gt;</operator><name>clogGroupFirst</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<while>while <condition>(<expr><name>true</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/*
+		 * Add the proc to list, if the clog page where we need to update the
+		 * current transaction status is same as group leader's clog page.
+		 *
+		 * There is a race condition here, which is that after doing the below
+		 * check and before adding this proc's clog update to a group, the
+		 * group leader might have already finished the group update for this
+		 * page and becomes group leader of another group. This will lead to a
+		 * situation where a single group can have different clog page
+		 * updates.  This isn't likely and will still work, just maybe a bit
+		 * less efficiently.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><name>nextidx</name> <operator>!=</operator> <name>INVALID_PGPROCNO</name> <operator>&amp;&amp;</operator>
+			<name><name>ProcGlobal</name><operator>-&gt;</operator><name>allProcs</name><index>[<expr><name>nextidx</name></expr>]</index></name><operator>.</operator><name>clogGroupMemberPage</name> <operator>!=</operator> <name><name>proc</name><operator>-&gt;</operator><name>clogGroupMemberPage</name></name></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><name><name>proc</name><operator>-&gt;</operator><name>clogGroupMember</name></name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+			<return>return <expr><name>false</name></expr>;</return>
+		</block_content>}</block></if></if_stmt>
+
+		<expr_stmt><expr><call><name>pg_atomic_write_u32</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>proc</name><operator>-&gt;</operator><name>clogGroupNext</name></name></expr></argument>, <argument><expr><name>nextidx</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<if_stmt><if>if <condition>(<expr><call><name>pg_atomic_compare_exchange_u32</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>procglobal</name><operator>-&gt;</operator><name>clogGroupFirst</name></name></expr></argument>,
+										   <argument><expr><operator>&amp;</operator><name>nextidx</name></expr></argument>,
+										   <argument><expr><operator>(</operator><name>uint32</name><operator>)</operator> <name><name>proc</name><operator>-&gt;</operator><name>pgprocno</name></name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<break>break;</break></block_content></block></if></if_stmt>
+	</block_content>}</block></while>
+
+	<comment type="block">/*
+	 * If the list was not empty, the leader will update the status of our
+	 * XID. It is impossible to have followers without a leader because the
+	 * first process that has added itself to the list will always have
+	 * nextidx as INVALID_PGPROCNO.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name>nextidx</name> <operator>!=</operator> <name>INVALID_PGPROCNO</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>int</name></type>			<name>extraWaits</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+
+		<comment type="block">/* Sleep until the leader updates our XID status. */</comment>
+		<expr_stmt><expr><call><name>pgstat_report_wait_start</name><argument_list>(<argument><expr><name>WAIT_EVENT_CLOG_GROUP_UPDATE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<for>for <control>(<init>;</init><condition>;</condition><incr/>)</control>
+		<block>{<block_content>
+			<comment type="block">/* acts as a read barrier */</comment>
+			<expr_stmt><expr><call><name>PGSemaphoreLock</name><argument_list>(<argument><expr><name><name>proc</name><operator>-&gt;</operator><name>sem</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<if_stmt><if>if <condition>(<expr><operator>!</operator><name><name>proc</name><operator>-&gt;</operator><name>clogGroupMember</name></name></expr>)</condition><block type="pseudo"><block_content>
+				<break>break;</break></block_content></block></if></if_stmt>
+			<expr_stmt><expr><name>extraWaits</name><operator>++</operator></expr>;</expr_stmt>
+		</block_content>}</block></for>
+		<expr_stmt><expr><call><name>pgstat_report_wait_end</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>pg_atomic_read_u32</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>proc</name><operator>-&gt;</operator><name>clogGroupNext</name></name></expr></argument>)</argument_list></call> <operator>==</operator> <name>INVALID_PGPROCNO</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/* Fix semaphore count for any absorbed wakeups */</comment>
+		<while>while <condition>(<expr><name>extraWaits</name><operator>--</operator> <operator>&gt;</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>PGSemaphoreUnlock</name><argument_list>(<argument><expr><name><name>proc</name><operator>-&gt;</operator><name>sem</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></while>
+		<return>return <expr><name>true</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/* We are the leader.  Acquire the lock on behalf of everyone. */</comment>
+	<expr_stmt><expr><call><name>LWLockAcquire</name><argument_list>(<argument><expr><name>CLogControlLock</name></expr></argument>, <argument><expr><name>LW_EXCLUSIVE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Now that we've got the lock, clear the list of processes waiting for
+	 * group XID status update, saving a pointer to the head of the list.
+	 * Trying to pop elements one at a time could lead to an ABA problem.
+	 */</comment>
+	<expr_stmt><expr><name>nextidx</name> <operator>=</operator> <call><name>pg_atomic_exchange_u32</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>procglobal</name><operator>-&gt;</operator><name>clogGroupFirst</name></name></expr></argument>,
+									 <argument><expr><name>INVALID_PGPROCNO</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Remember head of list so we can perform wakeups after dropping lock. */</comment>
+	<expr_stmt><expr><name>wakeidx</name> <operator>=</operator> <name>nextidx</name></expr>;</expr_stmt>
+
+	<comment type="block">/* Walk the list and update the status of all XIDs. */</comment>
+	<while>while <condition>(<expr><name>nextidx</name> <operator>!=</operator> <name>INVALID_PGPROCNO</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>PGPROC</name>	   <modifier>*</modifier></type><name>proc</name> <init>= <expr><operator>&amp;</operator><name><name>ProcGlobal</name><operator>-&gt;</operator><name>allProcs</name><index>[<expr><name>nextidx</name></expr>]</index></name></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>PGXACT</name>	   <modifier>*</modifier></type><name>pgxact</name> <init>= <expr><operator>&amp;</operator><name><name>ProcGlobal</name><operator>-&gt;</operator><name>allPgXact</name><index>[<expr><name>nextidx</name></expr>]</index></name></expr></init></decl>;</decl_stmt>
+
+		<comment type="block">/*
+		 * Overflowed transactions should not use group XID status update
+		 * mechanism.
+		 */</comment>
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><operator>!</operator><name><name>pgxact</name><operator>-&gt;</operator><name>overflowed</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><call><name>TransactionIdSetPageStatusInternal</name><argument_list>(<argument><expr><name><name>proc</name><operator>-&gt;</operator><name>clogGroupMemberXid</name></name></expr></argument>,
+										   <argument><expr><name><name>pgxact</name><operator>-&gt;</operator><name>nxids</name></name></expr></argument>,
+										   <argument><expr><name><name>proc</name><operator>-&gt;</operator><name>subxids</name><operator>.</operator><name>xids</name></name></expr></argument>,
+										   <argument><expr><name><name>proc</name><operator>-&gt;</operator><name>clogGroupMemberXidStatus</name></name></expr></argument>,
+										   <argument><expr><name><name>proc</name><operator>-&gt;</operator><name>clogGroupMemberLsn</name></name></expr></argument>,
+										   <argument><expr><name><name>proc</name><operator>-&gt;</operator><name>clogGroupMemberPage</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/* Move to next proc in list. */</comment>
+		<expr_stmt><expr><name>nextidx</name> <operator>=</operator> <call><name>pg_atomic_read_u32</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>proc</name><operator>-&gt;</operator><name>clogGroupNext</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></while>
+
+	<comment type="block">/* We're done with the lock now. */</comment>
+	<expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><name>CLogControlLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Now that we've released the lock, go back and wake everybody up.  We
+	 * don't do this under the lock so as to keep lock hold times to a
+	 * minimum.
+	 */</comment>
+	<while>while <condition>(<expr><name>wakeidx</name> <operator>!=</operator> <name>INVALID_PGPROCNO</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>PGPROC</name>	   <modifier>*</modifier></type><name>proc</name> <init>= <expr><operator>&amp;</operator><name><name>ProcGlobal</name><operator>-&gt;</operator><name>allProcs</name><index>[<expr><name>wakeidx</name></expr>]</index></name></expr></init></decl>;</decl_stmt>
+
+		<expr_stmt><expr><name>wakeidx</name> <operator>=</operator> <call><name>pg_atomic_read_u32</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>proc</name><operator>-&gt;</operator><name>clogGroupNext</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>pg_atomic_write_u32</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>proc</name><operator>-&gt;</operator><name>clogGroupNext</name></name></expr></argument>, <argument><expr><name>INVALID_PGPROCNO</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/* ensure all previous writes are visible before follower continues. */</comment>
+		<expr_stmt><expr><call><name>pg_write_barrier</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><name><name>proc</name><operator>-&gt;</operator><name>clogGroupMember</name></name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name>proc</name> <operator>!=</operator> <name>MyProc</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>PGSemaphoreUnlock</name><argument_list>(<argument><expr><name><name>proc</name><operator>-&gt;</operator><name>sem</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	</block_content>}</block></while>
+
+	<return>return <expr><name>true</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Sets the commit status of a single transaction.
+ *
+ * Must be called with CLogControlLock held
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>TransactionIdSetStatusBit</name><parameter_list>(<parameter><decl><type><name>TransactionId</name></type> <name>xid</name></decl></parameter>, <parameter><decl><type><name>XidStatus</name></type> <name>status</name></decl></parameter>, <parameter><decl><type><name>XLogRecPtr</name></type> <name>lsn</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>slotno</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>int</name></type>			<name>byteno</name> <init>= <expr><call><name>TransactionIdToByte</name><argument_list>(<argument><expr><name>xid</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>bshift</name> <init>= <expr><call><name>TransactionIdToBIndex</name><argument_list>(<argument><expr><name>xid</name></expr></argument>)</argument_list></call> <operator>*</operator> <name>CLOG_BITS_PER_XACT</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>byteptr</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>char</name></type>		<name>byteval</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>char</name></type>		<name>curval</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name>byteptr</name> <operator>=</operator> <name><name>ClogCtl</name><operator>-&gt;</operator><name>shared</name><operator>-&gt;</operator><name>page_buffer</name><index>[<expr><name>slotno</name></expr>]</index></name> <operator>+</operator> <name>byteno</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name>curval</name> <operator>=</operator> <operator>(</operator><operator>*</operator><name>byteptr</name> <operator>&gt;&gt;</operator> <name>bshift</name><operator>)</operator> <operator>&amp;</operator> <name>CLOG_XACT_BITMASK</name></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * When replaying transactions during recovery we still need to perform
+	 * the two phases of subcommit and then commit. However, some transactions
+	 * are already correctly marked, so we just treat those as a no-op which
+	 * allows us to keep the following Assert as restrictive as possible.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name>InRecovery</name> <operator>&amp;&amp;</operator> <name>status</name> <operator>==</operator> <name>TRANSACTION_STATUS_SUB_COMMITTED</name> <operator>&amp;&amp;</operator>
+		<name>curval</name> <operator>==</operator> <name>TRANSACTION_STATUS_COMMITTED</name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return;</return></block_content></block></if></if_stmt>
+
+	<comment type="block">/*
+	 * Current state change should be from 0 or subcommitted to target state
+	 * or we should already be there when replaying changes during recovery.
+	 */</comment>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>curval</name> <operator>==</operator> <literal type="number">0</literal> <operator>||</operator>
+		   <operator>(</operator><name>curval</name> <operator>==</operator> <name>TRANSACTION_STATUS_SUB_COMMITTED</name> <operator>&amp;&amp;</operator>
+			<name>status</name> <operator>!=</operator> <name>TRANSACTION_STATUS_IN_PROGRESS</name><operator>)</operator> <operator>||</operator>
+		   <name>curval</name> <operator>==</operator> <name>status</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* note this assumes exclusive access to the clog page */</comment>
+	<expr_stmt><expr><name>byteval</name> <operator>=</operator> <operator>*</operator><name>byteptr</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name>byteval</name> <operator>&amp;=</operator> <operator>~</operator><operator>(</operator><operator>(</operator><operator>(</operator><literal type="number">1</literal> <operator>&lt;&lt;</operator> <name>CLOG_BITS_PER_XACT</name><operator>)</operator> <operator>-</operator> <literal type="number">1</literal><operator>)</operator> <operator>&lt;&lt;</operator> <name>bshift</name><operator>)</operator></expr>;</expr_stmt>
+	<expr_stmt><expr><name>byteval</name> <operator>|=</operator> <operator>(</operator><name>status</name> <operator>&lt;&lt;</operator> <name>bshift</name><operator>)</operator></expr>;</expr_stmt>
+	<expr_stmt><expr><operator>*</operator><name>byteptr</name> <operator>=</operator> <name>byteval</name></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Update the group LSN if the transaction completion LSN is higher.
+	 *
+	 * Note: lsn will be invalid when supplied during InRecovery processing,
+	 * so we don't need to do anything special to avoid LSN updates during
+	 * recovery. After recovery completes the next clog change will set the
+	 * LSN correctly.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>XLogRecPtrIsInvalid</name><argument_list>(<argument><expr><name>lsn</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>int</name></type>			<name>lsnindex</name> <init>= <expr><call><name>GetLSNIndex</name><argument_list>(<argument><expr><name>slotno</name></expr></argument>, <argument><expr><name>xid</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name><name>ClogCtl</name><operator>-&gt;</operator><name>shared</name><operator>-&gt;</operator><name>group_lsn</name><index>[<expr><name>lsnindex</name></expr>]</index></name> <operator>&lt;</operator> <name>lsn</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><name><name>ClogCtl</name><operator>-&gt;</operator><name>shared</name><operator>-&gt;</operator><name>group_lsn</name><index>[<expr><name>lsnindex</name></expr>]</index></name> <operator>=</operator> <name>lsn</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	</block_content>}</block></if></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Interrogate the state of a transaction in the commit log.
+ *
+ * Aside from the actual commit status, this function returns (into *lsn)
+ * an LSN that is late enough to be able to guarantee that if we flush up to
+ * that LSN then we will have flushed the transaction's commit record to disk.
+ * The result is not necessarily the exact LSN of the transaction's commit
+ * record!	For example, for long-past transactions (those whose clog pages
+ * already migrated to disk), we'll return InvalidXLogRecPtr.  Also, because
+ * we group transactions on the same clog page to conserve storage, we might
+ * return the LSN of a later transaction that falls into the same group.
+ *
+ * NB: this is a low-level routine and is NOT the preferred entry point
+ * for most uses; TransactionLogFetch() in transam.c is the intended caller.
+ */</comment>
+<function><type><name>XidStatus</name></type>
+<name>TransactionIdGetStatus</name><parameter_list>(<parameter><decl><type><name>TransactionId</name></type> <name>xid</name></decl></parameter>, <parameter><decl><type><name>XLogRecPtr</name> <modifier>*</modifier></type><name>lsn</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>int</name></type>			<name>pageno</name> <init>= <expr><call><name>TransactionIdToPage</name><argument_list>(<argument><expr><name>xid</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>byteno</name> <init>= <expr><call><name>TransactionIdToByte</name><argument_list>(<argument><expr><name>xid</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>bshift</name> <init>= <expr><call><name>TransactionIdToBIndex</name><argument_list>(<argument><expr><name>xid</name></expr></argument>)</argument_list></call> <operator>*</operator> <name>CLOG_BITS_PER_XACT</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>slotno</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>lsnindex</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>byteptr</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>XidStatus</name></type>	<name>status</name></decl>;</decl_stmt>
+
+	<comment type="block">/* lock is acquired by SimpleLruReadPage_ReadOnly */</comment>
+
+	<expr_stmt><expr><name>slotno</name> <operator>=</operator> <call><name>SimpleLruReadPage_ReadOnly</name><argument_list>(<argument><expr><name>ClogCtl</name></expr></argument>, <argument><expr><name>pageno</name></expr></argument>, <argument><expr><name>xid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>byteptr</name> <operator>=</operator> <name><name>ClogCtl</name><operator>-&gt;</operator><name>shared</name><operator>-&gt;</operator><name>page_buffer</name><index>[<expr><name>slotno</name></expr>]</index></name> <operator>+</operator> <name>byteno</name></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>status</name> <operator>=</operator> <operator>(</operator><operator>*</operator><name>byteptr</name> <operator>&gt;&gt;</operator> <name>bshift</name><operator>)</operator> <operator>&amp;</operator> <name>CLOG_XACT_BITMASK</name></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>lsnindex</name> <operator>=</operator> <call><name>GetLSNIndex</name><argument_list>(<argument><expr><name>slotno</name></expr></argument>, <argument><expr><name>xid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><operator>*</operator><name>lsn</name> <operator>=</operator> <name><name>ClogCtl</name><operator>-&gt;</operator><name>shared</name><operator>-&gt;</operator><name>group_lsn</name><index>[<expr><name>lsnindex</name></expr>]</index></name></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><name>CLogControlLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<return>return <expr><name>status</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Find the next lowest transaction with a logged or recorded status.
+ * I.e. One that does not have a status of default (0) -- i.e: in-progress.
+ */</comment>
+<function><type><name>bool</name></type>
+<name>CLOGScanForPrevStatus</name><parameter_list>(
+	<parameter><decl><type><name>TransactionId</name> 			<modifier>*</modifier></type><name>indexXid</name></decl></parameter>,
+	<parameter><decl><type><name>XidStatus</name>				<modifier>*</modifier></type><name>status</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>TransactionId</name></type> <name>highXid</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type> <name>pageno</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>TransactionId</name></type> <name>lowXid</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type> <name>slotno</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type> <name>byteno</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type> <name>bshift</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>TransactionId</name></type> <name>xid</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>char</name> <modifier>*</modifier></type><name>byteptr</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><operator>*</operator><name>status</name> <operator>=</operator> <name>TRANSACTION_STATUS_IN_PROGRESS</name></expr>;</expr_stmt>	<comment type="line">// Set it to something.</comment>
+
+	<if_stmt><if>if <condition>(<expr><operator>(</operator><operator>*</operator><name>indexXid</name><operator>)</operator> <operator>==</operator> <name>InvalidTransactionId</name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>false</name></expr>;</return></block_content></block></if></if_stmt>
+	<expr_stmt><expr><name>highXid</name> <operator>=</operator> <operator>(</operator><operator>*</operator><name>indexXid</name><operator>)</operator> <operator>-</operator> <literal type="number">1</literal></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><name>highXid</name> <operator>&lt;</operator> <name>FirstNormalTransactionId</name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>false</name></expr>;</return></block_content></block></if></if_stmt>
+
+	<while>while <condition>(<expr><name>true</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name>pageno</name> <operator>=</operator> <call><name>TransactionIdToPage</name><argument_list>(<argument><expr><name>highXid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/*
+		 * Compute the xid floor for the page.
+		 */</comment>
+		<expr_stmt><expr><name>lowXid</name> <operator>=</operator> <name>pageno</name> <operator>*</operator> <operator>(</operator><name>TransactionId</name><operator>)</operator> <name>CLOG_XACTS_PER_PAGE</name></expr>;</expr_stmt>
+		<if_stmt><if>if <condition>(<expr><name>lowXid</name> <operator>==</operator> <name>InvalidTransactionId</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><name>lowXid</name> <operator>=</operator> <name>FirstNormalTransactionId</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+		<expr_stmt><expr><call><name>LWLockAcquire</name><argument_list>(<argument><expr><name>CLogControlLock</name></expr></argument>, <argument><expr><name>LW_EXCLUSIVE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/*
+		 * Peek to see if page exists.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>SimpleLruDoesPhysicalPageExist</name><argument_list>(<argument><expr><name>ClogCtl</name></expr></argument>, <argument><expr><name>pageno</name></expr></argument>)</argument_list></call></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><name>CLogControlLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+			<expr_stmt><expr><operator>*</operator><name>indexXid</name> <operator>=</operator> <name>InvalidTransactionId</name></expr>;</expr_stmt>
+			<expr_stmt><expr><operator>*</operator><name>status</name> <operator>=</operator> <name>TRANSACTION_STATUS_IN_PROGRESS</name></expr>;</expr_stmt>	<comment type="line">// Set it to something.</comment>
+			<return>return <expr><name>false</name></expr>;</return>
+		</block_content>}</block></if></if_stmt>
+			
+		<expr_stmt><expr><name>slotno</name> <operator>=</operator> <call><name>SimpleLruReadPage</name><argument_list>(<argument><expr><name>ClogCtl</name></expr></argument>, <argument><expr><name>pageno</name></expr></argument>, <argument><expr><name>false</name></expr></argument>, <argument><expr><name>highXid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<for>for <control>(<init><expr><name>xid</name> <operator>=</operator> <name>highXid</name></expr>;</init> <condition><expr><name>xid</name> <operator>&gt;=</operator> <name>lowXid</name></expr>;</condition> <incr><expr><name>xid</name><operator>--</operator></expr></incr>)</control>
+		<block>{<block_content>
+			<expr_stmt><expr><name>byteno</name> <operator>=</operator> <call><name>TransactionIdToByte</name><argument_list>(<argument><expr><name>xid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><name>bshift</name> <operator>=</operator> <call><name>TransactionIdToBIndex</name><argument_list>(<argument><expr><name>xid</name></expr></argument>)</argument_list></call> <operator>*</operator> <name>CLOG_BITS_PER_XACT</name></expr>;</expr_stmt>
+			<expr_stmt><expr><name>byteptr</name> <operator>=</operator> <name><name>ClogCtl</name><operator>-&gt;</operator><name>shared</name><operator>-&gt;</operator><name>page_buffer</name><index>[<expr><name>slotno</name></expr>]</index></name> <operator>+</operator> <name>byteno</name></expr>;</expr_stmt>
+			<expr_stmt><expr><operator>*</operator><name>status</name> <operator>=</operator> <operator>(</operator><operator>*</operator><name>byteptr</name> <operator>&gt;&gt;</operator> <name>bshift</name><operator>)</operator> <operator>&amp;</operator> <name>CLOG_XACT_BITMASK</name></expr>;</expr_stmt>
+
+			<if_stmt><if>if <condition>(<expr><operator>*</operator><name>status</name> <operator>!=</operator> <name>TRANSACTION_STATUS_IN_PROGRESS</name></expr>)</condition>
+			<block>{<block_content>
+				<expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><name>CLogControlLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+				<expr_stmt><expr><operator>*</operator><name>indexXid</name> <operator>=</operator> <name>xid</name></expr>;</expr_stmt>
+				<return>return <expr><name>true</name></expr>;</return>
+			</block_content>}</block></if></if_stmt>
+		</block_content>}</block></for>
+
+		<expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><name>CLogControlLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name>lowXid</name> <operator>==</operator> <name>FirstNormalTransactionId</name></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><operator>*</operator><name>indexXid</name> <operator>=</operator> <name>InvalidTransactionId</name></expr>;</expr_stmt>
+			<expr_stmt><expr><operator>*</operator><name>status</name> <operator>=</operator> <name>TRANSACTION_STATUS_IN_PROGRESS</name></expr>;</expr_stmt>	<comment type="line">// Set it to something.</comment>
+			<return>return <expr><name>false</name></expr>;</return>
+		</block_content>}</block></if></if_stmt>
+		
+		<expr_stmt><expr><name>highXid</name> <operator>=</operator> <name>lowXid</name> <operator>-</operator> <literal type="number">1</literal></expr>;</expr_stmt>	<comment type="line">// Go to last xid of previous page.</comment>
+	</block_content>}</block></while>
+
+	<return>return <expr><name>false</name></expr>;</return>	<comment type="line">// We'll never reach this.</comment>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Determine the "age" of a transaction id.
+ */</comment>
+<function><type><name>bool</name></type>
+<name>CLOGTransactionIsOld</name><parameter_list>(<parameter><decl><type><name>TransactionId</name></type> <name>xid</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>TransactionId</name></type> <name>nextXid</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type> <name>pagesBack</name></decl>;</decl_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>ShmemVariableCache</name> <operator>==</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>false</name></expr>;</return></block_content></block></if></if_stmt>	<comment type="line">// In case we are called very early in the life of the backend process, etc.</comment>
+
+	<expr_stmt><expr><name>nextXid</name> <operator>=</operator> <call><name>XidFromFullTransactionId</name><argument_list>(<argument><expr><name><name>ShmemVariableCache</name><operator>-&gt;</operator><name>nextFullXid</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>nextXid</name> <operator>&lt;</operator> <name>xid</name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>false</name></expr>;</return></block_content></block></if></if_stmt>	<comment type="line">// Not sure what is going on.</comment>
+
+	<expr_stmt><expr><name>pagesBack</name> <operator>=</operator> <operator>(</operator><name>nextXid</name> <operator>-</operator> <name>xid</name><operator>)</operator> <operator>/</operator> <name>CLOG_XACTS_PER_PAGE</name></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Declare the transaction old if it is in the bottom older half of the hot CLOG cache window, or
+	 * before the window.
+	 */</comment>
+	<return>return <expr><operator>(</operator><name>pagesBack</name> <operator>&gt;</operator> <call><name>CLOGShmemBuffers</name><argument_list>()</argument_list></call><operator>/</operator><literal type="number">2</literal><operator>)</operator></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Number of shared CLOG buffers.
+ *
+ * On larger multi-processor systems, it is possible to have many CLOG page
+ * requests in flight at one time which could lead to disk access for CLOG
+ * page if the required page is not found in memory.  Testing revealed that we
+ * can get the best performance by having 128 CLOG buffers, more than that it
+ * doesn't improve performance.
+ *
+ * Unconditionally keeping the number of CLOG buffers to 128 did not seem like
+ * a good idea, because it would increase the minimum amount of shared memory
+ * required to start, which could be a problem for people running very small
+ * configurations.  The following formula seems to represent a reasonable
+ * compromise: people with very low values for shared_buffers will get fewer
+ * CLOG buffers as well, and everyone else will get 128.
+ */</comment>
+<function><type><name>Size</name></type>
+<name>CLOGShmemBuffers</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<return>return <expr><call><name>Min</name><argument_list>(<argument><expr><literal type="number">128</literal></expr></argument>, <argument><expr><call><name>Max</name><argument_list>(<argument><expr><literal type="number">4</literal></expr></argument>, <argument><expr><name>NBuffers</name> <operator>/</operator> <literal type="number">512</literal></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Initialization of shared memory for CLOG
+ */</comment>
+<function><type><name>Size</name></type>
+<name>CLOGShmemSize</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<return>return <expr><call><name>SimpleLruShmemSize</name><argument_list>(<argument><expr><call><name>CLOGShmemBuffers</name><argument_list>()</argument_list></call></expr></argument>, <argument><expr><name>CLOG_LSNS_PER_PAGE</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><name>void</name></type>
+<name>CLOGShmemInit</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><name><name>ClogCtl</name><operator>-&gt;</operator><name>PagePrecedes</name></name> <operator>=</operator> <name>CLOGPagePrecedes</name></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>SimpleLruInit</name><argument_list>(<argument><expr><name>ClogCtl</name></expr></argument>, <argument><expr><literal type="string">"clog"</literal></expr></argument>, <argument><expr><call><name>CLOGShmemBuffers</name><argument_list>()</argument_list></call></expr></argument>, <argument><expr><name>CLOG_LSNS_PER_PAGE</name></expr></argument>,
+				  <argument><expr><name>CLogControlLock</name></expr></argument>, <argument><expr><literal type="string">"pg_xact"</literal></expr></argument>, <argument><expr><name>LWTRANCHE_CLOG_BUFFERS</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * This func must be called ONCE on system install.  It creates
+ * the initial CLOG segment.  (The CLOG directory is assumed to
+ * have been created by initdb, and CLOGShmemInit must have been
+ * called already.)
+ */</comment>
+<function><type><name>void</name></type>
+<name>BootStrapCLOG</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>int</name></type>			<name>slotno</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>LWLockAcquire</name><argument_list>(<argument><expr><name>CLogControlLock</name></expr></argument>, <argument><expr><name>LW_EXCLUSIVE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Create and zero the first page of the commit log */</comment>
+	<expr_stmt><expr><name>slotno</name> <operator>=</operator> <call><name>ZeroCLOGPage</name><argument_list>(<argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Make sure it's written out */</comment>
+	<expr_stmt><expr><call><name>SimpleLruWritePage</name><argument_list>(<argument><expr><name>ClogCtl</name></expr></argument>, <argument><expr><name>slotno</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><operator>!</operator><name><name>ClogCtl</name><operator>-&gt;</operator><name>shared</name><operator>-&gt;</operator><name>page_dirty</name><index>[<expr><name>slotno</name></expr>]</index></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><name>CLogControlLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Initialize (or reinitialize) a page of CLOG to zeroes.
+ * If writeXlog is true, also emit an XLOG record saying we did this.
+ *
+ * The page is not actually written, just set up in shared memory.
+ * The slot number of the new page is returned.
+ *
+ * Control lock must be held at entry, and will be held at exit.
+ */</comment>
+<function><type><specifier>static</specifier> <name>int</name></type>
+<name>ZeroCLOGPage</name><parameter_list>(<parameter><decl><type><name>int</name></type> <name>pageno</name></decl></parameter>, <parameter><decl><type><name>bool</name></type> <name>writeXlog</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>int</name></type>			<name>slotno</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name>slotno</name> <operator>=</operator> <call><name>SimpleLruZeroPage</name><argument_list>(<argument><expr><name>ClogCtl</name></expr></argument>, <argument><expr><name>pageno</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>writeXlog</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>WriteZeroPageXlogRec</name><argument_list>(<argument><expr><name>pageno</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<return>return <expr><name>slotno</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * This must be called ONCE during postmaster or standalone-backend startup,
+ * after StartupXLOG has initialized ShmemVariableCache-&gt;nextFullXid.
+ */</comment>
+<function><type><name>void</name></type>
+<name>StartupCLOG</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>TransactionId</name></type> <name>xid</name> <init>= <expr><call><name>XidFromFullTransactionId</name><argument_list>(<argument><expr><name><name>ShmemVariableCache</name><operator>-&gt;</operator><name>nextFullXid</name></name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>pageno</name> <init>= <expr><call><name>TransactionIdToPage</name><argument_list>(<argument><expr><name>xid</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>LWLockAcquire</name><argument_list>(<argument><expr><name>CLogControlLock</name></expr></argument>, <argument><expr><name>LW_EXCLUSIVE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Initialize our idea of the latest page number.
+	 */</comment>
+	<expr_stmt><expr><name><name>ClogCtl</name><operator>-&gt;</operator><name>shared</name><operator>-&gt;</operator><name>latest_page_number</name></name> <operator>=</operator> <name>pageno</name></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><name>CLogControlLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * This must be called ONCE at the end of startup/recovery.
+ */</comment>
+<function><type><name>void</name></type>
+<name>TrimCLOG</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>TransactionId</name></type> <name>xid</name> <init>= <expr><call><name>XidFromFullTransactionId</name><argument_list>(<argument><expr><name><name>ShmemVariableCache</name><operator>-&gt;</operator><name>nextFullXid</name></name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>pageno</name> <init>= <expr><call><name>TransactionIdToPage</name><argument_list>(<argument><expr><name>xid</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>LWLockAcquire</name><argument_list>(<argument><expr><name>CLogControlLock</name></expr></argument>, <argument><expr><name>LW_EXCLUSIVE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Re-Initialize our idea of the latest page number.
+	 */</comment>
+	<expr_stmt><expr><name><name>ClogCtl</name><operator>-&gt;</operator><name>shared</name><operator>-&gt;</operator><name>latest_page_number</name></name> <operator>=</operator> <name>pageno</name></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Zero out the remainder of the current clog page.  Under normal
+	 * circumstances it should be zeroes already, but it seems at least
+	 * theoretically possible that XLOG replay will have settled on a nextXID
+	 * value that is less than the last XID actually used and marked by the
+	 * previous database lifecycle (since subtransaction commit writes clog
+	 * but makes no WAL entry).  Let's just be safe. (We need not worry about
+	 * pages beyond the current one, since those will be zeroed when first
+	 * used.  For the same reason, there is no need to do anything when
+	 * nextFullXid is exactly at a page boundary; and it's likely that the
+	 * "current" page doesn't exist yet in that case.)
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><call><name>TransactionIdToPgIndex</name><argument_list>(<argument><expr><name>xid</name></expr></argument>)</argument_list></call> <operator>!=</operator> <literal type="number">0</literal></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>int</name></type>			<name>byteno</name> <init>= <expr><call><name>TransactionIdToByte</name><argument_list>(<argument><expr><name>xid</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>int</name></type>			<name>bshift</name> <init>= <expr><call><name>TransactionIdToBIndex</name><argument_list>(<argument><expr><name>xid</name></expr></argument>)</argument_list></call> <operator>*</operator> <name>CLOG_BITS_PER_XACT</name></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>int</name></type>			<name>slotno</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>byteptr</name></decl>;</decl_stmt>
+
+		<expr_stmt><expr><name>slotno</name> <operator>=</operator> <call><name>SimpleLruReadPage</name><argument_list>(<argument><expr><name>ClogCtl</name></expr></argument>, <argument><expr><name>pageno</name></expr></argument>, <argument><expr><name>false</name></expr></argument>, <argument><expr><name>xid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name>byteptr</name> <operator>=</operator> <name><name>ClogCtl</name><operator>-&gt;</operator><name>shared</name><operator>-&gt;</operator><name>page_buffer</name><index>[<expr><name>slotno</name></expr>]</index></name> <operator>+</operator> <name>byteno</name></expr>;</expr_stmt>
+
+		<comment type="block">/* Zero so-far-unused positions in the current byte */</comment>
+		<expr_stmt><expr><operator>*</operator><name>byteptr</name> <operator>&amp;=</operator> <operator>(</operator><literal type="number">1</literal> <operator>&lt;&lt;</operator> <name>bshift</name><operator>)</operator> <operator>-</operator> <literal type="number">1</literal></expr>;</expr_stmt>
+		<comment type="block">/* Zero the rest of the page */</comment>
+		<expr_stmt><expr><call><name>MemSet</name><argument_list>(<argument><expr><name>byteptr</name> <operator>+</operator> <literal type="number">1</literal></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><name>BLCKSZ</name> <operator>-</operator> <name>byteno</name> <operator>-</operator> <literal type="number">1</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><name><name>ClogCtl</name><operator>-&gt;</operator><name>shared</name><operator>-&gt;</operator><name>page_dirty</name><index>[<expr><name>slotno</name></expr>]</index></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><name>CLogControlLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * This must be called ONCE during postmaster or standalone-backend shutdown
+ */</comment>
+<function><type><name>void</name></type>
+<name>ShutdownCLOG</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<comment type="block">/* Flush dirty CLOG pages to disk */</comment>
+	<expr_stmt><expr><call><name>TRACE_POSTGRESQL_CLOG_CHECKPOINT_START</name><argument_list>(<argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>SimpleLruFlush</name><argument_list>(<argument><expr><name>ClogCtl</name></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * fsync pg_xact to ensure that any files flushed previously are durably
+	 * on disk.
+	 */</comment>
+	<expr_stmt><expr><call><name>fsync_fname</name><argument_list>(<argument><expr><literal type="string">"pg_xact"</literal></expr></argument>, <argument><expr><name>true</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>TRACE_POSTGRESQL_CLOG_CHECKPOINT_DONE</name><argument_list>(<argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Perform a checkpoint --- either during shutdown, or on-the-fly
+ */</comment>
+<function><type><name>void</name></type>
+<name>CheckPointCLOG</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<comment type="block">/* Flush dirty CLOG pages to disk */</comment>
+	<expr_stmt><expr><call><name>TRACE_POSTGRESQL_CLOG_CHECKPOINT_START</name><argument_list>(<argument><expr><name>true</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>SimpleLruFlush</name><argument_list>(<argument><expr><name>ClogCtl</name></expr></argument>, <argument><expr><name>true</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * fsync pg_xact to ensure that any files flushed previously are durably
+	 * on disk.
+	 */</comment>
+	<expr_stmt><expr><call><name>fsync_fname</name><argument_list>(<argument><expr><literal type="string">"pg_xact"</literal></expr></argument>, <argument><expr><name>true</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>TRACE_POSTGRESQL_CLOG_CHECKPOINT_DONE</name><argument_list>(<argument><expr><name>true</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * Make sure that CLOG has room for a newly-allocated XID.
+ *
+ * NB: this is called while holding XidGenLock.  We want it to be very fast
+ * most of the time; even when it's not so fast, no actual I/O need happen
+ * unless we're forced to write out a dirty clog or xlog page to make room
+ * in shared memory.
+ */</comment>
+<function><type><name>void</name></type>
+<name>ExtendCLOG</name><parameter_list>(<parameter><decl><type><name>TransactionId</name></type> <name>newestXact</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>int</name></type>			<name>pageno</name></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * No work except at first XID of a page.  But beware: just after
+	 * wraparound, the first XID of page zero is FirstNormalTransactionId.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><call><name>TransactionIdToPgIndex</name><argument_list>(<argument><expr><name>newestXact</name></expr></argument>)</argument_list></call> <operator>!=</operator> <literal type="number">0</literal> <operator>&amp;&amp;</operator>
+		<operator>!</operator><call><name>TransactionIdEquals</name><argument_list>(<argument><expr><name>newestXact</name></expr></argument>, <argument><expr><name>FirstNormalTransactionId</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<return>return;</return></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><name>pageno</name> <operator>=</operator> <call><name>TransactionIdToPage</name><argument_list>(<argument><expr><name>newestXact</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>LWLockAcquire</name><argument_list>(<argument><expr><name>CLogControlLock</name></expr></argument>, <argument><expr><name>LW_EXCLUSIVE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Zero the page and make an XLOG entry about it */</comment>
+	<expr_stmt><expr><call><name>ZeroCLOGPage</name><argument_list>(<argument><expr><name>pageno</name></expr></argument>, <argument><expr><name>true</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><name>CLogControlLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * Remove all CLOG segments before the one holding the passed transaction ID
+ *
+ * Before removing any CLOG data, we must flush XLOG to disk, to ensure
+ * that any recently-emitted HEAP_FREEZE records have reached disk; otherwise
+ * a crash and restart might leave us with some unfrozen tuples referencing
+ * removed CLOG data.  We choose to emit a special TRUNCATE XLOG record too.
+ * Replaying the deletion from XLOG is not critical, since the files could
+ * just as well be removed later, but doing so prevents a long-running hot
+ * standby server from acquiring an unreasonably bloated CLOG directory.
+ *
+ * Since CLOG segments hold a large number of transactions, the opportunity to
+ * actually remove a segment is fairly rare, and so it seems best not to do
+ * the XLOG flush unless we have confirmed that there is a removable segment.
+ */</comment>
+<function><type><name>void</name></type>
+<name>TruncateCLOG</name><parameter_list>(<parameter><decl><type><name>TransactionId</name></type> <name>oldestXact</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>oldestxid_datoid</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>int</name></type>			<name>cutoffPage</name></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * The cutoff point is the start of the segment containing oldestXact. We
+	 * pass the *page* containing oldestXact to SimpleLruTruncate.
+	 */</comment>
+	<expr_stmt><expr><name>cutoffPage</name> <operator>=</operator> <call><name>TransactionIdToPage</name><argument_list>(<argument><expr><name>oldestXact</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Check to see if there's any files that could be removed */</comment>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>SlruScanDirectory</name><argument_list>(<argument><expr><name>ClogCtl</name></expr></argument>, <argument><expr><name>SlruScanDirCbReportPresence</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>cutoffPage</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<return>return;</return></block_content></block></if></if_stmt>					<comment type="block">/* nothing to remove */</comment>
+
+	<comment type="block">/*
+	 * Advance oldestClogXid before truncating clog, so concurrent xact status
+	 * lookups can ensure they don't attempt to access truncated-away clog.
+	 *
+	 * It's only necessary to do this if we will actually truncate away clog
+	 * pages.
+	 */</comment>
+	<expr_stmt><expr><call><name>AdvanceOldestClogXid</name><argument_list>(<argument><expr><name>oldestXact</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Write XLOG record and flush XLOG to disk. We record the oldest xid
+	 * we're keeping information about here so we can ensure that it's always
+	 * ahead of clog truncation in case we crash, and so a standby finds out
+	 * the new valid xid before the next checkpoint.
+	 */</comment>
+	<expr_stmt><expr><call><name>WriteTruncateXlogRec</name><argument_list>(<argument><expr><name>cutoffPage</name></expr></argument>, <argument><expr><name>oldestXact</name></expr></argument>, <argument><expr><name>oldestxid_datoid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Now we can remove the old CLOG segment(s) */</comment>
+	<expr_stmt><expr><call><name>SimpleLruTruncate</name><argument_list>(<argument><expr><name>ClogCtl</name></expr></argument>, <argument><expr><name>cutoffPage</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * Decide which of two CLOG page numbers is "older" for truncation purposes.
+ *
+ * We need to use comparison of TransactionIds here in order to do the right
+ * thing with wraparound XID arithmetic.  However, if we are asked about
+ * page number zero, we don't want to hand InvalidTransactionId to
+ * TransactionIdPrecedes: it'll get weird about permanent xact IDs.  So,
+ * offset both xids by FirstNormalTransactionId to avoid that.
+ */</comment>
+<function><type><specifier>static</specifier> <name>bool</name></type>
+<name>CLOGPagePrecedes</name><parameter_list>(<parameter><decl><type><name>int</name></type> <name>page1</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>page2</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>TransactionId</name></type> <name>xid1</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>TransactionId</name></type> <name>xid2</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name>xid1</name> <operator>=</operator> <operator>(</operator><operator>(</operator><name>TransactionId</name><operator>)</operator> <name>page1</name><operator>)</operator> <operator>*</operator> <name>CLOG_XACTS_PER_PAGE</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name>xid1</name> <operator>+=</operator> <name>FirstNormalTransactionId</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name>xid2</name> <operator>=</operator> <operator>(</operator><operator>(</operator><name>TransactionId</name><operator>)</operator> <name>page2</name><operator>)</operator> <operator>*</operator> <name>CLOG_XACTS_PER_PAGE</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name>xid2</name> <operator>+=</operator> <name>FirstNormalTransactionId</name></expr>;</expr_stmt>
+
+	<return>return <expr><call><name>TransactionIdPrecedes</name><argument_list>(<argument><expr><name>xid1</name></expr></argument>, <argument><expr><name>xid2</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * Write a ZEROPAGE xlog record
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>WriteZeroPageXlogRec</name><parameter_list>(<parameter><decl><type><name>int</name></type> <name>pageno</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>XLogBeginInsert</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>XLogRegisterData</name><argument_list>(<argument><expr><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <operator>(</operator><operator>&amp;</operator><name>pageno</name><operator>)</operator></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>int</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><operator>(</operator><name>void</name><operator>)</operator> <call><name>XLogInsert</name><argument_list>(<argument><expr><name>RM_CLOG_ID</name></expr></argument>, <argument><expr><name>CLOG_ZEROPAGE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Write a TRUNCATE xlog record
+ *
+ * We must flush the xlog record to disk before returning --- see notes
+ * in TruncateCLOG().
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>WriteTruncateXlogRec</name><parameter_list>(<parameter><decl><type><name>int</name></type> <name>pageno</name></decl></parameter>, <parameter><decl><type><name>TransactionId</name></type> <name>oldestXact</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>oldestXactDb</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>XLogRecPtr</name></type>	<name>recptr</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>xl_clog_truncate</name></type> <name>xlrec</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name><name>xlrec</name><operator>.</operator><name>pageno</name></name> <operator>=</operator> <name>pageno</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>xlrec</name><operator>.</operator><name>oldestXact</name></name> <operator>=</operator> <name>oldestXact</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>xlrec</name><operator>.</operator><name>oldestXactDb</name></name> <operator>=</operator> <name>oldestXactDb</name></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>XLogBeginInsert</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>XLogRegisterData</name><argument_list>(<argument><expr><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <operator>(</operator><operator>&amp;</operator><name>xlrec</name><operator>)</operator></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>xl_clog_truncate</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>recptr</name> <operator>=</operator> <call><name>XLogInsert</name><argument_list>(<argument><expr><name>RM_CLOG_ID</name></expr></argument>, <argument><expr><name>CLOG_TRUNCATE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>XLogFlush</name><argument_list>(<argument><expr><name>recptr</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * CLOG resource manager's routines
+ */</comment>
+<function><type><name>void</name></type>
+<name>clog_redo</name><parameter_list>(<parameter><decl><type><name>XLogReaderState</name> <modifier>*</modifier></type><name>record</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>uint8</name></type>		<name>info</name> <init>= <expr><call><name>XLogRecGetInfo</name><argument_list>(<argument><expr><name>record</name></expr></argument>)</argument_list></call> <operator>&amp;</operator> <operator>~</operator><name>XLR_INFO_MASK</name></expr></init></decl>;</decl_stmt>
+
+	<comment type="block">/* Backup blocks are not used in clog records */</comment>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><operator>!</operator><call><name>XLogRecHasAnyBlockRefs</name><argument_list>(<argument><expr><name>record</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>info</name> <operator>==</operator> <name>CLOG_ZEROPAGE</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>int</name></type>			<name>pageno</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>int</name></type>			<name>slotno</name></decl>;</decl_stmt>
+
+		<expr_stmt><expr><call><name>memcpy</name><argument_list>(<argument><expr><operator>&amp;</operator><name>pageno</name></expr></argument>, <argument><expr><call><name>XLogRecGetData</name><argument_list>(<argument><expr><name>record</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>int</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><call><name>LWLockAcquire</name><argument_list>(<argument><expr><name>CLogControlLock</name></expr></argument>, <argument><expr><name>LW_EXCLUSIVE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><name>slotno</name> <operator>=</operator> <call><name>ZeroCLOGPage</name><argument_list>(<argument><expr><name>pageno</name></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>SimpleLruWritePage</name><argument_list>(<argument><expr><name>ClogCtl</name></expr></argument>, <argument><expr><name>slotno</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><operator>!</operator><name><name>ClogCtl</name><operator>-&gt;</operator><name>shared</name><operator>-&gt;</operator><name>page_dirty</name><index>[<expr><name>slotno</name></expr>]</index></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><name>CLogControlLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<if type="elseif">else if <condition>(<expr><name>info</name> <operator>==</operator> <name>CLOG_TRUNCATE</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>xl_clog_truncate</name></type> <name>xlrec</name></decl>;</decl_stmt>
+
+		<expr_stmt><expr><call><name>memcpy</name><argument_list>(<argument><expr><operator>&amp;</operator><name>xlrec</name></expr></argument>, <argument><expr><call><name>XLogRecGetData</name><argument_list>(<argument><expr><name>record</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>xl_clog_truncate</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/*
+		 * During XLOG replay, latest_page_number isn't set up yet; insert a
+		 * suitable value to bypass the sanity test in SimpleLruTruncate.
+		 */</comment>
+		<expr_stmt><expr><name><name>ClogCtl</name><operator>-&gt;</operator><name>shared</name><operator>-&gt;</operator><name>latest_page_number</name></name> <operator>=</operator> <name><name>xlrec</name><operator>.</operator><name>pageno</name></name></expr>;</expr_stmt>
+
+		<expr_stmt><expr><call><name>AdvanceOldestClogXid</name><argument_list>(<argument><expr><name><name>xlrec</name><operator>.</operator><name>oldestXact</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><call><name>SimpleLruTruncate</name><argument_list>(<argument><expr><name>ClogCtl</name></expr></argument>, <argument><expr><name><name>xlrec</name><operator>.</operator><name>pageno</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<else>else<block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>PANIC</name></expr></argument>, <argument><expr><literal type="string">"clog_redo: unknown op code %u"</literal></expr></argument>, <argument><expr><name>info</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></else></if_stmt>
+</block_content>}</block></function>
+</unit>

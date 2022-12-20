@@ -1,0 +1,1098 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<unit xmlns="http://www.srcML.org/srcML/src" xmlns:cpp="http://www.srcML.org/srcML/cpp" revision="1.0.0" language="C" filename="/cloned_projects/yugabyte-db/src/postgres/src/backend/storage/ipc/standby.c"><comment type="block">/*-------------------------------------------------------------------------
+ *
+ * standby.c
+ *	  Misc functions used in Hot Standby mode.
+ *
+ *	All functions for handling RM_STANDBY_ID, which relate to
+ *	AccessExclusiveLocks and starting snapshots for Hot Standby mode.
+ *	Plus conflict recovery processing.
+ *
+ * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1994, Regents of the University of California
+ *
+ * IDENTIFICATION
+ *	  src/backend/storage/ipc/standby.c
+ *
+ *-------------------------------------------------------------------------
+ */</comment>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"postgres.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/transam.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/twophase.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/xact.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/xlog.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/xloginsert.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"miscadmin.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"pgstat.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/bufmgr.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/lmgr.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/proc.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/procarray.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/sinvaladt.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/standby.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/hsearch.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/memutils.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/ps_status.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/timeout.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/timestamp.h"</cpp:file></cpp:include>
+
+<comment type="block">/* User-settable GUC parameters */</comment>
+<decl_stmt><decl><type><name>int</name></type>			<name>vacuum_defer_cleanup_age</name></decl>;</decl_stmt>
+<decl_stmt><decl><type><name>int</name></type>			<name>max_standby_archive_delay</name> <init>= <expr><literal type="number">30</literal> <operator>*</operator> <literal type="number">1000</literal></expr></init></decl>;</decl_stmt>
+<decl_stmt><decl><type><name>int</name></type>			<name>max_standby_streaming_delay</name> <init>= <expr><literal type="number">30</literal> <operator>*</operator> <literal type="number">1000</literal></expr></init></decl>;</decl_stmt>
+
+<decl_stmt><decl><type><specifier>static</specifier> <name>HTAB</name> <modifier>*</modifier></type><name>RecoveryLockLists</name></decl>;</decl_stmt>
+
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>ResolveRecoveryConflictWithVirtualXIDs</name><parameter_list>(<parameter><decl><type><name>VirtualTransactionId</name> <modifier>*</modifier></type><name>waitlist</name></decl></parameter>,
+									   <parameter><decl><type><name>ProcSignalReason</name></type> <name>reason</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>SendRecoveryConflictWithBufferPin</name><parameter_list>(<parameter><decl><type><name>ProcSignalReason</name></type> <name>reason</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>XLogRecPtr</name></type> <name>LogCurrentRunningXacts</name><parameter_list>(<parameter><decl><type><name>RunningTransactions</name></type> <name>CurrRunningXacts</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>LogAccessExclusiveLocks</name><parameter_list>(<parameter><decl><type><name>int</name></type> <name>nlocks</name></decl></parameter>, <parameter><decl><type><name>xl_standby_lock</name> <modifier>*</modifier></type><name>locks</name></decl></parameter>)</parameter_list>;</function_decl>
+
+<comment type="block">/*
+ * Keep track of all the locks owned by a given transaction.
+ */</comment>
+<typedef>typedef <type><struct>struct <name>RecoveryLockListsEntry</name>
+<block>{
+	<decl_stmt><decl><type><name>TransactionId</name></type> <name>xid</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>List</name>	   <modifier>*</modifier></type><name>locks</name></decl>;</decl_stmt>
+}</block></struct></type> <name>RecoveryLockListsEntry</name>;</typedef>
+
+<comment type="block">/*
+ * InitRecoveryTransactionEnvironment
+ *		Initialize tracking of in-progress transactions in master
+ *
+ * We need to issue shared invalidations and hold locks. Holding locks
+ * means others may want to wait on us, so we need to make a lock table
+ * vxact entry like a real transaction. We could create and delete
+ * lock table entries for each transaction but its simpler just to create
+ * one permanent entry and leave it there all the time. Locks are then
+ * acquired and released as needed. Yes, this means you can see the
+ * Startup process in pg_locks once we have run this.
+ */</comment>
+<function><type><name>void</name></type>
+<name>InitRecoveryTransactionEnvironment</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>VirtualTransactionId</name></type> <name>vxid</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>HASHCTL</name></type>		<name>hash_ctl</name></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * Initialize the hash table for tracking the list of locks held by each
+	 * transaction.
+	 */</comment>
+	<expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><operator>&amp;</operator><name>hash_ctl</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>hash_ctl</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>hash_ctl</name><operator>.</operator><name>keysize</name></name> <operator>=</operator> <sizeof>sizeof<argument_list>(<argument><expr><name>TransactionId</name></expr></argument>)</argument_list></sizeof></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>hash_ctl</name><operator>.</operator><name>entrysize</name></name> <operator>=</operator> <sizeof>sizeof<argument_list>(<argument><expr><name>RecoveryLockListsEntry</name></expr></argument>)</argument_list></sizeof></expr>;</expr_stmt>
+	<expr_stmt><expr><name>RecoveryLockLists</name> <operator>=</operator> <call><name>hash_create</name><argument_list>(<argument><expr><literal type="string">"RecoveryLockLists"</literal></expr></argument>,
+									<argument><expr><literal type="number">64</literal></expr></argument>,
+									<argument><expr><operator>&amp;</operator><name>hash_ctl</name></expr></argument>,
+									<argument><expr><name>HASH_ELEM</name> <operator>|</operator> <name>HASH_BLOBS</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Initialize shared invalidation management for Startup process, being
+	 * careful to register ourselves as a sendOnly process so we don't need to
+	 * read messages, nor will we get signalled when the queue starts filling
+	 * up.
+	 */</comment>
+	<expr_stmt><expr><call><name>SharedInvalBackendInit</name><argument_list>(<argument><expr><name>true</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Lock a virtual transaction id for Startup process.
+	 *
+	 * We need to do GetNextLocalTransactionId() because
+	 * SharedInvalBackendInit() leaves localTransactionid invalid and the lock
+	 * manager doesn't like that at all.
+	 *
+	 * Note that we don't need to run XactLockTableInsert() because nobody
+	 * needs to wait on xids. That sounds a little strange, but table locks
+	 * are held by vxids and row level locks are held by xids. All queries
+	 * hold AccessShareLocks so never block while we write or lock new rows.
+	 */</comment>
+	<expr_stmt><expr><name><name>vxid</name><operator>.</operator><name>backendId</name></name> <operator>=</operator> <name>MyBackendId</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>vxid</name><operator>.</operator><name>localTransactionId</name></name> <operator>=</operator> <call><name>GetNextLocalTransactionId</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>VirtualXactLockTableInsert</name><argument_list>(<argument><expr><name>vxid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>standbyState</name> <operator>=</operator> <name>STANDBY_INITIALIZED</name></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * ShutdownRecoveryTransactionEnvironment
+ *		Shut down transaction tracking
+ *
+ * Prepare to switch from hot standby mode to normal operation. Shut down
+ * recovery-time transaction tracking.
+ */</comment>
+<function><type><name>void</name></type>
+<name>ShutdownRecoveryTransactionEnvironment</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<comment type="block">/* Mark all tracked in-progress transactions as finished. */</comment>
+	<expr_stmt><expr><call><name>ExpireAllKnownAssignedTransactionIds</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Release all locks the tracked transactions were holding */</comment>
+	<expr_stmt><expr><call><name>StandbyReleaseAllLocks</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Destroy the hash table of locks. */</comment>
+	<expr_stmt><expr><call><name>hash_destroy</name><argument_list>(<argument><expr><name>RecoveryLockLists</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>RecoveryLockLists</name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+
+	<comment type="block">/* Cleanup our VirtualTransaction */</comment>
+	<expr_stmt><expr><call><name>VirtualXactLockTableCleanup</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * -----------------------------------------------------
+ *		Standby wait timers and backend cancel logic
+ * -----------------------------------------------------
+ */</comment>
+
+<comment type="block">/*
+ * Determine the cutoff time at which we want to start canceling conflicting
+ * transactions.  Returns zero (a time safely in the past) if we are willing
+ * to wait forever.
+ */</comment>
+<function><type><specifier>static</specifier> <name>TimestampTz</name></type>
+<name>GetStandbyLimitTime</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>TimestampTz</name></type> <name>rtime</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type>		<name>fromStream</name></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * The cutoff time is the last WAL data receipt time plus the appropriate
+	 * delay variable.  Delay of -1 means wait forever.
+	 */</comment>
+	<expr_stmt><expr><call><name>GetXLogReceiptTime</name><argument_list>(<argument><expr><operator>&amp;</operator><name>rtime</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>fromStream</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><name>fromStream</name></expr>)</condition>
+	<block>{<block_content>
+		<if_stmt><if>if <condition>(<expr><name>max_standby_streaming_delay</name> <operator>&lt;</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+			<return>return <expr><literal type="number">0</literal></expr>;</return></block_content></block></if></if_stmt>			<comment type="block">/* wait forever */</comment>
+		<return>return <expr><call><name>TimestampTzPlusMilliseconds</name><argument_list>(<argument><expr><name>rtime</name></expr></argument>, <argument><expr><name>max_standby_streaming_delay</name></expr></argument>)</argument_list></call></expr>;</return>
+	</block_content>}</block></if>
+	<else>else
+	<block>{<block_content>
+		<if_stmt><if>if <condition>(<expr><name>max_standby_archive_delay</name> <operator>&lt;</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+			<return>return <expr><literal type="number">0</literal></expr>;</return></block_content></block></if></if_stmt>			<comment type="block">/* wait forever */</comment>
+		<return>return <expr><call><name>TimestampTzPlusMilliseconds</name><argument_list>(<argument><expr><name>rtime</name></expr></argument>, <argument><expr><name>max_standby_archive_delay</name></expr></argument>)</argument_list></call></expr>;</return>
+	</block_content>}</block></else></if_stmt>
+</block_content>}</block></function>
+
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>STANDBY_INITIAL_WAIT_US</name></cpp:macro>  <cpp:value>1000</cpp:value></cpp:define>
+<decl_stmt><decl><type><specifier>static</specifier> <name>int</name></type>	<name>standbyWait_us</name> <init>= <expr><name>STANDBY_INITIAL_WAIT_US</name></expr></init></decl>;</decl_stmt>
+
+<comment type="block">/*
+ * Standby wait logic for ResolveRecoveryConflictWithVirtualXIDs.
+ * We wait here for a while then return. If we decide we can't wait any
+ * more then we return true, if we can wait some more return false.
+ */</comment>
+<function><type><specifier>static</specifier> <name>bool</name></type>
+<name>WaitExceedsMaxStandbyDelay</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>TimestampTz</name></type> <name>ltime</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>CHECK_FOR_INTERRUPTS</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Are we past the limit time? */</comment>
+	<expr_stmt><expr><name>ltime</name> <operator>=</operator> <call><name>GetStandbyLimitTime</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><name>ltime</name> <operator>&amp;&amp;</operator> <call><name>GetCurrentTimestamp</name><argument_list>()</argument_list></call> <operator>&gt;=</operator> <name>ltime</name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>true</name></expr>;</return></block_content></block></if></if_stmt>
+
+	<comment type="block">/*
+	 * Sleep a bit (this is essential to avoid busy-waiting).
+	 */</comment>
+	<expr_stmt><expr><call><name>pg_usleep</name><argument_list>(<argument><expr><name>standbyWait_us</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Progressively increase the sleep times, but not to more than 1s, since
+	 * pg_usleep isn't interruptable on some platforms.
+	 */</comment>
+	<expr_stmt><expr><name>standbyWait_us</name> <operator>*=</operator> <literal type="number">2</literal></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><name>standbyWait_us</name> <operator>&gt;</operator> <literal type="number">1000000</literal></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name>standbyWait_us</name> <operator>=</operator> <literal type="number">1000000</literal></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<return>return <expr><name>false</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * This is the main executioner for any query backend that conflicts with
+ * recovery processing. Judgement has already been passed on it within
+ * a specific rmgr. Here we just issue the orders to the procs. The procs
+ * then throw the required error as instructed.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>ResolveRecoveryConflictWithVirtualXIDs</name><parameter_list>(<parameter><decl><type><name>VirtualTransactionId</name> <modifier>*</modifier></type><name>waitlist</name></decl></parameter>,
+									   <parameter><decl><type><name>ProcSignalReason</name></type> <name>reason</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>TimestampTz</name></type> <name>waitStart</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>new_status</name></decl>;</decl_stmt>
+
+	<comment type="block">/* Fast exit, to avoid a kernel call if there's no work to be done. */</comment>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>VirtualTransactionIdIsValid</name><argument_list>(<argument><expr><operator>*</operator><name>waitlist</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<return>return;</return></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><name>waitStart</name> <operator>=</operator> <call><name>GetCurrentTimestamp</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>new_status</name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>			<comment type="block">/* we haven't changed the ps display */</comment>
+
+	<while>while <condition>(<expr><call><name>VirtualTransactionIdIsValid</name><argument_list>(<argument><expr><operator>*</operator><name>waitlist</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* reset standbyWait_us for each xact we wait for */</comment>
+		<expr_stmt><expr><name>standbyWait_us</name> <operator>=</operator> <name>STANDBY_INITIAL_WAIT_US</name></expr>;</expr_stmt>
+
+		<comment type="block">/* wait until the virtual xid is gone */</comment>
+		<while>while <condition>(<expr><operator>!</operator><call><name>VirtualXactLock</name><argument_list>(<argument><expr><operator>*</operator><name>waitlist</name></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/*
+			 * Report via ps if we have been waiting for more than 500 msec
+			 * (should that be configurable?)
+			 */</comment>
+			<if_stmt><if>if <condition>(<expr><name>update_process_title</name> <operator>&amp;&amp;</operator> <name>new_status</name> <operator>==</operator> <name>NULL</name> <operator>&amp;&amp;</operator>
+				<call><name>TimestampDifferenceExceeds</name><argument_list>(<argument><expr><name>waitStart</name></expr></argument>, <argument><expr><call><name>GetCurrentTimestamp</name><argument_list>()</argument_list></call></expr></argument>,
+										   <argument><expr><literal type="number">500</literal></expr></argument>)</argument_list></call></expr>)</condition>
+			<block>{<block_content>
+				<decl_stmt><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>old_status</name></decl>;</decl_stmt>
+				<decl_stmt><decl><type><name>int</name></type>			<name>len</name></decl>;</decl_stmt>
+
+				<expr_stmt><expr><name>old_status</name> <operator>=</operator> <call><name>get_ps_display</name><argument_list>(<argument><expr><operator>&amp;</operator><name>len</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<expr_stmt><expr><name>new_status</name> <operator>=</operator> <operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <call><name>palloc</name><argument_list>(<argument><expr><name>len</name> <operator>+</operator> <literal type="number">8</literal> <operator>+</operator> <literal type="number">1</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<expr_stmt><expr><call><name>memcpy</name><argument_list>(<argument><expr><name>new_status</name></expr></argument>, <argument><expr><name>old_status</name></expr></argument>, <argument><expr><name>len</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<expr_stmt><expr><call><name>strcpy</name><argument_list>(<argument><expr><name>new_status</name> <operator>+</operator> <name>len</name></expr></argument>, <argument><expr><literal type="string">" waiting"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<expr_stmt><expr><call><name>set_ps_display</name><argument_list>(<argument><expr><name>new_status</name></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<expr_stmt><expr><name><name>new_status</name><index>[<expr><name>len</name></expr>]</index></name> <operator>=</operator> <literal type="char">'\0'</literal></expr>;</expr_stmt> <comment type="block">/* truncate off " waiting" */</comment>
+			</block_content>}</block></if></if_stmt>
+
+			<comment type="block">/* Is it time to kill it? */</comment>
+			<if_stmt><if>if <condition>(<expr><call><name>WaitExceedsMaxStandbyDelay</name><argument_list>()</argument_list></call></expr>)</condition>
+			<block>{<block_content>
+				<decl_stmt><decl><type><name>pid_t</name></type>		<name>pid</name></decl>;</decl_stmt>
+
+				<comment type="block">/*
+				 * Now find out who to throw out of the balloon.
+				 */</comment>
+				<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>VirtualTransactionIdIsValid</name><argument_list>(<argument><expr><operator>*</operator><name>waitlist</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<expr_stmt><expr><name>pid</name> <operator>=</operator> <call><name>CancelVirtualTransaction</name><argument_list>(<argument><expr><operator>*</operator><name>waitlist</name></expr></argument>, <argument><expr><name>reason</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+				<comment type="block">/*
+				 * Wait a little bit for it to die so that we avoid flooding
+				 * an unresponsive backend when system is heavily loaded.
+				 */</comment>
+				<if_stmt><if>if <condition>(<expr><name>pid</name> <operator>!=</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+					<expr_stmt><expr><call><name>pg_usleep</name><argument_list>(<argument><expr><literal type="number">5000L</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+			</block_content>}</block></if></if_stmt>
+		</block_content>}</block></while>
+
+		<comment type="block">/* The virtual transaction is gone now, wait for the next one */</comment>
+		<expr_stmt><expr><name>waitlist</name><operator>++</operator></expr>;</expr_stmt>
+	</block_content>}</block></while>
+
+	<comment type="block">/* Reset ps display if we changed it */</comment>
+	<if_stmt><if>if <condition>(<expr><name>new_status</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>set_ps_display</name><argument_list>(<argument><expr><name>new_status</name></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>pfree</name><argument_list>(<argument><expr><name>new_status</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+</block_content>}</block></function>
+
+<function><type><name>void</name></type>
+<name>ResolveRecoveryConflictWithSnapshot</name><parameter_list>(<parameter><decl><type><name>TransactionId</name></type> <name>latestRemovedXid</name></decl></parameter>, <parameter><decl><type><name>RelFileNode</name></type> <name>node</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>VirtualTransactionId</name> <modifier>*</modifier></type><name>backends</name></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * If we get passed InvalidTransactionId then we are a little surprised,
+	 * but it is theoretically possible in normal running. It also happens
+	 * when replaying already applied WAL records after a standby crash or
+	 * restart, or when replaying an XLOG_HEAP2_VISIBLE record that marks as
+	 * frozen a page which was already all-visible.  If latestRemovedXid is
+	 * invalid then there is no conflict. That rule applies across all record
+	 * types that suffer from this conflict.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>TransactionIdIsValid</name><argument_list>(<argument><expr><name>latestRemovedXid</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<return>return;</return></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><name>backends</name> <operator>=</operator> <call><name>GetConflictingVirtualXIDs</name><argument_list>(<argument><expr><name>latestRemovedXid</name></expr></argument>,
+										 <argument><expr><name><name>node</name><operator>.</operator><name>dbNode</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>ResolveRecoveryConflictWithVirtualXIDs</name><argument_list>(<argument><expr><name>backends</name></expr></argument>,
+										   <argument><expr><name>PROCSIG_RECOVERY_CONFLICT_SNAPSHOT</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<function><type><name>void</name></type>
+<name>ResolveRecoveryConflictWithTablespace</name><parameter_list>(<parameter><decl><type><name>Oid</name></type> <name>tsid</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>VirtualTransactionId</name> <modifier>*</modifier></type><name>temp_file_users</name></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * Standby users may be currently using this tablespace for their
+	 * temporary files. We only care about current users because
+	 * temp_tablespace parameter will just ignore tablespaces that no longer
+	 * exist.
+	 *
+	 * Ask everybody to cancel their queries immediately so we can ensure no
+	 * temp files remain and we can remove the tablespace. Nuke the entire
+	 * site from orbit, it's the only way to be sure.
+	 *
+	 * XXX: We could work out the pids of active backends using this
+	 * tablespace by examining the temp filenames in the directory. We would
+	 * then convert the pids into VirtualXIDs before attempting to cancel
+	 * them.
+	 *
+	 * We don't wait for commit because drop tablespace is non-transactional.
+	 */</comment>
+	<expr_stmt><expr><name>temp_file_users</name> <operator>=</operator> <call><name>GetConflictingVirtualXIDs</name><argument_list>(<argument><expr><name>InvalidTransactionId</name></expr></argument>,
+												<argument><expr><name>InvalidOid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>ResolveRecoveryConflictWithVirtualXIDs</name><argument_list>(<argument><expr><name>temp_file_users</name></expr></argument>,
+										   <argument><expr><name>PROCSIG_RECOVERY_CONFLICT_TABLESPACE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<function><type><name>void</name></type>
+<name>ResolveRecoveryConflictWithDatabase</name><parameter_list>(<parameter><decl><type><name>Oid</name></type> <name>dbid</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<comment type="block">/*
+	 * We don't do ResolveRecoveryConflictWithVirtualXIDs() here since that
+	 * only waits for transactions and completely idle sessions would block
+	 * us. This is rare enough that we do this as simply as possible: no wait,
+	 * just force them off immediately.
+	 *
+	 * No locking is required here because we already acquired
+	 * AccessExclusiveLock. Anybody trying to connect while we do this will
+	 * block during InitPostgres() and then disconnect when they see the
+	 * database has been removed.
+	 */</comment>
+	<while>while <condition>(<expr><call><name>CountDBBackends</name><argument_list>(<argument><expr><name>dbid</name></expr></argument>)</argument_list></call> <operator>&gt;</operator> <literal type="number">0</literal></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>CancelDBBackends</name><argument_list>(<argument><expr><name>dbid</name></expr></argument>, <argument><expr><name>PROCSIG_RECOVERY_CONFLICT_DATABASE</name></expr></argument>, <argument><expr><name>true</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/*
+		 * Wait awhile for them to die so that we avoid flooding an
+		 * unresponsive backend when system is heavily loaded.
+		 */</comment>
+		<expr_stmt><expr><call><name>pg_usleep</name><argument_list>(<argument><expr><literal type="number">10000</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></while>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * ResolveRecoveryConflictWithLock is called from ProcSleep()
+ * to resolve conflicts with other backends holding relation locks.
+ *
+ * The WaitLatch sleep normally done in ProcSleep()
+ * (when not InHotStandby) is performed here, for code clarity.
+ *
+ * We either resolve conflicts immediately or set a timeout to wake us at
+ * the limit of our patience.
+ *
+ * Resolve conflicts by canceling to all backends holding a conflicting
+ * lock.  As we are already queued to be granted the lock, no new lock
+ * requests conflicting with ours will be granted in the meantime.
+ *
+ * Deadlocks involving the Startup process and an ordinary backend process
+ * will be detected by the deadlock detector within the ordinary backend.
+ */</comment>
+<function><type><name>void</name></type>
+<name>ResolveRecoveryConflictWithLock</name><parameter_list>(<parameter><decl><type><name>LOCKTAG</name></type> <name>locktag</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>TimestampTz</name></type> <name>ltime</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>InHotStandby</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>ltime</name> <operator>=</operator> <call><name>GetStandbyLimitTime</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><call><name>GetCurrentTimestamp</name><argument_list>()</argument_list></call> <operator>&gt;=</operator> <name>ltime</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/*
+		 * We're already behind, so clear a path as quickly as possible.
+		 */</comment>
+		<decl_stmt><decl><type><name>VirtualTransactionId</name> <modifier>*</modifier></type><name>backends</name></decl>;</decl_stmt>
+
+		<expr_stmt><expr><name>backends</name> <operator>=</operator> <call><name>GetLockConflicts</name><argument_list>(<argument><expr><operator>&amp;</operator><name>locktag</name></expr></argument>, <argument><expr><name>AccessExclusiveLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>ResolveRecoveryConflictWithVirtualXIDs</name><argument_list>(<argument><expr><name>backends</name></expr></argument>,
+											   <argument><expr><name>PROCSIG_RECOVERY_CONFLICT_LOCK</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<else>else
+	<block>{<block_content>
+		<comment type="block">/*
+		 * Wait (or wait again) until ltime
+		 */</comment>
+		<decl_stmt><decl><type><name>EnableTimeoutParams</name></type> <name><name>timeouts</name><index>[<expr><literal type="number">1</literal></expr>]</index></name></decl>;</decl_stmt>
+
+		<expr_stmt><expr><name><name>timeouts</name><index>[<expr><literal type="number">0</literal></expr>]</index></name><operator>.</operator><name>id</name> <operator>=</operator> <name>STANDBY_LOCK_TIMEOUT</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>timeouts</name><index>[<expr><literal type="number">0</literal></expr>]</index></name><operator>.</operator><name>type</name> <operator>=</operator> <name>TMPARAM_AT</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>timeouts</name><index>[<expr><literal type="number">0</literal></expr>]</index></name><operator>.</operator><name>fin_time</name> <operator>=</operator> <name>ltime</name></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>enable_timeouts</name><argument_list>(<argument><expr><name>timeouts</name></expr></argument>, <argument><expr><literal type="number">1</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></else></if_stmt>
+
+	<comment type="block">/* Wait to be signaled by the release of the Relation Lock */</comment>
+	<expr_stmt><expr><call><name>ProcWaitForSignal</name><argument_list>(<argument><expr><name>PG_WAIT_LOCK</name> <operator>|</operator> <name><name>locktag</name><operator>.</operator><name>locktag_type</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Clear any timeout requests established above.  We assume here that the
+	 * Startup process doesn't have any other outstanding timeouts than those
+	 * used by this function. If that stops being true, we could cancel the
+	 * timeouts individually, but that'd be slower.
+	 */</comment>
+	<expr_stmt><expr><call><name>disable_all_timeouts</name><argument_list>(<argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * ResolveRecoveryConflictWithBufferPin is called from LockBufferForCleanup()
+ * to resolve conflicts with other backends holding buffer pins.
+ *
+ * The ProcWaitForSignal() sleep normally done in LockBufferForCleanup()
+ * (when not InHotStandby) is performed here, for code clarity.
+ *
+ * We either resolve conflicts immediately or set a timeout to wake us at
+ * the limit of our patience.
+ *
+ * Resolve conflicts by sending a PROCSIG signal to all backends to check if
+ * they hold one of the buffer pins that is blocking Startup process. If so,
+ * those backends will take an appropriate error action, ERROR or FATAL.
+ *
+ * We also must check for deadlocks.  Deadlocks occur because if queries
+ * wait on a lock, that must be behind an AccessExclusiveLock, which can only
+ * be cleared if the Startup process replays a transaction completion record.
+ * If Startup process is also waiting then that is a deadlock. The deadlock
+ * can occur if the query is waiting and then the Startup sleeps, or if
+ * Startup is sleeping and the query waits on a lock. We protect against
+ * only the former sequence here, the latter sequence is checked prior to
+ * the query sleeping, in CheckRecoveryConflictDeadlock().
+ *
+ * Deadlocks are extremely rare, and relatively expensive to check for,
+ * so we don't do a deadlock check right away ... only if we have had to wait
+ * at least deadlock_timeout.
+ */</comment>
+<function><type><name>void</name></type>
+<name>ResolveRecoveryConflictWithBufferPin</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>TimestampTz</name></type> <name>ltime</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>InHotStandby</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>ltime</name> <operator>=</operator> <call><name>GetStandbyLimitTime</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>ltime</name> <operator>==</operator> <literal type="number">0</literal></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/*
+		 * We're willing to wait forever for conflicts, so set timeout for
+		 * deadlock check only
+		 */</comment>
+		<expr_stmt><expr><call><name>enable_timeout_after</name><argument_list>(<argument><expr><name>STANDBY_DEADLOCK_TIMEOUT</name></expr></argument>, <argument><expr><name>DeadlockTimeout</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<if type="elseif">else if <condition>(<expr><call><name>GetCurrentTimestamp</name><argument_list>()</argument_list></call> <operator>&gt;=</operator> <name>ltime</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/*
+		 * We're already behind, so clear a path as quickly as possible.
+		 */</comment>
+		<expr_stmt><expr><call><name>SendRecoveryConflictWithBufferPin</name><argument_list>(<argument><expr><name>PROCSIG_RECOVERY_CONFLICT_BUFFERPIN</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<else>else
+	<block>{<block_content>
+		<comment type="block">/*
+		 * Wake up at ltime, and check for deadlocks as well if we will be
+		 * waiting longer than deadlock_timeout
+		 */</comment>
+		<decl_stmt><decl><type><name>EnableTimeoutParams</name></type> <name><name>timeouts</name><index>[<expr><literal type="number">2</literal></expr>]</index></name></decl>;</decl_stmt>
+
+		<expr_stmt><expr><name><name>timeouts</name><index>[<expr><literal type="number">0</literal></expr>]</index></name><operator>.</operator><name>id</name> <operator>=</operator> <name>STANDBY_TIMEOUT</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>timeouts</name><index>[<expr><literal type="number">0</literal></expr>]</index></name><operator>.</operator><name>type</name> <operator>=</operator> <name>TMPARAM_AT</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>timeouts</name><index>[<expr><literal type="number">0</literal></expr>]</index></name><operator>.</operator><name>fin_time</name> <operator>=</operator> <name>ltime</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>timeouts</name><index>[<expr><literal type="number">1</literal></expr>]</index></name><operator>.</operator><name>id</name> <operator>=</operator> <name>STANDBY_DEADLOCK_TIMEOUT</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>timeouts</name><index>[<expr><literal type="number">1</literal></expr>]</index></name><operator>.</operator><name>type</name> <operator>=</operator> <name>TMPARAM_AFTER</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>timeouts</name><index>[<expr><literal type="number">1</literal></expr>]</index></name><operator>.</operator><name>delay_ms</name> <operator>=</operator> <name>DeadlockTimeout</name></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>enable_timeouts</name><argument_list>(<argument><expr><name>timeouts</name></expr></argument>, <argument><expr><literal type="number">2</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></else></if_stmt>
+
+	<comment type="block">/* Wait to be signaled by UnpinBuffer() */</comment>
+	<expr_stmt><expr><call><name>ProcWaitForSignal</name><argument_list>(<argument><expr><name>PG_WAIT_BUFFER_PIN</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Clear any timeout requests established above.  We assume here that the
+	 * Startup process doesn't have any other timeouts than what this function
+	 * uses.  If that stops being true, we could cancel the timeouts
+	 * individually, but that'd be slower.
+	 */</comment>
+	<expr_stmt><expr><call><name>disable_all_timeouts</name><argument_list>(<argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>SendRecoveryConflictWithBufferPin</name><parameter_list>(<parameter><decl><type><name>ProcSignalReason</name></type> <name>reason</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>reason</name> <operator>==</operator> <name>PROCSIG_RECOVERY_CONFLICT_BUFFERPIN</name> <operator>||</operator>
+		   <name>reason</name> <operator>==</operator> <name>PROCSIG_RECOVERY_CONFLICT_STARTUP_DEADLOCK</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * We send signal to all backends to ask them if they are holding the
+	 * buffer pin which is delaying the Startup process. We must not set the
+	 * conflict flag yet, since most backends will be innocent. Let the
+	 * SIGUSR1 handling in each backend decide their own fate.
+	 */</comment>
+	<expr_stmt><expr><call><name>CancelDBBackends</name><argument_list>(<argument><expr><name>InvalidOid</name></expr></argument>, <argument><expr><name>reason</name></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * In Hot Standby perform early deadlock detection.  We abort the lock
+ * wait if we are about to sleep while holding the buffer pin that Startup
+ * process is waiting for.
+ *
+ * Note: this code is pessimistic, because there is no way for it to
+ * determine whether an actual deadlock condition is present: the lock we
+ * need to wait for might be unrelated to any held by the Startup process.
+ * Sooner or later, this mechanism should get ripped out in favor of somehow
+ * accounting for buffer locks in DeadLockCheck().  However, errors here
+ * seem to be very low-probability in practice, so for now it's not worth
+ * the trouble.
+ */</comment>
+<function><type><name>void</name></type>
+<name>CheckRecoveryConflictDeadlock</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><operator>!</operator><name>InRecovery</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>		<comment type="block">/* do not call in Startup process */</comment>
+
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>HoldingBufferPinThatDelaysRecovery</name><argument_list>()</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<return>return;</return></block_content></block></if></if_stmt>
+
+	<comment type="block">/*
+	 * Error message should match ProcessInterrupts() but we avoid calling
+	 * that because we aren't handling an interrupt at this point. Note that
+	 * we only cancel the current transaction here, so if we are in a
+	 * subtransaction and the pin is held by a parent, then the Startup
+	 * process will continue to wait even though we have avoided deadlock.
+	 */</comment>
+	<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+			<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_T_R_DEADLOCK_DETECTED</name></expr></argument>)</argument_list></call><operator>,</operator>
+			 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"canceling statement due to conflict with recovery"</literal></expr></argument>)</argument_list></call><operator>,</operator>
+			 <call><name>errdetail</name><argument_list>(<argument><expr><literal type="string">"User transaction caused buffer deadlock with recovery."</literal></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+
+<comment type="block">/* --------------------------------
+ *		timeout handler routines
+ * --------------------------------
+ */</comment>
+
+<comment type="block">/*
+ * StandbyDeadLockHandler() will be called if STANDBY_DEADLOCK_TIMEOUT
+ * occurs before STANDBY_TIMEOUT.  Send out a request for hot-standby
+ * backends to check themselves for deadlocks.
+ */</comment>
+<function><type><name>void</name></type>
+<name>StandbyDeadLockHandler</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>SendRecoveryConflictWithBufferPin</name><argument_list>(<argument><expr><name>PROCSIG_RECOVERY_CONFLICT_STARTUP_DEADLOCK</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * StandbyTimeoutHandler() will be called if STANDBY_TIMEOUT is exceeded.
+ * Send out a request to release conflicting buffer pins unconditionally,
+ * so we can press ahead with applying changes in recovery.
+ */</comment>
+<function><type><name>void</name></type>
+<name>StandbyTimeoutHandler</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<comment type="block">/* forget any pending STANDBY_DEADLOCK_TIMEOUT request */</comment>
+	<expr_stmt><expr><call><name>disable_timeout</name><argument_list>(<argument><expr><name>STANDBY_DEADLOCK_TIMEOUT</name></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>SendRecoveryConflictWithBufferPin</name><argument_list>(<argument><expr><name>PROCSIG_RECOVERY_CONFLICT_BUFFERPIN</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * StandbyLockTimeoutHandler() will be called if STANDBY_LOCK_TIMEOUT is exceeded.
+ * This doesn't need to do anything, simply waking up is enough.
+ */</comment>
+<function><type><name>void</name></type>
+<name>StandbyLockTimeoutHandler</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * -----------------------------------------------------
+ * Locking in Recovery Mode
+ * -----------------------------------------------------
+ *
+ * All locks are held by the Startup process using a single virtual
+ * transaction. This implementation is both simpler and in some senses,
+ * more correct. The locks held mean "some original transaction held
+ * this lock, so query access is not allowed at this time". So the Startup
+ * process is the proxy by which the original locks are implemented.
+ *
+ * We only keep track of AccessExclusiveLocks, which are only ever held by
+ * one transaction on one relation.
+ *
+ * We keep a hash table of lists of locks in local memory keyed by xid,
+ * RecoveryLockLists, so we can keep track of the various entries made by
+ * the Startup process's virtual xid in the shared lock table.
+ *
+ * List elements use type xl_standby_lock, since the WAL record type exactly
+ * matches the information that we need to keep track of.
+ *
+ * We use session locks rather than normal locks so we don't need
+ * ResourceOwners.
+ */</comment>
+
+
+<function><type><name>void</name></type>
+<name>StandbyAcquireAccessExclusiveLock</name><parameter_list>(<parameter><decl><type><name>TransactionId</name></type> <name>xid</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>dbOid</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>relOid</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>RecoveryLockListsEntry</name> <modifier>*</modifier></type><name>entry</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>xl_standby_lock</name> <modifier>*</modifier></type><name>newlock</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>LOCKTAG</name></type>		<name>locktag</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type>		<name>found</name></decl>;</decl_stmt>
+
+	<comment type="block">/* Already processed? */</comment>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>TransactionIdIsValid</name><argument_list>(<argument><expr><name>xid</name></expr></argument>)</argument_list></call> <operator>||</operator>
+		<call><name>TransactionIdDidCommit</name><argument_list>(<argument><expr><name>xid</name></expr></argument>)</argument_list></call> <operator>||</operator>
+		<call><name>TransactionIdDidAbort</name><argument_list>(<argument><expr><name>xid</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<return>return;</return></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><call><name>trace_recovery</name><argument_list>(<argument><expr><name>DEBUG4</name></expr></argument>)</argument_list></call></expr></argument>,
+		 <argument><expr><literal type="string">"adding recovery lock: db %u rel %u"</literal></expr></argument>, <argument><expr><name>dbOid</name></expr></argument>, <argument><expr><name>relOid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* dbOid is InvalidOid when we are locking a shared relation. */</comment>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>OidIsValid</name><argument_list>(<argument><expr><name>relOid</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Create a new list for this xid, if we don't have one already. */</comment>
+	<expr_stmt><expr><name>entry</name> <operator>=</operator> <call><name>hash_search</name><argument_list>(<argument><expr><name>RecoveryLockLists</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>xid</name></expr></argument>, <argument><expr><name>HASH_ENTER</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>found</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><name>found</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name><name>entry</name><operator>-&gt;</operator><name>xid</name></name> <operator>=</operator> <name>xid</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>entry</name><operator>-&gt;</operator><name>locks</name></name> <operator>=</operator> <name>NIL</name></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<expr_stmt><expr><name>newlock</name> <operator>=</operator> <call><name>palloc</name><argument_list>(<argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>xl_standby_lock</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>newlock</name><operator>-&gt;</operator><name>xid</name></name> <operator>=</operator> <name>xid</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>newlock</name><operator>-&gt;</operator><name>dbOid</name></name> <operator>=</operator> <name>dbOid</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>newlock</name><operator>-&gt;</operator><name>relOid</name></name> <operator>=</operator> <name>relOid</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>entry</name><operator>-&gt;</operator><name>locks</name></name> <operator>=</operator> <call><name>lappend</name><argument_list>(<argument><expr><name><name>entry</name><operator>-&gt;</operator><name>locks</name></name></expr></argument>, <argument><expr><name>newlock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>SET_LOCKTAG_RELATION</name><argument_list>(<argument><expr><name>locktag</name></expr></argument>, <argument><expr><name><name>newlock</name><operator>-&gt;</operator><name>dbOid</name></name></expr></argument>, <argument><expr><name><name>newlock</name><operator>-&gt;</operator><name>relOid</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><operator>(</operator><name>void</name><operator>)</operator> <call><name>LockAcquire</name><argument_list>(<argument><expr><operator>&amp;</operator><name>locktag</name></expr></argument>, <argument><expr><name>AccessExclusiveLock</name></expr></argument>, <argument><expr><name>true</name></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>StandbyReleaseLockList</name><parameter_list>(<parameter><decl><type><name>List</name> <modifier>*</modifier></type><name>locks</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<while>while <condition>(<expr><name>locks</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>xl_standby_lock</name> <modifier>*</modifier></type><name>lock</name> <init>= <expr><operator>(</operator><name>xl_standby_lock</name> <operator>*</operator><operator>)</operator> <call><name>linitial</name><argument_list>(<argument><expr><name>locks</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>LOCKTAG</name></type>		<name>locktag</name></decl>;</decl_stmt>
+
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><call><name>trace_recovery</name><argument_list>(<argument><expr><name>DEBUG4</name></expr></argument>)</argument_list></call></expr></argument>,
+			 <argument><expr><literal type="string">"releasing recovery lock: xid %u db %u rel %u"</literal></expr></argument>,
+			 <argument><expr><name><name>lock</name><operator>-&gt;</operator><name>xid</name></name></expr></argument>, <argument><expr><name><name>lock</name><operator>-&gt;</operator><name>dbOid</name></name></expr></argument>, <argument><expr><name><name>lock</name><operator>-&gt;</operator><name>relOid</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>SET_LOCKTAG_RELATION</name><argument_list>(<argument><expr><name>locktag</name></expr></argument>, <argument><expr><name><name>lock</name><operator>-&gt;</operator><name>dbOid</name></name></expr></argument>, <argument><expr><name><name>lock</name><operator>-&gt;</operator><name>relOid</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>LockRelease</name><argument_list>(<argument><expr><operator>&amp;</operator><name>locktag</name></expr></argument>, <argument><expr><name>AccessExclusiveLock</name></expr></argument>, <argument><expr><name>true</name></expr></argument>)</argument_list></call></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>LOG</name></expr></argument>,
+				 <argument><expr><literal type="string">"RecoveryLockLists contains entry for lock no longer recorded by lock manager: xid %u database %u relation %u"</literal></expr></argument>,
+				 <argument><expr><name><name>lock</name><operator>-&gt;</operator><name>xid</name></name></expr></argument>, <argument><expr><name><name>lock</name><operator>-&gt;</operator><name>dbOid</name></name></expr></argument>, <argument><expr><name><name>lock</name><operator>-&gt;</operator><name>relOid</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+		<expr_stmt><expr><call><name>pfree</name><argument_list>(<argument><expr><name>lock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name>locks</name> <operator>=</operator> <call><name>list_delete_first</name><argument_list>(<argument><expr><name>locks</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></while>
+</block_content>}</block></function>
+
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>StandbyReleaseLocks</name><parameter_list>(<parameter><decl><type><name>TransactionId</name></type> <name>xid</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>RecoveryLockListsEntry</name> <modifier>*</modifier></type><name>entry</name></decl>;</decl_stmt>
+
+	<if_stmt><if>if <condition>(<expr><call><name>TransactionIdIsValid</name><argument_list>(<argument><expr><name>xid</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<if_stmt><if>if <condition>(<expr><operator>(</operator><name>entry</name> <operator>=</operator> <call><name>hash_search</name><argument_list>(<argument><expr><name>RecoveryLockLists</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>xid</name></expr></argument>, <argument><expr><name>HASH_FIND</name></expr></argument>, <argument><expr><name>NULL</name></expr></argument>)</argument_list></call><operator>)</operator></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><call><name>StandbyReleaseLockList</name><argument_list>(<argument><expr><name><name>entry</name><operator>-&gt;</operator><name>locks</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>hash_search</name><argument_list>(<argument><expr><name>RecoveryLockLists</name></expr></argument>, <argument><expr><name>entry</name></expr></argument>, <argument><expr><name>HASH_REMOVE</name></expr></argument>, <argument><expr><name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+	</block_content>}</block></if>
+	<else>else<block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>StandbyReleaseAllLocks</name><argument_list>()</argument_list></call></expr>;</expr_stmt></block_content></block></else></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Release locks for a transaction tree, starting at xid down, from
+ * RecoveryLockLists.
+ *
+ * Called during WAL replay of COMMIT/ROLLBACK when in hot standby mode,
+ * to remove any AccessExclusiveLocks requested by a transaction.
+ */</comment>
+<function><type><name>void</name></type>
+<name>StandbyReleaseLockTree</name><parameter_list>(<parameter><decl><type><name>TransactionId</name></type> <name>xid</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>nsubxids</name></decl></parameter>, <parameter><decl><type><name>TransactionId</name> <modifier>*</modifier></type><name>subxids</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>int</name></type>			<name>i</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>StandbyReleaseLocks</name><argument_list>(<argument><expr><name>xid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name>nsubxids</name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>StandbyReleaseLocks</name><argument_list>(<argument><expr><name><name>subxids</name><index>[<expr><name>i</name></expr>]</index></name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></for>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Called at end of recovery and when we see a shutdown checkpoint.
+ */</comment>
+<function><type><name>void</name></type>
+<name>StandbyReleaseAllLocks</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>HASH_SEQ_STATUS</name></type> <name>status</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>RecoveryLockListsEntry</name> <modifier>*</modifier></type><name>entry</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><call><name>trace_recovery</name><argument_list>(<argument><expr><name>DEBUG2</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><literal type="string">"release all standby locks"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>hash_seq_init</name><argument_list>(<argument><expr><operator>&amp;</operator><name>status</name></expr></argument>, <argument><expr><name>RecoveryLockLists</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<while>while <condition>(<expr><operator>(</operator><name>entry</name> <operator>=</operator> <call><name>hash_seq_search</name><argument_list>(<argument><expr><operator>&amp;</operator><name>status</name></expr></argument>)</argument_list></call><operator>)</operator></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>StandbyReleaseLockList</name><argument_list>(<argument><expr><name><name>entry</name><operator>-&gt;</operator><name>locks</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>hash_search</name><argument_list>(<argument><expr><name>RecoveryLockLists</name></expr></argument>, <argument><expr><name>entry</name></expr></argument>, <argument><expr><name>HASH_REMOVE</name></expr></argument>, <argument><expr><name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></while>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * StandbyReleaseOldLocks
+ *		Release standby locks held by top-level XIDs that aren't running,
+ *		as long as they're not prepared transactions.
+ */</comment>
+<function><type><name>void</name></type>
+<name>StandbyReleaseOldLocks</name><parameter_list>(<parameter><decl><type><name>TransactionId</name></type> <name>oldxid</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>HASH_SEQ_STATUS</name></type> <name>status</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>RecoveryLockListsEntry</name> <modifier>*</modifier></type><name>entry</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>hash_seq_init</name><argument_list>(<argument><expr><operator>&amp;</operator><name>status</name></expr></argument>, <argument><expr><name>RecoveryLockLists</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<while>while <condition>(<expr><operator>(</operator><name>entry</name> <operator>=</operator> <call><name>hash_seq_search</name><argument_list>(<argument><expr><operator>&amp;</operator><name>status</name></expr></argument>)</argument_list></call><operator>)</operator></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>TransactionIdIsValid</name><argument_list>(<argument><expr><name><name>entry</name><operator>-&gt;</operator><name>xid</name></name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/* Skip if prepared transaction. */</comment>
+		<if_stmt><if>if <condition>(<expr><call><name>StandbyTransactionIdIsPrepared</name><argument_list>(<argument><expr><name><name>entry</name><operator>-&gt;</operator><name>xid</name></name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<continue>continue;</continue></block_content></block></if></if_stmt>
+
+		<comment type="block">/* Skip if &gt;= oldxid. */</comment>
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>TransactionIdPrecedes</name><argument_list>(<argument><expr><name><name>entry</name><operator>-&gt;</operator><name>xid</name></name></expr></argument>, <argument><expr><name>oldxid</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<continue>continue;</continue></block_content></block></if></if_stmt>
+
+		<comment type="block">/* Remove all locks and hash table entry. */</comment>
+		<expr_stmt><expr><call><name>StandbyReleaseLockList</name><argument_list>(<argument><expr><name><name>entry</name><operator>-&gt;</operator><name>locks</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>hash_search</name><argument_list>(<argument><expr><name>RecoveryLockLists</name></expr></argument>, <argument><expr><name>entry</name></expr></argument>, <argument><expr><name>HASH_REMOVE</name></expr></argument>, <argument><expr><name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></while>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * --------------------------------------------------------------------
+ *		Recovery handling for Rmgr RM_STANDBY_ID
+ *
+ * These record types will only be created if XLogStandbyInfoActive()
+ * --------------------------------------------------------------------
+ */</comment>
+
+<function><type><name>void</name></type>
+<name>standby_redo</name><parameter_list>(<parameter><decl><type><name>XLogReaderState</name> <modifier>*</modifier></type><name>record</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>uint8</name></type>		<name>info</name> <init>= <expr><call><name>XLogRecGetInfo</name><argument_list>(<argument><expr><name>record</name></expr></argument>)</argument_list></call> <operator>&amp;</operator> <operator>~</operator><name>XLR_INFO_MASK</name></expr></init></decl>;</decl_stmt>
+
+	<comment type="block">/* Backup blocks are not used in standby records */</comment>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><operator>!</operator><call><name>XLogRecHasAnyBlockRefs</name><argument_list>(<argument><expr><name>record</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Do nothing if we're not in hot standby mode */</comment>
+	<if_stmt><if>if <condition>(<expr><name>standbyState</name> <operator>==</operator> <name>STANDBY_DISABLED</name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return;</return></block_content></block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>info</name> <operator>==</operator> <name>XLOG_STANDBY_LOCK</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>xl_standby_locks</name> <modifier>*</modifier></type><name>xlrec</name> <init>= <expr><operator>(</operator><name>xl_standby_locks</name> <operator>*</operator><operator>)</operator> <call><name>XLogRecGetData</name><argument_list>(<argument><expr><name>record</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>int</name></type>			<name>i</name></decl>;</decl_stmt>
+
+		<for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name><name>xlrec</name><operator>-&gt;</operator><name>nlocks</name></name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>StandbyAcquireAccessExclusiveLock</name><argument_list>(<argument><expr><name><name>xlrec</name><operator>-&gt;</operator><name>locks</name><index>[<expr><name>i</name></expr>]</index></name><operator>.</operator><name>xid</name></expr></argument>,
+											  <argument><expr><name><name>xlrec</name><operator>-&gt;</operator><name>locks</name><index>[<expr><name>i</name></expr>]</index></name><operator>.</operator><name>dbOid</name></expr></argument>,
+											  <argument><expr><name><name>xlrec</name><operator>-&gt;</operator><name>locks</name><index>[<expr><name>i</name></expr>]</index></name><operator>.</operator><name>relOid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></for>
+	</block_content>}</block></if>
+	<if type="elseif">else if <condition>(<expr><name>info</name> <operator>==</operator> <name>XLOG_RUNNING_XACTS</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>xl_running_xacts</name> <modifier>*</modifier></type><name>xlrec</name> <init>= <expr><operator>(</operator><name>xl_running_xacts</name> <operator>*</operator><operator>)</operator> <call><name>XLogRecGetData</name><argument_list>(<argument><expr><name>record</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>RunningTransactionsData</name></type> <name>running</name></decl>;</decl_stmt>
+
+		<expr_stmt><expr><name><name>running</name><operator>.</operator><name>xcnt</name></name> <operator>=</operator> <name><name>xlrec</name><operator>-&gt;</operator><name>xcnt</name></name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>running</name><operator>.</operator><name>subxcnt</name></name> <operator>=</operator> <name><name>xlrec</name><operator>-&gt;</operator><name>subxcnt</name></name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>running</name><operator>.</operator><name>subxid_overflow</name></name> <operator>=</operator> <name><name>xlrec</name><operator>-&gt;</operator><name>subxid_overflow</name></name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>running</name><operator>.</operator><name>nextXid</name></name> <operator>=</operator> <name><name>xlrec</name><operator>-&gt;</operator><name>nextXid</name></name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>running</name><operator>.</operator><name>latestCompletedXid</name></name> <operator>=</operator> <name><name>xlrec</name><operator>-&gt;</operator><name>latestCompletedXid</name></name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>running</name><operator>.</operator><name>oldestRunningXid</name></name> <operator>=</operator> <name><name>xlrec</name><operator>-&gt;</operator><name>oldestRunningXid</name></name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>running</name><operator>.</operator><name>xids</name></name> <operator>=</operator> <name><name>xlrec</name><operator>-&gt;</operator><name>xids</name></name></expr>;</expr_stmt>
+
+		<expr_stmt><expr><call><name>ProcArrayApplyRecoveryInfo</name><argument_list>(<argument><expr><operator>&amp;</operator><name>running</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<if type="elseif">else if <condition>(<expr><name>info</name> <operator>==</operator> <name>XLOG_INVALIDATIONS</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>xl_invalidations</name> <modifier>*</modifier></type><name>xlrec</name> <init>= <expr><operator>(</operator><name>xl_invalidations</name> <operator>*</operator><operator>)</operator> <call><name>XLogRecGetData</name><argument_list>(<argument><expr><name>record</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+		<expr_stmt><expr><call><name>ProcessCommittedInvalidationMessages</name><argument_list>(<argument><expr><name><name>xlrec</name><operator>-&gt;</operator><name>msgs</name></name></expr></argument>,
+											 <argument><expr><name><name>xlrec</name><operator>-&gt;</operator><name>nmsgs</name></name></expr></argument>,
+											 <argument><expr><name><name>xlrec</name><operator>-&gt;</operator><name>relcacheInitFileInval</name></name></expr></argument>,
+											 <argument><expr><name><name>xlrec</name><operator>-&gt;</operator><name>dbId</name></name></expr></argument>,
+											 <argument><expr><name><name>xlrec</name><operator>-&gt;</operator><name>tsId</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<else>else<block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>PANIC</name></expr></argument>, <argument><expr><literal type="string">"standby_redo: unknown op code %u"</literal></expr></argument>, <argument><expr><name>info</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></else></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Log details of the current snapshot to WAL. This allows the snapshot state
+ * to be reconstructed on the standby and for logical decoding.
+ *
+ * This is used for Hot Standby as follows:
+ *
+ * We can move directly to STANDBY_SNAPSHOT_READY at startup if we
+ * start from a shutdown checkpoint because we know nothing was running
+ * at that time and our recovery snapshot is known empty. In the more
+ * typical case of an online checkpoint we need to jump through a few
+ * hoops to get a correct recovery snapshot and this requires a two or
+ * sometimes a three stage process.
+ *
+ * The initial snapshot must contain all running xids and all current
+ * AccessExclusiveLocks at a point in time on the standby. Assembling
+ * that information while the server is running requires many and
+ * various LWLocks, so we choose to derive that information piece by
+ * piece and then re-assemble that info on the standby. When that
+ * information is fully assembled we move to STANDBY_SNAPSHOT_READY.
+ *
+ * Since locking on the primary when we derive the information is not
+ * strict, we note that there is a time window between the derivation and
+ * writing to WAL of the derived information. That allows race conditions
+ * that we must resolve, since xids and locks may enter or leave the
+ * snapshot during that window. This creates the issue that an xid or
+ * lock may start *after* the snapshot has been derived yet *before* the
+ * snapshot is logged in the running xacts WAL record. We resolve this by
+ * starting to accumulate changes at a point just prior to when we derive
+ * the snapshot on the primary, then ignore duplicates when we later apply
+ * the snapshot from the running xacts record. This is implemented during
+ * CreateCheckpoint() where we use the logical checkpoint location as
+ * our starting point and then write the running xacts record immediately
+ * before writing the main checkpoint WAL record. Since we always start
+ * up from a checkpoint and are immediately at our starting point, we
+ * unconditionally move to STANDBY_INITIALIZED. After this point we
+ * must do 4 things:
+ *	* move shared nextXid forwards as we see new xids
+ *	* extend the clog and subtrans with each new xid
+ *	* keep track of uncommitted known assigned xids
+ *	* keep track of uncommitted AccessExclusiveLocks
+ *
+ * When we see a commit/abort we must remove known assigned xids and locks
+ * from the completing transaction. Attempted removals that cannot locate
+ * an entry are expected and must not cause an error when we are in state
+ * STANDBY_INITIALIZED. This is implemented in StandbyReleaseLocks() and
+ * KnownAssignedXidsRemove().
+ *
+ * Later, when we apply the running xact data we must be careful to ignore
+ * transactions already committed, since those commits raced ahead when
+ * making WAL entries.
+ *
+ * The loose timing also means that locks may be recorded that have a
+ * zero xid, since xids are removed from procs before locks are removed.
+ * So we must prune the lock list down to ensure we hold locks only for
+ * currently running xids, performed by StandbyReleaseOldLocks().
+ * Zero xids should no longer be possible, but we may be replaying WAL
+ * from a time when they were possible.
+ *
+ * For logical decoding only the running xacts information is needed;
+ * there's no need to look at the locking information, but it's logged anyway,
+ * as there's no independent knob to just enable logical decoding. For
+ * details of how this is used, check snapbuild.c's introductory comment.
+ *
+ *
+ * Returns the RecPtr of the last inserted record.
+ */</comment>
+<function><type><name>XLogRecPtr</name></type>
+<name>LogStandbySnapshot</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>XLogRecPtr</name></type>	<name>recptr</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>RunningTransactions</name></type> <name>running</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>xl_standby_lock</name> <modifier>*</modifier></type><name>locks</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>nlocks</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>XLogStandbyInfoActive</name><argument_list>()</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Get details of any AccessExclusiveLocks being held at the moment.
+	 */</comment>
+	<expr_stmt><expr><name>locks</name> <operator>=</operator> <call><name>GetRunningTransactionLocks</name><argument_list>(<argument><expr><operator>&amp;</operator><name>nlocks</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><name>nlocks</name> <operator>&gt;</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>LogAccessExclusiveLocks</name><argument_list>(<argument><expr><name>nlocks</name></expr></argument>, <argument><expr><name>locks</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	<expr_stmt><expr><call><name>pfree</name><argument_list>(<argument><expr><name>locks</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Log details of all in-progress transactions. This should be the last
+	 * record we write, because standby will open up when it sees this.
+	 */</comment>
+	<expr_stmt><expr><name>running</name> <operator>=</operator> <call><name>GetRunningTransactionData</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * GetRunningTransactionData() acquired ProcArrayLock, we must release it.
+	 * For Hot Standby this can be done before inserting the WAL record
+	 * because ProcArrayApplyRecoveryInfo() rechecks the commit status using
+	 * the clog. For logical decoding, though, the lock can't be released
+	 * early because the clog might be "in the future" from the POV of the
+	 * historic snapshot. This would allow for situations where we're waiting
+	 * for the end of a transaction listed in the xl_running_xacts record
+	 * which, according to the WAL, has committed before the xl_running_xacts
+	 * record. Fortunately this routine isn't executed frequently, and it's
+	 * only a shared lock.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name>wal_level</name> <operator>&lt;</operator> <name>WAL_LEVEL_LOGICAL</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><name>ProcArrayLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><name>recptr</name> <operator>=</operator> <call><name>LogCurrentRunningXacts</name><argument_list>(<argument><expr><name>running</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Release lock if we kept it longer ... */</comment>
+	<if_stmt><if>if <condition>(<expr><name>wal_level</name> <operator>&gt;=</operator> <name>WAL_LEVEL_LOGICAL</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><name>ProcArrayLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<comment type="block">/* GetRunningTransactionData() acquired XidGenLock, we must release it */</comment>
+	<expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><name>XidGenLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<return>return <expr><name>recptr</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Record an enhanced snapshot of running transactions into WAL.
+ *
+ * The definitions of RunningTransactionsData and xl_xact_running_xacts are
+ * similar. We keep them separate because xl_xact_running_xacts is a
+ * contiguous chunk of memory and never exists fully until it is assembled in
+ * WAL. The inserted records are marked as not being important for durability,
+ * to avoid triggering superfluous checkpoint / archiving activity.
+ */</comment>
+<function><type><specifier>static</specifier> <name>XLogRecPtr</name></type>
+<name>LogCurrentRunningXacts</name><parameter_list>(<parameter><decl><type><name>RunningTransactions</name></type> <name>CurrRunningXacts</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>xl_running_xacts</name></type> <name>xlrec</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>XLogRecPtr</name></type>	<name>recptr</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name><name>xlrec</name><operator>.</operator><name>xcnt</name></name> <operator>=</operator> <name><name>CurrRunningXacts</name><operator>-&gt;</operator><name>xcnt</name></name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>xlrec</name><operator>.</operator><name>subxcnt</name></name> <operator>=</operator> <name><name>CurrRunningXacts</name><operator>-&gt;</operator><name>subxcnt</name></name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>xlrec</name><operator>.</operator><name>subxid_overflow</name></name> <operator>=</operator> <name><name>CurrRunningXacts</name><operator>-&gt;</operator><name>subxid_overflow</name></name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>xlrec</name><operator>.</operator><name>nextXid</name></name> <operator>=</operator> <name><name>CurrRunningXacts</name><operator>-&gt;</operator><name>nextXid</name></name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>xlrec</name><operator>.</operator><name>oldestRunningXid</name></name> <operator>=</operator> <name><name>CurrRunningXacts</name><operator>-&gt;</operator><name>oldestRunningXid</name></name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>xlrec</name><operator>.</operator><name>latestCompletedXid</name></name> <operator>=</operator> <name><name>CurrRunningXacts</name><operator>-&gt;</operator><name>latestCompletedXid</name></name></expr>;</expr_stmt>
+
+	<comment type="block">/* Header */</comment>
+	<expr_stmt><expr><call><name>XLogBeginInsert</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>XLogSetRecordFlags</name><argument_list>(<argument><expr><name>XLOG_MARK_UNIMPORTANT</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>XLogRegisterData</name><argument_list>(<argument><expr><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <operator>(</operator><operator>&amp;</operator><name>xlrec</name><operator>)</operator></expr></argument>, <argument><expr><name>MinSizeOfXactRunningXacts</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* array of TransactionIds */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>xlrec</name><operator>.</operator><name>xcnt</name></name> <operator>&gt;</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>XLogRegisterData</name><argument_list>(<argument><expr><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <name><name>CurrRunningXacts</name><operator>-&gt;</operator><name>xids</name></name></expr></argument>,
+						 <argument><expr><operator>(</operator><name><name>xlrec</name><operator>.</operator><name>xcnt</name></name> <operator>+</operator> <name><name>xlrec</name><operator>.</operator><name>subxcnt</name></name><operator>)</operator> <operator>*</operator> <sizeof>sizeof<argument_list>(<argument><expr><name>TransactionId</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><name>recptr</name> <operator>=</operator> <call><name>XLogInsert</name><argument_list>(<argument><expr><name>RM_STANDBY_ID</name></expr></argument>, <argument><expr><name>XLOG_RUNNING_XACTS</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name><name>CurrRunningXacts</name><operator>-&gt;</operator><name>subxid_overflow</name></name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><call><name>trace_recovery</name><argument_list>(<argument><expr><name>DEBUG2</name></expr></argument>)</argument_list></call></expr></argument>,
+			 <argument><expr><literal type="string">"snapshot of %u running transactions overflowed (lsn %X/%X oldest xid %u latest complete %u next xid %u)"</literal></expr></argument>,
+			 <argument><expr><name><name>CurrRunningXacts</name><operator>-&gt;</operator><name>xcnt</name></name></expr></argument>,
+			 <argument><expr><operator>(</operator><name>uint32</name><operator>)</operator> <operator>(</operator><name>recptr</name> <operator>&gt;&gt;</operator> <literal type="number">32</literal><operator>)</operator></expr></argument>, <argument><expr><operator>(</operator><name>uint32</name><operator>)</operator> <name>recptr</name></expr></argument>,
+			 <argument><expr><name><name>CurrRunningXacts</name><operator>-&gt;</operator><name>oldestRunningXid</name></name></expr></argument>,
+			 <argument><expr><name><name>CurrRunningXacts</name><operator>-&gt;</operator><name>latestCompletedXid</name></name></expr></argument>,
+			 <argument><expr><name><name>CurrRunningXacts</name><operator>-&gt;</operator><name>nextXid</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if>
+	<else>else<block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><call><name>trace_recovery</name><argument_list>(<argument><expr><name>DEBUG2</name></expr></argument>)</argument_list></call></expr></argument>,
+			 <argument><expr><literal type="string">"snapshot of %u+%u running transaction ids (lsn %X/%X oldest xid %u latest complete %u next xid %u)"</literal></expr></argument>,
+			 <argument><expr><name><name>CurrRunningXacts</name><operator>-&gt;</operator><name>xcnt</name></name></expr></argument>, <argument><expr><name><name>CurrRunningXacts</name><operator>-&gt;</operator><name>subxcnt</name></name></expr></argument>,
+			 <argument><expr><operator>(</operator><name>uint32</name><operator>)</operator> <operator>(</operator><name>recptr</name> <operator>&gt;&gt;</operator> <literal type="number">32</literal><operator>)</operator></expr></argument>, <argument><expr><operator>(</operator><name>uint32</name><operator>)</operator> <name>recptr</name></expr></argument>,
+			 <argument><expr><name><name>CurrRunningXacts</name><operator>-&gt;</operator><name>oldestRunningXid</name></name></expr></argument>,
+			 <argument><expr><name><name>CurrRunningXacts</name><operator>-&gt;</operator><name>latestCompletedXid</name></name></expr></argument>,
+			 <argument><expr><name><name>CurrRunningXacts</name><operator>-&gt;</operator><name>nextXid</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></else></if_stmt>
+
+	<comment type="block">/*
+	 * Ensure running_xacts information is synced to disk not too far in the
+	 * future. We don't want to stall anything though (i.e. use XLogFlush()),
+	 * so we let the wal writer do it during normal operation.
+	 * XLogSetAsyncXactLSN() conveniently will mark the LSN as to-be-synced
+	 * and nudge the WALWriter into action if sleeping. Check
+	 * XLogBackgroundFlush() for details why a record might not be flushed
+	 * without it.
+	 */</comment>
+	<expr_stmt><expr><call><name>XLogSetAsyncXactLSN</name><argument_list>(<argument><expr><name>recptr</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<return>return <expr><name>recptr</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Wholesale logging of AccessExclusiveLocks. Other lock types need not be
+ * logged, as described in backend/storage/lmgr/README.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>LogAccessExclusiveLocks</name><parameter_list>(<parameter><decl><type><name>int</name></type> <name>nlocks</name></decl></parameter>, <parameter><decl><type><name>xl_standby_lock</name> <modifier>*</modifier></type><name>locks</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>xl_standby_locks</name></type> <name>xlrec</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name><name>xlrec</name><operator>.</operator><name>nlocks</name></name> <operator>=</operator> <name>nlocks</name></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>XLogBeginInsert</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>XLogRegisterData</name><argument_list>(<argument><expr><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <operator>&amp;</operator><name>xlrec</name></expr></argument>, <argument><expr><call><name>offsetof</name><argument_list>(<argument><expr><name>xl_standby_locks</name></expr></argument>, <argument><expr><name>locks</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>XLogRegisterData</name><argument_list>(<argument><expr><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <name>locks</name></expr></argument>, <argument><expr><name>nlocks</name> <operator>*</operator> <sizeof>sizeof<argument_list>(<argument><expr><name>xl_standby_lock</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>XLogSetRecordFlags</name><argument_list>(<argument><expr><name>XLOG_MARK_UNIMPORTANT</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><operator>(</operator><name>void</name><operator>)</operator> <call><name>XLogInsert</name><argument_list>(<argument><expr><name>RM_STANDBY_ID</name></expr></argument>, <argument><expr><name>XLOG_STANDBY_LOCK</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Individual logging of AccessExclusiveLocks for use during LockAcquire()
+ */</comment>
+<function><type><name>void</name></type>
+<name>LogAccessExclusiveLock</name><parameter_list>(<parameter><decl><type><name>Oid</name></type> <name>dbOid</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>relOid</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>xl_standby_lock</name></type> <name>xlrec</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name><name>xlrec</name><operator>.</operator><name>xid</name></name> <operator>=</operator> <call><name>GetCurrentTransactionId</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name><name>xlrec</name><operator>.</operator><name>dbOid</name></name> <operator>=</operator> <name>dbOid</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>xlrec</name><operator>.</operator><name>relOid</name></name> <operator>=</operator> <name>relOid</name></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>LogAccessExclusiveLocks</name><argument_list>(<argument><expr><literal type="number">1</literal></expr></argument>, <argument><expr><operator>&amp;</operator><name>xlrec</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>MyXactFlags</name> <operator>|=</operator> <name>XACT_FLAGS_ACQUIREDACCESSEXCLUSIVELOCK</name></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Prepare to log an AccessExclusiveLock, for use during LockAcquire()
+ */</comment>
+<function><type><name>void</name></type>
+<name>LogAccessExclusiveLockPrepare</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<comment type="block">/*
+	 * Ensure that a TransactionId has been assigned to this transaction, for
+	 * two reasons, both related to lock release on the standby. First, we
+	 * must assign an xid so that RecordTransactionCommit() and
+	 * RecordTransactionAbort() do not optimise away the transaction
+	 * completion record which recovery relies upon to release locks. It's a
+	 * hack, but for a corner case not worth adding code for into the main
+	 * commit path. Second, we must assign an xid before the lock is recorded
+	 * in shared memory, otherwise a concurrently executing
+	 * GetRunningTransactionLocks() might see a lock associated with an
+	 * InvalidTransactionId which we later assert cannot happen.
+	 */</comment>
+	<expr_stmt><expr><operator>(</operator><name>void</name><operator>)</operator> <call><name>GetCurrentTransactionId</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Emit WAL for invalidations. This currently is only used for commits without
+ * an xid but which contain invalidations.
+ */</comment>
+<function><type><name>void</name></type>
+<name>LogStandbyInvalidations</name><parameter_list>(<parameter><decl><type><name>int</name></type> <name>nmsgs</name></decl></parameter>, <parameter><decl><type><name>SharedInvalidationMessage</name> <modifier>*</modifier></type><name>msgs</name></decl></parameter>,
+						<parameter><decl><type><name>bool</name></type> <name>relcacheInitFileInval</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>xl_invalidations</name></type> <name>xlrec</name></decl>;</decl_stmt>
+
+	<comment type="block">/* prepare record */</comment>
+	<expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><operator>&amp;</operator><name>xlrec</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>xlrec</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>xlrec</name><operator>.</operator><name>dbId</name></name> <operator>=</operator> <name>MyDatabaseId</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>xlrec</name><operator>.</operator><name>tsId</name></name> <operator>=</operator> <name>MyDatabaseTableSpace</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>xlrec</name><operator>.</operator><name>relcacheInitFileInval</name></name> <operator>=</operator> <name>relcacheInitFileInval</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>xlrec</name><operator>.</operator><name>nmsgs</name></name> <operator>=</operator> <name>nmsgs</name></expr>;</expr_stmt>
+
+	<comment type="block">/* perform insertion */</comment>
+	<expr_stmt><expr><call><name>XLogBeginInsert</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>XLogRegisterData</name><argument_list>(<argument><expr><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <operator>(</operator><operator>&amp;</operator><name>xlrec</name><operator>)</operator></expr></argument>, <argument><expr><name>MinSizeOfInvalidations</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>XLogRegisterData</name><argument_list>(<argument><expr><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <name>msgs</name></expr></argument>,
+					 <argument><expr><name>nmsgs</name> <operator>*</operator> <sizeof>sizeof<argument_list>(<argument><expr><name>SharedInvalidationMessage</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>XLogInsert</name><argument_list>(<argument><expr><name>RM_STANDBY_ID</name></expr></argument>, <argument><expr><name>XLOG_INVALIDATIONS</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+</unit>

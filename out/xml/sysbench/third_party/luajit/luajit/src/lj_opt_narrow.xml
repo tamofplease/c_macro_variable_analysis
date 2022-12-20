@@ -1,0 +1,653 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<unit xmlns="http://www.srcML.org/srcML/src" xmlns:cpp="http://www.srcML.org/srcML/cpp" revision="1.0.0" language="C" filename="/cloned_projects/sysbench/third_party/luajit/luajit/src/lj_opt_narrow.c"><comment type="block">/*
+** NARROW: Narrowing of numbers to integers (double to int32_t).
+** STRIPOV: Stripping of overflow checks.
+** Copyright (C) 2005-2020 Mike Pall. See Copyright Notice in luajit.h
+*/</comment>
+
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>lj_opt_narrow_c</name></cpp:macro></cpp:define>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>LUA_CORE</name></cpp:macro></cpp:define>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"lj_obj.h"</cpp:file></cpp:include>
+
+<cpp:if>#<cpp:directive>if</cpp:directive> <expr><name>LJ_HASJIT</name></expr></cpp:if>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"lj_bc.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"lj_ir.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"lj_jit.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"lj_iropt.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"lj_trace.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"lj_vm.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"lj_strscan.h"</cpp:file></cpp:include>
+
+<comment type="block">/* Rationale for narrowing optimizations:
+**
+** Lua has only a single number type and this is a FP double by default.
+** Narrowing doubles to integers does not pay off for the interpreter on a
+** current-generation x86/x64 machine. Most FP operations need the same
+** amount of execution resources as their integer counterparts, except
+** with slightly longer latencies. Longer latencies are a non-issue for
+** the interpreter, since they are usually hidden by other overhead.
+**
+** The total CPU execution bandwidth is the sum of the bandwidth of the FP
+** and the integer units, because they execute in parallel. The FP units
+** have an equal or higher bandwidth than the integer units. Not using
+** them means losing execution bandwidth. Moving work away from them to
+** the already quite busy integer units is a losing proposition.
+**
+** The situation for JIT-compiled code is a bit different: the higher code
+** density makes the extra latencies much more visible. Tight loops expose
+** the latencies for updating the induction variables. Array indexing
+** requires narrowing conversions with high latencies and additional
+** guards (to check that the index is really an integer). And many common
+** optimizations only work on integers.
+**
+** One solution would be speculative, eager narrowing of all number loads.
+** This causes many problems, like losing -0 or the need to resolve type
+** mismatches between traces. It also effectively forces the integer type
+** to have overflow-checking semantics. This impedes many basic
+** optimizations and requires adding overflow checks to all integer
+** arithmetic operations (whereas FP arithmetics can do without).
+**
+** Always replacing an FP op with an integer op plus an overflow check is
+** counter-productive on a current-generation super-scalar CPU. Although
+** the overflow check branches are highly predictable, they will clog the
+** execution port for the branch unit and tie up reorder buffers. This is
+** turning a pure data-flow dependency into a different data-flow
+** dependency (with slightly lower latency) *plus* a control dependency.
+** In general, you don't want to do this since latencies due to data-flow
+** dependencies can be well hidden by out-of-order execution.
+**
+** A better solution is to keep all numbers as FP values and only narrow
+** when it's beneficial to do so. LuaJIT uses predictive narrowing for
+** induction variables and demand-driven narrowing for index expressions,
+** integer arguments and bit operations. Additionally it can eliminate or
+** hoist most of the resulting overflow checks. Regular arithmetic
+** computations are never narrowed to integers.
+**
+** The integer type in the IR has convenient wrap-around semantics and
+** ignores overflow. Extra operations have been added for
+** overflow-checking arithmetic (ADDOV/SUBOV) instead of an extra type.
+** Apart from reducing overall complexity of the compiler, this also
+** nicely solves the problem where you want to apply algebraic
+** simplifications to ADD, but not to ADDOV. And the x86/x64 assembler can
+** use lea instead of an add for integer ADD, but not for ADDOV (lea does
+** not affect the flags, but it helps to avoid register moves).
+**
+**
+** All of the above has to be reconsidered for architectures with slow FP
+** operations or without a hardware FPU. The dual-number mode of LuaJIT
+** addresses this issue. Arithmetic operations are performed on integers
+** as far as possible and overflow checks are added as needed.
+**
+** This implies that narrowing for integer arguments and bit operations
+** should also strip overflow checks, e.g. replace ADDOV with ADD. The
+** original overflow guards are weak and can be eliminated by DCE, if
+** there's no other use.
+**
+** A slight twist is that it's usually beneficial to use overflow-checked
+** integer arithmetics if all inputs are already integers. This is the only
+** change that affects the single-number mode, too.
+*/</comment>
+
+<comment type="block">/* Some local macros to save typing. Undef'd at the end. */</comment>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>IR</name><parameter_list>(<parameter><type><name>ref</name></type></parameter>)</parameter_list></cpp:macro>			<cpp:value>(&amp;J-&gt;cur.ir[(ref)])</cpp:value></cpp:define>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>fins</name></cpp:macro>			<cpp:value>(&amp;J-&gt;fold.ins)</cpp:value></cpp:define>
+
+<comment type="block">/* Pass IR on to next optimization in chain (FOLD). */</comment>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>emitir</name><parameter_list>(<parameter><type><name>ot</name></type></parameter>, <parameter><type><name>a</name></type></parameter>, <parameter><type><name>b</name></type></parameter>)</parameter_list></cpp:macro>	<cpp:value>(lj_ir_set(J, (ot), (a), (b)), lj_opt_fold(J))</cpp:value></cpp:define>
+
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>emitir_raw</name><parameter_list>(<parameter><type><name>ot</name></type></parameter>, <parameter><type><name>a</name></type></parameter>, <parameter><type><name>b</name></type></parameter>)</parameter_list></cpp:macro>	<cpp:value>(lj_ir_set(J, (ot), (a), (b)), lj_ir_emit(J))</cpp:value></cpp:define>
+
+<comment type="block">/* -- Elimination of narrowing type conversions --------------------------- */</comment>
+
+<comment type="block">/* Narrowing of index expressions and bit operations is demand-driven. The
+** trace recorder emits a narrowing type conversion (CONV.int.num or TOBIT)
+** in all of these cases (e.g. array indexing or string indexing). FOLD
+** already takes care of eliminating simple redundant conversions like
+** CONV.int.num(CONV.num.int(x)) ==&gt; x.
+**
+** But the surrounding code is FP-heavy and arithmetic operations are
+** performed on FP numbers (for the single-number mode). Consider a common
+** example such as 'x=t[i+1]', with 'i' already an integer (due to induction
+** variable narrowing). The index expression would be recorded as
+**   CONV.int.num(ADD(CONV.num.int(i), 1))
+** which is clearly suboptimal.
+**
+** One can do better by recursively backpropagating the narrowing type
+** conversion across FP arithmetic operations. This turns FP ops into
+** their corresponding integer counterparts. Depending on the semantics of
+** the conversion they also need to check for overflow. Currently only ADD
+** and SUB are supported.
+**
+** The above example can be rewritten as
+**   ADDOV(CONV.int.num(CONV.num.int(i)), 1)
+** and then into ADDOV(i, 1) after folding of the conversions. The original
+** FP ops remain in the IR and are eliminated by DCE since all references to
+** them are gone.
+**
+** [In dual-number mode the trace recorder already emits ADDOV etc., but
+** this can be further reduced. See below.]
+**
+** Special care has to be taken to avoid narrowing across an operation
+** which is potentially operating on non-integral operands. One obvious
+** case is when an expression contains a non-integral constant, but ends
+** up as an integer index at runtime (like t[x+1.5] with x=0.5).
+**
+** Operations with two non-constant operands illustrate a similar problem
+** (like t[a+b] with a=1.5 and b=2.5). Backpropagation has to stop there,
+** unless it can be proven that either operand is integral (e.g. by CSEing
+** a previous conversion). As a not-so-obvious corollary this logic also
+** applies for a whole expression tree (e.g. t[(a+1)+(b+1)]).
+**
+** Correctness of the transformation is guaranteed by avoiding to expand
+** the tree by adding more conversions than the one we would need to emit
+** if not backpropagating. TOBIT employs a more optimistic rule, because
+** the conversion has special semantics, designed to make the life of the
+** compiler writer easier. ;-)
+**
+** Using on-the-fly backpropagation of an expression tree doesn't work
+** because it's unknown whether the transform is correct until the end.
+** This either requires IR rollback and cache invalidation for every
+** subtree or a two-pass algorithm. The former didn't work out too well,
+** so the code now combines a recursive collector with a stack-based
+** emitter.
+**
+** [A recursive backpropagation algorithm with backtracking, employing
+** skip-list lookup and round-robin caching, emitting stack operations
+** on-the-fly for a stack-based interpreter -- and all of that in a meager
+** kilobyte? Yep, compilers are a great treasure chest. Throw away your
+** textbooks and read the codebase of a compiler today!]
+**
+** There's another optimization opportunity for array indexing: it's
+** always accompanied by an array bounds-check. The outermost overflow
+** check may be delegated to the ABC operation. This works because ABC is
+** an unsigned comparison and wrap-around due to overflow creates negative
+** numbers.
+**
+** But this optimization is only valid for constants that cannot overflow
+** an int32_t into the range of valid array indexes [0..2^27+1). A check
+** for +-2^30 is safe since -2^31 - 2^30 wraps to 2^30 and 2^31-1 + 2^30
+** wraps to -2^30-1.
+**
+** It's also good enough in practice, since e.g. t[i+1] or t[i-10] are
+** quite common. So the above example finally ends up as ADD(i, 1)!
+**
+** Later on, the assembler is able to fuse the whole array reference and
+** the ADD into the memory operands of loads and other instructions. This
+** is why LuaJIT is able to generate very pretty (and fast) machine code
+** for array indexing. And that, my dear, concludes another story about
+** one of the hidden secrets of LuaJIT ...
+*/</comment>
+
+<comment type="block">/* Maximum backpropagation depth and maximum stack size. */</comment>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>NARROW_MAX_BACKPROP</name></cpp:macro>	<cpp:value>100</cpp:value></cpp:define>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>NARROW_MAX_STACK</name></cpp:macro>	<cpp:value>256</cpp:value></cpp:define>
+
+<comment type="block">/* The stack machine has a 32 bit instruction format: [IROpT | IRRef1]
+** The lower 16 bits hold a reference (or 0). The upper 16 bits hold
+** the IR opcode + type or one of the following special opcodes:
+*/</comment>
+<enum>enum <block>{
+  <decl><name>NARROW_REF</name></decl>,		<comment type="block">/* Push ref. */</comment>
+  <decl><name>NARROW_CONV</name></decl>,		<comment type="block">/* Push conversion of ref. */</comment>
+  <decl><name>NARROW_SEXT</name></decl>,		<comment type="block">/* Push sign-extension of ref. */</comment>
+  <decl><name>NARROW_INT</name></decl>		<comment type="block">/* Push KINT ref. The next code holds an int32_t. */</comment>
+}</block>;</enum>
+
+<typedef>typedef <type><name>uint32_t</name></type> <name>NarrowIns</name>;</typedef>
+
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>NARROWINS</name><parameter_list>(<parameter><type><name>op</name></type></parameter>, <parameter><type><name>ref</name></type></parameter>)</parameter_list></cpp:macro>	<cpp:value>(((op) &lt;&lt; 16) + (ref))</cpp:value></cpp:define>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>narrow_op</name><parameter_list>(<parameter><type><name>ins</name></type></parameter>)</parameter_list></cpp:macro>		<cpp:value>((IROpT)((ins) &gt;&gt; 16))</cpp:value></cpp:define>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>narrow_ref</name><parameter_list>(<parameter><type><name>ins</name></type></parameter>)</parameter_list></cpp:macro>		<cpp:value>((IRRef1)(ins))</cpp:value></cpp:define>
+
+<comment type="block">/* Context used for narrowing of type conversions. */</comment>
+<typedef>typedef <type><struct>struct <name>NarrowConv</name> <block>{
+  <decl_stmt><decl><type><name>jit_State</name> <modifier>*</modifier></type><name>J</name></decl>;</decl_stmt>		<comment type="block">/* JIT compiler state. */</comment>
+  <decl_stmt><decl><type><name>NarrowIns</name> <modifier>*</modifier></type><name>sp</name></decl>;</decl_stmt>	<comment type="block">/* Current stack pointer. */</comment>
+  <decl_stmt><decl><type><name>NarrowIns</name> <modifier>*</modifier></type><name>maxsp</name></decl>;</decl_stmt>	<comment type="block">/* Maximum stack pointer minus redzone. */</comment>
+  <decl_stmt><decl><type><name>IRRef</name></type> <name>mode</name></decl>;</decl_stmt>		<comment type="block">/* Conversion mode (IRCONV_*). */</comment>
+  <decl_stmt><decl><type><name>IRType</name></type> <name>t</name></decl>;</decl_stmt>		<comment type="block">/* Destination type: IRT_INT or IRT_I64. */</comment>
+  <decl_stmt><decl><type><name>NarrowIns</name></type> <name><name>stack</name><index>[<expr><name>NARROW_MAX_STACK</name></expr>]</index></name></decl>;</decl_stmt>  <comment type="block">/* Stack holding stack-machine code. */</comment>
+}</block></struct></type> <name>NarrowConv</name>;</typedef>
+
+<comment type="block">/* Lookup a reference in the backpropagation cache. */</comment>
+<function><type><specifier>static</specifier> <name>BPropEntry</name> <modifier>*</modifier></type><name>narrow_bpc_get</name><parameter_list>(<parameter><decl><type><name>jit_State</name> <modifier>*</modifier></type><name>J</name></decl></parameter>, <parameter><decl><type><name>IRRef1</name></type> <name>key</name></decl></parameter>, <parameter><decl><type><name>IRRef</name></type> <name>mode</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+  <decl_stmt><decl><type><name>ptrdiff_t</name></type> <name>i</name></decl>;</decl_stmt>
+  <for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name>BPROP_SLOTS</name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control> <block>{<block_content>
+    <decl_stmt><decl><type><name>BPropEntry</name> <modifier>*</modifier></type><name>bp</name> <init>= <expr><operator>&amp;</operator><name><name>J</name><operator>-&gt;</operator><name>bpropcache</name><index>[<expr><name>i</name></expr>]</index></name></expr></init></decl>;</decl_stmt>
+    <comment type="block">/* Stronger checks are ok, too. */</comment>
+    <if_stmt><if>if <condition>(<expr><name><name>bp</name><operator>-&gt;</operator><name>key</name></name> <operator>==</operator> <name>key</name> <operator>&amp;&amp;</operator> <name><name>bp</name><operator>-&gt;</operator><name>mode</name></name> <operator>&gt;=</operator> <name>mode</name> <operator>&amp;&amp;</operator>
+	<operator>(</operator><operator>(</operator><name><name>bp</name><operator>-&gt;</operator><name>mode</name></name> <operator>^</operator> <name>mode</name><operator>)</operator> <operator>&amp;</operator> <name>IRCONV_MODEMASK</name><operator>)</operator> <operator>==</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+      <return>return <expr><name>bp</name></expr>;</return></block_content></block></if></if_stmt>
+  </block_content>}</block></for>
+  <return>return <expr><name>NULL</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/* Add an entry to the backpropagation cache. */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type> <name>narrow_bpc_set</name><parameter_list>(<parameter><decl><type><name>jit_State</name> <modifier>*</modifier></type><name>J</name></decl></parameter>, <parameter><decl><type><name>IRRef1</name></type> <name>key</name></decl></parameter>, <parameter><decl><type><name>IRRef1</name></type> <name>val</name></decl></parameter>, <parameter><decl><type><name>IRRef</name></type> <name>mode</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+  <decl_stmt><decl><type><name>uint32_t</name></type> <name>slot</name> <init>= <expr><name><name>J</name><operator>-&gt;</operator><name>bpropslot</name></name></expr></init></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>BPropEntry</name> <modifier>*</modifier></type><name>bp</name> <init>= <expr><operator>&amp;</operator><name><name>J</name><operator>-&gt;</operator><name>bpropcache</name><index>[<expr><name>slot</name></expr>]</index></name></expr></init></decl>;</decl_stmt>
+  <expr_stmt><expr><name><name>J</name><operator>-&gt;</operator><name>bpropslot</name></name> <operator>=</operator> <operator>(</operator><name>slot</name> <operator>+</operator> <literal type="number">1</literal><operator>)</operator> <operator>&amp;</operator> <operator>(</operator><name>BPROP_SLOTS</name><operator>-</operator><literal type="number">1</literal><operator>)</operator></expr>;</expr_stmt>
+  <expr_stmt><expr><name><name>bp</name><operator>-&gt;</operator><name>key</name></name> <operator>=</operator> <name>key</name></expr>;</expr_stmt>
+  <expr_stmt><expr><name><name>bp</name><operator>-&gt;</operator><name>val</name></name> <operator>=</operator> <name>val</name></expr>;</expr_stmt>
+  <expr_stmt><expr><name><name>bp</name><operator>-&gt;</operator><name>mode</name></name> <operator>=</operator> <name>mode</name></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/* Backpropagate overflow stripping. */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type> <name>narrow_stripov_backprop</name><parameter_list>(<parameter><decl><type><name>NarrowConv</name> <modifier>*</modifier></type><name>nc</name></decl></parameter>, <parameter><decl><type><name>IRRef</name></type> <name>ref</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>depth</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+  <decl_stmt><decl><type><name>jit_State</name> <modifier>*</modifier></type><name>J</name> <init>= <expr><name><name>nc</name><operator>-&gt;</operator><name>J</name></name></expr></init></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>IRIns</name> <modifier>*</modifier></type><name>ir</name> <init>= <expr><call><name>IR</name><argument_list>(<argument><expr><name>ref</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+  <if_stmt><if>if <condition>(<expr><name><name>ir</name><operator>-&gt;</operator><name>o</name></name> <operator>==</operator> <name>IR_ADDOV</name> <operator>||</operator> <name><name>ir</name><operator>-&gt;</operator><name>o</name></name> <operator>==</operator> <name>IR_SUBOV</name> <operator>||</operator>
+      <operator>(</operator><name><name>ir</name><operator>-&gt;</operator><name>o</name></name> <operator>==</operator> <name>IR_MULOV</name> <operator>&amp;&amp;</operator> <operator>(</operator><name><name>nc</name><operator>-&gt;</operator><name>mode</name></name> <operator>&amp;</operator> <name>IRCONV_CONVMASK</name><operator>)</operator> <operator>==</operator> <name>IRCONV_ANY</name><operator>)</operator></expr>)</condition> <block>{<block_content>
+    <decl_stmt><decl><type><name>BPropEntry</name> <modifier>*</modifier></type><name>bp</name> <init>= <expr><call><name>narrow_bpc_get</name><argument_list>(<argument><expr><name><name>nc</name><operator>-&gt;</operator><name>J</name></name></expr></argument>, <argument><expr><name>ref</name></expr></argument>, <argument><expr><name>IRCONV_TOBIT</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+    <if_stmt><if>if <condition>(<expr><name>bp</name></expr>)</condition> <block>{<block_content>
+      <expr_stmt><expr><name>ref</name> <operator>=</operator> <name><name>bp</name><operator>-&gt;</operator><name>val</name></name></expr>;</expr_stmt>
+    </block_content>}</block></if> <if type="elseif">else if <condition>(<expr><operator>++</operator><name>depth</name> <operator>&lt;</operator> <name>NARROW_MAX_BACKPROP</name> <operator>&amp;&amp;</operator> <name><name>nc</name><operator>-&gt;</operator><name>sp</name></name> <operator>&lt;</operator> <name><name>nc</name><operator>-&gt;</operator><name>maxsp</name></name></expr>)</condition> <block>{<block_content>
+      <decl_stmt><decl><type><name>NarrowIns</name> <modifier>*</modifier></type><name>savesp</name> <init>= <expr><name><name>nc</name><operator>-&gt;</operator><name>sp</name></name></expr></init></decl>;</decl_stmt>
+      <expr_stmt><expr><call><name>narrow_stripov_backprop</name><argument_list>(<argument><expr><name>nc</name></expr></argument>, <argument><expr><name><name>ir</name><operator>-&gt;</operator><name>op1</name></name></expr></argument>, <argument><expr><name>depth</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+      <if_stmt><if>if <condition>(<expr><name><name>nc</name><operator>-&gt;</operator><name>sp</name></name> <operator>&lt;</operator> <name><name>nc</name><operator>-&gt;</operator><name>maxsp</name></name></expr>)</condition> <block>{<block_content>
+	<expr_stmt><expr><call><name>narrow_stripov_backprop</name><argument_list>(<argument><expr><name>nc</name></expr></argument>, <argument><expr><name><name>ir</name><operator>-&gt;</operator><name>op2</name></name></expr></argument>, <argument><expr><name>depth</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><name><name>nc</name><operator>-&gt;</operator><name>sp</name></name> <operator>&lt;</operator> <name><name>nc</name><operator>-&gt;</operator><name>maxsp</name></name></expr>)</condition> <block>{<block_content>
+	  <expr_stmt><expr><operator>*</operator><name><name>nc</name><operator>-&gt;</operator><name>sp</name></name><operator>++</operator> <operator>=</operator> <call><name>NARROWINS</name><argument_list>(<argument><expr><call><name>IRT</name><argument_list>(<argument><expr><name><name>ir</name><operator>-&gt;</operator><name>o</name></name> <operator>-</operator> <name>IR_ADDOV</name> <operator>+</operator> <name>IR_ADD</name></expr></argument>, <argument><expr><name>IRT_INT</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>ref</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	  <return>return;</return>
+	</block_content>}</block></if></if_stmt>
+      </block_content>}</block></if></if_stmt>
+      <expr_stmt><expr><name><name>nc</name><operator>-&gt;</operator><name>sp</name></name> <operator>=</operator> <name>savesp</name></expr>;</expr_stmt>  <comment type="block">/* Path too deep, need to backtrack. */</comment>
+    </block_content>}</block></if></if_stmt>
+  </block_content>}</block></if></if_stmt>
+  <expr_stmt><expr><operator>*</operator><name><name>nc</name><operator>-&gt;</operator><name>sp</name></name><operator>++</operator> <operator>=</operator> <call><name>NARROWINS</name><argument_list>(<argument><expr><name>NARROW_REF</name></expr></argument>, <argument><expr><name>ref</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/* Backpropagate narrowing conversion. Return number of needed conversions. */</comment>
+<function><type><specifier>static</specifier> <name>int</name></type> <name>narrow_conv_backprop</name><parameter_list>(<parameter><decl><type><name>NarrowConv</name> <modifier>*</modifier></type><name>nc</name></decl></parameter>, <parameter><decl><type><name>IRRef</name></type> <name>ref</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>depth</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+  <decl_stmt><decl><type><name>jit_State</name> <modifier>*</modifier></type><name>J</name> <init>= <expr><name><name>nc</name><operator>-&gt;</operator><name>J</name></name></expr></init></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>IRIns</name> <modifier>*</modifier></type><name>ir</name> <init>= <expr><call><name>IR</name><argument_list>(<argument><expr><name>ref</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>IRRef</name></type> <name>cref</name></decl>;</decl_stmt>
+
+  <if_stmt><if>if <condition>(<expr><name><name>nc</name><operator>-&gt;</operator><name>sp</name></name> <operator>&gt;=</operator> <name><name>nc</name><operator>-&gt;</operator><name>maxsp</name></name></expr>)</condition><block type="pseudo"><block_content> <return>return <expr><literal type="number">10</literal></expr>;</return></block_content></block></if></if_stmt>  <comment type="block">/* Path too deep. */</comment>
+
+  <comment type="block">/* Check the easy cases first. */</comment>
+  <if_stmt><if>if <condition>(<expr><name><name>ir</name><operator>-&gt;</operator><name>o</name></name> <operator>==</operator> <name>IR_CONV</name> <operator>&amp;&amp;</operator> <operator>(</operator><name><name>ir</name><operator>-&gt;</operator><name>op2</name></name> <operator>&amp;</operator> <name>IRCONV_SRCMASK</name><operator>)</operator> <operator>==</operator> <name>IRT_INT</name></expr>)</condition> <block>{<block_content>
+    <if_stmt><if>if <condition>(<expr><operator>(</operator><name><name>nc</name><operator>-&gt;</operator><name>mode</name></name> <operator>&amp;</operator> <name>IRCONV_CONVMASK</name><operator>)</operator> <operator>&lt;=</operator> <name>IRCONV_ANY</name></expr>)</condition><block type="pseudo"><block_content>
+      <expr_stmt><expr><call><name>narrow_stripov_backprop</name><argument_list>(<argument><expr><name>nc</name></expr></argument>, <argument><expr><name><name>ir</name><operator>-&gt;</operator><name>op1</name></name></expr></argument>, <argument><expr><name>depth</name><operator>+</operator><literal type="number">1</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if>
+    <else>else<block type="pseudo"><block_content>
+      <expr_stmt><expr><operator>*</operator><name><name>nc</name><operator>-&gt;</operator><name>sp</name></name><operator>++</operator> <operator>=</operator> <call><name>NARROWINS</name><argument_list>(<argument><expr><name>NARROW_REF</name></expr></argument>, <argument><expr><name><name>ir</name><operator>-&gt;</operator><name>op1</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></else></if_stmt>  <comment type="block">/* Undo conversion. */</comment>
+    <if_stmt><if>if <condition>(<expr><name><name>nc</name><operator>-&gt;</operator><name>t</name></name> <operator>==</operator> <name>IRT_I64</name></expr>)</condition><block type="pseudo"><block_content>
+      <expr_stmt><expr><operator>*</operator><name><name>nc</name><operator>-&gt;</operator><name>sp</name></name><operator>++</operator> <operator>=</operator> <call><name>NARROWINS</name><argument_list>(<argument><expr><name>NARROW_SEXT</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>  <comment type="block">/* Sign-extend integer. */</comment>
+    <return>return <expr><literal type="number">0</literal></expr>;</return>
+  </block_content>}</block></if> <if type="elseif">else if <condition>(<expr><name><name>ir</name><operator>-&gt;</operator><name>o</name></name> <operator>==</operator> <name>IR_KNUM</name></expr>)</condition> <block>{<block_content>  <comment type="block">/* Narrow FP constant. */</comment>
+    <decl_stmt><decl><type><name>lua_Number</name></type> <name>n</name> <init>= <expr><call><name>ir_knum</name><argument_list>(<argument><expr><name>ir</name></expr></argument>)</argument_list></call><operator>-&gt;</operator><name>n</name></expr></init></decl>;</decl_stmt>
+    <if_stmt><if>if <condition>(<expr><operator>(</operator><name><name>nc</name><operator>-&gt;</operator><name>mode</name></name> <operator>&amp;</operator> <name>IRCONV_CONVMASK</name><operator>)</operator> <operator>==</operator> <name>IRCONV_TOBIT</name></expr>)</condition> <block>{<block_content>
+      <comment type="block">/* Allows a wider range of constants. */</comment>
+      <decl_stmt><decl><type><name>int64_t</name></type> <name>k64</name> <init>= <expr><operator>(</operator><name>int64_t</name><operator>)</operator><name>n</name></expr></init></decl>;</decl_stmt>
+      <if_stmt><if>if <condition>(<expr><name>n</name> <operator>==</operator> <operator>(</operator><name>lua_Number</name><operator>)</operator><name>k64</name></expr>)</condition> <block>{<block_content>  <comment type="block">/* Only if const doesn't lose precision. */</comment>
+	<expr_stmt><expr><operator>*</operator><name><name>nc</name><operator>-&gt;</operator><name>sp</name></name><operator>++</operator> <operator>=</operator> <call><name>NARROWINS</name><argument_list>(<argument><expr><name>NARROW_INT</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><operator>*</operator><name><name>nc</name><operator>-&gt;</operator><name>sp</name></name><operator>++</operator> <operator>=</operator> <operator>(</operator><name>NarrowIns</name><operator>)</operator><name>k64</name></expr>;</expr_stmt>  <comment type="block">/* But always truncate to 32 bits. */</comment>
+	<return>return <expr><literal type="number">0</literal></expr>;</return>
+      </block_content>}</block></if></if_stmt>
+    </block_content>}</block></if> <else>else <block>{<block_content>
+      <decl_stmt><decl><type><name>int32_t</name></type> <name>k</name> <init>= <expr><call><name>lj_num2int</name><argument_list>(<argument><expr><name>n</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+      <comment type="block">/* Only if constant is a small integer. */</comment>
+      <if_stmt><if>if <condition>(<expr><call><name>checki16</name><argument_list>(<argument><expr><name>k</name></expr></argument>)</argument_list></call> <operator>&amp;&amp;</operator> <name>n</name> <operator>==</operator> <operator>(</operator><name>lua_Number</name><operator>)</operator><name>k</name></expr>)</condition> <block>{<block_content>
+	<expr_stmt><expr><operator>*</operator><name><name>nc</name><operator>-&gt;</operator><name>sp</name></name><operator>++</operator> <operator>=</operator> <call><name>NARROWINS</name><argument_list>(<argument><expr><name>NARROW_INT</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><operator>*</operator><name><name>nc</name><operator>-&gt;</operator><name>sp</name></name><operator>++</operator> <operator>=</operator> <operator>(</operator><name>NarrowIns</name><operator>)</operator><name>k</name></expr>;</expr_stmt>
+	<return>return <expr><literal type="number">0</literal></expr>;</return>
+      </block_content>}</block></if></if_stmt>
+    </block_content>}</block></else></if_stmt>
+    <return>return <expr><literal type="number">10</literal></expr>;</return>  <comment type="block">/* Never narrow other FP constants (this is rare). */</comment>
+  </block_content>}</block></if></if_stmt>
+
+  <comment type="block">/* Try to CSE the conversion. Stronger checks are ok, too. */</comment>
+  <expr_stmt><expr><name>cref</name> <operator>=</operator> <name><name>J</name><operator>-&gt;</operator><name>chain</name><index>[<expr><name><name>fins</name><operator>-&gt;</operator><name>o</name></name></expr>]</index></name></expr>;</expr_stmt>
+  <while>while <condition>(<expr><name>cref</name> <operator>&gt;</operator> <name>ref</name></expr>)</condition> <block>{<block_content>
+    <decl_stmt><decl><type><name>IRIns</name> <modifier>*</modifier></type><name>cr</name> <init>= <expr><call><name>IR</name><argument_list>(<argument><expr><name>cref</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+    <if_stmt><if>if <condition>(<expr><name><name>cr</name><operator>-&gt;</operator><name>op1</name></name> <operator>==</operator> <name>ref</name> <operator>&amp;&amp;</operator>
+	<operator>(</operator><name><name>fins</name><operator>-&gt;</operator><name>o</name></name> <operator>==</operator> <name>IR_TOBIT</name> <operator>||</operator>
+	 <operator>(</operator><operator>(</operator><name><name>cr</name><operator>-&gt;</operator><name>op2</name></name> <operator>&amp;</operator> <name>IRCONV_MODEMASK</name><operator>)</operator> <operator>==</operator> <operator>(</operator><name><name>nc</name><operator>-&gt;</operator><name>mode</name></name> <operator>&amp;</operator> <name>IRCONV_MODEMASK</name><operator>)</operator> <operator>&amp;&amp;</operator>
+	  <call><name>irt_isguard</name><argument_list>(<argument><expr><name><name>cr</name><operator>-&gt;</operator><name>t</name></name></expr></argument>)</argument_list></call> <operator>&gt;=</operator> <call><name>irt_isguard</name><argument_list>(<argument><expr><name><name>fins</name><operator>-&gt;</operator><name>t</name></name></expr></argument>)</argument_list></call><operator>)</operator><operator>)</operator></expr>)</condition> <block>{<block_content>
+      <expr_stmt><expr><operator>*</operator><name><name>nc</name><operator>-&gt;</operator><name>sp</name></name><operator>++</operator> <operator>=</operator> <call><name>NARROWINS</name><argument_list>(<argument><expr><name>NARROW_REF</name></expr></argument>, <argument><expr><name>cref</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+      <return>return <expr><literal type="number">0</literal></expr>;</return>  <comment type="block">/* Already there, no additional conversion needed. */</comment>
+    </block_content>}</block></if></if_stmt>
+    <expr_stmt><expr><name>cref</name> <operator>=</operator> <name><name>cr</name><operator>-&gt;</operator><name>prev</name></name></expr>;</expr_stmt>
+  </block_content>}</block></while>
+
+  <comment type="block">/* Backpropagate across ADD/SUB. */</comment>
+  <if_stmt><if>if <condition>(<expr><name><name>ir</name><operator>-&gt;</operator><name>o</name></name> <operator>==</operator> <name>IR_ADD</name> <operator>||</operator> <name><name>ir</name><operator>-&gt;</operator><name>o</name></name> <operator>==</operator> <name>IR_SUB</name></expr>)</condition> <block>{<block_content>
+    <comment type="block">/* Try cache lookup first. */</comment>
+    <decl_stmt><decl><type><name>IRRef</name></type> <name>mode</name> <init>= <expr><name><name>nc</name><operator>-&gt;</operator><name>mode</name></name></expr></init></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>BPropEntry</name> <modifier>*</modifier></type><name>bp</name></decl>;</decl_stmt>
+    <comment type="block">/* Inner conversions need a stronger check. */</comment>
+    <if_stmt><if>if <condition>(<expr><operator>(</operator><name>mode</name> <operator>&amp;</operator> <name>IRCONV_CONVMASK</name><operator>)</operator> <operator>==</operator> <name>IRCONV_INDEX</name> <operator>&amp;&amp;</operator> <name>depth</name> <operator>&gt;</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+      <expr_stmt><expr><name>mode</name> <operator>+=</operator> <name>IRCONV_CHECK</name><operator>-</operator><name>IRCONV_INDEX</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+    <expr_stmt><expr><name>bp</name> <operator>=</operator> <call><name>narrow_bpc_get</name><argument_list>(<argument><expr><name><name>nc</name><operator>-&gt;</operator><name>J</name></name></expr></argument>, <argument><expr><operator>(</operator><name>IRRef1</name><operator>)</operator><name>ref</name></expr></argument>, <argument><expr><name>mode</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <if_stmt><if>if <condition>(<expr><name>bp</name></expr>)</condition> <block>{<block_content>
+      <expr_stmt><expr><operator>*</operator><name><name>nc</name><operator>-&gt;</operator><name>sp</name></name><operator>++</operator> <operator>=</operator> <call><name>NARROWINS</name><argument_list>(<argument><expr><name>NARROW_REF</name></expr></argument>, <argument><expr><name><name>bp</name><operator>-&gt;</operator><name>val</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+      <return>return <expr><literal type="number">0</literal></expr>;</return>
+    </block_content>}</block></if> <if type="elseif">else if <condition>(<expr><name><name>nc</name><operator>-&gt;</operator><name>t</name></name> <operator>==</operator> <name>IRT_I64</name></expr>)</condition> <block>{<block_content>
+      <comment type="block">/* Try sign-extending from an existing (checked) conversion to int. */</comment>
+      <expr_stmt><expr><name>mode</name> <operator>=</operator> <operator>(</operator><name>IRT_INT</name><operator>&lt;&lt;</operator><literal type="number">5</literal><operator>)</operator><operator>|</operator><name>IRT_NUM</name><operator>|</operator><name>IRCONV_INDEX</name></expr>;</expr_stmt>
+      <expr_stmt><expr><name>bp</name> <operator>=</operator> <call><name>narrow_bpc_get</name><argument_list>(<argument><expr><name><name>nc</name><operator>-&gt;</operator><name>J</name></name></expr></argument>, <argument><expr><operator>(</operator><name>IRRef1</name><operator>)</operator><name>ref</name></expr></argument>, <argument><expr><name>mode</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+      <if_stmt><if>if <condition>(<expr><name>bp</name></expr>)</condition> <block>{<block_content>
+	<expr_stmt><expr><operator>*</operator><name><name>nc</name><operator>-&gt;</operator><name>sp</name></name><operator>++</operator> <operator>=</operator> <call><name>NARROWINS</name><argument_list>(<argument><expr><name>NARROW_REF</name></expr></argument>, <argument><expr><name><name>bp</name><operator>-&gt;</operator><name>val</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><operator>*</operator><name><name>nc</name><operator>-&gt;</operator><name>sp</name></name><operator>++</operator> <operator>=</operator> <call><name>NARROWINS</name><argument_list>(<argument><expr><name>NARROW_SEXT</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<return>return <expr><literal type="number">0</literal></expr>;</return>
+      </block_content>}</block></if></if_stmt>
+    </block_content>}</block></if></if_stmt>
+    <if_stmt><if>if <condition>(<expr><operator>++</operator><name>depth</name> <operator>&lt;</operator> <name>NARROW_MAX_BACKPROP</name> <operator>&amp;&amp;</operator> <name><name>nc</name><operator>-&gt;</operator><name>sp</name></name> <operator>&lt;</operator> <name><name>nc</name><operator>-&gt;</operator><name>maxsp</name></name></expr>)</condition> <block>{<block_content>
+      <decl_stmt><decl><type><name>NarrowIns</name> <modifier>*</modifier></type><name>savesp</name> <init>= <expr><name><name>nc</name><operator>-&gt;</operator><name>sp</name></name></expr></init></decl>;</decl_stmt>
+      <decl_stmt><decl><type><name>int</name></type> <name>count</name> <init>= <expr><call><name>narrow_conv_backprop</name><argument_list>(<argument><expr><name>nc</name></expr></argument>, <argument><expr><name><name>ir</name><operator>-&gt;</operator><name>op1</name></name></expr></argument>, <argument><expr><name>depth</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+      <expr_stmt><expr><name>count</name> <operator>+=</operator> <call><name>narrow_conv_backprop</name><argument_list>(<argument><expr><name>nc</name></expr></argument>, <argument><expr><name><name>ir</name><operator>-&gt;</operator><name>op2</name></name></expr></argument>, <argument><expr><name>depth</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+      <if_stmt><if>if <condition>(<expr><name>count</name> <operator>&lt;=</operator> <literal type="number">1</literal></expr>)</condition> <block>{<block_content>  <comment type="block">/* Limit total number of conversions. */</comment>
+	<expr_stmt><expr><operator>*</operator><name><name>nc</name><operator>-&gt;</operator><name>sp</name></name><operator>++</operator> <operator>=</operator> <call><name>NARROWINS</name><argument_list>(<argument><expr><call><name>IRT</name><argument_list>(<argument><expr><name><name>ir</name><operator>-&gt;</operator><name>o</name></name></expr></argument>, <argument><expr><name><name>nc</name><operator>-&gt;</operator><name>t</name></name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>ref</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<return>return <expr><name>count</name></expr>;</return>
+      </block_content>}</block></if></if_stmt>
+      <expr_stmt><expr><name><name>nc</name><operator>-&gt;</operator><name>sp</name></name> <operator>=</operator> <name>savesp</name></expr>;</expr_stmt>  <comment type="block">/* Too many conversions, need to backtrack. */</comment>
+    </block_content>}</block></if></if_stmt>
+  </block_content>}</block></if></if_stmt>
+
+  <comment type="block">/* Otherwise add a conversion. */</comment>
+  <expr_stmt><expr><operator>*</operator><name><name>nc</name><operator>-&gt;</operator><name>sp</name></name><operator>++</operator> <operator>=</operator> <call><name>NARROWINS</name><argument_list>(<argument><expr><name>NARROW_CONV</name></expr></argument>, <argument><expr><name>ref</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <return>return <expr><literal type="number">1</literal></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/* Emit the conversions collected during backpropagation. */</comment>
+<function><type><specifier>static</specifier> <name>IRRef</name></type> <name>narrow_conv_emit</name><parameter_list>(<parameter><decl><type><name>jit_State</name> <modifier>*</modifier></type><name>J</name></decl></parameter>, <parameter><decl><type><name>NarrowConv</name> <modifier>*</modifier></type><name>nc</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+  <comment type="block">/* The fins fields must be saved now -- emitir() overwrites them. */</comment>
+  <decl_stmt><decl><type><name>IROpT</name></type> <name>guardot</name> <init>= <expr><ternary><condition><expr><call><name>irt_isguard</name><argument_list>(<argument><expr><name><name>fins</name><operator>-&gt;</operator><name>t</name></name></expr></argument>)</argument_list></call></expr> ?</condition><then> <expr><call><name>IRTG</name><argument_list>(<argument><expr><name>IR_ADDOV</name><operator>-</operator><name>IR_ADD</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr> </then><else>: <expr><literal type="number">0</literal></expr></else></ternary></expr></init></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>IROpT</name></type> <name>convot</name> <init>= <expr><name><name>fins</name><operator>-&gt;</operator><name>ot</name></name></expr></init></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>IRRef1</name></type> <name>convop2</name> <init>= <expr><name><name>fins</name><operator>-&gt;</operator><name>op2</name></name></expr></init></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>NarrowIns</name> <modifier>*</modifier></type><name>next</name> <init>= <expr><name><name>nc</name><operator>-&gt;</operator><name>stack</name></name></expr></init></decl>;</decl_stmt>  <comment type="block">/* List of instructions from backpropagation. */</comment>
+  <decl_stmt><decl><type><name>NarrowIns</name> <modifier>*</modifier></type><name>last</name> <init>= <expr><name><name>nc</name><operator>-&gt;</operator><name>sp</name></name></expr></init></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>NarrowIns</name> <modifier>*</modifier></type><name>sp</name> <init>= <expr><name><name>nc</name><operator>-&gt;</operator><name>stack</name></name></expr></init></decl>;</decl_stmt>  <comment type="block">/* Recycle the stack to store operands. */</comment>
+  <while>while <condition>(<expr><name>next</name> <operator>&lt;</operator> <name>last</name></expr>)</condition> <block>{<block_content>  <comment type="block">/* Simple stack machine to process the ins. list. */</comment>
+    <decl_stmt><decl><type><name>NarrowIns</name></type> <name>ref</name> <init>= <expr><operator>*</operator><name>next</name><operator>++</operator></expr></init></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>IROpT</name></type> <name>op</name> <init>= <expr><call><name>narrow_op</name><argument_list>(<argument><expr><name>ref</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+    <if_stmt><if>if <condition>(<expr><name>op</name> <operator>==</operator> <name>NARROW_REF</name></expr>)</condition> <block>{<block_content>
+      <expr_stmt><expr><operator>*</operator><name>sp</name><operator>++</operator> <operator>=</operator> <name>ref</name></expr>;</expr_stmt>
+    </block_content>}</block></if> <if type="elseif">else if <condition>(<expr><name>op</name> <operator>==</operator> <name>NARROW_CONV</name></expr>)</condition> <block>{<block_content>
+      <expr_stmt><expr><operator>*</operator><name>sp</name><operator>++</operator> <operator>=</operator> <call><name>emitir_raw</name><argument_list>(<argument><expr><name>convot</name></expr></argument>, <argument><expr><name>ref</name></expr></argument>, <argument><expr><name>convop2</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>  <comment type="block">/* Raw emit avoids a loop. */</comment>
+    </block_content>}</block></if> <if type="elseif">else if <condition>(<expr><name>op</name> <operator>==</operator> <name>NARROW_SEXT</name></expr>)</condition> <block>{<block_content>
+      <expr_stmt><expr><call><name>lua_assert</name><argument_list>(<argument><expr><name>sp</name> <operator>&gt;=</operator> <name><name>nc</name><operator>-&gt;</operator><name>stack</name></name><operator>+</operator><literal type="number">1</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+      <expr_stmt><expr><name><name>sp</name><index>[<expr><operator>-</operator><literal type="number">1</literal></expr>]</index></name> <operator>=</operator> <call><name>emitir</name><argument_list>(<argument><expr><call><name>IRT</name><argument_list>(<argument><expr><name>IR_CONV</name></expr></argument>, <argument><expr><name>IRT_I64</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name><name>sp</name><index>[<expr><operator>-</operator><literal type="number">1</literal></expr>]</index></name></expr></argument>,
+		      <argument><expr><operator>(</operator><name>IRT_I64</name><operator>&lt;&lt;</operator><literal type="number">5</literal><operator>)</operator><operator>|</operator><name>IRT_INT</name><operator>|</operator><name>IRCONV_SEXT</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    </block_content>}</block></if> <if type="elseif">else if <condition>(<expr><name>op</name> <operator>==</operator> <name>NARROW_INT</name></expr>)</condition> <block>{<block_content>
+      <expr_stmt><expr><call><name>lua_assert</name><argument_list>(<argument><expr><name>next</name> <operator>&lt;</operator> <name>last</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+      <expr_stmt><expr><operator>*</operator><name>sp</name><operator>++</operator> <operator>=</operator> <ternary><condition><expr><name><name>nc</name><operator>-&gt;</operator><name>t</name></name> <operator>==</operator> <name>IRT_I64</name></expr> ?</condition><then>
+	      <expr><call><name>lj_ir_kint64</name><argument_list>(<argument><expr><name>J</name></expr></argument>, <argument><expr><operator>(</operator><name>int64_t</name><operator>)</operator><operator>(</operator><name>int32_t</name><operator>)</operator><operator>*</operator><name>next</name><operator>++</operator></expr></argument>)</argument_list></call></expr> </then><else>:
+	      <expr><call><name>lj_ir_kint</name><argument_list>(<argument><expr><name>J</name></expr></argument>, <argument><expr><operator>*</operator><name>next</name><operator>++</operator></expr></argument>)</argument_list></call></expr></else></ternary></expr>;</expr_stmt>
+    </block_content>}</block></if> <else>else <block>{<block_content>  <comment type="block">/* Regular IROpT. Pops two operands and pushes one result. */</comment>
+      <decl_stmt><decl><type><name>IRRef</name></type> <name>mode</name> <init>= <expr><name><name>nc</name><operator>-&gt;</operator><name>mode</name></name></expr></init></decl>;</decl_stmt>
+      <expr_stmt><expr><call><name>lua_assert</name><argument_list>(<argument><expr><name>sp</name> <operator>&gt;=</operator> <name><name>nc</name><operator>-&gt;</operator><name>stack</name></name><operator>+</operator><literal type="number">2</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+      <expr_stmt><expr><name>sp</name><operator>--</operator></expr>;</expr_stmt>
+      <comment type="block">/* Omit some overflow checks for array indexing. See comments above. */</comment>
+      <if_stmt><if>if <condition>(<expr><operator>(</operator><name>mode</name> <operator>&amp;</operator> <name>IRCONV_CONVMASK</name><operator>)</operator> <operator>==</operator> <name>IRCONV_INDEX</name></expr>)</condition> <block>{<block_content>
+	<if_stmt><if>if <condition>(<expr><name>next</name> <operator>==</operator> <name>last</name> <operator>&amp;&amp;</operator> <call><name>irref_isk</name><argument_list>(<argument><expr><call><name>narrow_ref</name><argument_list>(<argument><expr><name><name>sp</name><index>[<expr><literal type="number">0</literal></expr>]</index></name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call> <operator>&amp;&amp;</operator>
+	  <operator>(</operator><name>uint32_t</name><operator>)</operator><call><name>IR</name><argument_list>(<argument><expr><call><name>narrow_ref</name><argument_list>(<argument><expr><name><name>sp</name><index>[<expr><literal type="number">0</literal></expr>]</index></name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call><operator>-&gt;</operator><name>i</name> <operator>+</operator> <literal type="number">0x40000000u</literal> <operator>&lt;</operator> <literal type="number">0x80000000u</literal></expr>)</condition><block type="pseudo"><block_content>
+	  <expr_stmt><expr><name>guardot</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt></block_content></block></if>
+	<else>else<block type="pseudo"><block_content>  <comment type="block">/* Otherwise cache a stronger check. */</comment>
+	  <expr_stmt><expr><name>mode</name> <operator>+=</operator> <name>IRCONV_CHECK</name><operator>-</operator><name>IRCONV_INDEX</name></expr>;</expr_stmt></block_content></block></else></if_stmt>
+      </block_content>}</block></if></if_stmt>
+      <expr_stmt><expr><name><name>sp</name><index>[<expr><operator>-</operator><literal type="number">1</literal></expr>]</index></name> <operator>=</operator> <call><name>emitir</name><argument_list>(<argument><expr><name>op</name><operator>+</operator><name>guardot</name></expr></argument>, <argument><expr><name><name>sp</name><index>[<expr><operator>-</operator><literal type="number">1</literal></expr>]</index></name></expr></argument>, <argument><expr><name><name>sp</name><index>[<expr><literal type="number">0</literal></expr>]</index></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+      <comment type="block">/* Add to cache. */</comment>
+      <if_stmt><if>if <condition>(<expr><call><name>narrow_ref</name><argument_list>(<argument><expr><name>ref</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+	<expr_stmt><expr><call><name>narrow_bpc_set</name><argument_list>(<argument><expr><name>J</name></expr></argument>, <argument><expr><call><name>narrow_ref</name><argument_list>(<argument><expr><name>ref</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><call><name>narrow_ref</name><argument_list>(<argument><expr><name><name>sp</name><index>[<expr><operator>-</operator><literal type="number">1</literal></expr>]</index></name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>mode</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+    </block_content>}</block></else></if_stmt>
+  </block_content>}</block></while>
+  <expr_stmt><expr><call><name>lua_assert</name><argument_list>(<argument><expr><name>sp</name> <operator>==</operator> <name><name>nc</name><operator>-&gt;</operator><name>stack</name></name><operator>+</operator><literal type="number">1</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <return>return <expr><name><name>nc</name><operator>-&gt;</operator><name>stack</name><index>[<expr><literal type="number">0</literal></expr>]</index></name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/* Narrow a type conversion of an arithmetic operation. */</comment>
+<function><type><name>TRef</name> <name>LJ_FASTCALL</name></type> <name>lj_opt_narrow_convert</name><parameter_list>(<parameter><decl><type><name>jit_State</name> <modifier>*</modifier></type><name>J</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+  <if_stmt><if>if <condition>(<expr><operator>(</operator><name><name>J</name><operator>-&gt;</operator><name>flags</name></name> <operator>&amp;</operator> <name>JIT_F_OPT_NARROW</name><operator>)</operator></expr>)</condition> <block>{<block_content>
+    <decl_stmt><decl><type><name>NarrowConv</name></type> <name>nc</name></decl>;</decl_stmt>
+    <expr_stmt><expr><name><name>nc</name><operator>.</operator><name>J</name></name> <operator>=</operator> <name>J</name></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>nc</name><operator>.</operator><name>sp</name></name> <operator>=</operator> <name><name>nc</name><operator>.</operator><name>stack</name></name></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>nc</name><operator>.</operator><name>maxsp</name></name> <operator>=</operator> <operator>&amp;</operator><name><name>nc</name><operator>.</operator><name>stack</name><index>[<expr><name>NARROW_MAX_STACK</name><operator>-</operator><literal type="number">4</literal></expr>]</index></name></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>nc</name><operator>.</operator><name>t</name></name> <operator>=</operator> <call><name>irt_type</name><argument_list>(<argument><expr><name><name>fins</name><operator>-&gt;</operator><name>t</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <if_stmt><if>if <condition>(<expr><name><name>fins</name><operator>-&gt;</operator><name>o</name></name> <operator>==</operator> <name>IR_TOBIT</name></expr>)</condition> <block>{<block_content>
+      <expr_stmt><expr><name><name>nc</name><operator>.</operator><name>mode</name></name> <operator>=</operator> <name>IRCONV_TOBIT</name></expr>;</expr_stmt>  <comment type="block">/* Used only in the backpropagation cache. */</comment>
+    </block_content>}</block></if> <else>else <block>{<block_content>
+      <expr_stmt><expr><name><name>nc</name><operator>.</operator><name>mode</name></name> <operator>=</operator> <name><name>fins</name><operator>-&gt;</operator><name>op2</name></name></expr>;</expr_stmt>
+    </block_content>}</block></else></if_stmt>
+    <if_stmt><if>if <condition>(<expr><call><name>narrow_conv_backprop</name><argument_list>(<argument><expr><operator>&amp;</operator><name>nc</name></expr></argument>, <argument><expr><name><name>fins</name><operator>-&gt;</operator><name>op1</name></name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call> <operator>&lt;=</operator> <literal type="number">1</literal></expr>)</condition><block type="pseudo"><block_content>
+      <return>return <expr><call><name>narrow_conv_emit</name><argument_list>(<argument><expr><name>J</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>nc</name></expr></argument>)</argument_list></call></expr>;</return></block_content></block></if></if_stmt>
+  </block_content>}</block></if></if_stmt>
+  <return>return <expr><name>NEXTFOLD</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/* -- Narrowing of implicit conversions ----------------------------------- */</comment>
+
+<comment type="block">/* Recursively strip overflow checks. */</comment>
+<function><type><specifier>static</specifier> <name>TRef</name></type> <name>narrow_stripov</name><parameter_list>(<parameter><decl><type><name>jit_State</name> <modifier>*</modifier></type><name>J</name></decl></parameter>, <parameter><decl><type><name>TRef</name></type> <name>tr</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>lastop</name></decl></parameter>, <parameter><decl><type><name>IRRef</name></type> <name>mode</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+  <decl_stmt><decl><type><name>IRRef</name></type> <name>ref</name> <init>= <expr><call><name>tref_ref</name><argument_list>(<argument><expr><name>tr</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>IRIns</name> <modifier>*</modifier></type><name>ir</name> <init>= <expr><call><name>IR</name><argument_list>(<argument><expr><name>ref</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>int</name></type> <name>op</name> <init>= <expr><name><name>ir</name><operator>-&gt;</operator><name>o</name></name></expr></init></decl>;</decl_stmt>
+  <if_stmt><if>if <condition>(<expr><name>op</name> <operator>&gt;=</operator> <name>IR_ADDOV</name> <operator>&amp;&amp;</operator> <name>op</name> <operator>&lt;=</operator> <name>lastop</name></expr>)</condition> <block>{<block_content>
+    <decl_stmt><decl><type><name>BPropEntry</name> <modifier>*</modifier></type><name>bp</name> <init>= <expr><call><name>narrow_bpc_get</name><argument_list>(<argument><expr><name>J</name></expr></argument>, <argument><expr><name>ref</name></expr></argument>, <argument><expr><name>mode</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+    <if_stmt><if>if <condition>(<expr><name>bp</name></expr>)</condition> <block>{<block_content>
+      <return>return <expr><call><name>TREF</name><argument_list>(<argument><expr><name><name>bp</name><operator>-&gt;</operator><name>val</name></name></expr></argument>, <argument><expr><call><name>irt_t</name><argument_list>(<argument><expr><call><name>IR</name><argument_list>(<argument><expr><name><name>bp</name><operator>-&gt;</operator><name>val</name></name></expr></argument>)</argument_list></call><operator>-&gt;</operator><name>t</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</return>
+    </block_content>}</block></if> <else>else <block>{<block_content>
+      <decl_stmt><decl><type><name>IRRef</name></type> <name>op1</name> <init>= <expr><name><name>ir</name><operator>-&gt;</operator><name>op1</name></name></expr></init></decl>, <decl><type ref="prev"/><name>op2</name> <init>= <expr><name><name>ir</name><operator>-&gt;</operator><name>op2</name></name></expr></init></decl>;</decl_stmt>  <comment type="block">/* The IR may be reallocated. */</comment>
+      <expr_stmt><expr><name>op1</name> <operator>=</operator> <call><name>narrow_stripov</name><argument_list>(<argument><expr><name>J</name></expr></argument>, <argument><expr><name>op1</name></expr></argument>, <argument><expr><name>lastop</name></expr></argument>, <argument><expr><name>mode</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+      <expr_stmt><expr><name>op2</name> <operator>=</operator> <call><name>narrow_stripov</name><argument_list>(<argument><expr><name>J</name></expr></argument>, <argument><expr><name>op2</name></expr></argument>, <argument><expr><name>lastop</name></expr></argument>, <argument><expr><name>mode</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+      <expr_stmt><expr><name>tr</name> <operator>=</operator> <call><name>emitir</name><argument_list>(<argument><expr><call><name>IRT</name><argument_list>(<argument><expr><name>op</name> <operator>-</operator> <name>IR_ADDOV</name> <operator>+</operator> <name>IR_ADD</name></expr></argument>,
+		      <argument><expr><operator>(</operator><operator>(</operator><name>mode</name> <operator>&amp;</operator> <name>IRCONV_DSTMASK</name><operator>)</operator> <operator>&gt;&gt;</operator> <name>IRCONV_DSH</name><operator>)</operator></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>op1</name></expr></argument>, <argument><expr><name>op2</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+      <expr_stmt><expr><call><name>narrow_bpc_set</name><argument_list>(<argument><expr><name>J</name></expr></argument>, <argument><expr><name>ref</name></expr></argument>, <argument><expr><call><name>tref_ref</name><argument_list>(<argument><expr><name>tr</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>mode</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    </block_content>}</block></else></if_stmt>
+  </block_content>}</block></if> <if type="elseif">else if <condition>(<expr><name>LJ_64</name> <operator>&amp;&amp;</operator> <operator>(</operator><name>mode</name> <operator>&amp;</operator> <name>IRCONV_SEXT</name><operator>)</operator> <operator>&amp;&amp;</operator> <operator>!</operator><call><name>irt_is64</name><argument_list>(<argument><expr><name><name>ir</name><operator>-&gt;</operator><name>t</name></name></expr></argument>)</argument_list></call></expr>)</condition> <block>{<block_content>
+    <expr_stmt><expr><name>tr</name> <operator>=</operator> <call><name>emitir</name><argument_list>(<argument><expr><call><name>IRT</name><argument_list>(<argument><expr><name>IR_CONV</name></expr></argument>, <argument><expr><name>IRT_INTP</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>tr</name></expr></argument>, <argument><expr><name>mode</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  </block_content>}</block></if></if_stmt>
+  <return>return <expr><name>tr</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/* Narrow array index. */</comment>
+<function><type><name>TRef</name> <name>LJ_FASTCALL</name></type> <name>lj_opt_narrow_index</name><parameter_list>(<parameter><decl><type><name>jit_State</name> <modifier>*</modifier></type><name>J</name></decl></parameter>, <parameter><decl><type><name>TRef</name></type> <name>tr</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+  <decl_stmt><decl><type><name>IRIns</name> <modifier>*</modifier></type><name>ir</name></decl>;</decl_stmt>
+  <expr_stmt><expr><call><name>lua_assert</name><argument_list>(<argument><expr><call><name>tref_isnumber</name><argument_list>(<argument><expr><name>tr</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <if_stmt><if>if <condition>(<expr><call><name>tref_isnum</name><argument_list>(<argument><expr><name>tr</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>  <comment type="block">/* Conversion may be narrowed, too. See above. */</comment>
+    <return>return <expr><call><name>emitir</name><argument_list>(<argument><expr><call><name>IRTGI</name><argument_list>(<argument><expr><name>IR_CONV</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>tr</name></expr></argument>, <argument><expr><name>IRCONV_INT_NUM</name><operator>|</operator><name>IRCONV_INDEX</name></expr></argument>)</argument_list></call></expr>;</return></block_content></block></if></if_stmt>
+  <comment type="block">/* Omit some overflow checks for array indexing. See comments above. */</comment>
+  <expr_stmt><expr><name>ir</name> <operator>=</operator> <call><name>IR</name><argument_list>(<argument><expr><call><name>tref_ref</name><argument_list>(<argument><expr><name>tr</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <if_stmt><if>if <condition>(<expr><operator>(</operator><name><name>ir</name><operator>-&gt;</operator><name>o</name></name> <operator>==</operator> <name>IR_ADDOV</name> <operator>||</operator> <name><name>ir</name><operator>-&gt;</operator><name>o</name></name> <operator>==</operator> <name>IR_SUBOV</name><operator>)</operator> <operator>&amp;&amp;</operator> <call><name>irref_isk</name><argument_list>(<argument><expr><name><name>ir</name><operator>-&gt;</operator><name>op2</name></name></expr></argument>)</argument_list></call> <operator>&amp;&amp;</operator>
+      <operator>(</operator><name>uint32_t</name><operator>)</operator><call><name>IR</name><argument_list>(<argument><expr><name><name>ir</name><operator>-&gt;</operator><name>op2</name></name></expr></argument>)</argument_list></call><operator>-&gt;</operator><name>i</name> <operator>+</operator> <literal type="number">0x40000000u</literal> <operator>&lt;</operator> <literal type="number">0x80000000u</literal></expr>)</condition><block type="pseudo"><block_content>
+    <return>return <expr><call><name>emitir</name><argument_list>(<argument><expr><call><name>IRTI</name><argument_list>(<argument><expr><name><name>ir</name><operator>-&gt;</operator><name>o</name></name> <operator>-</operator> <name>IR_ADDOV</name> <operator>+</operator> <name>IR_ADD</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name><name>ir</name><operator>-&gt;</operator><name>op1</name></name></expr></argument>, <argument><expr><name><name>ir</name><operator>-&gt;</operator><name>op2</name></name></expr></argument>)</argument_list></call></expr>;</return></block_content></block></if></if_stmt>
+  <return>return <expr><name>tr</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/* Narrow conversion to integer operand (overflow undefined). */</comment>
+<function><type><name>TRef</name> <name>LJ_FASTCALL</name></type> <name>lj_opt_narrow_toint</name><parameter_list>(<parameter><decl><type><name>jit_State</name> <modifier>*</modifier></type><name>J</name></decl></parameter>, <parameter><decl><type><name>TRef</name></type> <name>tr</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+  <if_stmt><if>if <condition>(<expr><call><name>tref_isstr</name><argument_list>(<argument><expr><name>tr</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+    <expr_stmt><expr><name>tr</name> <operator>=</operator> <call><name>emitir</name><argument_list>(<argument><expr><call><name>IRTG</name><argument_list>(<argument><expr><name>IR_STRTO</name></expr></argument>, <argument><expr><name>IRT_NUM</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>tr</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+  <if_stmt><if>if <condition>(<expr><call><name>tref_isnum</name><argument_list>(<argument><expr><name>tr</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>  <comment type="block">/* Conversion may be narrowed, too. See above. */</comment>
+    <return>return <expr><call><name>emitir</name><argument_list>(<argument><expr><call><name>IRTI</name><argument_list>(<argument><expr><name>IR_CONV</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>tr</name></expr></argument>, <argument><expr><name>IRCONV_INT_NUM</name><operator>|</operator><name>IRCONV_ANY</name></expr></argument>)</argument_list></call></expr>;</return></block_content></block></if></if_stmt>
+  <if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>tref_isinteger</name><argument_list>(<argument><expr><name>tr</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+    <expr_stmt><expr><call><name>lj_trace_err</name><argument_list>(<argument><expr><name>J</name></expr></argument>, <argument><expr><name>LJ_TRERR_BADTYPE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+  <comment type="block">/*
+  ** Undefined overflow semantics allow stripping of ADDOV, SUBOV and MULOV.
+  ** Use IRCONV_TOBIT for the cache entries, since the semantics are the same.
+  */</comment>
+  <return>return <expr><call><name>narrow_stripov</name><argument_list>(<argument><expr><name>J</name></expr></argument>, <argument><expr><name>tr</name></expr></argument>, <argument><expr><name>IR_MULOV</name></expr></argument>, <argument><expr><operator>(</operator><name>IRT_INT</name><operator>&lt;&lt;</operator><literal type="number">5</literal><operator>)</operator><operator>|</operator><name>IRT_INT</name><operator>|</operator><name>IRCONV_TOBIT</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/* Narrow conversion to bitop operand (overflow wrapped). */</comment>
+<function><type><name>TRef</name> <name>LJ_FASTCALL</name></type> <name>lj_opt_narrow_tobit</name><parameter_list>(<parameter><decl><type><name>jit_State</name> <modifier>*</modifier></type><name>J</name></decl></parameter>, <parameter><decl><type><name>TRef</name></type> <name>tr</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+  <if_stmt><if>if <condition>(<expr><call><name>tref_isstr</name><argument_list>(<argument><expr><name>tr</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+    <expr_stmt><expr><name>tr</name> <operator>=</operator> <call><name>emitir</name><argument_list>(<argument><expr><call><name>IRTG</name><argument_list>(<argument><expr><name>IR_STRTO</name></expr></argument>, <argument><expr><name>IRT_NUM</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>tr</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+  <if_stmt><if>if <condition>(<expr><call><name>tref_isnum</name><argument_list>(<argument><expr><name>tr</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>  <comment type="block">/* Conversion may be narrowed, too. See above. */</comment>
+    <return>return <expr><call><name>emitir</name><argument_list>(<argument><expr><call><name>IRTI</name><argument_list>(<argument><expr><name>IR_TOBIT</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>tr</name></expr></argument>, <argument><expr><call><name>lj_ir_knum_tobit</name><argument_list>(<argument><expr><name>J</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</return></block_content></block></if></if_stmt>
+  <if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>tref_isinteger</name><argument_list>(<argument><expr><name>tr</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+    <expr_stmt><expr><call><name>lj_trace_err</name><argument_list>(<argument><expr><name>J</name></expr></argument>, <argument><expr><name>LJ_TRERR_BADTYPE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+  <comment type="block">/*
+  ** Wrapped overflow semantics allow stripping of ADDOV and SUBOV.
+  ** MULOV cannot be stripped due to precision widening.
+  */</comment>
+  <return>return <expr><call><name>narrow_stripov</name><argument_list>(<argument><expr><name>J</name></expr></argument>, <argument><expr><name>tr</name></expr></argument>, <argument><expr><name>IR_SUBOV</name></expr></argument>, <argument><expr><operator>(</operator><name>IRT_INT</name><operator>&lt;&lt;</operator><literal type="number">5</literal><operator>)</operator><operator>|</operator><name>IRT_INT</name><operator>|</operator><name>IRCONV_TOBIT</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<cpp:if>#<cpp:directive>if</cpp:directive> <expr><name>LJ_HASFFI</name></expr></cpp:if>
+<comment type="block">/* Narrow C array index (overflow undefined). */</comment>
+<function><type><name>TRef</name> <name>LJ_FASTCALL</name></type> <name>lj_opt_narrow_cindex</name><parameter_list>(<parameter><decl><type><name>jit_State</name> <modifier>*</modifier></type><name>J</name></decl></parameter>, <parameter><decl><type><name>TRef</name></type> <name>tr</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+  <expr_stmt><expr><call><name>lua_assert</name><argument_list>(<argument><expr><call><name>tref_isnumber</name><argument_list>(<argument><expr><name>tr</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <if_stmt><if>if <condition>(<expr><call><name>tref_isnum</name><argument_list>(<argument><expr><name>tr</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+    <return>return <expr><call><name>emitir</name><argument_list>(<argument><expr><call><name>IRT</name><argument_list>(<argument><expr><name>IR_CONV</name></expr></argument>, <argument><expr><name>IRT_INTP</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>tr</name></expr></argument>, <argument><expr><operator>(</operator><name>IRT_INTP</name><operator>&lt;&lt;</operator><literal type="number">5</literal><operator>)</operator><operator>|</operator><name>IRT_NUM</name><operator>|</operator><name>IRCONV_ANY</name></expr></argument>)</argument_list></call></expr>;</return></block_content></block></if></if_stmt>
+  <comment type="block">/* Undefined overflow semantics allow stripping of ADDOV, SUBOV and MULOV. */</comment>
+  <return>return <expr><call><name>narrow_stripov</name><argument_list>(<argument><expr><name>J</name></expr></argument>, <argument><expr><name>tr</name></expr></argument>, <argument><expr><name>IR_MULOV</name></expr></argument>,
+			<argument><expr><ternary><condition><expr><name>LJ_64</name></expr> ?</condition><then> <expr><operator>(</operator><operator>(</operator><name>IRT_INTP</name><operator>&lt;&lt;</operator><literal type="number">5</literal><operator>)</operator><operator>|</operator><name>IRT_INT</name><operator>|</operator><name>IRCONV_SEXT</name><operator>)</operator></expr> </then><else>:
+				<expr><operator>(</operator><operator>(</operator><name>IRT_INTP</name><operator>&lt;&lt;</operator><literal type="number">5</literal><operator>)</operator><operator>|</operator><name>IRT_INT</name><operator>|</operator><name>IRCONV_TOBIT</name><operator>)</operator></expr></else></ternary></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+<comment type="block">/* -- Narrowing of arithmetic operators ----------------------------------- */</comment>
+
+<comment type="block">/* Check whether a number fits into an int32_t (-0 is ok, too). */</comment>
+<function><type><specifier>static</specifier> <name>int</name></type> <name>numisint</name><parameter_list>(<parameter><decl><type><name>lua_Number</name></type> <name>n</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+  <return>return <expr><operator>(</operator><name>n</name> <operator>==</operator> <operator>(</operator><name>lua_Number</name><operator>)</operator><call><name>lj_num2int</name><argument_list>(<argument><expr><name>n</name></expr></argument>)</argument_list></call><operator>)</operator></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/* Convert string to number. Error out for non-numeric string values. */</comment>
+<function><type><specifier>static</specifier> <name>TRef</name></type> <name>conv_str_tonum</name><parameter_list>(<parameter><decl><type><name>jit_State</name> <modifier>*</modifier></type><name>J</name></decl></parameter>, <parameter><decl><type><name>TRef</name></type> <name>tr</name></decl></parameter>, <parameter><decl><type><name>TValue</name> <modifier>*</modifier></type><name>o</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+  <if_stmt><if>if <condition>(<expr><call><name>tref_isstr</name><argument_list>(<argument><expr><name>tr</name></expr></argument>)</argument_list></call></expr>)</condition> <block>{<block_content>
+    <expr_stmt><expr><name>tr</name> <operator>=</operator> <call><name>emitir</name><argument_list>(<argument><expr><call><name>IRTG</name><argument_list>(<argument><expr><name>IR_STRTO</name></expr></argument>, <argument><expr><name>IRT_NUM</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>tr</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <comment type="block">/* Would need an inverted STRTO for this rare and useless case. */</comment>
+    <if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>lj_strscan_num</name><argument_list>(<argument><expr><call><name>strV</name><argument_list>(<argument><expr><name>o</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>o</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>  <comment type="block">/* Convert in-place. Value used below. */</comment>
+      <expr_stmt><expr><call><name>lj_trace_err</name><argument_list>(<argument><expr><name>J</name></expr></argument>, <argument><expr><name>LJ_TRERR_BADTYPE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>  <comment type="block">/* Punt if non-numeric. */</comment>
+  </block_content>}</block></if></if_stmt>
+  <return>return <expr><name>tr</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/* Narrowing of arithmetic operations. */</comment>
+<function><type><name>TRef</name></type> <name>lj_opt_narrow_arith</name><parameter_list>(<parameter><decl><type><name>jit_State</name> <modifier>*</modifier></type><name>J</name></decl></parameter>, <parameter><decl><type><name>TRef</name></type> <name>rb</name></decl></parameter>, <parameter><decl><type><name>TRef</name></type> <name>rc</name></decl></parameter>,
+			 <parameter><decl><type><name>TValue</name> <modifier>*</modifier></type><name>vb</name></decl></parameter>, <parameter><decl><type><name>TValue</name> <modifier>*</modifier></type><name>vc</name></decl></parameter>, <parameter><decl><type><name>IROp</name></type> <name>op</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+  <expr_stmt><expr><name>rb</name> <operator>=</operator> <call><name>conv_str_tonum</name><argument_list>(<argument><expr><name>J</name></expr></argument>, <argument><expr><name>rb</name></expr></argument>, <argument><expr><name>vb</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><name>rc</name> <operator>=</operator> <call><name>conv_str_tonum</name><argument_list>(<argument><expr><name>J</name></expr></argument>, <argument><expr><name>rc</name></expr></argument>, <argument><expr><name>vc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <comment type="block">/* Must not narrow MUL in non-DUALNUM variant, because it loses -0. */</comment>
+  <if_stmt><if>if <condition>(<expr><operator>(</operator><name>op</name> <operator>&gt;=</operator> <name>IR_ADD</name> <operator>&amp;&amp;</operator> <name>op</name> <operator>&lt;=</operator> <operator>(</operator><ternary><condition><expr><name>LJ_DUALNUM</name></expr> ?</condition><then> <expr><name>IR_MUL</name></expr> </then><else>: <expr><name>IR_SUB</name></expr></else></ternary><operator>)</operator><operator>)</operator> <operator>&amp;&amp;</operator>
+      <call><name>tref_isinteger</name><argument_list>(<argument><expr><name>rb</name></expr></argument>)</argument_list></call> <operator>&amp;&amp;</operator> <call><name>tref_isinteger</name><argument_list>(<argument><expr><name>rc</name></expr></argument>)</argument_list></call> <operator>&amp;&amp;</operator>
+      <call><name>numisint</name><argument_list>(<argument><expr><call><name>lj_vm_foldarith</name><argument_list>(<argument><expr><call><name>numberVnum</name><argument_list>(<argument><expr><name>vb</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><call><name>numberVnum</name><argument_list>(<argument><expr><name>vc</name></expr></argument>)</argument_list></call></expr></argument>,
+			       <argument><expr><operator>(</operator><name>int</name><operator>)</operator><name>op</name> <operator>-</operator> <operator>(</operator><name>int</name><operator>)</operator><name>IR_ADD</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+    <return>return <expr><call><name>emitir</name><argument_list>(<argument><expr><call><name>IRTGI</name><argument_list>(<argument><expr><operator>(</operator><name>int</name><operator>)</operator><name>op</name> <operator>-</operator> <operator>(</operator><name>int</name><operator>)</operator><name>IR_ADD</name> <operator>+</operator> <operator>(</operator><name>int</name><operator>)</operator><name>IR_ADDOV</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>rb</name></expr></argument>, <argument><expr><name>rc</name></expr></argument>)</argument_list></call></expr>;</return></block_content></block></if></if_stmt>
+  <if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>tref_isnum</name><argument_list>(<argument><expr><name>rb</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content> <expr_stmt><expr><name>rb</name> <operator>=</operator> <call><name>emitir</name><argument_list>(<argument><expr><call><name>IRTN</name><argument_list>(<argument><expr><name>IR_CONV</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>rb</name></expr></argument>, <argument><expr><name>IRCONV_NUM_INT</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+  <if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>tref_isnum</name><argument_list>(<argument><expr><name>rc</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content> <expr_stmt><expr><name>rc</name> <operator>=</operator> <call><name>emitir</name><argument_list>(<argument><expr><call><name>IRTN</name><argument_list>(<argument><expr><name>IR_CONV</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>rc</name></expr></argument>, <argument><expr><name>IRCONV_NUM_INT</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+  <return>return <expr><call><name>emitir</name><argument_list>(<argument><expr><call><name>IRTN</name><argument_list>(<argument><expr><name>op</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>rb</name></expr></argument>, <argument><expr><name>rc</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/* Narrowing of unary minus operator. */</comment>
+<function><type><name>TRef</name></type> <name>lj_opt_narrow_unm</name><parameter_list>(<parameter><decl><type><name>jit_State</name> <modifier>*</modifier></type><name>J</name></decl></parameter>, <parameter><decl><type><name>TRef</name></type> <name>rc</name></decl></parameter>, <parameter><decl><type><name>TValue</name> <modifier>*</modifier></type><name>vc</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+  <expr_stmt><expr><name>rc</name> <operator>=</operator> <call><name>conv_str_tonum</name><argument_list>(<argument><expr><name>J</name></expr></argument>, <argument><expr><name>rc</name></expr></argument>, <argument><expr><name>vc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <if_stmt><if>if <condition>(<expr><call><name>tref_isinteger</name><argument_list>(<argument><expr><name>rc</name></expr></argument>)</argument_list></call></expr>)</condition> <block>{<block_content>
+    <decl_stmt><decl><type><name>uint32_t</name></type> <name>k</name> <init>= <expr><operator>(</operator><name>uint32_t</name><operator>)</operator><call><name>numberVint</name><argument_list>(<argument><expr><name>vc</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+    <if_stmt><if>if <condition>(<expr><operator>(</operator><name>LJ_DUALNUM</name> <operator>||</operator> <name>k</name> <operator>!=</operator> <literal type="number">0</literal><operator>)</operator> <operator>&amp;&amp;</operator> <name>k</name> <operator>!=</operator> <literal type="number">0x80000000u</literal></expr>)</condition> <block>{<block_content>
+      <decl_stmt><decl><type><name>TRef</name></type> <name>zero</name> <init>= <expr><call><name>lj_ir_kint</name><argument_list>(<argument><expr><name>J</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+      <if_stmt><if>if <condition>(<expr><operator>!</operator><name>LJ_DUALNUM</name></expr>)</condition><block type="pseudo"><block_content>
+	<expr_stmt><expr><call><name>emitir</name><argument_list>(<argument><expr><call><name>IRTGI</name><argument_list>(<argument><expr><name>IR_NE</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>rc</name></expr></argument>, <argument><expr><name>zero</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+      <return>return <expr><call><name>emitir</name><argument_list>(<argument><expr><call><name>IRTGI</name><argument_list>(<argument><expr><name>IR_SUBOV</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>zero</name></expr></argument>, <argument><expr><name>rc</name></expr></argument>)</argument_list></call></expr>;</return>
+    </block_content>}</block></if></if_stmt>
+    <expr_stmt><expr><name>rc</name> <operator>=</operator> <call><name>emitir</name><argument_list>(<argument><expr><call><name>IRTN</name><argument_list>(<argument><expr><name>IR_CONV</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>rc</name></expr></argument>, <argument><expr><name>IRCONV_NUM_INT</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  </block_content>}</block></if></if_stmt>
+  <return>return <expr><call><name>emitir</name><argument_list>(<argument><expr><call><name>IRTN</name><argument_list>(<argument><expr><name>IR_NEG</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>rc</name></expr></argument>, <argument><expr><call><name>lj_ir_ksimd</name><argument_list>(<argument><expr><name>J</name></expr></argument>, <argument><expr><name>LJ_KSIMD_NEG</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/* Narrowing of modulo operator. */</comment>
+<function><type><name>TRef</name></type> <name>lj_opt_narrow_mod</name><parameter_list>(<parameter><decl><type><name>jit_State</name> <modifier>*</modifier></type><name>J</name></decl></parameter>, <parameter><decl><type><name>TRef</name></type> <name>rb</name></decl></parameter>, <parameter><decl><type><name>TRef</name></type> <name>rc</name></decl></parameter>, <parameter><decl><type><name>TValue</name> <modifier>*</modifier></type><name>vb</name></decl></parameter>, <parameter><decl><type><name>TValue</name> <modifier>*</modifier></type><name>vc</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+  <decl_stmt><decl><type><name>TRef</name></type> <name>tmp</name></decl>;</decl_stmt>
+  <expr_stmt><expr><name>rb</name> <operator>=</operator> <call><name>conv_str_tonum</name><argument_list>(<argument><expr><name>J</name></expr></argument>, <argument><expr><name>rb</name></expr></argument>, <argument><expr><name>vb</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><name>rc</name> <operator>=</operator> <call><name>conv_str_tonum</name><argument_list>(<argument><expr><name>J</name></expr></argument>, <argument><expr><name>rc</name></expr></argument>, <argument><expr><name>vc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <if_stmt><if>if <condition>(<expr><operator>(</operator><name>LJ_DUALNUM</name> <operator>||</operator> <operator>(</operator><name><name>J</name><operator>-&gt;</operator><name>flags</name></name> <operator>&amp;</operator> <name>JIT_F_OPT_NARROW</name><operator>)</operator><operator>)</operator> <operator>&amp;&amp;</operator>
+      <call><name>tref_isinteger</name><argument_list>(<argument><expr><name>rb</name></expr></argument>)</argument_list></call> <operator>&amp;&amp;</operator> <call><name>tref_isinteger</name><argument_list>(<argument><expr><name>rc</name></expr></argument>)</argument_list></call> <operator>&amp;&amp;</operator>
+      <operator>(</operator><ternary><condition><expr><call><name>tvisint</name><argument_list>(<argument><expr><name>vc</name></expr></argument>)</argument_list></call></expr> ?</condition><then> <expr><call><name>intV</name><argument_list>(<argument><expr><name>vc</name></expr></argument>)</argument_list></call> <operator>!=</operator> <literal type="number">0</literal></expr> </then><else>: <expr><operator>!</operator><call><name>tviszero</name><argument_list>(<argument><expr><name>vc</name></expr></argument>)</argument_list></call></expr></else></ternary><operator>)</operator></expr>)</condition> <block>{<block_content>
+    <expr_stmt><expr><call><name>emitir</name><argument_list>(<argument><expr><call><name>IRTGI</name><argument_list>(<argument><expr><name>IR_NE</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>rc</name></expr></argument>, <argument><expr><call><name>lj_ir_kint</name><argument_list>(<argument><expr><name>J</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <return>return <expr><call><name>emitir</name><argument_list>(<argument><expr><call><name>IRTI</name><argument_list>(<argument><expr><name>IR_MOD</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>rb</name></expr></argument>, <argument><expr><name>rc</name></expr></argument>)</argument_list></call></expr>;</return>
+  </block_content>}</block></if></if_stmt>
+  <comment type="block">/* b % c ==&gt; b - floor(b/c)*c */</comment>
+  <expr_stmt><expr><name>rb</name> <operator>=</operator> <call><name>lj_ir_tonum</name><argument_list>(<argument><expr><name>J</name></expr></argument>, <argument><expr><name>rb</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><name>rc</name> <operator>=</operator> <call><name>lj_ir_tonum</name><argument_list>(<argument><expr><name>J</name></expr></argument>, <argument><expr><name>rc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><name>tmp</name> <operator>=</operator> <call><name>emitir</name><argument_list>(<argument><expr><call><name>IRTN</name><argument_list>(<argument><expr><name>IR_DIV</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>rb</name></expr></argument>, <argument><expr><name>rc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><name>tmp</name> <operator>=</operator> <call><name>emitir</name><argument_list>(<argument><expr><call><name>IRTN</name><argument_list>(<argument><expr><name>IR_FPMATH</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>tmp</name></expr></argument>, <argument><expr><name>IRFPM_FLOOR</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><name>tmp</name> <operator>=</operator> <call><name>emitir</name><argument_list>(<argument><expr><call><name>IRTN</name><argument_list>(<argument><expr><name>IR_MUL</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>tmp</name></expr></argument>, <argument><expr><name>rc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <return>return <expr><call><name>emitir</name><argument_list>(<argument><expr><call><name>IRTN</name><argument_list>(<argument><expr><name>IR_SUB</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>rb</name></expr></argument>, <argument><expr><name>tmp</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/* Narrowing of power operator or math.pow. */</comment>
+<function><type><name>TRef</name></type> <name>lj_opt_narrow_pow</name><parameter_list>(<parameter><decl><type><name>jit_State</name> <modifier>*</modifier></type><name>J</name></decl></parameter>, <parameter><decl><type><name>TRef</name></type> <name>rb</name></decl></parameter>, <parameter><decl><type><name>TRef</name></type> <name>rc</name></decl></parameter>, <parameter><decl><type><name>TValue</name> <modifier>*</modifier></type><name>vb</name></decl></parameter>, <parameter><decl><type><name>TValue</name> <modifier>*</modifier></type><name>vc</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+  <expr_stmt><expr><name>rb</name> <operator>=</operator> <call><name>conv_str_tonum</name><argument_list>(<argument><expr><name>J</name></expr></argument>, <argument><expr><name>rb</name></expr></argument>, <argument><expr><name>vb</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><name>rb</name> <operator>=</operator> <call><name>lj_ir_tonum</name><argument_list>(<argument><expr><name>J</name></expr></argument>, <argument><expr><name>rb</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>  <comment type="block">/* Left arg is always treated as an FP number. */</comment>
+  <expr_stmt><expr><name>rc</name> <operator>=</operator> <call><name>conv_str_tonum</name><argument_list>(<argument><expr><name>J</name></expr></argument>, <argument><expr><name>rc</name></expr></argument>, <argument><expr><name>vc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <comment type="block">/* Narrowing must be unconditional to preserve (-x)^i semantics. */</comment>
+  <if_stmt><if>if <condition>(<expr><call><name>tvisint</name><argument_list>(<argument><expr><name>vc</name></expr></argument>)</argument_list></call> <operator>||</operator> <call><name>numisint</name><argument_list>(<argument><expr><call><name>numV</name><argument_list>(<argument><expr><name>vc</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>)</condition> <block>{<block_content>
+    <decl_stmt><decl><type><name>int</name></type> <name>checkrange</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+    <comment type="block">/* pow() is faster for bigger exponents. But do this only for (+k)^i. */</comment>
+    <if_stmt><if>if <condition>(<expr><call><name>tref_isk</name><argument_list>(<argument><expr><name>rb</name></expr></argument>)</argument_list></call> <operator>&amp;&amp;</operator> <operator>(</operator><name>int32_t</name><operator>)</operator><call><name>ir_knum</name><argument_list>(<argument><expr><call><name>IR</name><argument_list>(<argument><expr><call><name>tref_ref</name><argument_list>(<argument><expr><name>rb</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call><operator>-&gt;</operator><name><name>u32</name><operator>.</operator><name>hi</name></name> <operator>&gt;=</operator> <literal type="number">0</literal></expr>)</condition> <block>{<block_content>
+      <decl_stmt><decl><type><name>int32_t</name></type> <name>k</name> <init>= <expr><call><name>numberVint</name><argument_list>(<argument><expr><name>vc</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+      <if_stmt><if>if <condition>(<expr><operator>!</operator><operator>(</operator><name>k</name> <operator>&gt;=</operator> <operator>-</operator><literal type="number">65536</literal> <operator>&amp;&amp;</operator> <name>k</name> <operator>&lt;=</operator> <literal type="number">65536</literal><operator>)</operator></expr>)</condition><block type="pseudo"><block_content> <goto>goto <name>force_pow_num</name>;</goto></block_content></block></if></if_stmt>
+      <expr_stmt><expr><name>checkrange</name> <operator>=</operator> <literal type="number">1</literal></expr>;</expr_stmt>
+    </block_content>}</block></if></if_stmt>
+    <if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>tref_isinteger</name><argument_list>(<argument><expr><name>rc</name></expr></argument>)</argument_list></call></expr>)</condition> <block>{<block_content>
+      <comment type="block">/* Guarded conversion to integer! */</comment>
+      <expr_stmt><expr><name>rc</name> <operator>=</operator> <call><name>emitir</name><argument_list>(<argument><expr><call><name>IRTGI</name><argument_list>(<argument><expr><name>IR_CONV</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>rc</name></expr></argument>, <argument><expr><name>IRCONV_INT_NUM</name><operator>|</operator><name>IRCONV_CHECK</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    </block_content>}</block></if></if_stmt>
+    <if_stmt><if>if <condition>(<expr><name>checkrange</name> <operator>&amp;&amp;</operator> <operator>!</operator><call><name>tref_isk</name><argument_list>(<argument><expr><name>rc</name></expr></argument>)</argument_list></call></expr>)</condition> <block>{<block_content>  <comment type="block">/* Range guard: -65536 &lt;= i &lt;= 65536 */</comment>
+      <decl_stmt><decl><type><name>TRef</name></type> <name>tmp</name> <init>= <expr><call><name>emitir</name><argument_list>(<argument><expr><call><name>IRTI</name><argument_list>(<argument><expr><name>IR_ADD</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>rc</name></expr></argument>, <argument><expr><call><name>lj_ir_kint</name><argument_list>(<argument><expr><name>J</name></expr></argument>, <argument><expr><literal type="number">65536</literal></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+      <expr_stmt><expr><call><name>emitir</name><argument_list>(<argument><expr><call><name>IRTGI</name><argument_list>(<argument><expr><name>IR_ULE</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>tmp</name></expr></argument>, <argument><expr><call><name>lj_ir_kint</name><argument_list>(<argument><expr><name>J</name></expr></argument>, <argument><expr><literal type="number">2</literal><operator>*</operator><literal type="number">65536</literal></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    </block_content>}</block></if></if_stmt>
+  </block_content>}</block></if> <else>else <block>{<block_content>
+<label><name>force_pow_num</name>:</label>
+    <expr_stmt><expr><name>rc</name> <operator>=</operator> <call><name>lj_ir_tonum</name><argument_list>(<argument><expr><name>J</name></expr></argument>, <argument><expr><name>rc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>  <comment type="block">/* Want POW(num, num), not POW(num, int). */</comment>
+  </block_content>}</block></else></if_stmt>
+  <return>return <expr><call><name>emitir</name><argument_list>(<argument><expr><call><name>IRTN</name><argument_list>(<argument><expr><name>IR_POW</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>rb</name></expr></argument>, <argument><expr><name>rc</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/* -- Predictive narrowing of induction variables ------------------------- */</comment>
+
+<comment type="block">/* Narrow a single runtime value. */</comment>
+<function><type><specifier>static</specifier> <name>int</name></type> <name>narrow_forl</name><parameter_list>(<parameter><decl><type><name>jit_State</name> <modifier>*</modifier></type><name>J</name></decl></parameter>, <parameter><decl><type><name>cTValue</name> <modifier>*</modifier></type><name>o</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+  <if_stmt><if>if <condition>(<expr><call><name>tvisint</name><argument_list>(<argument><expr><name>o</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content> <return>return <expr><literal type="number">1</literal></expr>;</return></block_content></block></if></if_stmt>
+  <if_stmt><if>if <condition>(<expr><name>LJ_DUALNUM</name> <operator>||</operator> <operator>(</operator><name><name>J</name><operator>-&gt;</operator><name>flags</name></name> <operator>&amp;</operator> <name>JIT_F_OPT_NARROW</name><operator>)</operator></expr>)</condition><block type="pseudo"><block_content> <return>return <expr><call><name>numisint</name><argument_list>(<argument><expr><call><name>numV</name><argument_list>(<argument><expr><name>o</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</return></block_content></block></if></if_stmt>
+  <return>return <expr><literal type="number">0</literal></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/* Narrow the FORL index type by looking at the runtime values. */</comment>
+<function><type><name>IRType</name></type> <name>lj_opt_narrow_forl</name><parameter_list>(<parameter><decl><type><name>jit_State</name> <modifier>*</modifier></type><name>J</name></decl></parameter>, <parameter><decl><type><name>cTValue</name> <modifier>*</modifier></type><name>tv</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+  <expr_stmt><expr><call><name>lua_assert</name><argument_list>(<argument><expr><call><name>tvisnumber</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>tv</name><index>[<expr><name>FORL_IDX</name></expr>]</index></name></expr></argument>)</argument_list></call> <operator>&amp;&amp;</operator>
+	     <call><name>tvisnumber</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>tv</name><index>[<expr><name>FORL_STOP</name></expr>]</index></name></expr></argument>)</argument_list></call> <operator>&amp;&amp;</operator>
+	     <call><name>tvisnumber</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>tv</name><index>[<expr><name>FORL_STEP</name></expr>]</index></name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <comment type="block">/* Narrow only if the runtime values of start/stop/step are all integers. */</comment>
+  <if_stmt><if>if <condition>(<expr><call><name>narrow_forl</name><argument_list>(<argument><expr><name>J</name></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>tv</name><index>[<expr><name>FORL_IDX</name></expr>]</index></name></expr></argument>)</argument_list></call> <operator>&amp;&amp;</operator>
+      <call><name>narrow_forl</name><argument_list>(<argument><expr><name>J</name></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>tv</name><index>[<expr><name>FORL_STOP</name></expr>]</index></name></expr></argument>)</argument_list></call> <operator>&amp;&amp;</operator>
+      <call><name>narrow_forl</name><argument_list>(<argument><expr><name>J</name></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>tv</name><index>[<expr><name>FORL_STEP</name></expr>]</index></name></expr></argument>)</argument_list></call></expr>)</condition> <block>{<block_content>
+    <comment type="block">/* And if the loop index can't possibly overflow. */</comment>
+    <decl_stmt><decl><type><name>lua_Number</name></type> <name>step</name> <init>= <expr><call><name>numberVnum</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>tv</name><index>[<expr><name>FORL_STEP</name></expr>]</index></name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>lua_Number</name></type> <name>sum</name> <init>= <expr><call><name>numberVnum</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>tv</name><index>[<expr><name>FORL_STOP</name></expr>]</index></name></expr></argument>)</argument_list></call> <operator>+</operator> <name>step</name></expr></init></decl>;</decl_stmt>
+    <if_stmt><if>if <condition>(<expr><ternary><condition><expr><literal type="number">0</literal> <operator>&lt;=</operator> <name>step</name></expr> ?</condition><then> <expr><operator>(</operator><name>sum</name> <operator>&lt;=</operator> <literal type="number">2147483647.0</literal><operator>)</operator></expr> </then><else>: <expr><operator>(</operator><name>sum</name> <operator>&gt;=</operator> <operator>-</operator><literal type="number">2147483648.0</literal><operator>)</operator></expr></else></ternary></expr>)</condition><block type="pseudo"><block_content>
+      <return>return <expr><name>IRT_INT</name></expr>;</return></block_content></block></if></if_stmt>
+  </block_content>}</block></if></if_stmt>
+  <return>return <expr><name>IRT_NUM</name></expr>;</return>
+</block_content>}</block></function>
+
+<cpp:undef>#<cpp:directive>undef</cpp:directive> <name>IR</name></cpp:undef>
+<cpp:undef>#<cpp:directive>undef</cpp:directive> <name>fins</name></cpp:undef>
+<cpp:undef>#<cpp:directive>undef</cpp:directive> <name>emitir</name></cpp:undef>
+<cpp:undef>#<cpp:directive>undef</cpp:directive> <name>emitir_raw</name></cpp:undef>
+
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+</unit>

@@ -1,0 +1,438 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<unit xmlns="http://www.srcML.org/srcML/src" xmlns:cpp="http://www.srcML.org/srcML/cpp" revision="1.0.0" language="C" filename="/cloned_projects/agensgraph/src/backend/optimizer/path/tidpath.c"><comment type="block">/*-------------------------------------------------------------------------
+ *
+ * tidpath.c
+ *	  Routines to determine which TID conditions are usable for scanning
+ *	  a given relation, and create TidPaths accordingly.
+ *
+ * What we are looking for here is WHERE conditions of the form
+ * "CTID = pseudoconstant", which can be implemented by just fetching
+ * the tuple directly via heap_fetch().  We can also handle OR'd conditions
+ * such as (CTID = const1) OR (CTID = const2), as well as ScalarArrayOpExpr
+ * conditions of the form CTID = ANY(pseudoconstant_array).  In particular
+ * this allows
+ *		WHERE ctid IN (tid1, tid2, ...)
+ *
+ * As with indexscans, our definition of "pseudoconstant" is pretty liberal:
+ * we allow anything that doesn't involve a volatile function or a Var of
+ * the relation under consideration.  Vars belonging to other relations of
+ * the query are allowed, giving rise to parameterized TID scans.
+ *
+ * We also support "WHERE CURRENT OF cursor" conditions (CurrentOfExpr),
+ * which amount to "CTID = run-time-determined-TID".  These could in
+ * theory be translated to a simple comparison of CTID to the result of
+ * a function, but in practice it works better to keep the special node
+ * representation all the way through to execution.
+ *
+ *
+ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1994, Regents of the University of California
+ *
+ *
+ * IDENTIFICATION
+ *	  src/backend/optimizer/path/tidpath.c
+ *
+ *-------------------------------------------------------------------------
+ */</comment>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"postgres.h"</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/sysattr.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/pg_operator.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/pg_type.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"nodes/nodeFuncs.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"optimizer/clauses.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"optimizer/optimizer.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"optimizer/pathnode.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"optimizer/paths.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"optimizer/restrictinfo.h"</cpp:file></cpp:include>
+
+<comment type="block">/* source-code-compatibility hacks for pull_varnos() API change */</comment>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>pull_varnos</name><parameter_list>(<parameter><type><name>a</name></type></parameter>,<parameter><type><name>b</name></type></parameter>)</parameter_list></cpp:macro> <cpp:value>pull_varnos_new(a,b)</cpp:value></cpp:define>
+
+
+<comment type="block">/*
+ * Does this Var represent the CTID column of the specified baserel?
+ */</comment>
+<function><type><specifier>static</specifier> <specifier>inline</specifier> <name>bool</name></type>
+<name>IsCTIDVar</name><parameter_list>(<parameter><decl><type><name>Var</name> <modifier>*</modifier></type><name>var</name></decl></parameter>, <parameter><decl><type><name>RelOptInfo</name> <modifier>*</modifier></type><name>rel</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<comment type="block">/* The vartype check is strictly paranoia */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>var</name><operator>-&gt;</operator><name>varattno</name></name> <operator>==</operator> <name>SelfItemPointerAttributeNumber</name> <operator>&amp;&amp;</operator>
+		<name><name>var</name><operator>-&gt;</operator><name>vartype</name></name> <operator>==</operator> <name>TIDOID</name> <operator>&amp;&amp;</operator>
+		<name><name>var</name><operator>-&gt;</operator><name>varno</name></name> <operator>==</operator> <name><name>rel</name><operator>-&gt;</operator><name>relid</name></name> <operator>&amp;&amp;</operator>
+		<name><name>var</name><operator>-&gt;</operator><name>varlevelsup</name></name> <operator>==</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>true</name></expr>;</return></block_content></block></if></if_stmt>
+	<return>return <expr><name>false</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Check to see if a RestrictInfo is of the form
+ *		CTID = pseudoconstant
+ * or
+ *		pseudoconstant = CTID
+ * where the CTID Var belongs to relation "rel", and nothing on the
+ * other side of the clause does.
+ */</comment>
+<function><type><specifier>static</specifier> <name>bool</name></type>
+<name>IsTidEqualClause</name><parameter_list>(<parameter><decl><type><name>RestrictInfo</name> <modifier>*</modifier></type><name>rinfo</name></decl></parameter>, <parameter><decl><type><name>RelOptInfo</name> <modifier>*</modifier></type><name>rel</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>OpExpr</name>	   <modifier>*</modifier></type><name>node</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Node</name>	   <modifier>*</modifier></type><name>arg1</name></decl>,
+			   <decl><type ref="prev"><modifier>*</modifier></type><name>arg2</name></decl>,
+			   <decl><type ref="prev"><modifier>*</modifier></type><name>other</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Relids</name></type>		<name>other_relids</name></decl>;</decl_stmt>
+
+	<comment type="block">/* Must be an OpExpr */</comment>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>is_opclause</name><argument_list>(<argument><expr><name><name>rinfo</name><operator>-&gt;</operator><name>clause</name></name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>false</name></expr>;</return></block_content></block></if></if_stmt>
+	<expr_stmt><expr><name>node</name> <operator>=</operator> <operator>(</operator><name>OpExpr</name> <operator>*</operator><operator>)</operator> <name><name>rinfo</name><operator>-&gt;</operator><name>clause</name></name></expr>;</expr_stmt>
+
+	<comment type="block">/* Operator must be tideq */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>node</name><operator>-&gt;</operator><name>opno</name></name> <operator>!=</operator> <name>TIDEqualOperator</name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>false</name></expr>;</return></block_content></block></if></if_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>list_length</name><argument_list>(<argument><expr><name><name>node</name><operator>-&gt;</operator><name>args</name></name></expr></argument>)</argument_list></call> <operator>==</operator> <literal type="number">2</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>arg1</name> <operator>=</operator> <call><name>linitial</name><argument_list>(<argument><expr><name><name>node</name><operator>-&gt;</operator><name>args</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>arg2</name> <operator>=</operator> <call><name>lsecond</name><argument_list>(<argument><expr><name><name>node</name><operator>-&gt;</operator><name>args</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Look for CTID as either argument */</comment>
+	<expr_stmt><expr><name>other</name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name>other_relids</name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><name>arg1</name> <operator>&amp;&amp;</operator> <call><name>IsA</name><argument_list>(<argument><expr><name>arg1</name></expr></argument>, <argument><expr><name>Var</name></expr></argument>)</argument_list></call> <operator>&amp;&amp;</operator>
+		<call><name>IsCTIDVar</name><argument_list>(<argument><expr><operator>(</operator><name>Var</name> <operator>*</operator><operator>)</operator> <name>arg1</name></expr></argument>, <argument><expr><name>rel</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name>other</name> <operator>=</operator> <name>arg2</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name>other_relids</name> <operator>=</operator> <name><name>rinfo</name><operator>-&gt;</operator><name>right_relids</name></name></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><name>other</name> <operator>&amp;&amp;</operator> <name>arg2</name> <operator>&amp;&amp;</operator> <call><name>IsA</name><argument_list>(<argument><expr><name>arg2</name></expr></argument>, <argument><expr><name>Var</name></expr></argument>)</argument_list></call> <operator>&amp;&amp;</operator>
+		<call><name>IsCTIDVar</name><argument_list>(<argument><expr><operator>(</operator><name>Var</name> <operator>*</operator><operator>)</operator> <name>arg2</name></expr></argument>, <argument><expr><name>rel</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name>other</name> <operator>=</operator> <name>arg1</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name>other_relids</name> <operator>=</operator> <name><name>rinfo</name><operator>-&gt;</operator><name>left_relids</name></name></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><name>other</name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>false</name></expr>;</return></block_content></block></if></if_stmt>
+
+	<comment type="block">/* The other argument must be a pseudoconstant */</comment>
+	<if_stmt><if>if <condition>(<expr><call><name>bms_is_member</name><argument_list>(<argument><expr><name><name>rel</name><operator>-&gt;</operator><name>relid</name></name></expr></argument>, <argument><expr><name>other_relids</name></expr></argument>)</argument_list></call> <operator>||</operator>
+		<call><name>contain_volatile_functions</name><argument_list>(<argument><expr><name>other</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>false</name></expr>;</return></block_content></block></if></if_stmt>
+
+	<return>return <expr><name>true</name></expr>;</return>				<comment type="block">/* success */</comment>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Check to see if a RestrictInfo is of the form
+ *		CTID = ANY (pseudoconstant_array)
+ * where the CTID Var belongs to relation "rel", and nothing on the
+ * other side of the clause does.
+ */</comment>
+<function><type><specifier>static</specifier> <name>bool</name></type>
+<name>IsTidEqualAnyClause</name><parameter_list>(<parameter><decl><type><name>PlannerInfo</name> <modifier>*</modifier></type><name>root</name></decl></parameter>, <parameter><decl><type><name>RestrictInfo</name> <modifier>*</modifier></type><name>rinfo</name></decl></parameter>, <parameter><decl><type><name>RelOptInfo</name> <modifier>*</modifier></type><name>rel</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>ScalarArrayOpExpr</name> <modifier>*</modifier></type><name>node</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Node</name>	   <modifier>*</modifier></type><name>arg1</name></decl>,
+			   <decl><type ref="prev"><modifier>*</modifier></type><name>arg2</name></decl>;</decl_stmt>
+
+	<comment type="block">/* Must be a ScalarArrayOpExpr */</comment>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><operator>(</operator><name><name>rinfo</name><operator>-&gt;</operator><name>clause</name></name> <operator>&amp;&amp;</operator> <call><name>IsA</name><argument_list>(<argument><expr><name><name>rinfo</name><operator>-&gt;</operator><name>clause</name></name></expr></argument>, <argument><expr><name>ScalarArrayOpExpr</name></expr></argument>)</argument_list></call><operator>)</operator></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>false</name></expr>;</return></block_content></block></if></if_stmt>
+	<expr_stmt><expr><name>node</name> <operator>=</operator> <operator>(</operator><name>ScalarArrayOpExpr</name> <operator>*</operator><operator>)</operator> <name><name>rinfo</name><operator>-&gt;</operator><name>clause</name></name></expr>;</expr_stmt>
+
+	<comment type="block">/* Operator must be tideq */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>node</name><operator>-&gt;</operator><name>opno</name></name> <operator>!=</operator> <name>TIDEqualOperator</name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>false</name></expr>;</return></block_content></block></if></if_stmt>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><name><name>node</name><operator>-&gt;</operator><name>useOr</name></name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>false</name></expr>;</return></block_content></block></if></if_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>list_length</name><argument_list>(<argument><expr><name><name>node</name><operator>-&gt;</operator><name>args</name></name></expr></argument>)</argument_list></call> <operator>==</operator> <literal type="number">2</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>arg1</name> <operator>=</operator> <call><name>linitial</name><argument_list>(<argument><expr><name><name>node</name><operator>-&gt;</operator><name>args</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>arg2</name> <operator>=</operator> <call><name>lsecond</name><argument_list>(<argument><expr><name><name>node</name><operator>-&gt;</operator><name>args</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* CTID must be first argument */</comment>
+	<if_stmt><if>if <condition>(<expr><name>arg1</name> <operator>&amp;&amp;</operator> <call><name>IsA</name><argument_list>(<argument><expr><name>arg1</name></expr></argument>, <argument><expr><name>Var</name></expr></argument>)</argument_list></call> <operator>&amp;&amp;</operator>
+		<call><name>IsCTIDVar</name><argument_list>(<argument><expr><operator>(</operator><name>Var</name> <operator>*</operator><operator>)</operator> <name>arg1</name></expr></argument>, <argument><expr><name>rel</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* The other argument must be a pseudoconstant */</comment>
+		<if_stmt><if>if <condition>(<expr><call><name>bms_is_member</name><argument_list>(<argument><expr><name><name>rel</name><operator>-&gt;</operator><name>relid</name></name></expr></argument>, <argument><expr><call><name>pull_varnos</name><argument_list>(<argument><expr><name>root</name></expr></argument>, <argument><expr><name>arg2</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call> <operator>||</operator>
+			<call><name>contain_volatile_functions</name><argument_list>(<argument><expr><name>arg2</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<return>return <expr><name>false</name></expr>;</return></block_content></block></if></if_stmt>
+
+		<return>return <expr><name>true</name></expr>;</return>			<comment type="block">/* success */</comment>
+	</block_content>}</block></if></if_stmt>
+
+	<return>return <expr><name>false</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Check to see if a RestrictInfo is a CurrentOfExpr referencing "rel".
+ */</comment>
+<function><type><specifier>static</specifier> <name>bool</name></type>
+<name>IsCurrentOfClause</name><parameter_list>(<parameter><decl><type><name>RestrictInfo</name> <modifier>*</modifier></type><name>rinfo</name></decl></parameter>, <parameter><decl><type><name>RelOptInfo</name> <modifier>*</modifier></type><name>rel</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>CurrentOfExpr</name> <modifier>*</modifier></type><name>node</name></decl>;</decl_stmt>
+
+	<comment type="block">/* Must be a CurrentOfExpr */</comment>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><operator>(</operator><name><name>rinfo</name><operator>-&gt;</operator><name>clause</name></name> <operator>&amp;&amp;</operator> <call><name>IsA</name><argument_list>(<argument><expr><name><name>rinfo</name><operator>-&gt;</operator><name>clause</name></name></expr></argument>, <argument><expr><name>CurrentOfExpr</name></expr></argument>)</argument_list></call><operator>)</operator></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>false</name></expr>;</return></block_content></block></if></if_stmt>
+	<expr_stmt><expr><name>node</name> <operator>=</operator> <operator>(</operator><name>CurrentOfExpr</name> <operator>*</operator><operator>)</operator> <name><name>rinfo</name><operator>-&gt;</operator><name>clause</name></name></expr>;</expr_stmt>
+
+	<comment type="block">/* If it references this rel, we're good */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>node</name><operator>-&gt;</operator><name>cvarno</name></name> <operator>==</operator> <name><name>rel</name><operator>-&gt;</operator><name>relid</name></name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>true</name></expr>;</return></block_content></block></if></if_stmt>
+
+	<return>return <expr><name>false</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Extract a set of CTID conditions from the given RestrictInfo
+ *
+ * Returns a List of CTID qual RestrictInfos for the specified rel (with
+ * implicit OR semantics across the list), or NIL if there are no usable
+ * conditions.
+ *
+ * This function considers only base cases; AND/OR combination is handled
+ * below.  Therefore the returned List never has more than one element.
+ * (Using a List may seem a bit weird, but it simplifies the caller.)
+ */</comment>
+<function><type><specifier>static</specifier> <name>List</name> <modifier>*</modifier></type>
+<name>TidQualFromRestrictInfo</name><parameter_list>(<parameter><decl><type><name>PlannerInfo</name> <modifier>*</modifier></type><name>root</name></decl></parameter>, <parameter><decl><type><name>RestrictInfo</name> <modifier>*</modifier></type><name>rinfo</name></decl></parameter>, <parameter><decl><type><name>RelOptInfo</name> <modifier>*</modifier></type><name>rel</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<comment type="block">/*
+	 * We may ignore pseudoconstant clauses (they can't contain Vars, so could
+	 * not match anyway).
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>rinfo</name><operator>-&gt;</operator><name>pseudoconstant</name></name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>NIL</name></expr>;</return></block_content></block></if></if_stmt>
+
+	<comment type="block">/*
+	 * If clause must wait till after some lower-security-level restriction
+	 * clause, reject it.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>restriction_is_securely_promotable</name><argument_list>(<argument><expr><name>rinfo</name></expr></argument>, <argument><expr><name>rel</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>NIL</name></expr>;</return></block_content></block></if></if_stmt>
+
+	<comment type="block">/*
+	 * Check all base cases.  If we get a match, return the clause.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><call><name>IsTidEqualClause</name><argument_list>(<argument><expr><name>rinfo</name></expr></argument>, <argument><expr><name>rel</name></expr></argument>)</argument_list></call> <operator>||</operator>
+		<call><name>IsTidEqualAnyClause</name><argument_list>(<argument><expr><name>root</name></expr></argument>, <argument><expr><name>rinfo</name></expr></argument>, <argument><expr><name>rel</name></expr></argument>)</argument_list></call> <operator>||</operator>
+		<call><name>IsCurrentOfClause</name><argument_list>(<argument><expr><name>rinfo</name></expr></argument>, <argument><expr><name>rel</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><call><name>list_make1</name><argument_list>(<argument><expr><name>rinfo</name></expr></argument>)</argument_list></call></expr>;</return></block_content></block></if></if_stmt>
+
+	<return>return <expr><name>NIL</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Extract a set of CTID conditions from implicit-AND List of RestrictInfos
+ *
+ * Returns a List of CTID qual RestrictInfos for the specified rel (with
+ * implicit OR semantics across the list), or NIL if there are no usable
+ * conditions.
+ *
+ * This function is just concerned with handling AND/OR recursion.
+ */</comment>
+<function><type><specifier>static</specifier> <name>List</name> <modifier>*</modifier></type>
+<name>TidQualFromRestrictInfoList</name><parameter_list>(<parameter><decl><type><name>PlannerInfo</name> <modifier>*</modifier></type><name>root</name></decl></parameter>, <parameter><decl><type><name>List</name> <modifier>*</modifier></type><name>rlist</name></decl></parameter>, <parameter><decl><type><name>RelOptInfo</name> <modifier>*</modifier></type><name>rel</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>List</name>	   <modifier>*</modifier></type><name>rlst</name> <init>= <expr><name>NIL</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>ListCell</name>   <modifier>*</modifier></type><name>l</name></decl>;</decl_stmt>
+
+	<macro><name>foreach</name><argument_list>(<argument>l</argument>, <argument>rlist</argument>)</argument_list></macro>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>RestrictInfo</name> <modifier>*</modifier></type><name>rinfo</name> <init>= <expr><call><name>lfirst_node</name><argument_list>(<argument><expr><name>RestrictInfo</name></expr></argument>, <argument><expr><name>l</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+		<if_stmt><if>if <condition>(<expr><call><name>restriction_is_or_clause</name><argument_list>(<argument><expr><name>rinfo</name></expr></argument>)</argument_list></call></expr>)</condition>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>ListCell</name>   <modifier>*</modifier></type><name>j</name></decl>;</decl_stmt>
+
+			<comment type="block">/*
+			 * We must be able to extract a CTID condition from every
+			 * sub-clause of an OR, or we can't use it.
+			 */</comment>
+			<macro><name>foreach</name><argument_list>(<argument>j</argument>, <argument>((BoolExpr *) rinfo-&gt;orclause)-&gt;args</argument>)</argument_list></macro>
+			<block>{<block_content>
+				<decl_stmt><decl><type><name>Node</name>	   <modifier>*</modifier></type><name>orarg</name> <init>= <expr><operator>(</operator><name>Node</name> <operator>*</operator><operator>)</operator> <call><name>lfirst</name><argument_list>(<argument><expr><name>j</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+				<decl_stmt><decl><type><name>List</name>	   <modifier>*</modifier></type><name>sublist</name></decl>;</decl_stmt>
+
+				<comment type="block">/* OR arguments should be ANDs or sub-RestrictInfos */</comment>
+				<if_stmt><if>if <condition>(<expr><call><name>is_andclause</name><argument_list>(<argument><expr><name>orarg</name></expr></argument>)</argument_list></call></expr>)</condition>
+				<block>{<block_content>
+					<decl_stmt><decl><type><name>List</name>	   <modifier>*</modifier></type><name>andargs</name> <init>= <expr><operator>(</operator><operator>(</operator><name>BoolExpr</name> <operator>*</operator><operator>)</operator> <name>orarg</name><operator>)</operator><operator>-&gt;</operator><name>args</name></expr></init></decl>;</decl_stmt>
+
+					<comment type="block">/* Recurse in case there are sub-ORs */</comment>
+					<expr_stmt><expr><name>sublist</name> <operator>=</operator> <call><name>TidQualFromRestrictInfoList</name><argument_list>(<argument><expr><name>root</name></expr></argument>, <argument><expr><name>andargs</name></expr></argument>, <argument><expr><name>rel</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				</block_content>}</block></if>
+				<else>else
+				<block>{<block_content>
+					<decl_stmt><decl><type><name>RestrictInfo</name> <modifier>*</modifier></type><name>rinfo</name> <init>= <expr><call><name>castNode</name><argument_list>(<argument><expr><name>RestrictInfo</name></expr></argument>, <argument><expr><name>orarg</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+					<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><operator>!</operator><call><name>restriction_is_or_clause</name><argument_list>(<argument><expr><name>rinfo</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+					<expr_stmt><expr><name>sublist</name> <operator>=</operator> <call><name>TidQualFromRestrictInfo</name><argument_list>(<argument><expr><name>root</name></expr></argument>, <argument><expr><name>rinfo</name></expr></argument>, <argument><expr><name>rel</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				</block_content>}</block></else></if_stmt>
+
+				<comment type="block">/*
+				 * If nothing found in this arm, we can't do anything with
+				 * this OR clause.
+				 */</comment>
+				<if_stmt><if>if <condition>(<expr><name>sublist</name> <operator>==</operator> <name>NIL</name></expr>)</condition>
+				<block>{<block_content>
+					<expr_stmt><expr><name>rlst</name> <operator>=</operator> <name>NIL</name></expr>;</expr_stmt> <comment type="block">/* forget anything we had */</comment>
+					<break>break;</break>		<comment type="block">/* out of loop over OR args */</comment>
+				</block_content>}</block></if></if_stmt>
+
+				<comment type="block">/*
+				 * OK, continue constructing implicitly-OR'ed result list.
+				 */</comment>
+				<expr_stmt><expr><name>rlst</name> <operator>=</operator> <call><name>list_concat</name><argument_list>(<argument><expr><name>rlst</name></expr></argument>, <argument><expr><name>sublist</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			</block_content>}</block>
+		</block_content>}</block></if>
+		<else>else
+		<block>{<block_content>
+			<comment type="block">/* Not an OR clause, so handle base cases */</comment>
+			<expr_stmt><expr><name>rlst</name> <operator>=</operator> <call><name>TidQualFromRestrictInfo</name><argument_list>(<argument><expr><name>root</name></expr></argument>, <argument><expr><name>rinfo</name></expr></argument>, <argument><expr><name>rel</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></else></if_stmt>
+
+		<comment type="block">/*
+		 * Stop as soon as we find any usable CTID condition.  In theory we
+		 * could get CTID equality conditions from different AND'ed clauses,
+		 * in which case we could try to pick the most efficient one.  In
+		 * practice, such usage seems very unlikely, so we don't bother; we
+		 * just exit as soon as we find the first candidate.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><name>rlst</name></expr>)</condition><block type="pseudo"><block_content>
+			<break>break;</break></block_content></block></if></if_stmt>
+	</block_content>}</block>
+
+	<return>return <expr><name>rlst</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Given a list of join clauses involving our rel, create a parameterized
+ * TidPath for each one that is a suitable TidEqual clause.
+ *
+ * In principle we could combine clauses that reference the same outer rels,
+ * but it doesn't seem like such cases would arise often enough to be worth
+ * troubling over.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>BuildParameterizedTidPaths</name><parameter_list>(<parameter><decl><type><name>PlannerInfo</name> <modifier>*</modifier></type><name>root</name></decl></parameter>, <parameter><decl><type><name>RelOptInfo</name> <modifier>*</modifier></type><name>rel</name></decl></parameter>, <parameter><decl><type><name>List</name> <modifier>*</modifier></type><name>clauses</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>ListCell</name>   <modifier>*</modifier></type><name>l</name></decl>;</decl_stmt>
+
+	<macro><name>foreach</name><argument_list>(<argument>l</argument>, <argument>clauses</argument>)</argument_list></macro>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>RestrictInfo</name> <modifier>*</modifier></type><name>rinfo</name> <init>= <expr><call><name>lfirst_node</name><argument_list>(<argument><expr><name>RestrictInfo</name></expr></argument>, <argument><expr><name>l</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>List</name>	   <modifier>*</modifier></type><name>tidquals</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>Relids</name></type>		<name>required_outer</name></decl>;</decl_stmt>
+
+		<comment type="block">/*
+		 * Validate whether each clause is actually usable; we must check this
+		 * even when examining clauses generated from an EquivalenceClass,
+		 * since they might not satisfy the restriction on not having Vars of
+		 * our rel on the other side, or somebody might've built an operator
+		 * class that accepts type "tid" but has other operators in it.
+		 *
+		 * We currently consider only TidEqual join clauses.  In principle we
+		 * might find a suitable ScalarArrayOpExpr in the rel's joininfo list,
+		 * but it seems unlikely to be worth expending the cycles to check.
+		 * And we definitely won't find a CurrentOfExpr here.  Hence, we don't
+		 * use TidQualFromRestrictInfo; but this must match that function
+		 * otherwise.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><name><name>rinfo</name><operator>-&gt;</operator><name>pseudoconstant</name></name> <operator>||</operator>
+			<operator>!</operator><call><name>restriction_is_securely_promotable</name><argument_list>(<argument><expr><name>rinfo</name></expr></argument>, <argument><expr><name>rel</name></expr></argument>)</argument_list></call> <operator>||</operator>
+			<operator>!</operator><call><name>IsTidEqualClause</name><argument_list>(<argument><expr><name>rinfo</name></expr></argument>, <argument><expr><name>rel</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<continue>continue;</continue></block_content></block></if></if_stmt>
+
+		<comment type="block">/*
+		 * Check if clause can be moved to this rel; this is probably
+		 * redundant when considering EC-derived clauses, but we must check it
+		 * for "loose" join clauses.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>join_clause_is_movable_to</name><argument_list>(<argument><expr><name>rinfo</name></expr></argument>, <argument><expr><name>rel</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<continue>continue;</continue></block_content></block></if></if_stmt>
+
+		<comment type="block">/* OK, make list of clauses for this path */</comment>
+		<expr_stmt><expr><name>tidquals</name> <operator>=</operator> <call><name>list_make1</name><argument_list>(<argument><expr><name>rinfo</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/* Compute required outer rels for this path */</comment>
+		<expr_stmt><expr><name>required_outer</name> <operator>=</operator> <call><name>bms_union</name><argument_list>(<argument><expr><name><name>rinfo</name><operator>-&gt;</operator><name>required_relids</name></name></expr></argument>, <argument><expr><name><name>rel</name><operator>-&gt;</operator><name>lateral_relids</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name>required_outer</name> <operator>=</operator> <call><name>bms_del_member</name><argument_list>(<argument><expr><name>required_outer</name></expr></argument>, <argument><expr><name><name>rel</name><operator>-&gt;</operator><name>relid</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><call><name>add_path</name><argument_list>(<argument><expr><name>rel</name></expr></argument>, <argument><expr><operator>(</operator><name>Path</name> <operator>*</operator><operator>)</operator> <call><name>create_tidscan_path</name><argument_list>(<argument><expr><name>root</name></expr></argument>, <argument><expr><name>rel</name></expr></argument>, <argument><expr><name>tidquals</name></expr></argument>,
+												   <argument><expr><name>required_outer</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Test whether an EquivalenceClass member matches our rel's CTID Var.
+ *
+ * This is a callback for use by generate_implied_equalities_for_column.
+ */</comment>
+<function><type><specifier>static</specifier> <name>bool</name></type>
+<name>ec_member_matches_ctid</name><parameter_list>(<parameter><decl><type><name>PlannerInfo</name> <modifier>*</modifier></type><name>root</name></decl></parameter>, <parameter><decl><type><name>RelOptInfo</name> <modifier>*</modifier></type><name>rel</name></decl></parameter>,
+					   <parameter><decl><type><name>EquivalenceClass</name> <modifier>*</modifier></type><name>ec</name></decl></parameter>, <parameter><decl><type><name>EquivalenceMember</name> <modifier>*</modifier></type><name>em</name></decl></parameter>,
+					   <parameter><decl><type><name>void</name> <modifier>*</modifier></type><name>arg</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<if_stmt><if>if <condition>(<expr><name><name>em</name><operator>-&gt;</operator><name>em_expr</name></name> <operator>&amp;&amp;</operator> <call><name>IsA</name><argument_list>(<argument><expr><name><name>em</name><operator>-&gt;</operator><name>em_expr</name></name></expr></argument>, <argument><expr><name>Var</name></expr></argument>)</argument_list></call> <operator>&amp;&amp;</operator>
+		<call><name>IsCTIDVar</name><argument_list>(<argument><expr><operator>(</operator><name>Var</name> <operator>*</operator><operator>)</operator> <name><name>em</name><operator>-&gt;</operator><name>em_expr</name></name></expr></argument>, <argument><expr><name>rel</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>true</name></expr>;</return></block_content></block></if></if_stmt>
+	<return>return <expr><name>false</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * create_tidscan_paths
+ *	  Create paths corresponding to direct TID scans of the given rel.
+ *
+ *	  Candidate paths are added to the rel's pathlist (using add_path).
+ */</comment>
+<function><type><name>void</name></type>
+<name>create_tidscan_paths</name><parameter_list>(<parameter><decl><type><name>PlannerInfo</name> <modifier>*</modifier></type><name>root</name></decl></parameter>, <parameter><decl><type><name>RelOptInfo</name> <modifier>*</modifier></type><name>rel</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>List</name>	   <modifier>*</modifier></type><name>tidquals</name></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * If any suitable quals exist in the rel's baserestrict list, generate a
+	 * plain (unparameterized) TidPath with them.
+	 */</comment>
+	<expr_stmt><expr><name>tidquals</name> <operator>=</operator> <call><name>TidQualFromRestrictInfoList</name><argument_list>(<argument><expr><name>root</name></expr></argument>, <argument><expr><name><name>rel</name><operator>-&gt;</operator><name>baserestrictinfo</name></name></expr></argument>, <argument><expr><name>rel</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>tidquals</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/*
+		 * This path uses no join clauses, but it could still have required
+		 * parameterization due to LATERAL refs in its tlist.
+		 */</comment>
+		<decl_stmt><decl><type><name>Relids</name></type>		<name>required_outer</name> <init>= <expr><name><name>rel</name><operator>-&gt;</operator><name>lateral_relids</name></name></expr></init></decl>;</decl_stmt>
+
+		<expr_stmt><expr><call><name>add_path</name><argument_list>(<argument><expr><name>rel</name></expr></argument>, <argument><expr><operator>(</operator><name>Path</name> <operator>*</operator><operator>)</operator> <call><name>create_tidscan_path</name><argument_list>(<argument><expr><name>root</name></expr></argument>, <argument><expr><name>rel</name></expr></argument>, <argument><expr><name>tidquals</name></expr></argument>,
+												   <argument><expr><name>required_outer</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/*
+	 * Try to generate parameterized TidPaths using equality clauses extracted
+	 * from EquivalenceClasses.  (This is important since simple "t1.ctid =
+	 * t2.ctid" clauses will turn into ECs.)
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>rel</name><operator>-&gt;</operator><name>has_eclass_joins</name></name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>List</name>	   <modifier>*</modifier></type><name>clauses</name></decl>;</decl_stmt>
+
+		<comment type="block">/* Generate clauses, skipping any that join to lateral_referencers */</comment>
+		<expr_stmt><expr><name>clauses</name> <operator>=</operator> <call><name>generate_implied_equalities_for_column</name><argument_list>(<argument><expr><name>root</name></expr></argument>,
+														 <argument><expr><name>rel</name></expr></argument>,
+														 <argument><expr><name>ec_member_matches_ctid</name></expr></argument>,
+														 <argument><expr><name>NULL</name></expr></argument>,
+														 <argument><expr><name><name>rel</name><operator>-&gt;</operator><name>lateral_referencers</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/* Generate a path for each usable join clause */</comment>
+		<expr_stmt><expr><call><name>BuildParameterizedTidPaths</name><argument_list>(<argument><expr><name>root</name></expr></argument>, <argument><expr><name>rel</name></expr></argument>, <argument><expr><name>clauses</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/*
+	 * Also consider parameterized TidPaths using "loose" join quals.  Quals
+	 * of the form "t1.ctid = t2.ctid" would turn into these if they are outer
+	 * join quals, for example.
+	 */</comment>
+	<expr_stmt><expr><call><name>BuildParameterizedTidPaths</name><argument_list>(<argument><expr><name>root</name></expr></argument>, <argument><expr><name>rel</name></expr></argument>, <argument><expr><name><name>rel</name><operator>-&gt;</operator><name>joininfo</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+</unit>

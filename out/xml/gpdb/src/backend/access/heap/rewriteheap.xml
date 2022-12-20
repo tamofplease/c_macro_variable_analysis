@@ -1,0 +1,1321 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<unit xmlns="http://www.srcML.org/srcML/src" xmlns:cpp="http://www.srcML.org/srcML/cpp" revision="1.0.0" language="C" filename="/cloned_projects/gpdb/src/backend/access/heap/rewriteheap.c"><comment type="block">/*-------------------------------------------------------------------------
+ *
+ * rewriteheap.c
+ *	  Support functions to rewrite tables.
+ *
+ * These functions provide a facility to completely rewrite a heap, while
+ * preserving visibility information and update chains.
+ *
+ * INTERFACE
+ *
+ * The caller is responsible for creating the new heap, all catalog
+ * changes, supplying the tuples to be written to the new heap, and
+ * rebuilding indexes.  The caller must hold AccessExclusiveLock on the
+ * target table, because we assume no one else is writing into it.
+ *
+ * To use the facility:
+ *
+ * begin_heap_rewrite
+ * while (fetch next tuple)
+ * {
+ *	   if (tuple is dead)
+ *		   rewrite_heap_dead_tuple
+ *	   else
+ *	   {
+ *		   // do any transformations here if required
+ *		   rewrite_heap_tuple
+ *	   }
+ * }
+ * end_heap_rewrite
+ *
+ * The contents of the new relation shouldn't be relied on until after
+ * end_heap_rewrite is called.
+ *
+ *
+ * IMPLEMENTATION
+ *
+ * This would be a fairly trivial affair, except that we need to maintain
+ * the ctid chains that link versions of an updated tuple together.
+ * Since the newly stored tuples will have tids different from the original
+ * ones, if we just copied t_ctid fields to the new table the links would
+ * be wrong.  When we are required to copy a (presumably recently-dead or
+ * delete-in-progress) tuple whose ctid doesn't point to itself, we have
+ * to substitute the correct ctid instead.
+ *
+ * For each ctid reference from A -&gt; B, we might encounter either A first
+ * or B first.  (Note that a tuple in the middle of a chain is both A and B
+ * of different pairs.)
+ *
+ * If we encounter A first, we'll store the tuple in the unresolved_tups
+ * hash table. When we later encounter B, we remove A from the hash table,
+ * fix the ctid to point to the new location of B, and insert both A and B
+ * to the new heap.
+ *
+ * If we encounter B first, we can insert B to the new heap right away.
+ * We then add an entry to the old_new_tid_map hash table showing B's
+ * original tid (in the old heap) and new tid (in the new heap).
+ * When we later encounter A, we get the new location of B from the table,
+ * and can write A immediately with the correct ctid.
+ *
+ * Entries in the hash tables can be removed as soon as the later tuple
+ * is encountered.  That helps to keep the memory usage down.  At the end,
+ * both tables are usually empty; we should have encountered both A and B
+ * of each pair.  However, it's possible for A to be RECENTLY_DEAD and B
+ * entirely DEAD according to HeapTupleSatisfiesVacuum, because the test
+ * for deadness using OldestXmin is not exact.  In such a case we might
+ * encounter B first, and skip it, and find A later.  Then A would be added
+ * to unresolved_tups, and stay there until end of the rewrite.  Since
+ * this case is very unusual, we don't worry about the memory usage.
+ *
+ * Using in-memory hash tables means that we use some memory for each live
+ * update chain in the table, from the time we find one end of the
+ * reference until we find the other end.  That shouldn't be a problem in
+ * practice, but if you do something like an UPDATE without a where-clause
+ * on a large table, and then run CLUSTER in the same transaction, you
+ * could run out of memory.  It doesn't seem worthwhile to add support for
+ * spill-to-disk, as there shouldn't be that many RECENTLY_DEAD tuples in a
+ * table under normal circumstances.  Furthermore, in the typical scenario
+ * of CLUSTERing on an unchanging key column, we'll see all the versions
+ * of a given tuple together anyway, and so the peak memory usage is only
+ * proportional to the number of RECENTLY_DEAD versions of a single row, not
+ * in the whole table.  Note that if we do fail halfway through a CLUSTER,
+ * the old table is still valid, so failure is not catastrophic.
+ *
+ * We can't use the normal heap_insert function to insert into the new
+ * heap, because heap_insert overwrites the visibility information.
+ * We use a special-purpose raw_heap_insert function instead, which
+ * is optimized for bulk inserting a lot of tuples, knowing that we have
+ * exclusive access to the heap.  raw_heap_insert builds new pages in
+ * local storage.  When a page is full, or at the end of the process,
+ * we insert it to WAL as a single record and then write it to disk
+ * directly through smgr.  Note, however, that any data sent to the new
+ * heap's TOAST table will go through the normal bufmgr.
+ *
+ *
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1994-5, Regents of the University of California
+ *
+ * IDENTIFICATION
+ *	  src/backend/access/heap/rewriteheap.c
+ *
+ *-------------------------------------------------------------------------
+ */</comment>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"postgres.h"</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;sys/stat.h&gt;</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;unistd.h&gt;</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"miscadmin.h"</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/heapam.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/heapam_xlog.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/rewriteheap.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/transam.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/tuptoaster.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/xact.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/xloginsert.h"</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/catalog.h"</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"lib/ilist.h"</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"pgstat.h"</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"replication/logical.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"replication/slot.h"</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/bufmgr.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/fd.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/smgr.h"</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/memutils.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/rel.h"</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/procarray.h"</cpp:file></cpp:include>
+
+<comment type="block">/*
+ * State associated with a rewrite operation. This is opaque to the user
+ * of the rewrite facility.
+ */</comment>
+<typedef>typedef <type><struct>struct <name>RewriteStateData</name>
+<block>{
+	<decl_stmt><decl><type><name>Relation</name></type>	<name>rs_old_rel</name></decl>;</decl_stmt>		<comment type="block">/* source heap */</comment>
+	<decl_stmt><decl><type><name>Relation</name></type>	<name>rs_new_rel</name></decl>;</decl_stmt>		<comment type="block">/* destination heap */</comment>
+	<decl_stmt><decl><type><name>Page</name></type>		<name>rs_buffer</name></decl>;</decl_stmt>		<comment type="block">/* page currently being built */</comment>
+	<decl_stmt><decl><type><name>BlockNumber</name></type> <name>rs_blockno</name></decl>;</decl_stmt>		<comment type="block">/* block where page will go */</comment>
+	<decl_stmt><decl><type><name>bool</name></type>		<name>rs_buffer_valid</name></decl>;</decl_stmt>	<comment type="block">/* T if any tuples in buffer */</comment>
+	<decl_stmt><decl><type><name>bool</name></type>		<name>rs_use_wal</name></decl>;</decl_stmt>		<comment type="block">/* must we WAL-log inserts? */</comment>
+	<decl_stmt><decl><type><name>bool</name></type>		<name>rs_logical_rewrite</name></decl>;</decl_stmt> <comment type="block">/* do we need to do logical rewriting */</comment>
+	<decl_stmt><decl><type><name>TransactionId</name></type> <name>rs_oldest_xmin</name></decl>;</decl_stmt>	<comment type="block">/* oldest xmin used by caller to determine
+									 * tuple visibility */</comment>
+	<decl_stmt><decl><type><name>TransactionId</name></type> <name>rs_freeze_xid</name></decl>;</decl_stmt>	<comment type="block">/* Xid that will be used as freeze cutoff
+									 * point */</comment>
+	<decl_stmt><decl><type><name>TransactionId</name></type> <name>rs_logical_xmin</name></decl>;</decl_stmt>	<comment type="block">/* Xid that will be used as cutoff point
+									 * for logical rewrites */</comment>
+	<decl_stmt><decl><type><name>MultiXactId</name></type> <name>rs_cutoff_multi</name></decl>;</decl_stmt>	<comment type="block">/* MultiXactId that will be used as cutoff
+									 * point for multixacts */</comment>
+	<decl_stmt><decl><type><name>MemoryContext</name></type> <name>rs_cxt</name></decl>;</decl_stmt>		<comment type="block">/* for hash tables and entries and tuples in
+								 * them */</comment>
+	<decl_stmt><decl><type><name>XLogRecPtr</name></type>	<name>rs_begin_lsn</name></decl>;</decl_stmt>	<comment type="block">/* XLogInsertLsn when starting the rewrite */</comment>
+	<decl_stmt><decl><type><name>HTAB</name>	   <modifier>*</modifier></type><name>rs_unresolved_tups</name></decl>;</decl_stmt> <comment type="block">/* unmatched A tuples */</comment>
+	<decl_stmt><decl><type><name>HTAB</name>	   <modifier>*</modifier></type><name>rs_old_new_tid_map</name></decl>;</decl_stmt> <comment type="block">/* unmatched B tuples */</comment>
+	<decl_stmt><decl><type><name>HTAB</name>	   <modifier>*</modifier></type><name>rs_logical_mappings</name></decl>;</decl_stmt>	<comment type="block">/* logical remapping files */</comment>
+	<decl_stmt><decl><type><name>uint32</name></type>		<name>rs_num_rewrite_mappings</name></decl>;</decl_stmt>	<comment type="block">/* # in memory mappings */</comment>
+}</block></struct></type>			<name>RewriteStateData</name>;</typedef>
+
+<comment type="block">/*
+ * The lookup keys for the hash tables are tuple TID and xmin (we must check
+ * both to avoid false matches from dead tuples).  Beware that there is
+ * probably some padding space in this struct; it must be zeroed out for
+ * correct hashtable operation.
+ */</comment>
+<typedef>typedef <type><struct>struct
+<block>{
+	<decl_stmt><decl><type><name>TransactionId</name></type> <name>xmin</name></decl>;</decl_stmt>			<comment type="block">/* tuple xmin */</comment>
+	<decl_stmt><decl><type><name>ItemPointerData</name></type> <name>tid</name></decl>;</decl_stmt>		<comment type="block">/* tuple location in old heap */</comment>
+}</block></struct></type> <name>TidHashKey</name>;</typedef>
+
+<comment type="block">/*
+ * Entry structures for the hash tables
+ */</comment>
+<typedef>typedef <type><struct>struct
+<block>{
+	<decl_stmt><decl><type><name>TidHashKey</name></type>	<name>key</name></decl>;</decl_stmt>			<comment type="block">/* expected xmin/old location of B tuple */</comment>
+	<decl_stmt><decl><type><name>ItemPointerData</name></type> <name>old_tid</name></decl>;</decl_stmt>	<comment type="block">/* A's location in the old heap */</comment>
+	<decl_stmt><decl><type><name>HeapTuple</name></type>	<name>tuple</name></decl>;</decl_stmt>			<comment type="block">/* A's tuple contents */</comment>
+}</block></struct></type> <name>UnresolvedTupData</name>;</typedef>
+
+<typedef>typedef <type><name>UnresolvedTupData</name> <modifier>*</modifier></type><name>UnresolvedTup</name>;</typedef>
+
+<typedef>typedef <type><struct>struct
+<block>{
+	<decl_stmt><decl><type><name>TidHashKey</name></type>	<name>key</name></decl>;</decl_stmt>			<comment type="block">/* actual xmin/old location of B tuple */</comment>
+	<decl_stmt><decl><type><name>ItemPointerData</name></type> <name>new_tid</name></decl>;</decl_stmt>	<comment type="block">/* where we put it in the new heap */</comment>
+}</block></struct></type> <name>OldToNewMappingData</name>;</typedef>
+
+<typedef>typedef <type><name>OldToNewMappingData</name> <modifier>*</modifier></type><name>OldToNewMapping</name>;</typedef>
+
+<comment type="block">/*
+ * In-Memory data for an xid that might need logical remapping entries
+ * to be logged.
+ */</comment>
+<typedef>typedef <type><struct>struct <name>RewriteMappingFile</name>
+<block>{
+	<decl_stmt><decl><type><name>TransactionId</name></type> <name>xid</name></decl>;</decl_stmt>			<comment type="block">/* xid that might need to see the row */</comment>
+	<decl_stmt><decl><type><name>int</name></type>			<name>vfd</name></decl>;</decl_stmt>			<comment type="block">/* fd of mappings file */</comment>
+	<decl_stmt><decl><type><name>off_t</name></type>		<name>off</name></decl>;</decl_stmt>			<comment type="block">/* how far have we written yet */</comment>
+	<decl_stmt><decl><type><name>uint32</name></type>		<name>num_mappings</name></decl>;</decl_stmt>	<comment type="block">/* number of in-memory mappings */</comment>
+	<decl_stmt><decl><type><name>dlist_head</name></type>	<name>mappings</name></decl>;</decl_stmt>		<comment type="block">/* list of in-memory mappings */</comment>
+	<decl_stmt><decl><type><name>char</name></type>		<name><name>path</name><index>[<expr><name>MAXPGPATH</name></expr>]</index></name></decl>;</decl_stmt>	<comment type="block">/* path, for error messages */</comment>
+}</block></struct></type> <name>RewriteMappingFile</name>;</typedef>
+
+<comment type="block">/*
+ * A single In-Memory logical rewrite mapping, hanging off
+ * RewriteMappingFile-&gt;mappings.
+ */</comment>
+<typedef>typedef <type><struct>struct <name>RewriteMappingDataEntry</name>
+<block>{
+	<decl_stmt><decl><type><name>LogicalRewriteMappingData</name></type> <name>map</name></decl>;</decl_stmt>	<comment type="block">/* map between old and new location of the
+									 * tuple */</comment>
+	<decl_stmt><decl><type><name>dlist_node</name></type>	<name>node</name></decl>;</decl_stmt>
+}</block></struct></type> <name>RewriteMappingDataEntry</name>;</typedef>
+
+
+<comment type="block">/* prototypes for internal functions */</comment>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>raw_heap_insert</name><parameter_list>(<parameter><decl><type><name>RewriteState</name></type> <name>state</name></decl></parameter>, <parameter><decl><type><name>HeapTuple</name></type> <name>tup</name></decl></parameter>)</parameter_list>;</function_decl>
+
+<comment type="block">/* internal logical remapping prototypes */</comment>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>logical_begin_heap_rewrite</name><parameter_list>(<parameter><decl><type><name>RewriteState</name></type> <name>state</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>logical_rewrite_heap_tuple</name><parameter_list>(<parameter><decl><type><name>RewriteState</name></type> <name>state</name></decl></parameter>, <parameter><decl><type><name>ItemPointerData</name></type> <name>old_tid</name></decl></parameter>, <parameter><decl><type><name>HeapTuple</name></type> <name>new_tuple</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>logical_end_heap_rewrite</name><parameter_list>(<parameter><decl><type><name>RewriteState</name></type> <name>state</name></decl></parameter>)</parameter_list>;</function_decl>
+
+
+<comment type="block">/*
+ * Begin a rewrite of a table
+ *
+ * old_heap		old, locked heap relation tuples will be read from
+ * new_heap		new, locked heap relation to insert tuples to
+ * oldest_xmin	xid used by the caller to determine which tuples are dead
+ * freeze_xid	xid before which tuples will be frozen
+ * min_multi	multixact before which multis will be removed
+ * use_wal		should the inserts to the new heap be WAL-logged?
+ *
+ * Returns an opaque RewriteState, allocated in current memory context,
+ * to be used in subsequent calls to the other functions.
+ */</comment>
+<function><type><name>RewriteState</name></type>
+<name>begin_heap_rewrite</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>old_heap</name></decl></parameter>, <parameter><decl><type><name>Relation</name></type> <name>new_heap</name></decl></parameter>, <parameter><decl><type><name>TransactionId</name></type> <name>oldest_xmin</name></decl></parameter>,
+				   <parameter><decl><type><name>TransactionId</name></type> <name>freeze_xid</name></decl></parameter>, <parameter><decl><type><name>MultiXactId</name></type> <name>cutoff_multi</name></decl></parameter>,
+				   <parameter><decl><type><name>bool</name></type> <name>use_wal</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>RewriteState</name></type> <name>state</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>MemoryContext</name></type> <name>rw_cxt</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>MemoryContext</name></type> <name>old_cxt</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>HASHCTL</name></type>		<name>hash_ctl</name></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * To ease cleanup, make a separate context that will contain the
+	 * RewriteState struct itself plus all subsidiary data.
+	 */</comment>
+	<expr_stmt><expr><name>rw_cxt</name> <operator>=</operator> <call><name>AllocSetContextCreate</name><argument_list>(<argument><expr><name>CurrentMemoryContext</name></expr></argument>,
+								   <argument><expr><literal type="string">"Table rewrite"</literal></expr></argument>,
+								   <argument><expr><name>ALLOCSET_DEFAULT_SIZES</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>old_cxt</name> <operator>=</operator> <call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>rw_cxt</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Create and fill in the state struct */</comment>
+	<expr_stmt><expr><name>state</name> <operator>=</operator> <call><name>palloc0</name><argument_list>(<argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>RewriteStateData</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name><name>state</name><operator>-&gt;</operator><name>rs_old_rel</name></name> <operator>=</operator> <name>old_heap</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>state</name><operator>-&gt;</operator><name>rs_new_rel</name></name> <operator>=</operator> <name>new_heap</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>state</name><operator>-&gt;</operator><name>rs_buffer</name></name> <operator>=</operator> <operator>(</operator><name>Page</name><operator>)</operator> <call><name>palloc</name><argument_list>(<argument><expr><name>BLCKSZ</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<comment type="block">/* new_heap needn't be empty, just locked */</comment>
+	<expr_stmt><expr><name><name>state</name><operator>-&gt;</operator><name>rs_blockno</name></name> <operator>=</operator> <call><name>AcquireNumberOfBlocks</name><argument_list>(<argument><expr><name>new_heap</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>state</name><operator>-&gt;</operator><name>rs_buffer_valid</name></name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>state</name><operator>-&gt;</operator><name>rs_use_wal</name></name> <operator>=</operator> <name>use_wal</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>state</name><operator>-&gt;</operator><name>rs_oldest_xmin</name></name> <operator>=</operator> <name>oldest_xmin</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>state</name><operator>-&gt;</operator><name>rs_freeze_xid</name></name> <operator>=</operator> <name>freeze_xid</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>state</name><operator>-&gt;</operator><name>rs_cutoff_multi</name></name> <operator>=</operator> <name>cutoff_multi</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>state</name><operator>-&gt;</operator><name>rs_cxt</name></name> <operator>=</operator> <name>rw_cxt</name></expr>;</expr_stmt>
+
+	<comment type="block">/* Initialize hash tables used to track update chains */</comment>
+	<expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><operator>&amp;</operator><name>hash_ctl</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>hash_ctl</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>hash_ctl</name><operator>.</operator><name>keysize</name></name> <operator>=</operator> <sizeof>sizeof<argument_list>(<argument><expr><name>TidHashKey</name></expr></argument>)</argument_list></sizeof></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>hash_ctl</name><operator>.</operator><name>entrysize</name></name> <operator>=</operator> <sizeof>sizeof<argument_list>(<argument><expr><name>UnresolvedTupData</name></expr></argument>)</argument_list></sizeof></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>hash_ctl</name><operator>.</operator><name>hcxt</name></name> <operator>=</operator> <name><name>state</name><operator>-&gt;</operator><name>rs_cxt</name></name></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name><name>state</name><operator>-&gt;</operator><name>rs_unresolved_tups</name></name> <operator>=</operator>
+		<call><name>hash_create</name><argument_list>(<argument><expr><literal type="string">"Rewrite / Unresolved ctids"</literal></expr></argument>,
+					<argument><expr><literal type="number">128</literal></expr></argument>,		<comment type="block">/* arbitrary initial size */</comment>
+					<argument><expr><operator>&amp;</operator><name>hash_ctl</name></expr></argument>,
+					<argument><expr><name>HASH_ELEM</name> <operator>|</operator> <name>HASH_BLOBS</name> <operator>|</operator> <name>HASH_CONTEXT</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name><name>hash_ctl</name><operator>.</operator><name>entrysize</name></name> <operator>=</operator> <sizeof>sizeof<argument_list>(<argument><expr><name>OldToNewMappingData</name></expr></argument>)</argument_list></sizeof></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name><name>state</name><operator>-&gt;</operator><name>rs_old_new_tid_map</name></name> <operator>=</operator>
+		<call><name>hash_create</name><argument_list>(<argument><expr><literal type="string">"Rewrite / Old to new tid map"</literal></expr></argument>,
+					<argument><expr><literal type="number">128</literal></expr></argument>,		<comment type="block">/* arbitrary initial size */</comment>
+					<argument><expr><operator>&amp;</operator><name>hash_ctl</name></expr></argument>,
+					<argument><expr><name>HASH_ELEM</name> <operator>|</operator> <name>HASH_BLOBS</name> <operator>|</operator> <name>HASH_CONTEXT</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>old_cxt</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>logical_begin_heap_rewrite</name><argument_list>(<argument><expr><name>state</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<return>return <expr><name>state</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * End a rewrite.
+ *
+ * state and any other resources are freed.
+ */</comment>
+<function><type><name>void</name></type>
+<name>end_heap_rewrite</name><parameter_list>(<parameter><decl><type><name>RewriteState</name></type> <name>state</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>HASH_SEQ_STATUS</name></type> <name>seq_status</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>UnresolvedTup</name></type> <name>unresolved</name></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * Write any remaining tuples in the UnresolvedTups table. If we have any
+	 * left, they should in fact be dead, but let's err on the safe side.
+	 */</comment>
+	<expr_stmt><expr><call><name>hash_seq_init</name><argument_list>(<argument><expr><operator>&amp;</operator><name>seq_status</name></expr></argument>, <argument><expr><name><name>state</name><operator>-&gt;</operator><name>rs_unresolved_tups</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<while>while <condition>(<expr><operator>(</operator><name>unresolved</name> <operator>=</operator> <call><name>hash_seq_search</name><argument_list>(<argument><expr><operator>&amp;</operator><name>seq_status</name></expr></argument>)</argument_list></call><operator>)</operator> <operator>!=</operator> <name>NULL</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>ItemPointerSetInvalid</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>unresolved</name><operator>-&gt;</operator><name>tuple</name><operator>-&gt;</operator><name>t_data</name><operator>-&gt;</operator><name>t_ctid</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>raw_heap_insert</name><argument_list>(<argument><expr><name>state</name></expr></argument>, <argument><expr><name><name>unresolved</name><operator>-&gt;</operator><name>tuple</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></while>
+
+	<comment type="block">/* Write the last page, if any */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>state</name><operator>-&gt;</operator><name>rs_buffer_valid</name></name></expr>)</condition>
+	<block>{<block_content>
+		<if_stmt><if>if <condition>(<expr><name><name>state</name><operator>-&gt;</operator><name>rs_use_wal</name></name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>log_newpage</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>state</name><operator>-&gt;</operator><name>rs_new_rel</name><operator>-&gt;</operator><name>rd_node</name></name></expr></argument>,
+						<argument><expr><name>MAIN_FORKNUM</name></expr></argument>,
+						<argument><expr><name><name>state</name><operator>-&gt;</operator><name>rs_blockno</name></name></expr></argument>,
+						<argument><expr><name><name>state</name><operator>-&gt;</operator><name>rs_buffer</name></name></expr></argument>,
+						<argument><expr><name>true</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+		<expr_stmt><expr><call><name>RelationOpenSmgr</name><argument_list>(<argument><expr><name><name>state</name><operator>-&gt;</operator><name>rs_new_rel</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><call><name>PageSetChecksumInplace</name><argument_list>(<argument><expr><name><name>state</name><operator>-&gt;</operator><name>rs_buffer</name></name></expr></argument>, <argument><expr><name><name>state</name><operator>-&gt;</operator><name>rs_blockno</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><call><name>smgrextend</name><argument_list>(<argument><expr><name><name>state</name><operator>-&gt;</operator><name>rs_new_rel</name><operator>-&gt;</operator><name>rd_smgr</name></name></expr></argument>, <argument><expr><name>MAIN_FORKNUM</name></expr></argument>, <argument><expr><name><name>state</name><operator>-&gt;</operator><name>rs_blockno</name></name></expr></argument>,
+				   <argument><expr><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <name><name>state</name><operator>-&gt;</operator><name>rs_buffer</name></name></expr></argument>, <argument><expr><name>true</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/*
+	 * If the rel is WAL-logged, must fsync before commit.  We use heap_sync
+	 * to ensure that the toast table gets fsync'd too.
+	 *
+	 * It's obvious that we must do this when not WAL-logging. It's less
+	 * obvious that we have to do it even if we did WAL-log the pages. The
+	 * reason is the same as in storage.c's RelationCopyStorage(): we're
+	 * writing data that's not in shared buffers, and so a CHECKPOINT
+	 * occurring during the rewriteheap operation won't have fsync'd data we
+	 * wrote before the checkpoint.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><call><name>RelationNeedsWAL</name><argument_list>(<argument><expr><name><name>state</name><operator>-&gt;</operator><name>rs_new_rel</name></name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>heap_sync</name><argument_list>(<argument><expr><name><name>state</name><operator>-&gt;</operator><name>rs_new_rel</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>logical_end_heap_rewrite</name><argument_list>(<argument><expr><name>state</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Deleting the context frees everything */</comment>
+	<expr_stmt><expr><call><name>MemoryContextDelete</name><argument_list>(<argument><expr><name><name>state</name><operator>-&gt;</operator><name>rs_cxt</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Add a tuple to the new heap.
+ *
+ * Visibility information is copied from the original tuple, except that
+ * we "freeze" very-old tuples.  Note that since we scribble on new_tuple,
+ * it had better be temp storage not a pointer to the original tuple.
+ *
+ * state		opaque state as returned by begin_heap_rewrite
+ * old_tuple	original tuple in the old heap
+ * new_tuple	new, rewritten tuple to be inserted to new heap
+ */</comment>
+<function><type><name>void</name></type>
+<name>rewrite_heap_tuple</name><parameter_list>(<parameter><decl><type><name>RewriteState</name></type> <name>state</name></decl></parameter>,
+				   <parameter><decl><type><name>HeapTuple</name></type> <name>old_tuple</name></decl></parameter>, <parameter><decl><type><name>HeapTuple</name></type> <name>new_tuple</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>MemoryContext</name></type> <name>old_cxt</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>ItemPointerData</name></type> <name>old_tid</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>TidHashKey</name></type>	<name>hashkey</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type>		<name>found</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type>		<name>free_new</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name>old_cxt</name> <operator>=</operator> <call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name><name>state</name><operator>-&gt;</operator><name>rs_cxt</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Copy the original tuple's visibility information into new_tuple.
+	 *
+	 * XXX we might later need to copy some t_infomask2 bits, too? Right now,
+	 * we intentionally clear the HOT status bits.
+	 */</comment>
+	<expr_stmt><expr><call><name>memcpy</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>new_tuple</name><operator>-&gt;</operator><name>t_data</name><operator>-&gt;</operator><name>t_choice</name><operator>.</operator><name>t_heap</name></name></expr></argument>,
+		   <argument><expr><operator>&amp;</operator><name><name>old_tuple</name><operator>-&gt;</operator><name>t_data</name><operator>-&gt;</operator><name>t_choice</name><operator>.</operator><name>t_heap</name></name></expr></argument>,
+		   <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>HeapTupleFields</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name><name>new_tuple</name><operator>-&gt;</operator><name>t_data</name><operator>-&gt;</operator><name>t_infomask</name></name> <operator>&amp;=</operator> <operator>~</operator><name>HEAP_XACT_MASK</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>new_tuple</name><operator>-&gt;</operator><name>t_data</name><operator>-&gt;</operator><name>t_infomask2</name></name> <operator>&amp;=</operator> <operator>~</operator><name>HEAP2_XACT_MASK</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>new_tuple</name><operator>-&gt;</operator><name>t_data</name><operator>-&gt;</operator><name>t_infomask</name></name> <operator>|=</operator>
+		<name><name>old_tuple</name><operator>-&gt;</operator><name>t_data</name><operator>-&gt;</operator><name>t_infomask</name></name> <operator>&amp;</operator> <name>HEAP_XACT_MASK</name></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * While we have our hands on the tuple, we may as well freeze any
+	 * eligible xmin or xmax, so that future VACUUM effort can be saved.
+	 */</comment>
+	<expr_stmt><expr><call><name>heap_freeze_tuple</name><argument_list>(<argument><expr><name><name>new_tuple</name><operator>-&gt;</operator><name>t_data</name></name></expr></argument>,
+					  <argument><expr><name><name>state</name><operator>-&gt;</operator><name>rs_old_rel</name><operator>-&gt;</operator><name>rd_rel</name><operator>-&gt;</operator><name>relfrozenxid</name></name></expr></argument>,
+					  <argument><expr><name><name>state</name><operator>-&gt;</operator><name>rs_old_rel</name><operator>-&gt;</operator><name>rd_rel</name><operator>-&gt;</operator><name>relminmxid</name></name></expr></argument>,
+					  <argument><expr><name><name>state</name><operator>-&gt;</operator><name>rs_freeze_xid</name></name></expr></argument>,
+					  <argument><expr><name><name>state</name><operator>-&gt;</operator><name>rs_cutoff_multi</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Invalid ctid means that ctid should point to the tuple itself. We'll
+	 * override it later if the tuple is part of an update chain.
+	 */</comment>
+	<expr_stmt><expr><call><name>ItemPointerSetInvalid</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>new_tuple</name><operator>-&gt;</operator><name>t_data</name><operator>-&gt;</operator><name>t_ctid</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * If the tuple has been updated, check the old-to-new mapping hash table.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><operator>(</operator><operator>(</operator><name><name>old_tuple</name><operator>-&gt;</operator><name>t_data</name><operator>-&gt;</operator><name>t_infomask</name></name> <operator>&amp;</operator> <name>HEAP_XMAX_INVALID</name><operator>)</operator> <operator>||</operator>
+		  <call><name>HeapTupleHeaderIsOnlyLocked</name><argument_list>(<argument><expr><name><name>old_tuple</name><operator>-&gt;</operator><name>t_data</name></name></expr></argument>)</argument_list></call><operator>)</operator> <operator>&amp;&amp;</operator>
+		<operator>!</operator><call><name>HeapTupleHeaderIndicatesMovedPartitions</name><argument_list>(<argument><expr><name><name>old_tuple</name><operator>-&gt;</operator><name>t_data</name></name></expr></argument>)</argument_list></call> <operator>&amp;&amp;</operator>
+		<operator>!</operator><operator>(</operator><call><name>ItemPointerEquals</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>old_tuple</name><operator>-&gt;</operator><name>t_self</name></name><operator>)</operator></expr></argument>,
+							<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>old_tuple</name><operator>-&gt;</operator><name>t_data</name><operator>-&gt;</operator><name>t_ctid</name></name><operator>)</operator></expr></argument>)</argument_list></call><operator>)</operator></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>OldToNewMapping</name></type> <name>mapping</name></decl>;</decl_stmt>
+
+		<expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><operator>&amp;</operator><name>hashkey</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>hashkey</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>hashkey</name><operator>.</operator><name>xmin</name></name> <operator>=</operator> <call><name>HeapTupleHeaderGetUpdateXid</name><argument_list>(<argument><expr><name><name>old_tuple</name><operator>-&gt;</operator><name>t_data</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>hashkey</name><operator>.</operator><name>tid</name></name> <operator>=</operator> <name><name>old_tuple</name><operator>-&gt;</operator><name>t_data</name><operator>-&gt;</operator><name>t_ctid</name></name></expr>;</expr_stmt>
+
+		<expr_stmt><expr><name>mapping</name> <operator>=</operator> <operator>(</operator><name>OldToNewMapping</name><operator>)</operator>
+			<call><name>hash_search</name><argument_list>(<argument><expr><name><name>state</name><operator>-&gt;</operator><name>rs_old_new_tid_map</name></name></expr></argument>, <argument><expr><operator>&amp;</operator><name>hashkey</name></expr></argument>,
+						<argument><expr><name>HASH_FIND</name></expr></argument>, <argument><expr><name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name>mapping</name> <operator>!=</operator> <name>NULL</name></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/*
+			 * We've already copied the tuple that t_ctid points to, so we can
+			 * set the ctid of this tuple to point to the new location, and
+			 * insert it right away.
+			 */</comment>
+			<expr_stmt><expr><name><name>new_tuple</name><operator>-&gt;</operator><name>t_data</name><operator>-&gt;</operator><name>t_ctid</name></name> <operator>=</operator> <name><name>mapping</name><operator>-&gt;</operator><name>new_tid</name></name></expr>;</expr_stmt>
+
+			<comment type="block">/* We don't need the mapping entry anymore */</comment>
+			<expr_stmt><expr><call><name>hash_search</name><argument_list>(<argument><expr><name><name>state</name><operator>-&gt;</operator><name>rs_old_new_tid_map</name></name></expr></argument>, <argument><expr><operator>&amp;</operator><name>hashkey</name></expr></argument>,
+						<argument><expr><name>HASH_REMOVE</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>found</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>found</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></if>
+		<else>else
+		<block>{<block_content>
+			<comment type="block">/*
+			 * We haven't seen the tuple t_ctid points to yet. Stash this
+			 * tuple into unresolved_tups to be written later.
+			 */</comment>
+			<decl_stmt><decl><type><name>UnresolvedTup</name></type> <name>unresolved</name></decl>;</decl_stmt>
+
+			<expr_stmt><expr><name>unresolved</name> <operator>=</operator> <call><name>hash_search</name><argument_list>(<argument><expr><name><name>state</name><operator>-&gt;</operator><name>rs_unresolved_tups</name></name></expr></argument>, <argument><expr><operator>&amp;</operator><name>hashkey</name></expr></argument>,
+									 <argument><expr><name>HASH_ENTER</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>found</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><operator>!</operator><name>found</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+			<expr_stmt><expr><name><name>unresolved</name><operator>-&gt;</operator><name>old_tid</name></name> <operator>=</operator> <name><name>old_tuple</name><operator>-&gt;</operator><name>t_self</name></name></expr>;</expr_stmt>
+			<expr_stmt><expr><name><name>unresolved</name><operator>-&gt;</operator><name>tuple</name></name> <operator>=</operator> <call><name>heap_copytuple</name><argument_list>(<argument><expr><name>new_tuple</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+			<comment type="block">/*
+			 * We can't do anything more now, since we don't know where the
+			 * tuple will be written.
+			 */</comment>
+			<expr_stmt><expr><call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>old_cxt</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<return>return;</return>
+		</block_content>}</block></else></if_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/*
+	 * Now we will write the tuple, and then check to see if it is the B tuple
+	 * in any new or known pair.  When we resolve a known pair, we will be
+	 * able to write that pair's A tuple, and then we have to check if it
+	 * resolves some other pair.  Hence, we need a loop here.
+	 */</comment>
+	<expr_stmt><expr><name>old_tid</name> <operator>=</operator> <name><name>old_tuple</name><operator>-&gt;</operator><name>t_self</name></name></expr>;</expr_stmt>
+	<expr_stmt><expr><name>free_new</name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+
+	<for>for <control>(<init>;</init><condition>;</condition><incr/>)</control>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>ItemPointerData</name></type> <name>new_tid</name></decl>;</decl_stmt>
+
+		<comment type="block">/* Insert the tuple and find out where it's put in new_heap */</comment>
+		<expr_stmt><expr><call><name>raw_heap_insert</name><argument_list>(<argument><expr><name>state</name></expr></argument>, <argument><expr><name>new_tuple</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name>new_tid</name> <operator>=</operator> <name><name>new_tuple</name><operator>-&gt;</operator><name>t_self</name></name></expr>;</expr_stmt>
+
+		<expr_stmt><expr><call><name>logical_rewrite_heap_tuple</name><argument_list>(<argument><expr><name>state</name></expr></argument>, <argument><expr><name>old_tid</name></expr></argument>, <argument><expr><name>new_tuple</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/*
+		 * If the tuple is the updated version of a row, and the prior version
+		 * wouldn't be DEAD yet, then we need to either resolve the prior
+		 * version (if it's waiting in rs_unresolved_tups), or make an entry
+		 * in rs_old_new_tid_map (so we can resolve it when we do see it). The
+		 * previous tuple's xmax would equal this one's xmin, so it's
+		 * RECENTLY_DEAD if and only if the xmin is not before OldestXmin.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><operator>(</operator><name><name>new_tuple</name><operator>-&gt;</operator><name>t_data</name><operator>-&gt;</operator><name>t_infomask</name></name> <operator>&amp;</operator> <name>HEAP_UPDATED</name><operator>)</operator> <operator>&amp;&amp;</operator>
+			<operator>!</operator><call><name>TransactionIdPrecedes</name><argument_list>(<argument><expr><call><name>HeapTupleHeaderGetXmin</name><argument_list>(<argument><expr><name><name>new_tuple</name><operator>-&gt;</operator><name>t_data</name></name></expr></argument>)</argument_list></call></expr></argument>,
+								   <argument><expr><name><name>state</name><operator>-&gt;</operator><name>rs_oldest_xmin</name></name></expr></argument>)</argument_list></call></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/*
+			 * Okay, this is B in an update pair.  See if we've seen A.
+			 */</comment>
+			<decl_stmt><decl><type><name>UnresolvedTup</name></type> <name>unresolved</name></decl>;</decl_stmt>
+
+			<expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><operator>&amp;</operator><name>hashkey</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>hashkey</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><name><name>hashkey</name><operator>.</operator><name>xmin</name></name> <operator>=</operator> <call><name>HeapTupleHeaderGetXmin</name><argument_list>(<argument><expr><name><name>new_tuple</name><operator>-&gt;</operator><name>t_data</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><name><name>hashkey</name><operator>.</operator><name>tid</name></name> <operator>=</operator> <name>old_tid</name></expr>;</expr_stmt>
+
+			<expr_stmt><expr><name>unresolved</name> <operator>=</operator> <call><name>hash_search</name><argument_list>(<argument><expr><name><name>state</name><operator>-&gt;</operator><name>rs_unresolved_tups</name></name></expr></argument>, <argument><expr><operator>&amp;</operator><name>hashkey</name></expr></argument>,
+									 <argument><expr><name>HASH_FIND</name></expr></argument>, <argument><expr><name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+			<if_stmt><if>if <condition>(<expr><name>unresolved</name> <operator>!=</operator> <name>NULL</name></expr>)</condition>
+			<block>{<block_content>
+				<comment type="block">/*
+				 * We have seen and memorized the previous tuple already. Now
+				 * that we know where we inserted the tuple its t_ctid points
+				 * to, fix its t_ctid and insert it to the new heap.
+				 */</comment>
+				<if_stmt><if>if <condition>(<expr><name>free_new</name></expr>)</condition><block type="pseudo"><block_content>
+					<expr_stmt><expr><call><name>heap_freetuple</name><argument_list>(<argument><expr><name>new_tuple</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+				<expr_stmt><expr><name>new_tuple</name> <operator>=</operator> <name><name>unresolved</name><operator>-&gt;</operator><name>tuple</name></name></expr>;</expr_stmt>
+				<expr_stmt><expr><name>free_new</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+				<expr_stmt><expr><name>old_tid</name> <operator>=</operator> <name><name>unresolved</name><operator>-&gt;</operator><name>old_tid</name></name></expr>;</expr_stmt>
+				<expr_stmt><expr><name><name>new_tuple</name><operator>-&gt;</operator><name>t_data</name><operator>-&gt;</operator><name>t_ctid</name></name> <operator>=</operator> <name>new_tid</name></expr>;</expr_stmt>
+
+				<comment type="block">/*
+				 * We don't need the hash entry anymore, but don't free its
+				 * tuple just yet.
+				 */</comment>
+				<expr_stmt><expr><call><name>hash_search</name><argument_list>(<argument><expr><name><name>state</name><operator>-&gt;</operator><name>rs_unresolved_tups</name></name></expr></argument>, <argument><expr><operator>&amp;</operator><name>hashkey</name></expr></argument>,
+							<argument><expr><name>HASH_REMOVE</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>found</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>found</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+				<comment type="block">/* loop back to insert the previous tuple in the chain */</comment>
+				<continue>continue;</continue>
+			</block_content>}</block></if>
+			<else>else
+			<block>{<block_content>
+				<comment type="block">/*
+				 * Remember the new tid of this tuple. We'll use it to set the
+				 * ctid when we find the previous tuple in the chain.
+				 */</comment>
+				<decl_stmt><decl><type><name>OldToNewMapping</name></type> <name>mapping</name></decl>;</decl_stmt>
+
+				<expr_stmt><expr><name>mapping</name> <operator>=</operator> <call><name>hash_search</name><argument_list>(<argument><expr><name><name>state</name><operator>-&gt;</operator><name>rs_old_new_tid_map</name></name></expr></argument>, <argument><expr><operator>&amp;</operator><name>hashkey</name></expr></argument>,
+									  <argument><expr><name>HASH_ENTER</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>found</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><operator>!</operator><name>found</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+				<expr_stmt><expr><name><name>mapping</name><operator>-&gt;</operator><name>new_tid</name></name> <operator>=</operator> <name>new_tid</name></expr>;</expr_stmt>
+			</block_content>}</block></else></if_stmt>
+		</block_content>}</block></if></if_stmt>
+
+		<comment type="block">/* Done with this (chain of) tuples, for now */</comment>
+		<if_stmt><if>if <condition>(<expr><name>free_new</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>heap_freetuple</name><argument_list>(<argument><expr><name>new_tuple</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+		<break>break;</break>
+	</block_content>}</block></for>
+
+	<expr_stmt><expr><call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>old_cxt</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Register a dead tuple with an ongoing rewrite. Dead tuples are not
+ * copied to the new table, but we still make note of them so that we
+ * can release some resources earlier.
+ *
+ * Returns true if a tuple was removed from the unresolved_tups table.
+ * This indicates that that tuple, previously thought to be "recently dead",
+ * is now known really dead and won't be written to the output.
+ */</comment>
+<function><type><name>bool</name></type>
+<name>rewrite_heap_dead_tuple</name><parameter_list>(<parameter><decl><type><name>RewriteState</name></type> <name>state</name></decl></parameter>, <parameter><decl><type><name>HeapTuple</name></type> <name>old_tuple</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<comment type="block">/*
+	 * If we have already seen an earlier tuple in the update chain that
+	 * points to this tuple, let's forget about that earlier tuple. It's in
+	 * fact dead as well, our simple xmax &lt; OldestXmin test in
+	 * HeapTupleSatisfiesVacuum just wasn't enough to detect it. It happens
+	 * when xmin of a tuple is greater than xmax, which sounds
+	 * counter-intuitive but is perfectly valid.
+	 *
+	 * We don't bother to try to detect the situation the other way round,
+	 * when we encounter the dead tuple first and then the recently dead one
+	 * that points to it. If that happens, we'll have some unmatched entries
+	 * in the UnresolvedTups hash table at the end. That can happen anyway,
+	 * because a vacuum might have removed the dead tuple in the chain before
+	 * us.
+	 */</comment>
+	<decl_stmt><decl><type><name>UnresolvedTup</name></type> <name>unresolved</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>TidHashKey</name></type>	<name>hashkey</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type>		<name>found</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><operator>&amp;</operator><name>hashkey</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>hashkey</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>hashkey</name><operator>.</operator><name>xmin</name></name> <operator>=</operator> <call><name>HeapTupleHeaderGetXmin</name><argument_list>(<argument><expr><name><name>old_tuple</name><operator>-&gt;</operator><name>t_data</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>hashkey</name><operator>.</operator><name>tid</name></name> <operator>=</operator> <name><name>old_tuple</name><operator>-&gt;</operator><name>t_self</name></name></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>unresolved</name> <operator>=</operator> <call><name>hash_search</name><argument_list>(<argument><expr><name><name>state</name><operator>-&gt;</operator><name>rs_unresolved_tups</name></name></expr></argument>, <argument><expr><operator>&amp;</operator><name>hashkey</name></expr></argument>,
+							 <argument><expr><name>HASH_FIND</name></expr></argument>, <argument><expr><name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>unresolved</name> <operator>!=</operator> <name>NULL</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* Need to free the contained tuple as well as the hashtable entry */</comment>
+		<expr_stmt><expr><call><name>heap_freetuple</name><argument_list>(<argument><expr><name><name>unresolved</name><operator>-&gt;</operator><name>tuple</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>hash_search</name><argument_list>(<argument><expr><name><name>state</name><operator>-&gt;</operator><name>rs_unresolved_tups</name></name></expr></argument>, <argument><expr><operator>&amp;</operator><name>hashkey</name></expr></argument>,
+					<argument><expr><name>HASH_REMOVE</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>found</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>found</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<return>return <expr><name>true</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<return>return <expr><name>false</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Insert a tuple to the new relation.  This has to track heap_insert
+ * and its subsidiary functions!
+ *
+ * t_self of the tuple is set to the new TID of the tuple. If t_ctid of the
+ * tuple is invalid on entry, it's replaced with the new TID as well (in
+ * the inserted data only, not in the caller's copy).
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>raw_heap_insert</name><parameter_list>(<parameter><decl><type><name>RewriteState</name></type> <name>state</name></decl></parameter>, <parameter><decl><type><name>HeapTuple</name></type> <name>tup</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>Page</name></type>		<name>page</name> <init>= <expr><name><name>state</name><operator>-&gt;</operator><name>rs_buffer</name></name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Size</name></type>		<name>pageFreeSpace</name></decl>,
+				<decl><type ref="prev"/><name>saveFreeSpace</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Size</name></type>		<name>len</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>OffsetNumber</name></type> <name>newoff</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>HeapTuple</name></type>	<name>heaptup</name></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * If the new tuple is too big for storage or contains already toasted
+	 * out-of-line attributes from some other relation, invoke the toaster.
+	 *
+	 * Note: below this point, heaptup is the data we actually intend to store
+	 * into the relation; tup is the caller's original untoasted data.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>state</name><operator>-&gt;</operator><name>rs_new_rel</name><operator>-&gt;</operator><name>rd_rel</name><operator>-&gt;</operator><name>relkind</name></name> <operator>==</operator> <name>RELKIND_TOASTVALUE</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* toast table entries should never be recursively toasted */</comment>
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><operator>!</operator><call><name>HeapTupleHasExternal</name><argument_list>(<argument><expr><name>tup</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name>heaptup</name> <operator>=</operator> <name>tup</name></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<if type="elseif">else if <condition>(<expr><call><name>HeapTupleHasExternal</name><argument_list>(<argument><expr><name>tup</name></expr></argument>)</argument_list></call> <operator>||</operator> <name><name>tup</name><operator>-&gt;</operator><name>t_len</name></name> <operator>&gt;</operator> <name>TOAST_TUPLE_THRESHOLD</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>int</name></type>			<name>options</name> <init>= <expr><name>HEAP_INSERT_SKIP_FSM</name></expr></init></decl>;</decl_stmt>
+
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><name><name>state</name><operator>-&gt;</operator><name>rs_use_wal</name></name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><name>options</name> <operator>|=</operator> <name>HEAP_INSERT_SKIP_WAL</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+		<comment type="block">/*
+		 * While rewriting the heap for VACUUM FULL / CLUSTER, make sure data
+		 * for the TOAST table are not logically decoded.  The main heap is
+		 * WAL-logged as XLOG FPI records, which are not logically decoded.
+		 */</comment>
+		<expr_stmt><expr><name>options</name> <operator>|=</operator> <name>HEAP_INSERT_NO_LOGICAL</name></expr>;</expr_stmt>
+
+		<expr_stmt><expr><name>heaptup</name> <operator>=</operator> <call><name>toast_insert_or_update</name><argument_list>(<argument><expr><name><name>state</name><operator>-&gt;</operator><name>rs_new_rel</name></name></expr></argument>, <argument><expr><name>tup</name></expr></argument>, <argument><expr><name>NULL</name></expr></argument>,
+										 <argument><expr><name>TOAST_TUPLE_TARGET</name></expr></argument>,
+										 <argument><expr><name>false</name></expr></argument>,
+										 <argument><expr><name>options</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<else>else<block type="pseudo"><block_content>
+		<expr_stmt><expr><name>heaptup</name> <operator>=</operator> <name>tup</name></expr>;</expr_stmt></block_content></block></else></if_stmt>
+
+	<expr_stmt><expr><name>len</name> <operator>=</operator> <call><name>MAXALIGN</name><argument_list>(<argument><expr><name><name>heaptup</name><operator>-&gt;</operator><name>t_len</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt> <comment type="block">/* be conservative */</comment>
+
+	<comment type="block">/*
+	 * If we're gonna fail for oversize tuple, do it right away
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name>len</name> <operator>&gt;</operator> <name>MaxHeapTupleSize</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_PROGRAM_LIMIT_EXCEEDED</name></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"row is too big: size %zu, maximum size %zu"</literal></expr></argument>,
+						<argument><expr><name>len</name></expr></argument>, <argument><expr><name>MaxHeapTupleSize</name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<comment type="block">/* Compute desired extra freespace due to fillfactor option */</comment>
+	<expr_stmt><expr><name>saveFreeSpace</name> <operator>=</operator> <call><name>RelationGetTargetPageFreeSpace</name><argument_list>(<argument><expr><name><name>state</name><operator>-&gt;</operator><name>rs_new_rel</name></name></expr></argument>,
+												   <argument><expr><name>HEAP_DEFAULT_FILLFACTOR</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Now we can check to see if there's enough free space already. */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>state</name><operator>-&gt;</operator><name>rs_buffer_valid</name></name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name>pageFreeSpace</name> <operator>=</operator> <call><name>PageGetHeapFreeSpace</name><argument_list>(<argument><expr><name>page</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name>len</name> <operator>+</operator> <name>saveFreeSpace</name> <operator>&gt;</operator> <name>pageFreeSpace</name></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/* Doesn't fit, so write out the existing page */</comment>
+
+			<comment type="block">/* XLOG stuff */</comment>
+			<if_stmt><if>if <condition>(<expr><name><name>state</name><operator>-&gt;</operator><name>rs_use_wal</name></name></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><call><name>log_newpage</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>state</name><operator>-&gt;</operator><name>rs_new_rel</name><operator>-&gt;</operator><name>rd_node</name></name></expr></argument>,
+							<argument><expr><name>MAIN_FORKNUM</name></expr></argument>,
+							<argument><expr><name><name>state</name><operator>-&gt;</operator><name>rs_blockno</name></name></expr></argument>,
+							<argument><expr><name>page</name></expr></argument>,
+							<argument><expr><name>true</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+			<comment type="block">/*
+			 * Now write the page. We say isTemp = true even if it's not a
+			 * temp table, because there's no need for smgr to schedule an
+			 * fsync for this write; we'll do it ourselves in
+			 * end_heap_rewrite.
+			 */</comment>
+			<expr_stmt><expr><call><name>RelationOpenSmgr</name><argument_list>(<argument><expr><name><name>state</name><operator>-&gt;</operator><name>rs_new_rel</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+			<expr_stmt><expr><call><name>PageSetChecksumInplace</name><argument_list>(<argument><expr><name>page</name></expr></argument>, <argument><expr><name><name>state</name><operator>-&gt;</operator><name>rs_blockno</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+			<expr_stmt><expr><call><name>smgrextend</name><argument_list>(<argument><expr><name><name>state</name><operator>-&gt;</operator><name>rs_new_rel</name><operator>-&gt;</operator><name>rd_smgr</name></name></expr></argument>, <argument><expr><name>MAIN_FORKNUM</name></expr></argument>,
+					   <argument><expr><name><name>state</name><operator>-&gt;</operator><name>rs_blockno</name></name></expr></argument>, <argument><expr><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <name>page</name></expr></argument>, <argument><expr><name>true</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+			<expr_stmt><expr><name><name>state</name><operator>-&gt;</operator><name>rs_blockno</name></name><operator>++</operator></expr>;</expr_stmt>
+			<expr_stmt><expr><name><name>state</name><operator>-&gt;</operator><name>rs_buffer_valid</name></name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+
+			<if_stmt><if>if <condition>(<expr><name><name>state</name><operator>-&gt;</operator><name>rs_use_wal</name></name></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><call><name>wait_to_avoid_large_repl_lag</name><argument_list>()</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+		</block_content>}</block></if></if_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><name><name>state</name><operator>-&gt;</operator><name>rs_buffer_valid</name></name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* Initialize a new empty page */</comment>
+		<expr_stmt><expr><call><name>PageInit</name><argument_list>(<argument><expr><name>page</name></expr></argument>, <argument><expr><name>BLCKSZ</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>state</name><operator>-&gt;</operator><name>rs_buffer_valid</name></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/* And now we can insert the tuple into the page */</comment>
+	<expr_stmt><expr><name>newoff</name> <operator>=</operator> <call><name>PageAddItem</name><argument_list>(<argument><expr><name>page</name></expr></argument>, <argument><expr><operator>(</operator><name>Item</name><operator>)</operator> <name><name>heaptup</name><operator>-&gt;</operator><name>t_data</name></name></expr></argument>, <argument><expr><name><name>heaptup</name><operator>-&gt;</operator><name>t_len</name></name></expr></argument>,
+						 <argument><expr><name>InvalidOffsetNumber</name></expr></argument>, <argument><expr><name>false</name></expr></argument>, <argument><expr><name>true</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><name>newoff</name> <operator>==</operator> <name>InvalidOffsetNumber</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"failed to add tuple"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<comment type="block">/* Update caller's t_self to the actual position where it was stored */</comment>
+	<expr_stmt><expr><call><name>ItemPointerSet</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>tup</name><operator>-&gt;</operator><name>t_self</name></name><operator>)</operator></expr></argument>, <argument><expr><name><name>state</name><operator>-&gt;</operator><name>rs_blockno</name></name></expr></argument>, <argument><expr><name>newoff</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Insert the correct position into CTID of the stored tuple, too, if the
+	 * caller didn't supply a valid CTID.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>ItemPointerIsValid</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>tup</name><operator>-&gt;</operator><name>t_data</name><operator>-&gt;</operator><name>t_ctid</name></name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>ItemId</name></type>		<name>newitemid</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>HeapTupleHeader</name></type> <name>onpage_tup</name></decl>;</decl_stmt>
+
+		<expr_stmt><expr><name>newitemid</name> <operator>=</operator> <call><name>PageGetItemId</name><argument_list>(<argument><expr><name>page</name></expr></argument>, <argument><expr><name>newoff</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name>onpage_tup</name> <operator>=</operator> <operator>(</operator><name>HeapTupleHeader</name><operator>)</operator> <call><name>PageGetItem</name><argument_list>(<argument><expr><name>page</name></expr></argument>, <argument><expr><name>newitemid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><name><name>onpage_tup</name><operator>-&gt;</operator><name>t_ctid</name></name> <operator>=</operator> <name><name>tup</name><operator>-&gt;</operator><name>t_self</name></name></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/* If heaptup is a private copy, release it. */</comment>
+	<if_stmt><if>if <condition>(<expr><name>heaptup</name> <operator>!=</operator> <name>tup</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>heap_freetuple</name><argument_list>(<argument><expr><name>heaptup</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/* ------------------------------------------------------------------------
+ * Logical rewrite support
+ *
+ * When doing logical decoding - which relies on using cmin/cmax of catalog
+ * tuples, via xl_heap_new_cid records - heap rewrites have to log enough
+ * information to allow the decoding backend to updates its internal mapping
+ * of (relfilenode,ctid) =&gt; (cmin, cmax) to be correct for the rewritten heap.
+ *
+ * For that, every time we find a tuple that's been modified in a catalog
+ * relation within the xmin horizon of any decoding slot, we log a mapping
+ * from the old to the new location.
+ *
+ * To deal with rewrites that abort the filename of a mapping file contains
+ * the xid of the transaction performing the rewrite, which then can be
+ * checked before being read in.
+ *
+ * For efficiency we don't immediately spill every single map mapping for a
+ * row to disk but only do so in batches when we've collected several of them
+ * in memory or when end_heap_rewrite() has been called.
+ *
+ * Crash-Safety: This module diverts from the usual patterns of doing WAL
+ * since it cannot rely on checkpoint flushing out all buffers and thus
+ * waiting for exclusive locks on buffers. Usually the XLogInsert() covering
+ * buffer modifications is performed while the buffer(s) that are being
+ * modified are exclusively locked guaranteeing that both the WAL record and
+ * the modified heap are on either side of the checkpoint. But since the
+ * mapping files we log aren't in shared_buffers that interlock doesn't work.
+ *
+ * Instead we simply write the mapping files out to disk, *before* the
+ * XLogInsert() is performed. That guarantees that either the XLogInsert() is
+ * inserted after the checkpoint's redo pointer or that the checkpoint (via
+ * LogicalRewriteHeapCheckpoint()) has flushed the (partial) mapping file to
+ * disk. That leaves the tail end that has not yet been flushed open to
+ * corruption, which is solved by including the current offset in the
+ * xl_heap_rewrite_mapping records and truncating the mapping file to it
+ * during replay. Every time a rewrite is finished all generated mapping files
+ * are synced to disk.
+ *
+ * Note that if we were only concerned about crash safety we wouldn't have to
+ * deal with WAL logging at all - an fsync() at the end of a rewrite would be
+ * sufficient for crash safety. Any mapping that hasn't been safely flushed to
+ * disk has to be by an aborted (explicitly or via a crash) transaction and is
+ * ignored by virtue of the xid in its name being subject to a
+ * TransactionDidCommit() check. But we want to support having standbys via
+ * physical replication, both for availability and to do logical decoding
+ * there.
+ * ------------------------------------------------------------------------
+ */</comment>
+
+<comment type="block">/*
+ * Do preparations for logging logical mappings during a rewrite if
+ * necessary. If we detect that we don't need to log anything we'll prevent
+ * any further action by the various logical rewrite functions.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>logical_begin_heap_rewrite</name><parameter_list>(<parameter><decl><type><name>RewriteState</name></type> <name>state</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>HASHCTL</name></type>		<name>hash_ctl</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>TransactionId</name></type> <name>logical_xmin</name></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * We only need to persist these mappings if the rewritten table can be
+	 * accessed during logical decoding, if not, we can skip doing any
+	 * additional work.
+	 */</comment>
+	<expr_stmt><expr><name><name>state</name><operator>-&gt;</operator><name>rs_logical_rewrite</name></name> <operator>=</operator>
+		<call><name>RelationIsAccessibleInLogicalDecoding</name><argument_list>(<argument><expr><name><name>state</name><operator>-&gt;</operator><name>rs_old_rel</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><name><name>state</name><operator>-&gt;</operator><name>rs_logical_rewrite</name></name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return;</return></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>ProcArrayGetReplicationSlotXmin</name><argument_list>(<argument><expr><name>NULL</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>logical_xmin</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * If there are no logical slots in progress we don't need to do anything,
+	 * there cannot be any remappings for relevant rows yet. The relation's
+	 * lock protects us against races.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name>logical_xmin</name> <operator>==</operator> <name>InvalidTransactionId</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name><name>state</name><operator>-&gt;</operator><name>rs_logical_rewrite</name></name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+		<return>return;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<expr_stmt><expr><name><name>state</name><operator>-&gt;</operator><name>rs_logical_xmin</name></name> <operator>=</operator> <name>logical_xmin</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>state</name><operator>-&gt;</operator><name>rs_begin_lsn</name></name> <operator>=</operator> <call><name>GetXLogInsertRecPtr</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>state</name><operator>-&gt;</operator><name>rs_num_rewrite_mappings</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><operator>&amp;</operator><name>hash_ctl</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>hash_ctl</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>hash_ctl</name><operator>.</operator><name>keysize</name></name> <operator>=</operator> <sizeof>sizeof<argument_list>(<argument><expr><name>TransactionId</name></expr></argument>)</argument_list></sizeof></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>hash_ctl</name><operator>.</operator><name>entrysize</name></name> <operator>=</operator> <sizeof>sizeof<argument_list>(<argument><expr><name>RewriteMappingFile</name></expr></argument>)</argument_list></sizeof></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>hash_ctl</name><operator>.</operator><name>hcxt</name></name> <operator>=</operator> <name><name>state</name><operator>-&gt;</operator><name>rs_cxt</name></name></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name><name>state</name><operator>-&gt;</operator><name>rs_logical_mappings</name></name> <operator>=</operator>
+		<call><name>hash_create</name><argument_list>(<argument><expr><literal type="string">"Logical rewrite mapping"</literal></expr></argument>,
+					<argument><expr><literal type="number">128</literal></expr></argument>,		<comment type="block">/* arbitrary initial size */</comment>
+					<argument><expr><operator>&amp;</operator><name>hash_ctl</name></expr></argument>,
+					<argument><expr><name>HASH_ELEM</name> <operator>|</operator> <name>HASH_BLOBS</name> <operator>|</operator> <name>HASH_CONTEXT</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Flush all logical in-memory mappings to disk, but don't fsync them yet.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>logical_heap_rewrite_flush_mappings</name><parameter_list>(<parameter><decl><type><name>RewriteState</name></type> <name>state</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>HASH_SEQ_STATUS</name></type> <name>seq_status</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>RewriteMappingFile</name> <modifier>*</modifier></type><name>src</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>dlist_mutable_iter</name></type> <name>iter</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>state</name><operator>-&gt;</operator><name>rs_logical_rewrite</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* no logical rewrite in progress, no need to iterate over mappings */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>state</name><operator>-&gt;</operator><name>rs_num_rewrite_mappings</name></name> <operator>==</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+		<return>return;</return></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>DEBUG1</name></expr></argument>, <argument><expr><literal type="string">"flushing %u logical rewrite mapping entries"</literal></expr></argument>,
+		 <argument><expr><name><name>state</name><operator>-&gt;</operator><name>rs_num_rewrite_mappings</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>hash_seq_init</name><argument_list>(<argument><expr><operator>&amp;</operator><name>seq_status</name></expr></argument>, <argument><expr><name><name>state</name><operator>-&gt;</operator><name>rs_logical_mappings</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<while>while <condition>(<expr><operator>(</operator><name>src</name> <operator>=</operator> <operator>(</operator><name>RewriteMappingFile</name> <operator>*</operator><operator>)</operator> <call><name>hash_seq_search</name><argument_list>(<argument><expr><operator>&amp;</operator><name>seq_status</name></expr></argument>)</argument_list></call><operator>)</operator> <operator>!=</operator> <name>NULL</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>waldata</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>waldata_start</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>xl_heap_rewrite_mapping</name></type> <name>xlrec</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>Oid</name></type>			<name>dboid</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>uint32</name></type>		<name>len</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>int</name></type>			<name>written</name></decl>;</decl_stmt>
+
+		<comment type="block">/* this file hasn't got any new mappings */</comment>
+		<if_stmt><if>if <condition>(<expr><name><name>src</name><operator>-&gt;</operator><name>num_mappings</name></name> <operator>==</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+			<continue>continue;</continue></block_content></block></if></if_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name><name>state</name><operator>-&gt;</operator><name>rs_old_rel</name><operator>-&gt;</operator><name>rd_rel</name><operator>-&gt;</operator><name>relisshared</name></name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><name>dboid</name> <operator>=</operator> <name>InvalidOid</name></expr>;</expr_stmt></block_content></block></if>
+		<else>else<block type="pseudo"><block_content>
+			<expr_stmt><expr><name>dboid</name> <operator>=</operator> <name>MyDatabaseId</name></expr>;</expr_stmt></block_content></block></else></if_stmt>
+
+		<expr_stmt><expr><name><name>xlrec</name><operator>.</operator><name>num_mappings</name></name> <operator>=</operator> <name><name>src</name><operator>-&gt;</operator><name>num_mappings</name></name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>xlrec</name><operator>.</operator><name>mapped_rel</name></name> <operator>=</operator> <call><name>RelationGetRelid</name><argument_list>(<argument><expr><name><name>state</name><operator>-&gt;</operator><name>rs_old_rel</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>xlrec</name><operator>.</operator><name>mapped_xid</name></name> <operator>=</operator> <name><name>src</name><operator>-&gt;</operator><name>xid</name></name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>xlrec</name><operator>.</operator><name>mapped_db</name></name> <operator>=</operator> <name>dboid</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>xlrec</name><operator>.</operator><name>offset</name></name> <operator>=</operator> <name><name>src</name><operator>-&gt;</operator><name>off</name></name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>xlrec</name><operator>.</operator><name>start_lsn</name></name> <operator>=</operator> <name><name>state</name><operator>-&gt;</operator><name>rs_begin_lsn</name></name></expr>;</expr_stmt>
+
+		<comment type="block">/* write all mappings consecutively */</comment>
+		<expr_stmt><expr><name>len</name> <operator>=</operator> <name><name>src</name><operator>-&gt;</operator><name>num_mappings</name></name> <operator>*</operator> <sizeof>sizeof<argument_list>(<argument><expr><name>LogicalRewriteMappingData</name></expr></argument>)</argument_list></sizeof></expr>;</expr_stmt>
+		<expr_stmt><expr><name>waldata_start</name> <operator>=</operator> <name>waldata</name> <operator>=</operator> <call><name>palloc</name><argument_list>(<argument><expr><name>len</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/*
+		 * collect data we need to write out, but don't modify ondisk data yet
+		 */</comment>
+		<macro><name>dlist_foreach_modify</name><argument_list>(<argument>iter</argument>, <argument>&amp;src-&gt;mappings</argument>)</argument_list></macro>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>RewriteMappingDataEntry</name> <modifier>*</modifier></type><name>pmap</name></decl>;</decl_stmt>
+
+			<expr_stmt><expr><name>pmap</name> <operator>=</operator> <call><name>dlist_container</name><argument_list>(<argument><expr><name>RewriteMappingDataEntry</name></expr></argument>, <argument><expr><name>node</name></expr></argument>, <argument><expr><name><name>iter</name><operator>.</operator><name>cur</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+			<expr_stmt><expr><call><name>memcpy</name><argument_list>(<argument><expr><name>waldata</name></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>pmap</name><operator>-&gt;</operator><name>map</name></name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name><name>pmap</name><operator>-&gt;</operator><name>map</name></name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><name>waldata</name> <operator>+=</operator> <sizeof>sizeof<argument_list>(<argument><expr><name><name>pmap</name><operator>-&gt;</operator><name>map</name></name></expr></argument>)</argument_list></sizeof></expr>;</expr_stmt>
+
+			<comment type="block">/* remove from the list and free */</comment>
+			<expr_stmt><expr><call><name>dlist_delete</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>pmap</name><operator>-&gt;</operator><name>node</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>pfree</name><argument_list>(<argument><expr><name>pmap</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+			<comment type="block">/* update bookkeeping */</comment>
+			<expr_stmt><expr><name><name>state</name><operator>-&gt;</operator><name>rs_num_rewrite_mappings</name></name><operator>--</operator></expr>;</expr_stmt>
+			<expr_stmt><expr><name><name>src</name><operator>-&gt;</operator><name>num_mappings</name></name><operator>--</operator></expr>;</expr_stmt>
+		</block_content>}</block>
+
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>src</name><operator>-&gt;</operator><name>num_mappings</name></name> <operator>==</operator> <literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>waldata</name> <operator>==</operator> <name>waldata_start</name> <operator>+</operator> <name>len</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/*
+		 * Note that we deviate from the usual WAL coding practices here,
+		 * check the above "Logical rewrite support" comment for reasoning.
+		 */</comment>
+		<expr_stmt><expr><name>written</name> <operator>=</operator> <call><name>FileWrite</name><argument_list>(<argument><expr><name><name>src</name><operator>-&gt;</operator><name>vfd</name></name></expr></argument>, <argument><expr><name>waldata_start</name></expr></argument>, <argument><expr><name>len</name></expr></argument>, <argument><expr><name><name>src</name><operator>-&gt;</operator><name>off</name></name></expr></argument>,
+							<argument><expr><name>WAIT_EVENT_LOGICAL_REWRITE_WRITE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<if_stmt><if>if <condition>(<expr><name>written</name> <operator>!=</operator> <name>len</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+					<argument><expr><operator>(</operator><call><name>errcode_for_file_access</name><argument_list>()</argument_list></call><operator>,</operator>
+					 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"could not write to file \"%s\", wrote %d of %d: %m"</literal></expr></argument>, <argument><expr><name><name>src</name><operator>-&gt;</operator><name>path</name></name></expr></argument>,
+							<argument><expr><name>written</name></expr></argument>, <argument><expr><name>len</name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+		<expr_stmt><expr><name><name>src</name><operator>-&gt;</operator><name>off</name></name> <operator>+=</operator> <name>len</name></expr>;</expr_stmt>
+
+		<expr_stmt><expr><call><name>XLogBeginInsert</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>XLogRegisterData</name><argument_list>(<argument><expr><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <operator>(</operator><operator>&amp;</operator><name>xlrec</name><operator>)</operator></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>xlrec</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>XLogRegisterData</name><argument_list>(<argument><expr><name>waldata_start</name></expr></argument>, <argument><expr><name>len</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/* write xlog record */</comment>
+		<expr_stmt><expr><call><name>XLogInsert</name><argument_list>(<argument><expr><name>RM_HEAP2_ID</name></expr></argument>, <argument><expr><name>XLOG_HEAP2_REWRITE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><call><name>pfree</name><argument_list>(<argument><expr><name>waldata_start</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></while>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>state</name><operator>-&gt;</operator><name>rs_num_rewrite_mappings</name></name> <operator>==</operator> <literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Logical remapping part of end_heap_rewrite().
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>logical_end_heap_rewrite</name><parameter_list>(<parameter><decl><type><name>RewriteState</name></type> <name>state</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>HASH_SEQ_STATUS</name></type> <name>seq_status</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>RewriteMappingFile</name> <modifier>*</modifier></type><name>src</name></decl>;</decl_stmt>
+
+	<comment type="block">/* done, no logical rewrite in progress */</comment>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><name><name>state</name><operator>-&gt;</operator><name>rs_logical_rewrite</name></name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return;</return></block_content></block></if></if_stmt>
+
+	<comment type="block">/* writeout remaining in-memory entries */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>state</name><operator>-&gt;</operator><name>rs_num_rewrite_mappings</name></name> <operator>&gt;</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>logical_heap_rewrite_flush_mappings</name><argument_list>(<argument><expr><name>state</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<comment type="block">/* Iterate over all mappings we have written and fsync the files. */</comment>
+	<expr_stmt><expr><call><name>hash_seq_init</name><argument_list>(<argument><expr><operator>&amp;</operator><name>seq_status</name></expr></argument>, <argument><expr><name><name>state</name><operator>-&gt;</operator><name>rs_logical_mappings</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<while>while <condition>(<expr><operator>(</operator><name>src</name> <operator>=</operator> <operator>(</operator><name>RewriteMappingFile</name> <operator>*</operator><operator>)</operator> <call><name>hash_seq_search</name><argument_list>(<argument><expr><operator>&amp;</operator><name>seq_status</name></expr></argument>)</argument_list></call><operator>)</operator> <operator>!=</operator> <name>NULL</name></expr>)</condition>
+	<block>{<block_content>
+		<if_stmt><if>if <condition>(<expr><call><name>FileSync</name><argument_list>(<argument><expr><name><name>src</name><operator>-&gt;</operator><name>vfd</name></name></expr></argument>, <argument><expr><name>WAIT_EVENT_LOGICAL_REWRITE_SYNC</name></expr></argument>)</argument_list></call> <operator>!=</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><call><name>data_sync_elevel</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>)</argument_list></call></expr></argument>,
+					<argument><expr><operator>(</operator><call><name>errcode_for_file_access</name><argument_list>()</argument_list></call><operator>,</operator>
+					 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"could not fsync file \"%s\": %m"</literal></expr></argument>, <argument><expr><name><name>src</name><operator>-&gt;</operator><name>path</name></name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+		<expr_stmt><expr><call><name>FileClose</name><argument_list>(<argument><expr><name><name>src</name><operator>-&gt;</operator><name>vfd</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></while>
+	<comment type="block">/* memory context cleanup will deal with the rest */</comment>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Log a single (old-&gt;new) mapping for 'xid'.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>logical_rewrite_log_mapping</name><parameter_list>(<parameter><decl><type><name>RewriteState</name></type> <name>state</name></decl></parameter>, <parameter><decl><type><name>TransactionId</name></type> <name>xid</name></decl></parameter>,
+							<parameter><decl><type><name>LogicalRewriteMappingData</name> <modifier>*</modifier></type><name>map</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>RewriteMappingFile</name> <modifier>*</modifier></type><name>src</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>RewriteMappingDataEntry</name> <modifier>*</modifier></type><name>pmap</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Oid</name></type>			<name>relid</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type>		<name>found</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name>relid</name> <operator>=</operator> <call><name>RelationGetRelid</name><argument_list>(<argument><expr><name><name>state</name><operator>-&gt;</operator><name>rs_old_rel</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* look for existing mappings for this 'mapped' xid */</comment>
+	<expr_stmt><expr><name>src</name> <operator>=</operator> <call><name>hash_search</name><argument_list>(<argument><expr><name><name>state</name><operator>-&gt;</operator><name>rs_logical_mappings</name></name></expr></argument>, <argument><expr><operator>&amp;</operator><name>xid</name></expr></argument>,
+					  <argument><expr><name>HASH_ENTER</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>found</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * We haven't yet had the need to map anything for this xid, create
+	 * per-xid data structures.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><name>found</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>char</name></type>		<name><name>path</name><index>[<expr><name>MAXPGPATH</name></expr>]</index></name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>Oid</name></type>			<name>dboid</name></decl>;</decl_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name><name>state</name><operator>-&gt;</operator><name>rs_old_rel</name><operator>-&gt;</operator><name>rd_rel</name><operator>-&gt;</operator><name>relisshared</name></name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><name>dboid</name> <operator>=</operator> <name>InvalidOid</name></expr>;</expr_stmt></block_content></block></if>
+		<else>else<block type="pseudo"><block_content>
+			<expr_stmt><expr><name>dboid</name> <operator>=</operator> <name>MyDatabaseId</name></expr>;</expr_stmt></block_content></block></else></if_stmt>
+
+		<expr_stmt><expr><call><name>snprintf</name><argument_list>(<argument><expr><name>path</name></expr></argument>, <argument><expr><name>MAXPGPATH</name></expr></argument>,
+				 <argument><expr><literal type="string">"pg_logical/mappings/"</literal> <name>LOGICAL_REWRITE_FORMAT</name></expr></argument>,
+				 <argument><expr><name>dboid</name></expr></argument>, <argument><expr><name>relid</name></expr></argument>,
+				 <argument><expr><operator>(</operator><name>uint32</name><operator>)</operator> <operator>(</operator><name><name>state</name><operator>-&gt;</operator><name>rs_begin_lsn</name></name> <operator>&gt;&gt;</operator> <literal type="number">32</literal><operator>)</operator></expr></argument>,
+				 <argument><expr><operator>(</operator><name>uint32</name><operator>)</operator> <name><name>state</name><operator>-&gt;</operator><name>rs_begin_lsn</name></name></expr></argument>,
+				 <argument><expr><name>xid</name></expr></argument>, <argument><expr><call><name>GetCurrentTransactionId</name><argument_list>()</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><call><name>dlist_init</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>src</name><operator>-&gt;</operator><name>mappings</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>src</name><operator>-&gt;</operator><name>num_mappings</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>src</name><operator>-&gt;</operator><name>off</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>memcpy</name><argument_list>(<argument><expr><name><name>src</name><operator>-&gt;</operator><name>path</name></name></expr></argument>, <argument><expr><name>path</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>path</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>src</name><operator>-&gt;</operator><name>vfd</name></name> <operator>=</operator> <call><name>PathNameOpenFile</name><argument_list>(<argument><expr><name>path</name></expr></argument>,
+									<argument><expr><name>O_CREAT</name> <operator>|</operator> <name>O_EXCL</name> <operator>|</operator> <name>O_WRONLY</name> <operator>|</operator> <name>PG_BINARY</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<if_stmt><if>if <condition>(<expr><name><name>src</name><operator>-&gt;</operator><name>vfd</name></name> <operator>&lt;</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+					<argument><expr><operator>(</operator><call><name>errcode_for_file_access</name><argument_list>()</argument_list></call><operator>,</operator>
+					 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"could not create file \"%s\": %m"</literal></expr></argument>, <argument><expr><name>path</name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<expr_stmt><expr><name>pmap</name> <operator>=</operator> <call><name>MemoryContextAlloc</name><argument_list>(<argument><expr><name><name>state</name><operator>-&gt;</operator><name>rs_cxt</name></name></expr></argument>,
+							  <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>RewriteMappingDataEntry</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>memcpy</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>pmap</name><operator>-&gt;</operator><name>map</name></name></expr></argument>, <argument><expr><name>map</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>LogicalRewriteMappingData</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>dlist_push_tail</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>src</name><operator>-&gt;</operator><name>mappings</name></name></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>pmap</name><operator>-&gt;</operator><name>node</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>src</name><operator>-&gt;</operator><name>num_mappings</name></name><operator>++</operator></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>state</name><operator>-&gt;</operator><name>rs_num_rewrite_mappings</name></name><operator>++</operator></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Write out buffer every time we've too many in-memory entries across all
+	 * mapping files.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>state</name><operator>-&gt;</operator><name>rs_num_rewrite_mappings</name></name> <operator>&gt;=</operator> <literal type="number">1000</literal></expr> <comment type="block">/* arbitrary number */</comment> )</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>logical_heap_rewrite_flush_mappings</name><argument_list>(<argument><expr><name>state</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Perform logical remapping for a tuple that's mapped from old_tid to
+ * new_tuple-&gt;t_self by rewrite_heap_tuple() if necessary for the tuple.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>logical_rewrite_heap_tuple</name><parameter_list>(<parameter><decl><type><name>RewriteState</name></type> <name>state</name></decl></parameter>, <parameter><decl><type><name>ItemPointerData</name></type> <name>old_tid</name></decl></parameter>,
+						   <parameter><decl><type><name>HeapTuple</name></type> <name>new_tuple</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>ItemPointerData</name></type> <name>new_tid</name> <init>= <expr><name><name>new_tuple</name><operator>-&gt;</operator><name>t_self</name></name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>TransactionId</name></type> <name>cutoff</name> <init>= <expr><name><name>state</name><operator>-&gt;</operator><name>rs_logical_xmin</name></name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>TransactionId</name></type> <name>xmin</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>TransactionId</name></type> <name>xmax</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type>		<name>do_log_xmin</name> <init>= <expr><name>false</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type>		<name>do_log_xmax</name> <init>= <expr><name>false</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>LogicalRewriteMappingData</name></type> <name>map</name></decl>;</decl_stmt>
+
+	<comment type="block">/* no logical rewrite in progress, we don't need to log anything */</comment>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><name><name>state</name><operator>-&gt;</operator><name>rs_logical_rewrite</name></name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return;</return></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><name>xmin</name> <operator>=</operator> <call><name>HeapTupleHeaderGetXmin</name><argument_list>(<argument><expr><name><name>new_tuple</name><operator>-&gt;</operator><name>t_data</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<comment type="block">/* use *GetUpdateXid to correctly deal with multixacts */</comment>
+	<expr_stmt><expr><name>xmax</name> <operator>=</operator> <call><name>HeapTupleHeaderGetUpdateXid</name><argument_list>(<argument><expr><name><name>new_tuple</name><operator>-&gt;</operator><name>t_data</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Log the mapping iff the tuple has been created recently.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><call><name>TransactionIdIsNormal</name><argument_list>(<argument><expr><name>xmin</name></expr></argument>)</argument_list></call> <operator>&amp;&amp;</operator> <operator>!</operator><call><name>TransactionIdPrecedes</name><argument_list>(<argument><expr><name>xmin</name></expr></argument>, <argument><expr><name>cutoff</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name>do_log_xmin</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>TransactionIdIsNormal</name><argument_list>(<argument><expr><name>xmax</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/*
+		 * no xmax is set, can't have any permanent ones, so this check is
+		 * sufficient
+		 */</comment>
+	</block_content>}</block></if>
+	<if type="elseif">else if <condition>(<expr><call><name>HEAP_XMAX_IS_LOCKED_ONLY</name><argument_list>(<argument><expr><name><name>new_tuple</name><operator>-&gt;</operator><name>t_data</name><operator>-&gt;</operator><name>t_infomask</name></name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* only locked, we don't care */</comment>
+	</block_content>}</block></if>
+	<if type="elseif">else if <condition>(<expr><operator>!</operator><call><name>TransactionIdPrecedes</name><argument_list>(<argument><expr><name>xmax</name></expr></argument>, <argument><expr><name>cutoff</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* tuple has been deleted recently, log */</comment>
+		<expr_stmt><expr><name>do_log_xmax</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/* if neither needs to be logged, we're done */</comment>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><name>do_log_xmin</name> <operator>&amp;&amp;</operator> <operator>!</operator><name>do_log_xmax</name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return;</return></block_content></block></if></if_stmt>
+
+	<comment type="block">/* fill out mapping information */</comment>
+	<expr_stmt><expr><name><name>map</name><operator>.</operator><name>old_node</name></name> <operator>=</operator> <name><name>state</name><operator>-&gt;</operator><name>rs_old_rel</name><operator>-&gt;</operator><name>rd_node</name></name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>map</name><operator>.</operator><name>old_tid</name></name> <operator>=</operator> <name>old_tid</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>map</name><operator>.</operator><name>new_node</name></name> <operator>=</operator> <name><name>state</name><operator>-&gt;</operator><name>rs_new_rel</name><operator>-&gt;</operator><name>rd_node</name></name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>map</name><operator>.</operator><name>new_tid</name></name> <operator>=</operator> <name>new_tid</name></expr>;</expr_stmt>
+
+	<comment type="block">/* ---
+	 * Now persist the mapping for the individual xids that are affected. We
+	 * need to log for both xmin and xmax if they aren't the same transaction
+	 * since the mapping files are per "affected" xid.
+	 * We don't muster all that much effort detecting whether xmin and xmax
+	 * are actually the same transaction, we just check whether the xid is the
+	 * same disregarding subtransactions. Logging too much is relatively
+	 * harmless and we could never do the check fully since subtransaction
+	 * data is thrown away during restarts.
+	 * ---
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name>do_log_xmin</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>logical_rewrite_log_mapping</name><argument_list>(<argument><expr><name>state</name></expr></argument>, <argument><expr><name>xmin</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>map</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	<comment type="block">/* separately log mapping for xmax unless it'd be redundant */</comment>
+	<if_stmt><if>if <condition>(<expr><name>do_log_xmax</name> <operator>&amp;&amp;</operator> <operator>!</operator><call><name>TransactionIdEquals</name><argument_list>(<argument><expr><name>xmin</name></expr></argument>, <argument><expr><name>xmax</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>logical_rewrite_log_mapping</name><argument_list>(<argument><expr><name>state</name></expr></argument>, <argument><expr><name>xmax</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>map</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Replay XLOG_HEAP2_REWRITE records
+ */</comment>
+<function><type><name>void</name></type>
+<name>heap_xlog_logical_rewrite</name><parameter_list>(<parameter><decl><type><name>XLogReaderState</name> <modifier>*</modifier></type><name>r</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>char</name></type>		<name><name>path</name><index>[<expr><name>MAXPGPATH</name></expr>]</index></name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>fd</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>xl_heap_rewrite_mapping</name> <modifier>*</modifier></type><name>xlrec</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>uint32</name></type>		<name>len</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>data</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name>xlrec</name> <operator>=</operator> <operator>(</operator><name>xl_heap_rewrite_mapping</name> <operator>*</operator><operator>)</operator> <call><name>XLogRecGetData</name><argument_list>(<argument><expr><name>r</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>snprintf</name><argument_list>(<argument><expr><name>path</name></expr></argument>, <argument><expr><name>MAXPGPATH</name></expr></argument>,
+			 <argument><expr><literal type="string">"pg_logical/mappings/"</literal> <name>LOGICAL_REWRITE_FORMAT</name></expr></argument>,
+			 <argument><expr><name><name>xlrec</name><operator>-&gt;</operator><name>mapped_db</name></name></expr></argument>, <argument><expr><name><name>xlrec</name><operator>-&gt;</operator><name>mapped_rel</name></name></expr></argument>,
+			 <argument><expr><operator>(</operator><name>uint32</name><operator>)</operator> <operator>(</operator><name><name>xlrec</name><operator>-&gt;</operator><name>start_lsn</name></name> <operator>&gt;&gt;</operator> <literal type="number">32</literal><operator>)</operator></expr></argument>,
+			 <argument><expr><operator>(</operator><name>uint32</name><operator>)</operator> <name><name>xlrec</name><operator>-&gt;</operator><name>start_lsn</name></name></expr></argument>,
+			 <argument><expr><name><name>xlrec</name><operator>-&gt;</operator><name>mapped_xid</name></name></expr></argument>, <argument><expr><call><name>XLogRecGetXid</name><argument_list>(<argument><expr><name>r</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>fd</name> <operator>=</operator> <call><name>OpenTransientFile</name><argument_list>(<argument><expr><name>path</name></expr></argument>,
+						   <argument><expr><name>O_CREAT</name> <operator>|</operator> <name>O_WRONLY</name> <operator>|</operator> <name>PG_BINARY</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><name>fd</name> <operator>&lt;</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode_for_file_access</name><argument_list>()</argument_list></call><operator>,</operator>
+				 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"could not create file \"%s\": %m"</literal></expr></argument>, <argument><expr><name>path</name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<comment type="block">/*
+	 * Truncate all data that's not guaranteed to have been safely fsynced (by
+	 * previous record or by the last checkpoint).
+	 */</comment>
+	<expr_stmt><expr><call><name>pgstat_report_wait_start</name><argument_list>(<argument><expr><name>WAIT_EVENT_LOGICAL_REWRITE_TRUNCATE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><call><name>ftruncate</name><argument_list>(<argument><expr><name>fd</name></expr></argument>, <argument><expr><name><name>xlrec</name><operator>-&gt;</operator><name>offset</name></name></expr></argument>)</argument_list></call> <operator>!=</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode_for_file_access</name><argument_list>()</argument_list></call><operator>,</operator>
+				 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"could not truncate file \"%s\" to %u: %m"</literal></expr></argument>,
+						<argument><expr><name>path</name></expr></argument>, <argument><expr><operator>(</operator><name>uint32</name><operator>)</operator> <name><name>xlrec</name><operator>-&gt;</operator><name>offset</name></name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	<expr_stmt><expr><call><name>pgstat_report_wait_end</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* now seek to the position we want to write our data to */</comment>
+	<if_stmt><if>if <condition>(<expr><call><name>lseek</name><argument_list>(<argument><expr><name>fd</name></expr></argument>, <argument><expr><name><name>xlrec</name><operator>-&gt;</operator><name>offset</name></name></expr></argument>, <argument><expr><name>SEEK_SET</name></expr></argument>)</argument_list></call> <operator>!=</operator> <name><name>xlrec</name><operator>-&gt;</operator><name>offset</name></name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode_for_file_access</name><argument_list>()</argument_list></call><operator>,</operator>
+				 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"could not seek to end of file \"%s\": %m"</literal></expr></argument>,
+						<argument><expr><name>path</name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><name>data</name> <operator>=</operator> <call><name>XLogRecGetData</name><argument_list>(<argument><expr><name>r</name></expr></argument>)</argument_list></call> <operator>+</operator> <sizeof>sizeof<argument_list>(<argument><expr><operator>*</operator><name>xlrec</name></expr></argument>)</argument_list></sizeof></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>len</name> <operator>=</operator> <name><name>xlrec</name><operator>-&gt;</operator><name>num_mappings</name></name> <operator>*</operator> <sizeof>sizeof<argument_list>(<argument><expr><name>LogicalRewriteMappingData</name></expr></argument>)</argument_list></sizeof></expr>;</expr_stmt>
+
+	<comment type="block">/* write out tail end of mapping file (again) */</comment>
+	<expr_stmt><expr><name>errno</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>pgstat_report_wait_start</name><argument_list>(<argument><expr><name>WAIT_EVENT_LOGICAL_REWRITE_MAPPING_WRITE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><call><name>write</name><argument_list>(<argument><expr><name>fd</name></expr></argument>, <argument><expr><name>data</name></expr></argument>, <argument><expr><name>len</name></expr></argument>)</argument_list></call> <operator>!=</operator> <name>len</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* if write didn't set errno, assume problem is no disk space */</comment>
+		<if_stmt><if>if <condition>(<expr><name>errno</name> <operator>==</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><name>errno</name> <operator>=</operator> <name>ENOSPC</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode_for_file_access</name><argument_list>()</argument_list></call><operator>,</operator>
+				 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"could not write to file \"%s\": %m"</literal></expr></argument>, <argument><expr><name>path</name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+	<expr_stmt><expr><call><name>pgstat_report_wait_end</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Now fsync all previously written data. We could improve things and only
+	 * do this for the last write to a file, but the required bookkeeping
+	 * doesn't seem worth the trouble.
+	 */</comment>
+	<expr_stmt><expr><call><name>pgstat_report_wait_start</name><argument_list>(<argument><expr><name>WAIT_EVENT_LOGICAL_REWRITE_MAPPING_SYNC</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><call><name>pg_fsync</name><argument_list>(<argument><expr><name>fd</name></expr></argument>)</argument_list></call> <operator>!=</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><call><name>data_sync_elevel</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>)</argument_list></call></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode_for_file_access</name><argument_list>()</argument_list></call><operator>,</operator>
+				 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"could not fsync file \"%s\": %m"</literal></expr></argument>, <argument><expr><name>path</name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	<expr_stmt><expr><call><name>pgstat_report_wait_end</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><call><name>CloseTransientFile</name><argument_list>(<argument><expr><name>fd</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode_for_file_access</name><argument_list>()</argument_list></call><operator>,</operator>
+				 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"could not close file \"%s\": %m"</literal></expr></argument>, <argument><expr><name>path</name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/* ---
+ * Perform a checkpoint for logical rewrite mappings
+ *
+ * This serves two tasks:
+ * 1) Remove all mappings not needed anymore based on the logical restart LSN
+ * 2) Flush all remaining mappings to disk, so that replay after a checkpoint
+ *	  only has to deal with the parts of a mapping that have been written out
+ *	  after the checkpoint started.
+ * ---
+ */</comment>
+<function><type><name>void</name></type>
+<name>CheckPointLogicalRewriteHeap</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>XLogRecPtr</name></type>	<name>cutoff</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>XLogRecPtr</name></type>	<name>redo</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>DIR</name>		   <modifier>*</modifier></type><name>mappings_dir</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name><name>struct</name> <name>dirent</name></name> <modifier>*</modifier></type><name>mapping_de</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>char</name></type>		<name><name>path</name><index>[<expr><name>MAXPGPATH</name> <operator>+</operator> <literal type="number">20</literal></expr>]</index></name></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * We start of with a minimum of the last redo pointer. No new decoding
+	 * slot will start before that, so that's a safe upper bound for removal.
+	 */</comment>
+	<expr_stmt><expr><name>redo</name> <operator>=</operator> <call><name>GetRedoRecPtr</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* now check for the restart ptrs from existing slots */</comment>
+	<expr_stmt><expr><name>cutoff</name> <operator>=</operator> <call><name>ReplicationSlotsComputeLogicalRestartLSN</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* don't start earlier than the restart lsn */</comment>
+	<if_stmt><if>if <condition>(<expr><name>cutoff</name> <operator>!=</operator> <name>InvalidXLogRecPtr</name> <operator>&amp;&amp;</operator> <name>redo</name> <operator>&lt;</operator> <name>cutoff</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name>cutoff</name> <operator>=</operator> <name>redo</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><name>mappings_dir</name> <operator>=</operator> <call><name>AllocateDir</name><argument_list>(<argument><expr><literal type="string">"pg_logical/mappings"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<while>while <condition>(<expr><operator>(</operator><name>mapping_de</name> <operator>=</operator> <call><name>ReadDir</name><argument_list>(<argument><expr><name>mappings_dir</name></expr></argument>, <argument><expr><literal type="string">"pg_logical/mappings"</literal></expr></argument>)</argument_list></call><operator>)</operator> <operator>!=</operator> <name>NULL</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name><name>struct</name> <name>stat</name></name></type> <name>statbuf</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>Oid</name></type>			<name>dboid</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>Oid</name></type>			<name>relid</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>XLogRecPtr</name></type>	<name>lsn</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>TransactionId</name></type> <name>rewrite_xid</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>TransactionId</name></type> <name>create_xid</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>uint32</name></type>		<name>hi</name></decl>,
+					<decl><type ref="prev"/><name>lo</name></decl>;</decl_stmt>
+
+		<if_stmt><if>if <condition>(<expr><call><name>strcmp</name><argument_list>(<argument><expr><name><name>mapping_de</name><operator>-&gt;</operator><name>d_name</name></name></expr></argument>, <argument><expr><literal type="string">"."</literal></expr></argument>)</argument_list></call> <operator>==</operator> <literal type="number">0</literal> <operator>||</operator>
+			<call><name>strcmp</name><argument_list>(<argument><expr><name><name>mapping_de</name><operator>-&gt;</operator><name>d_name</name></name></expr></argument>, <argument><expr><literal type="string">".."</literal></expr></argument>)</argument_list></call> <operator>==</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+			<continue>continue;</continue></block_content></block></if></if_stmt>
+
+		<expr_stmt><expr><call><name>snprintf</name><argument_list>(<argument><expr><name>path</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>path</name></expr></argument>)</argument_list></sizeof></expr></argument>, <argument><expr><literal type="string">"pg_logical/mappings/%s"</literal></expr></argument>, <argument><expr><name><name>mapping_de</name><operator>-&gt;</operator><name>d_name</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<if_stmt><if>if <condition>(<expr><call><name>lstat</name><argument_list>(<argument><expr><name>path</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>statbuf</name></expr></argument>)</argument_list></call> <operator>==</operator> <literal type="number">0</literal> <operator>&amp;&amp;</operator> <operator>!</operator><call><name>S_ISREG</name><argument_list>(<argument><expr><name><name>statbuf</name><operator>.</operator><name>st_mode</name></name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<continue>continue;</continue></block_content></block></if></if_stmt>
+
+		<comment type="block">/* Skip over files that cannot be ours. */</comment>
+		<if_stmt><if>if <condition>(<expr><call><name>strncmp</name><argument_list>(<argument><expr><name><name>mapping_de</name><operator>-&gt;</operator><name>d_name</name></name></expr></argument>, <argument><expr><literal type="string">"map-"</literal></expr></argument>, <argument><expr><literal type="number">4</literal></expr></argument>)</argument_list></call> <operator>!=</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+			<continue>continue;</continue></block_content></block></if></if_stmt>
+
+		<if_stmt><if>if <condition>(<expr><call><name>sscanf</name><argument_list>(<argument><expr><name><name>mapping_de</name><operator>-&gt;</operator><name>d_name</name></name></expr></argument>, <argument><expr><name>LOGICAL_REWRITE_FORMAT</name></expr></argument>,
+				   <argument><expr><operator>&amp;</operator><name>dboid</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>relid</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>hi</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>lo</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>rewrite_xid</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>create_xid</name></expr></argument>)</argument_list></call> <operator>!=</operator> <literal type="number">6</literal></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"could not parse filename \"%s\""</literal></expr></argument>, <argument><expr><name><name>mapping_de</name><operator>-&gt;</operator><name>d_name</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+		<expr_stmt><expr><name>lsn</name> <operator>=</operator> <operator>(</operator><operator>(</operator><name>uint64</name><operator>)</operator> <name>hi</name><operator>)</operator> <operator>&lt;&lt;</operator> <literal type="number">32</literal> <operator>|</operator> <name>lo</name></expr>;</expr_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name>lsn</name> <operator>&lt;</operator> <name>cutoff</name> <operator>||</operator> <name>cutoff</name> <operator>==</operator> <name>InvalidXLogRecPtr</name></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>DEBUG1</name></expr></argument>, <argument><expr><literal type="string">"removing logical rewrite file \"%s\""</literal></expr></argument>, <argument><expr><name>path</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<if_stmt><if>if <condition>(<expr><call><name>unlink</name><argument_list>(<argument><expr><name>path</name></expr></argument>)</argument_list></call> <operator>&lt;</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+						<argument><expr><operator>(</operator><call><name>errcode_for_file_access</name><argument_list>()</argument_list></call><operator>,</operator>
+						 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"could not remove file \"%s\": %m"</literal></expr></argument>, <argument><expr><name>path</name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+		</block_content>}</block></if>
+		<else>else
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>int</name></type>			<name>fd</name> <init>= <expr><call><name>OpenTransientFile</name><argument_list>(<argument><expr><name>path</name></expr></argument>, <argument><expr><name>O_RDONLY</name> <operator>|</operator> <name>PG_BINARY</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+			<comment type="block">/*
+			 * The file cannot vanish due to concurrency since this function
+			 * is the only one removing logical mappings and it's run while
+			 * CheckpointLock is held exclusively.
+			 */</comment>
+			<if_stmt><if>if <condition>(<expr><name>fd</name> <operator>&lt;</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+						<argument><expr><operator>(</operator><call><name>errcode_for_file_access</name><argument_list>()</argument_list></call><operator>,</operator>
+						 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"could not open file \"%s\": %m"</literal></expr></argument>, <argument><expr><name>path</name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+			<comment type="block">/*
+			 * We could try to avoid fsyncing files that either haven't
+			 * changed or have only been created since the checkpoint's start,
+			 * but it's currently not deemed worth the effort.
+			 */</comment>
+			<expr_stmt><expr><call><name>pgstat_report_wait_start</name><argument_list>(<argument><expr><name>WAIT_EVENT_LOGICAL_REWRITE_CHECKPOINT_SYNC</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<if_stmt><if>if <condition>(<expr><call><name>pg_fsync</name><argument_list>(<argument><expr><name>fd</name></expr></argument>)</argument_list></call> <operator>!=</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><call><name>data_sync_elevel</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>)</argument_list></call></expr></argument>,
+						<argument><expr><operator>(</operator><call><name>errcode_for_file_access</name><argument_list>()</argument_list></call><operator>,</operator>
+						 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"could not fsync file \"%s\": %m"</literal></expr></argument>, <argument><expr><name>path</name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+			<expr_stmt><expr><call><name>pgstat_report_wait_end</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+			<if_stmt><if>if <condition>(<expr><call><name>CloseTransientFile</name><argument_list>(<argument><expr><name>fd</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+						<argument><expr><operator>(</operator><call><name>errcode_for_file_access</name><argument_list>()</argument_list></call><operator>,</operator>
+						 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"could not close file \"%s\": %m"</literal></expr></argument>, <argument><expr><name>path</name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+		</block_content>}</block></else></if_stmt>
+	</block_content>}</block></while>
+	<expr_stmt><expr><call><name>FreeDir</name><argument_list>(<argument><expr><name>mappings_dir</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+</unit>

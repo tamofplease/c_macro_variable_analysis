@@ -1,0 +1,553 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<unit xmlns="http://www.srcML.org/srcML/src" xmlns:cpp="http://www.srcML.org/srcML/cpp" revision="1.0.0" language="C" filename="/cloned_projects/gpdb/src/backend/utils/mmgr/memprot.c"><comment type="block">/* 
+ * memprot.c
+ *		Memory allocation under greenplum memory allocation.
+ * 
+ * Copyright(c) 2008, Greenplum Inc.
+ * 
+ * We wrap up calls to malloc/realloc/free with our own accounting
+ * so that we will make sure a postgres process will not go beyond
+ * its allowed quota
+ */</comment>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"postgres.h"</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;signal.h&gt;</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;unistd.h&gt;</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;sys/file.h&gt;</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;sys/time.h&gt;</cpp:file></cpp:include>
+
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>HAVE_SYS_IPC_H</name></cpp:ifdef>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;sys/ipc.h&gt;</cpp:file></cpp:include>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>HAVE_SYS_SEM_H</name></cpp:ifdef>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;sys/sem.h&gt;</cpp:file></cpp:include>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>HAVE_KERNEL_OS_H</name></cpp:ifdef>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;kernel/OS.h&gt;</cpp:file></cpp:include>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"miscadmin.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"port/atomics.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/pg_sema.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/ipc.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/shmem.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/palloc.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/memutils.h"</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"cdb/cdbvars.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/vmem_tracker.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/session_state.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/gp_alloc.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/guc.h"</cpp:file></cpp:include>
+
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>SHMEM_OOM_TIME</name></cpp:macro> <cpp:value>"last vmem oom time"</cpp:value></cpp:define>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>MAX_REQUESTABLE_SIZE</name></cpp:macro> <cpp:value>0x7fffffff</cpp:value></cpp:define>
+
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>gp_failed_to_alloc</name><parameter_list>(<parameter><decl><type><name>MemoryAllocationStatus</name></type> <name>ec</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>en</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>sz</name></decl></parameter>)</parameter_list>;</function_decl>
+
+<comment type="block">/*
+ * Last OOM time of a segment. Maintained in shared memory.
+ */</comment>
+<decl_stmt><decl><type><specifier>volatile</specifier> <name>OOMTimeType</name> <modifier>*</modifier></type><name>segmentOOMTime</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+
+<comment type="block">/*
+ * We don't report memory usage of current process multiple times
+ * for a single OOM event. This variable saves the last time we reported
+ * OOM. If this time is not greater than the segmentOOMTime, we don't
+ * report memory usage.
+ */</comment>
+<decl_stmt><decl><type><specifier>volatile</specifier> <name>OOMTimeType</name></type> <name>alreadyReportedOOMTime</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+
+<comment type="block">/*
+ * Time when we started tracking for OOM in this process.
+ * If this time is greater than segmentOOMTime, we don't
+ * consider this process as culpable for that OOM event.
+ */</comment>
+<decl_stmt><decl><type><specifier>volatile</specifier> <name>OOMTimeType</name></type> <name>oomTrackerStartTime</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+<comment type="block">/*
+ * The thread that owns the memory protection. The owner thread is the
+ * one that initializes the memory protection by calling GPMemoryProtect_Init().
+ * This should be the main thread. No other thread is allowed to call gp_malloc
+ * or any memory protection related functions.
+ */</comment>
+<cpp:ifndef>#<cpp:directive>ifndef</cpp:directive> <name>_WIN32</name></cpp:ifndef>
+<decl_stmt><decl><type><specifier>static</specifier> <name>pthread_t</name></type> <name>memprotOwnerThread</name> <init>= <expr><operator>(</operator><name>pthread_t</name><operator>)</operator><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+<cpp:else>#<cpp:directive>else</cpp:directive></cpp:else>
+<decl_stmt><decl><type><specifier>static</specifier> <name>pthread_t</name></type> <name>memprotOwnerThread</name> <init>= <expr><block>{<expr><literal type="number">0</literal></expr>,<expr><literal type="number">0</literal></expr>}</block></expr></init></decl>;</decl_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+<comment type="block">/* Is memory protection enabled? */</comment>
+<decl_stmt><decl><type><name>bool</name></type> <name>gp_mp_inited</name> <init>= <expr><name>false</name></expr></init></decl>;</decl_stmt>
+
+<comment type="block">/*
+ * UpdateTimeAtomically
+ *
+ * Updates a OOMTimeType variable atomically, using compare_and_swap_*
+ */</comment>
+<function><type><name>void</name></type> <name>UpdateTimeAtomically</name><parameter_list>(<parameter><decl><type><specifier>volatile</specifier> <name>OOMTimeType</name><modifier>*</modifier></type> <name>time_var</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>bool</name></type> <name>updateCompleted</name> <init>= <expr><name>false</name></expr></init></decl>;</decl_stmt>
+
+	<decl_stmt><decl><type><name>OOMTimeType</name></type> <name>newOOMTime</name></decl>;</decl_stmt>
+
+	<while>while <condition>(<expr><operator>!</operator><name>updateCompleted</name></expr>)</condition>
+	<block>{<block_content>
+<cpp:if>#<cpp:directive>if</cpp:directive> <expr><call><name>defined</name><argument_list>(<argument><expr><name>__x86_64__</name></expr></argument>)</argument_list></call></expr></cpp:if>
+		<expr_stmt><expr><name>newOOMTime</name> <operator>=</operator> <call><name>GetCurrentTimestamp</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+<cpp:else>#<cpp:directive>else</cpp:directive></cpp:else>
+		<decl_stmt><decl><type><name><name>struct</name> <name>timeval</name></name></type> <name>curTime</name></decl>;</decl_stmt>
+		<expr_stmt><expr><call><name>gettimeofday</name><argument_list>(<argument><expr><operator>&amp;</operator><name>curTime</name></expr></argument>, <argument><expr><name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><name>newOOMTime</name> <operator>=</operator> <operator>(</operator><name>uint32</name><operator>)</operator><name><name>curTime</name><operator>.</operator><name>tv_sec</name></name></expr>;</expr_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+		<decl_stmt><decl><type><name>OOMTimeType</name></type> <name>oldOOMTime</name> <init>= <expr><operator>*</operator><name>time_var</name></expr></init></decl>;</decl_stmt>
+
+<cpp:if>#<cpp:directive>if</cpp:directive> <expr><call><name>defined</name><argument_list>(<argument><expr><name>__x86_64__</name></expr></argument>)</argument_list></call></expr></cpp:if>
+		<expr_stmt><expr><name>updateCompleted</name> <operator>=</operator> <call><name>pg_atomic_compare_exchange_u64</name><argument_list>(<argument><expr><operator>(</operator><name>pg_atomic_uint64</name> <operator>*</operator><operator>)</operator><name>time_var</name></expr></argument>,
+				<argument><expr><operator>(</operator><name>uint64</name> <operator>*</operator><operator>)</operator><operator>&amp;</operator><name>oldOOMTime</name></expr></argument>,
+				<argument><expr><operator>(</operator><name>uint64</name><operator>)</operator><name>newOOMTime</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+<cpp:else>#<cpp:directive>else</cpp:directive></cpp:else>
+		<expr_stmt><expr><name>updateCompleted</name> <operator>=</operator> <call><name>pg_atomic_compare_exchange_u32</name><argument_list>(<argument><expr><operator>(</operator><name>pg_atomic_uint32</name> <operator>*</operator><operator>)</operator><name>time_var</name></expr></argument>,
+				<argument><expr><operator>(</operator><name>uint32</name> <operator>*</operator><operator>)</operator><operator>&amp;</operator><name>oldOOMTime</name></expr></argument>,
+				<argument><expr><operator>(</operator><name>uint32</name><operator>)</operator><name>newOOMTime</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+	</block_content>}</block></while>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * InitPerProcessOOMTracking
+ *
+ * Initializes per-process OOM tracking data structures.
+ */</comment>
+<function><type><name>void</name></type> <name>InitPerProcessOOMTracking</name><parameter_list>()</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>NULL</name> <operator>!=</operator> <name>segmentOOMTime</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>alreadyReportedOOMTime</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+
+<cpp:if>#<cpp:directive>if</cpp:directive> <expr><call><name>defined</name><argument_list>(<argument><expr><name>__x86_64__</name></expr></argument>)</argument_list></call></expr></cpp:if>
+	<expr_stmt><expr><name>oomTrackerStartTime</name> <operator>=</operator> <call><name>GetCurrentTimestamp</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+<cpp:else>#<cpp:directive>else</cpp:directive></cpp:else>
+	<decl_stmt><decl><type><name><name>struct</name> <name>timeval</name></name></type> <name>curTime</name></decl>;</decl_stmt>
+	<expr_stmt><expr><call><name>gettimeofday</name><argument_list>(<argument><expr><operator>&amp;</operator><name>curTime</name></expr></argument>, <argument><expr><name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>oomTrackerStartTime</name> <operator>=</operator> <operator>(</operator><name>uint32</name><operator>)</operator><name><name>curTime</name><operator>.</operator><name>tv_sec</name></name></expr>;</expr_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+</block_content>}</block></function>
+
+<comment type="block">/* Initializes shared memory data structures */</comment>
+<function><type><name>void</name></type> <name>GPMemoryProtect_ShmemInit</name><parameter_list>()</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><operator>!</operator><name>gp_mp_inited</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>VmemTracker_ShmemInit</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+	<decl_stmt><decl><type><name>bool</name></type>		<name>isSegmentOOMTimeInShmem</name> <init>= <expr><name>false</name></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name>segmentOOMTime</name> <operator>=</operator> <operator>(</operator><name>OOMTimeType</name> <operator>*</operator><operator>)</operator>
+						<call><name>ShmemInitStruct</name><argument_list>(<argument><expr><name>SHMEM_OOM_TIME</name></expr></argument>,
+								<argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>OOMTimeType</name></expr></argument>)</argument_list></sizeof></expr></argument>,
+								<argument><expr><operator>&amp;</operator><name>isSegmentOOMTimeInShmem</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>isSegmentOOMTimeInShmem</name> <operator>||</operator> <operator>!</operator><name>IsUnderPostmaster</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>NULL</name> <operator>!=</operator> <name>segmentOOMTime</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><name>IsUnderPostmaster</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/*
+		 * Initializing segmentOOMTime to 0 ensures that no
+		 * process dumps memory usage, unless we hit an OOM
+		 * and update segmentOOMTime to a proper value.
+		 */</comment>
+		<expr_stmt><expr><operator>*</operator><name>segmentOOMTime</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/* Initializes per-process data structures and enables memory protection */</comment>
+<function><type><name>void</name></type> <name>GPMemoryProtect_Init</name><parameter_list>()</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><operator>!</operator><name>gp_mp_inited</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>NULL</name> <operator>==</operator> <name>MySessionState</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* Only database sessions have memory protection enabled */</comment>
+		<return>return;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/*
+	 * Lock in the current thread that is initializing the memory protection
+	 * so that no other thread can use memory protection later on.
+	 */</comment>
+	<expr_stmt><expr><name>memprotOwnerThread</name> <operator>=</operator> <call><name>pthread_self</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>VmemTracker_Init</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>NULL</name> <operator>!=</operator> <name>segmentOOMTime</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>InitPerProcessOOMTracking</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>gp_mp_inited</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/* Disables memory protection */</comment>
+<function><type><name>void</name></type> <name>GPMemoryProtect_Shutdown</name><parameter_list>()</parameter_list>
+<block>{<block_content>
+	<if_stmt><if>if <condition>(<expr><name>NULL</name> <operator>==</operator> <name>MySessionState</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><operator>!</operator><name>gp_mp_inited</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<comment type="block">/* Only database sessions have memory protection enabled */</comment>
+		<return>return;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>VmemTracker_UnregisterStartupMemory</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>gp_mp_inited</name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>VmemTracker_Shutdown</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Add the per-process startup committed memory to vmem tracker.
+ *
+ * Postgresql suggests setting vm.overcommit_memory to 2, so system level OOM
+ * is triggered by committed memory size.  Each postgres process has several MB
+ * committed memory since it being forked, in practice the size can be 6~16 MB,
+ * depends on build-time and runtime configurations.
+ *
+ * These memory were not tracked by vmem tracker however, as a result an idle
+ * (just gets launched, or just finished execution) QE process has 0 chunks in
+ * track, but it might have 16MB committed memory.  The vmem tracker protect
+ * limit will never be reached no matter how many such processes there are, but
+ * when there are enough such processes the system level OOM will be triggered,
+ * which will lead to unpredictable failures on not only postgres but also all
+ * the other processes on the system.
+ *
+ * To prevent this worst case we add a startup cost to the vmem tracker, so the
+ * vmem tracker OOM will happen instead of the system one, this is less harmful
+ * and easier to handle.  The startup cost, however, is a hard coded value from
+ * practice for now, we may want to make a better estimation at runtime in the
+ * future.  Another thing to improve is that this startup cost should only be
+ * added when vm.overcommit_memory is 2.
+ */</comment>
+<function><type><name>void</name></type>
+<name>GPMemoryProtect_TrackStartupMemory</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>MemoryAllocationStatus</name></type> <name>status</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int64</name></type>		<name>bytes</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>gp_mp_inited</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * When compile without ORCA a postgress process will commit 6MB, this
+	 * includes the memory allocated before vmem tracker initialization.
+	 */</comment>
+	<expr_stmt><expr><name>bytes</name> <operator>+=</operator> <literal type="number">6L</literal> <operator>&lt;&lt;</operator> <name>BITS_IN_MB</name></expr>;</expr_stmt>
+
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>USE_ORCA</name></cpp:ifdef>
+	<comment type="block">/* When compile with ORCA it will commit 6MB more */</comment>
+	<expr_stmt><expr><name>bytes</name> <operator>+=</operator> <literal type="number">6L</literal> <operator>&lt;&lt;</operator> <name>BITS_IN_MB</name></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * When optimizer_use_gpdb_allocators is on, at least 2MB of above will be
+	 * tracked by vmem tracker later, so do not recount them.  This GUC is not
+	 * available until gpdb 5.1.0 .
+	 */</comment>
+<cpp:if>#<cpp:directive>if</cpp:directive> <expr><name>GP_VERSION_NUM</name> <operator>&gt;=</operator> <literal type="number">50100</literal></expr></cpp:if>
+	<if_stmt><if>if <condition>(<expr><name>optimizer_use_gpdb_allocators</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name>bytes</name> <operator>-=</operator> <literal type="number">2L</literal> <operator>&lt;&lt;</operator> <name>BITS_IN_MB</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>  <comment type="block">/* GP_VERSION_NUM */</comment>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>  <comment type="block">/* USE_ORCA */</comment>
+
+	<comment type="block">/* Leave some buffer for extensions like metrics_collector */</comment>
+	<expr_stmt><expr><name>bytes</name> <operator>+=</operator> <literal type="number">2L</literal> <operator>&lt;&lt;</operator> <name>BITS_IN_MB</name></expr>;</expr_stmt>
+
+	<comment type="block">/* Register the startup memory */</comment>
+	<expr_stmt><expr><name>status</name> <operator>=</operator> <call><name>VmemTracker_RegisterStartupMemory</name><argument_list>(<argument><expr><name>bytes</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><name>status</name> <operator>!=</operator> <name>MemoryAllocation_Success</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>gp_failed_to_alloc</name><argument_list>(<argument><expr><name>status</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><name>bytes</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ *  Returns true if the current thread is the owner thread, i.e.,
+ * the thread that initialized the memory protection subsystem
+ * by calling GPMemoryProtect_Init()
+ */</comment>
+<function><type><name>bool</name></type>
+<name>MemoryProtection_IsOwnerThread</name><parameter_list>()</parameter_list>
+<block>{<block_content>
+	<return>return <expr><call><name>pthread_equal</name><argument_list>(<argument><expr><name>memprotOwnerThread</name></expr></argument>, <argument><expr><call><name>pthread_self</name><argument_list>()</argument_list></call></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * gp_failed_to_alloc is called upon an OOM. We can have either a VMEM
+ * limited OOM (i.e., the system still has memory, but we ran out of either
+ * per-query VMEM limit or segment VMEM limit) or a true OOM, where the
+ * malloc returns a NULL pointer.
+ *
+ * This function logs OOM details, such as memory allocation/deallocation/peak.
+ * It also updates segment OOM time by calling UpdateTimeAtomically().
+ *
+ * Parameters:
+ *
+ * 		ec: error code; indicates what type of OOM event happend (system, VMEM, per-query VMEM)
+ * 		en: the last seen error number as retrieved by calling __error() or similar function
+ * 		sz: the requested allocation size for which we reached OOM
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type> <name>gp_failed_to_alloc</name><parameter_list>(<parameter><decl><type><name>MemoryAllocationStatus</name></type> <name>ec</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>en</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>sz</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<comment type="block">/*
+	 * A per-query vmem overflow shouldn't trigger a segment-wide
+	 * OOM reporting.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name>MemoryFailure_QueryMemoryExhausted</name> <operator>!=</operator> <name>ec</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>UpdateTimeAtomically</name><argument_list>(<argument><expr><name>segmentOOMTime</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>UpdateTimeAtomically</name><argument_list>(<argument><expr><operator>&amp;</operator><name>alreadyReportedOOMTime</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Request 1 MB of waiver for processing error */</comment>
+	<expr_stmt><expr><call><name>VmemTracker_RequestWaiver</name><argument_list>(<argument><expr><literal type="number">1024</literal> <operator>*</operator> <literal type="number">1024</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>MemoryProtection_IsOwnerThread</name><argument_list>()</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><name>ec</name> <operator>==</operator> <name>MemoryFailure_QueryMemoryExhausted</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>LOG</name></expr></argument>, <argument><expr><literal type="string">"Logging memory usage for reaching per-query memory limit"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<if type="elseif">else if <condition>(<expr><name>ec</name> <operator>==</operator> <name>MemoryFailure_VmemExhausted</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>LOG</name></expr></argument>, <argument><expr><literal type="string">"Logging memory usage for reaching Vmem limit"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<if type="elseif">else if <condition>(<expr><name>ec</name> <operator>==</operator> <name>MemoryFailure_SystemMemoryExhausted</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/*
+		 * The system memory is exhausted and malloc returned a null pointer.
+		 * Although elog switches to ErrorContext, which already
+		 * has pre-allocated space, we are not risking any new allocation until
+		 * we dump the memory context and memory accounting tree. We are therefore
+		 * printing the log message header using write_stderr.
+		 */</comment>
+		<expr_stmt><expr><call><name>write_stderr</name><argument_list>(<argument><expr><literal type="string">"Logging memory usage for reaching system memory limit"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<if type="elseif">else if <condition>(<expr><name>ec</name> <operator>==</operator> <name>MemoryFailure_ResourceGroupMemoryExhausted</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>LOG</name></expr></argument>, <argument><expr><literal type="string">"Logging memory usage for reaching resource group limit"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<else>else<block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"Unknown memory failure error code"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></else></if_stmt>
+
+	<expr_stmt><expr><call><name>RedZoneHandler_LogVmemUsageOfAllSessions</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>MemoryContextStats</name><argument_list>(<argument><expr><name>TopMemoryContext</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>coredump_on_memerror</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/*
+		 * Generate a core dump by writing to NULL pointer
+		 */</comment>
+		<expr_stmt><expr><operator>*</operator><operator>(</operator><specifier>volatile</specifier> <name>int</name> <operator>*</operator><operator>)</operator> <name>NULL</name> <operator>=</operator> <name>ec</name></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>ec</name> <operator>==</operator> <name>MemoryFailure_VmemExhausted</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* Hit MOP limit */</comment>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_GP_MEMPROT_KILL</name></expr></argument>)</argument_list></call><operator>,</operator>
+				<call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"Out of memory"</literal></expr></argument>)</argument_list></call><operator>,</operator>
+				<call><name>errdetail</name><argument_list>(<argument><expr><literal type="string">"Vmem limit reached, failed to allocate %d bytes from tracker, which has %d MB available"</literal></expr></argument>,
+						<argument><expr><name>sz</name></expr></argument>, <argument><expr><call><name>VmemTracker_GetAvailableVmemMB</name><argument_list>()</argument_list></call></expr></argument>
+				)</argument_list></call>
+		<operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<if type="elseif">else if <condition>(<expr><name>ec</name> <operator>==</operator> <name>MemoryFailure_QueryMemoryExhausted</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* Hit MOP limit */</comment>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_GP_MEMPROT_KILL</name></expr></argument>)</argument_list></call><operator>,</operator>
+				<call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"Out of memory"</literal></expr></argument>)</argument_list></call><operator>,</operator>
+				<call><name>errdetail</name><argument_list>(<argument><expr><literal type="string">"Per-query memory limit reached: current limit is %d kB, requested %d bytes, has %d MB available for this query"</literal></expr></argument>,
+						<argument><expr><name>gp_vmem_limit_per_query</name></expr></argument>, <argument><expr><name>sz</name></expr></argument>, <argument><expr><call><name>VmemTracker_GetAvailableQueryVmemMB</name><argument_list>()</argument_list></call></expr></argument>
+				)</argument_list></call>
+		<operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<if type="elseif">else if <condition>(<expr><name>ec</name> <operator>==</operator> <name>MemoryFailure_SystemMemoryExhausted</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_GP_MEMPROT_KILL</name></expr></argument>)</argument_list></call><operator>,</operator>
+				<call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"Out of memory"</literal></expr></argument>)</argument_list></call><operator>,</operator>
+				<call><name>errdetail</name><argument_list>(<argument><expr><literal type="string">"System memory limit reached, failed to allocate %d bytes from system"</literal></expr></argument>, <argument><expr><name>sz</name></expr></argument>)</argument_list></call>
+		<operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<if type="elseif">else if <condition>(<expr><name>ec</name> <operator>==</operator> <name>MemoryFailure_ResourceGroupMemoryExhausted</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_GP_MEMPROT_KILL</name></expr></argument>)</argument_list></call><operator>,</operator>
+				<call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"Out of memory"</literal></expr></argument>)</argument_list></call><operator>,</operator>
+				<call><name>errdetail</name><argument_list>(<argument><expr><literal type="string">"Resource group memory limit reached"</literal></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<else>else
+	<block>{<block_content>
+		<comment type="block">/* SemOp error.  */</comment>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_GP_MEMPROT_KILL</name></expr></argument>)</argument_list></call><operator>,</operator>
+				<call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"Failed to allocate memory under virtual memory protection"</literal></expr></argument>)</argument_list></call><operator>,</operator>
+				<call><name>errdetail</name><argument_list>(<argument><expr><literal type="string">"Error %d, errno %d, %s"</literal></expr></argument>, <argument><expr><name>ec</name></expr></argument>, <argument><expr><name>en</name></expr></argument>, <argument><expr><call><name>strerror</name><argument_list>(<argument><expr><name>en</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call>
+		<operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></else></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * malloc the requested "size" and additional memory for metadata and store header and/or
+ * footer metadata information. Caller is in charge to update Vmem counter accordingly.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name> <modifier>*</modifier></type><name>malloc_and_store_metadata</name><parameter_list>(<parameter><decl><type><name>size_t</name></type> <name>size</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>size_t</name></type> <name>malloc_size</name> <init>= <expr><call><name>UserPtrSize_GetVmemPtrSize</name><argument_list>(<argument><expr><name>size</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>void</name> <modifier>*</modifier></type><name>malloc_pointer</name> <init>= <expr><call><name>malloc</name><argument_list>(<argument><expr><name>malloc_size</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<if_stmt><if>if <condition>(<expr><name>NULL</name> <operator>==</operator> <name>malloc_pointer</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/*
+		 * A NULL pointer from the underlying allocator will be returned as-is
+		 * and the caller is supposed to convert it to error or other ways it
+		 * sees fit.
+		 */</comment>
+		<return>return <expr><name>NULL</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+	<expr_stmt><expr><call><name>VmemPtr_Initialize</name><argument_list>(<argument><expr><operator>(</operator><name>VmemHeader</name><operator>*</operator><operator>)</operator> <name>malloc_pointer</name></expr></argument>, <argument><expr><name>size</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<return>return <expr><call><name>VmemPtrToUserPtr</name><argument_list>(<argument><expr><operator>(</operator><name>VmemHeader</name><operator>*</operator><operator>)</operator> <name>malloc_pointer</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * realloc the requested "size" and additional memory for metadata and store header and/or
+ * footer metadata information. Caller is in charge to update Vmem counter accordingly.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name> <modifier>*</modifier></type><name>realloc_and_store_metadata</name><parameter_list>(<parameter><decl><type><name>void</name> <modifier>*</modifier></type><name>usable_pointer</name></decl></parameter>, <parameter><decl><type><name>size_t</name></type> <name>new_usable_size</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>UserPtr_GetVmemPtr</name><argument_list>(<argument><expr><name>usable_pointer</name></expr></argument>)</argument_list></call><operator>-&gt;</operator><name>checksum</name> <operator>==</operator> <name>VMEM_HEADER_CHECKSUM</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><operator>*</operator><call><name>VmemPtr_GetPointerToFooterChecksum</name><argument_list>(<argument><expr><call><name>UserPtr_GetVmemPtr</name><argument_list>(<argument><expr><name>usable_pointer</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call> <operator>==</operator> <name>VMEM_FOOTER_CHECKSUM</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<decl_stmt><decl><type><name>void</name> <modifier>*</modifier></type><name>realloc_pointer</name> <init>= <expr><call><name>realloc</name><argument_list>(<argument><expr><call><name>UserPtr_GetVmemPtr</name><argument_list>(<argument><expr><name>usable_pointer</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><call><name>UserPtrSize_GetVmemPtrSize</name><argument_list>(<argument><expr><name>new_usable_size</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>NULL</name> <operator>==</operator> <name>realloc_pointer</name></expr>)</condition>
+	<block>{<block_content>
+		<return>return <expr><name>NULL</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+	<expr_stmt><expr><call><name>VmemPtr_Initialize</name><argument_list>(<argument><expr><operator>(</operator><name>VmemHeader</name><operator>*</operator><operator>)</operator> <name>realloc_pointer</name></expr></argument>, <argument><expr><name>new_usable_size</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<return>return <expr><call><name>VmemPtrToUserPtr</name><argument_list>(<argument><expr><operator>(</operator><name>VmemHeader</name><operator>*</operator><operator>)</operator> <name>realloc_pointer</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/* Reserves vmem from vmem tracker and allocates memory by calling malloc/calloc */</comment>
+<function><type><specifier>static</specifier> <name>void</name> <modifier>*</modifier></type><name>gp_malloc_internal</name><parameter_list>(<parameter><decl><type><name>int64</name></type> <name>requested_size</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>void</name> <modifier>*</modifier></type><name>usable_pointer</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>requested_size</name> <operator>&gt;</operator> <literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<decl_stmt><decl><type><name>size_t</name></type> <name>size_with_overhead</name> <init>= <expr><call><name>UserPtrSize_GetVmemPtrSize</name><argument_list>(<argument><expr><name>requested_size</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>size_with_overhead</name> <operator>&lt;=</operator> <name>MAX_REQUESTABLE_SIZE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<decl_stmt><decl><type><name>MemoryAllocationStatus</name></type> <name>stat</name> <init>= <expr><call><name>VmemTracker_ReserveVmem</name><argument_list>(<argument><expr><name>size_with_overhead</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<if_stmt><if>if <condition>(<expr><name>MemoryAllocation_Success</name> <operator>==</operator> <name>stat</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name>usable_pointer</name> <operator>=</operator> <call><name>malloc_and_store_metadata</name><argument_list>(<argument><expr><name>requested_size</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>usable_pointer</name> <operator>==</operator> <name>NULL</name> <operator>||</operator> <call><name>VmemPtr_GetUserPtrSize</name><argument_list>(<argument><expr><call><name>UserPtr_GetVmemPtr</name><argument_list>(<argument><expr><name>usable_pointer</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call> <operator>==</operator> <name>requested_size</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<if_stmt><if>if<condition>(<expr><operator>!</operator><name>usable_pointer</name></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><call><name>VmemTracker_ReleaseVmem</name><argument_list>(<argument><expr><name>size_with_overhead</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>gp_failed_to_alloc</name><argument_list>(<argument><expr><name>MemoryFailure_SystemMemoryExhausted</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><name>size_with_overhead</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+			<return>return <expr><name>NULL</name></expr>;</return>
+		</block_content>}</block></if></if_stmt>
+
+		<return>return <expr><name>usable_pointer</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>gp_failed_to_alloc</name><argument_list>(<argument><expr><name>stat</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><name>size_with_overhead</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<return>return <expr><name>NULL</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Allocates sz bytes. If memory protection is enabled, this method
+ * uses gp_malloc_internal to reserve vmem and allocate memory.
+ */</comment>
+<function><type><name>void</name> <modifier>*</modifier></type><name>gp_malloc</name><parameter_list>(<parameter><decl><type><name>int64</name></type> <name>sz</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><operator>!</operator><name>gp_mp_inited</name> <operator>||</operator> <call><name>MemoryProtection_IsOwnerThread</name><argument_list>()</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<decl_stmt><decl><type><name>void</name> <modifier>*</modifier></type><name>ret</name></decl>;</decl_stmt>
+
+	<if_stmt><if>if<condition>(<expr><name>gp_mp_inited</name></expr>)</condition>
+	<block>{<block_content>
+		<return>return <expr><call><name>gp_malloc_internal</name><argument_list>(<argument><expr><name>sz</name></expr></argument>)</argument_list></call></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<expr_stmt><expr><name>ret</name> <operator>=</operator> <call><name>malloc_and_store_metadata</name><argument_list>(<argument><expr><name>sz</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<return>return <expr><name>ret</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/* Reallocates memory, respecting vmem protection, if enabled */</comment>
+<function><type><name>void</name> <modifier>*</modifier></type><name>gp_realloc</name><parameter_list>(<parameter><decl><type><name>void</name> <modifier>*</modifier></type><name>ptr</name></decl></parameter>, <parameter><decl><type><name>int64</name></type> <name>new_size</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><operator>!</operator><name>gp_mp_inited</name> <operator>||</operator> <call><name>MemoryProtection_IsOwnerThread</name><argument_list>()</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>NULL</name> <operator>!=</operator> <name>ptr</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<decl_stmt><decl><type><name>void</name> <modifier>*</modifier></type><name>ret</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+
+	<if_stmt><if>if<condition>(<expr><operator>!</operator><name>gp_mp_inited</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name>ret</name> <operator>=</operator> <call><name>realloc_and_store_metadata</name><argument_list>(<argument><expr><name>ptr</name></expr></argument>, <argument><expr><name>new_size</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<return>return <expr><name>ret</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<decl_stmt><decl><type><name>size_t</name></type> <name>old_size</name> <init>= <expr><call><name>UserPtr_GetUserPtrSize</name><argument_list>(<argument><expr><name>ptr</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int64</name></type> <name>size_diff</name> <init>= <expr><operator>(</operator><name>new_size</name> <operator>-</operator> <name>old_size</name><operator>)</operator></expr></init></decl>;</decl_stmt>
+
+	<decl_stmt><decl><type><name>MemoryAllocationStatus</name></type> <name>stat</name> <init>= <expr><name>MemoryAllocation_Success</name></expr></init></decl>;</decl_stmt>
+	<if_stmt><if>if<condition>(<expr><name>new_size</name> <operator>&lt;=</operator> <name>old_size</name> <operator>||</operator> <name>MemoryAllocation_Success</name> <operator>==</operator> <operator>(</operator><name>stat</name> <operator>=</operator>  <call><name>VmemTracker_ReserveVmem</name><argument_list>(<argument><expr><name>size_diff</name></expr></argument>)</argument_list></call><operator>)</operator></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name>ret</name> <operator>=</operator> <call><name>realloc_and_store_metadata</name><argument_list>(<argument><expr><name>ptr</name></expr></argument>, <argument><expr><name>new_size</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<if_stmt><if>if<condition>(<expr><operator>!</operator><name>ret</name></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/*
+			 * There is no guarantee that realloc would not fail during a shrinkage.
+			 * But, we haven't touched Vmem at all for a shrinkage. So, nothing to undo.
+			 */</comment>
+			<if_stmt><if>if <condition>(<expr><name>size_diff</name> <operator>&gt;</operator> <literal type="number">0</literal></expr>)</condition>
+			<block>{<block_content>
+				<expr_stmt><expr><call><name>VmemTracker_ReleaseVmem</name><argument_list>(<argument><expr><name>size_diff</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			</block_content>}</block></if></if_stmt>
+
+			<expr_stmt><expr><call><name>gp_failed_to_alloc</name><argument_list>(<argument><expr><name>MemoryFailure_SystemMemoryExhausted</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><name>new_size</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<return>return <expr><name>NULL</name></expr>;</return>
+		</block_content>}</block></if></if_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name>size_diff</name> <operator>&lt;</operator> <literal type="number">0</literal></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/*
+			 * As there is no guarantee that a shrinkage during realloc would not fail,
+			 * we follow a lazy approach of adjusting VMEM during shrinkage. Upon a
+			 * successful realloc, we finally release a VMEM, which should virtually never fail.
+			 */</comment>
+			<expr_stmt><expr><call><name>VmemTracker_ReleaseVmem</name><argument_list>(<argument><expr><operator>-</operator><literal type="number">1</literal> <operator>*</operator> <name>size_diff</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+
+		<return>return <expr><name>ret</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>MemoryAllocation_Success</name> <operator>!=</operator> <name>stat</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>gp_failed_to_alloc</name><argument_list>(<argument><expr><name>stat</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><name>new_size</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<return>return <expr><name>NULL</name></expr>;</return> 
+</block_content>}</block></function>
+
+<comment type="block">/* Frees memory and releases vmem accordingly */</comment>
+<function><type><name>void</name></type> <name>gp_free</name><parameter_list>(<parameter><decl><type><name>void</name> <modifier>*</modifier></type><name>user_pointer</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><operator>!</operator><name>gp_mp_inited</name> <operator>||</operator> <call><name>MemoryProtection_IsOwnerThread</name><argument_list>()</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>NULL</name> <operator>!=</operator> <name>user_pointer</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<decl_stmt><decl><type><name>void</name> <modifier>*</modifier></type><name>malloc_pointer</name> <init>= <expr><call><name>UserPtr_GetVmemPtr</name><argument_list>(<argument><expr><name>user_pointer</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>size_t</name></type> <name>usable_size</name> <init>= <expr><call><name>VmemPtr_GetUserPtrSize</name><argument_list>(<argument><expr><operator>(</operator><name>VmemHeader</name><operator>*</operator><operator>)</operator> <name>malloc_pointer</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>usable_size</name> <operator>&gt;</operator> <literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>UserPtr_VerifyChecksum</name><argument_list>(<argument><expr><name>user_pointer</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>free</name><argument_list>(<argument><expr><name>malloc_pointer</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>VmemTracker_ReleaseVmem</name><argument_list>(<argument><expr><call><name>UserPtrSize_GetVmemPtrSize</name><argument_list>(<argument><expr><name>usable_size</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+</unit>

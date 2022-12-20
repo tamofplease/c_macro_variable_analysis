@@ -1,0 +1,324 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<unit xmlns="http://www.srcML.org/srcML/src" xmlns:cpp="http://www.srcML.org/srcML/cpp" revision="1.0.0" language="C" filename="/cloned_projects/gpdb/src/backend/access/heap/syncscan.c"><comment type="block">/*-------------------------------------------------------------------------
+ *
+ * syncscan.c
+ *	  heap scan synchronization support
+ *
+ * When multiple backends run a sequential scan on the same table, we try
+ * to keep them synchronized to reduce the overall I/O needed.  The goal is
+ * to read each page into shared buffer cache only once, and let all backends
+ * that take part in the shared scan process the page before it falls out of
+ * the cache.
+ *
+ * Since the "leader" in a pack of backends doing a seqscan will have to wait
+ * for I/O, while the "followers" don't, there is a strong self-synchronizing
+ * effect once we can get the backends examining approximately the same part
+ * of the table at the same time.  Hence all that is really needed is to get
+ * a new backend beginning a seqscan to begin it close to where other backends
+ * are reading.  We can scan the table circularly, from block X up to the
+ * end and then from block 0 to X-1, to ensure we visit all rows while still
+ * participating in the common scan.
+ *
+ * To accomplish that, we keep track of the scan position of each table, and
+ * start new scans close to where the previous scan(s) are.  We don't try to
+ * do any extra synchronization to keep the scans together afterwards; some
+ * scans might progress much more slowly than others, for example if the
+ * results need to be transferred to the client over a slow network, and we
+ * don't want such queries to slow down others.
+ *
+ * There can realistically only be a few large sequential scans on different
+ * tables in progress at any time.  Therefore we just keep the scan positions
+ * in a small LRU list which we scan every time we need to look up or update a
+ * scan position.  The whole mechanism is only applied for tables exceeding
+ * a threshold size (but that is not the concern of this module).
+ *
+ * INTERFACE ROUTINES
+ *		ss_get_location		- return current scan location of a relation
+ *		ss_report_location	- update current scan location
+ *
+ *
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1994, Regents of the University of California
+ *
+ * IDENTIFICATION
+ *	  src/backend/access/heap/syncscan.c
+ *
+ *-------------------------------------------------------------------------
+ */</comment>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"postgres.h"</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/heapam.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"miscadmin.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/lwlock.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/shmem.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/rel.h"</cpp:file></cpp:include>
+
+
+<comment type="block">/* GUC variables */</comment>
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>TRACE_SYNCSCAN</name></cpp:ifdef>
+<decl_stmt><decl><type><name>bool</name></type>		<name>trace_syncscan</name> <init>= <expr><name>false</name></expr></init></decl>;</decl_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+
+<comment type="block">/*
+ * Size of the LRU list.
+ *
+ * Note: the code assumes that SYNC_SCAN_NELEM &gt; 1.
+ *
+ * XXX: What's a good value? It should be large enough to hold the
+ * maximum number of large tables scanned simultaneously.  But a larger value
+ * means more traversing of the LRU list when starting a new scan.
+ */</comment>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>SYNC_SCAN_NELEM</name></cpp:macro> <cpp:value>20</cpp:value></cpp:define>
+
+<comment type="block">/*
+ * Interval between reports of the location of the current scan, in pages.
+ *
+ * Note: This should be smaller than the ring size (see buffer/freelist.c)
+ * we use for bulk reads.  Otherwise a scan joining other scans might start
+ * from a page that's no longer in the buffer cache.  This is a bit fuzzy;
+ * there's no guarantee that the new scan will read the page before it leaves
+ * the buffer cache anyway, and on the other hand the page is most likely
+ * still in the OS cache.
+ */</comment>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>SYNC_SCAN_REPORT_INTERVAL</name></cpp:macro> <cpp:value>(128 * 1024 / BLCKSZ)</cpp:value></cpp:define>
+
+
+<comment type="block">/*
+ * The scan locations structure is essentially a doubly-linked LRU with head
+ * and tail pointer, but designed to hold a fixed maximum number of elements in
+ * fixed-size shared memory.
+ */</comment>
+<typedef>typedef <type><struct>struct <name>ss_scan_location_t</name>
+<block>{
+	<decl_stmt><decl><type><name>RelFileNode</name></type> <name>relfilenode</name></decl>;</decl_stmt>	<comment type="block">/* identity of a relation */</comment>
+	<decl_stmt><decl><type><name>BlockNumber</name></type> <name>location</name></decl>;</decl_stmt>		<comment type="block">/* last-reported location in the relation */</comment>
+}</block></struct></type> <name>ss_scan_location_t</name>;</typedef>
+
+<typedef>typedef <type><struct>struct <name>ss_lru_item_t</name>
+<block>{
+	<decl_stmt><decl><type><name><name>struct</name> <name>ss_lru_item_t</name></name> <modifier>*</modifier></type><name>prev</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name><name>struct</name> <name>ss_lru_item_t</name></name> <modifier>*</modifier></type><name>next</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>ss_scan_location_t</name></type> <name>location</name></decl>;</decl_stmt>
+}</block></struct></type> <name>ss_lru_item_t</name>;</typedef>
+
+<typedef>typedef <type><struct>struct <name>ss_scan_locations_t</name>
+<block>{
+	<decl_stmt><decl><type><name>ss_lru_item_t</name> <modifier>*</modifier></type><name>head</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>ss_lru_item_t</name> <modifier>*</modifier></type><name>tail</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>ss_lru_item_t</name></type> <name><name>items</name><index>[<expr><name>FLEXIBLE_ARRAY_MEMBER</name></expr>]</index></name></decl>;</decl_stmt> <comment type="block">/* SYNC_SCAN_NELEM items */</comment>
+}</block></struct></type> <name>ss_scan_locations_t</name>;</typedef>
+
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>SizeOfScanLocations</name><parameter_list>(<parameter><type><name>N</name></type></parameter>)</parameter_list></cpp:macro> \
+	<cpp:value>(offsetof(ss_scan_locations_t, items) + (N) * sizeof(ss_lru_item_t))</cpp:value></cpp:define>
+
+<comment type="block">/* Pointer to struct in shared memory */</comment>
+<decl_stmt><decl><type><specifier>static</specifier> <name>ss_scan_locations_t</name> <modifier>*</modifier></type><name>scan_locations</name></decl>;</decl_stmt>
+
+<comment type="block">/* prototypes for internal functions */</comment>
+<function_decl><type><specifier>static</specifier> <name>BlockNumber</name></type> <name>ss_search</name><parameter_list>(<parameter><decl><type><name>RelFileNode</name></type> <name>relfilenode</name></decl></parameter>,
+							 <parameter><decl><type><name>BlockNumber</name></type> <name>location</name></decl></parameter>, <parameter><decl><type><name>bool</name></type> <name>set</name></decl></parameter>)</parameter_list>;</function_decl>
+
+
+<comment type="block">/*
+ * SyncScanShmemSize --- report amount of shared memory space needed
+ */</comment>
+<function><type><name>Size</name></type>
+<name>SyncScanShmemSize</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<return>return <expr><call><name>SizeOfScanLocations</name><argument_list>(<argument><expr><name>SYNC_SCAN_NELEM</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * SyncScanShmemInit --- initialize this module's shared memory
+ */</comment>
+<function><type><name>void</name></type>
+<name>SyncScanShmemInit</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>int</name></type>			<name>i</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type>		<name>found</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name>scan_locations</name> <operator>=</operator> <operator>(</operator><name>ss_scan_locations_t</name> <operator>*</operator><operator>)</operator>
+		<call><name>ShmemInitStruct</name><argument_list>(<argument><expr><literal type="string">"Sync Scan Locations List"</literal></expr></argument>,
+						<argument><expr><call><name>SizeOfScanLocations</name><argument_list>(<argument><expr><name>SYNC_SCAN_NELEM</name></expr></argument>)</argument_list></call></expr></argument>,
+						<argument><expr><operator>&amp;</operator><name>found</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><name>IsUnderPostmaster</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* Initialize shared memory area */</comment>
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><operator>!</operator><name>found</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><name><name>scan_locations</name><operator>-&gt;</operator><name>head</name></name> <operator>=</operator> <operator>&amp;</operator><name><name>scan_locations</name><operator>-&gt;</operator><name>items</name><index>[<expr><literal type="number">0</literal></expr>]</index></name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>scan_locations</name><operator>-&gt;</operator><name>tail</name></name> <operator>=</operator> <operator>&amp;</operator><name><name>scan_locations</name><operator>-&gt;</operator><name>items</name><index>[<expr><name>SYNC_SCAN_NELEM</name> <operator>-</operator> <literal type="number">1</literal></expr>]</index></name></expr>;</expr_stmt>
+
+		<for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name>SYNC_SCAN_NELEM</name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>ss_lru_item_t</name> <modifier>*</modifier></type><name>item</name> <init>= <expr><operator>&amp;</operator><name><name>scan_locations</name><operator>-&gt;</operator><name>items</name><index>[<expr><name>i</name></expr>]</index></name></expr></init></decl>;</decl_stmt>
+
+			<comment type="block">/*
+			 * Initialize all slots with invalid values. As scans are started,
+			 * these invalid entries will fall off the LRU list and get
+			 * replaced with real entries.
+			 */</comment>
+			<expr_stmt><expr><name><name>item</name><operator>-&gt;</operator><name>location</name><operator>.</operator><name>relfilenode</name><operator>.</operator><name>spcNode</name></name> <operator>=</operator> <name>InvalidOid</name></expr>;</expr_stmt>
+			<expr_stmt><expr><name><name>item</name><operator>-&gt;</operator><name>location</name><operator>.</operator><name>relfilenode</name><operator>.</operator><name>dbNode</name></name> <operator>=</operator> <name>InvalidOid</name></expr>;</expr_stmt>
+			<expr_stmt><expr><name><name>item</name><operator>-&gt;</operator><name>location</name><operator>.</operator><name>relfilenode</name><operator>.</operator><name>relNode</name></name> <operator>=</operator> <name>InvalidOid</name></expr>;</expr_stmt>
+			<expr_stmt><expr><name><name>item</name><operator>-&gt;</operator><name>location</name><operator>.</operator><name>location</name></name> <operator>=</operator> <name>InvalidBlockNumber</name></expr>;</expr_stmt>
+
+			<expr_stmt><expr><name><name>item</name><operator>-&gt;</operator><name>prev</name></name> <operator>=</operator> <ternary><condition><expr><operator>(</operator><name>i</name> <operator>&gt;</operator> <literal type="number">0</literal><operator>)</operator></expr> ?</condition><then>
+				<expr><operator>(</operator><operator>&amp;</operator><name><name>scan_locations</name><operator>-&gt;</operator><name>items</name><index>[<expr><name>i</name> <operator>-</operator> <literal type="number">1</literal></expr>]</index></name><operator>)</operator></expr> </then><else>: <expr><name>NULL</name></expr></else></ternary></expr>;</expr_stmt>
+			<expr_stmt><expr><name><name>item</name><operator>-&gt;</operator><name>next</name></name> <operator>=</operator> <ternary><condition><expr><operator>(</operator><name>i</name> <operator>&lt;</operator> <name>SYNC_SCAN_NELEM</name> <operator>-</operator> <literal type="number">1</literal><operator>)</operator></expr> ?</condition><then>
+				<expr><operator>(</operator><operator>&amp;</operator><name><name>scan_locations</name><operator>-&gt;</operator><name>items</name><index>[<expr><name>i</name> <operator>+</operator> <literal type="number">1</literal></expr>]</index></name><operator>)</operator></expr> </then><else>: <expr><name>NULL</name></expr></else></ternary></expr>;</expr_stmt>
+		</block_content>}</block></for>
+	</block_content>}</block></if>
+	<else>else<block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>found</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></else></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * ss_search --- search the scan_locations structure for an entry with the
+ *		given relfilenode.
+ *
+ * If "set" is true, the location is updated to the given location.  If no
+ * entry for the given relfilenode is found, it will be created at the head
+ * of the list with the given location, even if "set" is false.
+ *
+ * In any case, the location after possible update is returned.
+ *
+ * Caller is responsible for having acquired suitable lock on the shared
+ * data structure.
+ */</comment>
+<function><type><specifier>static</specifier> <name>BlockNumber</name></type>
+<name>ss_search</name><parameter_list>(<parameter><decl><type><name>RelFileNode</name></type> <name>relfilenode</name></decl></parameter>, <parameter><decl><type><name>BlockNumber</name></type> <name>location</name></decl></parameter>, <parameter><decl><type><name>bool</name></type> <name>set</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>ss_lru_item_t</name> <modifier>*</modifier></type><name>item</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name>item</name> <operator>=</operator> <name><name>scan_locations</name><operator>-&gt;</operator><name>head</name></name></expr>;</expr_stmt>
+	<for>for <control>(<init>;</init><condition>;</condition><incr/>)</control>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>bool</name></type>		<name>match</name></decl>;</decl_stmt>
+
+		<expr_stmt><expr><name>match</name> <operator>=</operator> <call><name>RelFileNodeEquals</name><argument_list>(<argument><expr><name><name>item</name><operator>-&gt;</operator><name>location</name><operator>.</operator><name>relfilenode</name></name></expr></argument>, <argument><expr><name>relfilenode</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name>match</name> <operator>||</operator> <name><name>item</name><operator>-&gt;</operator><name>next</name></name> <operator>==</operator> <name>NULL</name></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/*
+			 * If we reached the end of list and no match was found, take over
+			 * the last entry
+			 */</comment>
+			<if_stmt><if>if <condition>(<expr><operator>!</operator><name>match</name></expr>)</condition>
+			<block>{<block_content>
+				<expr_stmt><expr><name><name>item</name><operator>-&gt;</operator><name>location</name><operator>.</operator><name>relfilenode</name></name> <operator>=</operator> <name>relfilenode</name></expr>;</expr_stmt>
+				<expr_stmt><expr><name><name>item</name><operator>-&gt;</operator><name>location</name><operator>.</operator><name>location</name></name> <operator>=</operator> <name>location</name></expr>;</expr_stmt>
+			</block_content>}</block></if>
+			<if type="elseif">else if <condition>(<expr><name>set</name></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><name><name>item</name><operator>-&gt;</operator><name>location</name><operator>.</operator><name>location</name></name> <operator>=</operator> <name>location</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+			<comment type="block">/* Move the entry to the front of the LRU list */</comment>
+			<if_stmt><if>if <condition>(<expr><name>item</name> <operator>!=</operator> <name><name>scan_locations</name><operator>-&gt;</operator><name>head</name></name></expr>)</condition>
+			<block>{<block_content>
+				<comment type="block">/* unlink */</comment>
+				<if_stmt><if>if <condition>(<expr><name>item</name> <operator>==</operator> <name><name>scan_locations</name><operator>-&gt;</operator><name>tail</name></name></expr>)</condition><block type="pseudo"><block_content>
+					<expr_stmt><expr><name><name>scan_locations</name><operator>-&gt;</operator><name>tail</name></name> <operator>=</operator> <name><name>item</name><operator>-&gt;</operator><name>prev</name></name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+				<expr_stmt><expr><name><name>item</name><operator>-&gt;</operator><name>prev</name><operator>-&gt;</operator><name>next</name></name> <operator>=</operator> <name><name>item</name><operator>-&gt;</operator><name>next</name></name></expr>;</expr_stmt>
+				<if_stmt><if>if <condition>(<expr><name><name>item</name><operator>-&gt;</operator><name>next</name></name></expr>)</condition><block type="pseudo"><block_content>
+					<expr_stmt><expr><name><name>item</name><operator>-&gt;</operator><name>next</name><operator>-&gt;</operator><name>prev</name></name> <operator>=</operator> <name><name>item</name><operator>-&gt;</operator><name>prev</name></name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+				<comment type="block">/* link */</comment>
+				<expr_stmt><expr><name><name>item</name><operator>-&gt;</operator><name>prev</name></name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+				<expr_stmt><expr><name><name>item</name><operator>-&gt;</operator><name>next</name></name> <operator>=</operator> <name><name>scan_locations</name><operator>-&gt;</operator><name>head</name></name></expr>;</expr_stmt>
+				<expr_stmt><expr><name><name>scan_locations</name><operator>-&gt;</operator><name>head</name><operator>-&gt;</operator><name>prev</name></name> <operator>=</operator> <name>item</name></expr>;</expr_stmt>
+				<expr_stmt><expr><name><name>scan_locations</name><operator>-&gt;</operator><name>head</name></name> <operator>=</operator> <name>item</name></expr>;</expr_stmt>
+			</block_content>}</block></if></if_stmt>
+
+			<return>return <expr><name><name>item</name><operator>-&gt;</operator><name>location</name><operator>.</operator><name>location</name></name></expr>;</return>
+		</block_content>}</block></if></if_stmt>
+
+		<expr_stmt><expr><name>item</name> <operator>=</operator> <name><name>item</name><operator>-&gt;</operator><name>next</name></name></expr>;</expr_stmt>
+	</block_content>}</block></for>
+
+	<comment type="block">/* not reached */</comment>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * ss_get_location --- get the optimal starting location for scan
+ *
+ * Returns the last-reported location of a sequential scan on the
+ * relation, or 0 if no valid location is found.
+ *
+ * We expect the caller has just done RelationGetNumberOfBlocks(), and
+ * so that number is passed in rather than computing it again.  The result
+ * is guaranteed less than relnblocks (assuming that's &gt; 0).
+ */</comment>
+<function><type><name>BlockNumber</name></type>
+<name>ss_get_location</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>rel</name></decl></parameter>, <parameter><decl><type><name>BlockNumber</name></type> <name>relnblocks</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>BlockNumber</name></type> <name>startloc</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>LWLockAcquire</name><argument_list>(<argument><expr><name>SyncScanLock</name></expr></argument>, <argument><expr><name>LW_EXCLUSIVE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>startloc</name> <operator>=</operator> <call><name>ss_search</name><argument_list>(<argument><expr><name><name>rel</name><operator>-&gt;</operator><name>rd_node</name></name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><name>SyncScanLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * If the location is not a valid block number for this scan, start at 0.
+	 *
+	 * This can happen if for instance a VACUUM truncated the table since the
+	 * location was saved.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name>startloc</name> <operator>&gt;=</operator> <name>relnblocks</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name>startloc</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>TRACE_SYNCSCAN</name></cpp:ifdef>
+	<if_stmt><if>if <condition>(<expr><name>trace_syncscan</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>LOG</name></expr></argument>,
+			 <argument><expr><literal type="string">"SYNC_SCAN: start \"%s\" (size %u) at %u"</literal></expr></argument>,
+			 <argument><expr><call><name>RelationGetRelationName</name><argument_list>(<argument><expr><name>rel</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>relnblocks</name></expr></argument>, <argument><expr><name>startloc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+	<return>return <expr><name>startloc</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * ss_report_location --- update the current scan location
+ *
+ * Writes an entry into the shared Sync Scan state of the form
+ * (relfilenode, blocknumber), overwriting any existing entry for the
+ * same relfilenode.
+ */</comment>
+<function><type><name>void</name></type>
+<name>ss_report_location</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>rel</name></decl></parameter>, <parameter><decl><type><name>BlockNumber</name></type> <name>location</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>TRACE_SYNCSCAN</name></cpp:ifdef>
+	<if_stmt><if>if <condition>(<expr><name>trace_syncscan</name></expr>)</condition>
+	<block>{<block_content>
+		<if_stmt><if>if <condition>(<expr><operator>(</operator><name>location</name> <operator>%</operator> <literal type="number">1024</literal><operator>)</operator> <operator>==</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>LOG</name></expr></argument>,
+				 <argument><expr><literal type="string">"SYNC_SCAN: scanning \"%s\" at %u"</literal></expr></argument>,
+				 <argument><expr><call><name>RelationGetRelationName</name><argument_list>(<argument><expr><name>rel</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>location</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	</block_content>}</block></if></if_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+	<comment type="block">/*
+	 * To reduce lock contention, only report scan progress every N pages. For
+	 * the same reason, don't block if the lock isn't immediately available.
+	 * Missing a few updates isn't critical, it just means that a new scan
+	 * that wants to join the pack will start a little bit behind the head of
+	 * the scan.  Hopefully the pages are still in OS cache and the scan
+	 * catches up quickly.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><operator>(</operator><name>location</name> <operator>%</operator> <name>SYNC_SCAN_REPORT_INTERVAL</name><operator>)</operator> <operator>==</operator> <literal type="number">0</literal></expr>)</condition>
+	<block>{<block_content>
+		<if_stmt><if>if <condition>(<expr><call><name>LWLockConditionalAcquire</name><argument_list>(<argument><expr><name>SyncScanLock</name></expr></argument>, <argument><expr><name>LW_EXCLUSIVE</name></expr></argument>)</argument_list></call></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><operator>(</operator><name>void</name><operator>)</operator> <call><name>ss_search</name><argument_list>(<argument><expr><name><name>rel</name><operator>-&gt;</operator><name>rd_node</name></name></expr></argument>, <argument><expr><name>location</name></expr></argument>, <argument><expr><name>true</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><name>SyncScanLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></if>
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>TRACE_SYNCSCAN</name></cpp:ifdef>
+		<if type="elseif">else if <condition>(<expr><name>trace_syncscan</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>LOG</name></expr></argument>,
+				 <argument><expr><literal type="string">"SYNC_SCAN: missed update for \"%s\" at %u"</literal></expr></argument>,
+				 <argument><expr><call><name>RelationGetRelationName</name><argument_list>(<argument><expr><name>rel</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>location</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+	</block_content>}</block></if></if_stmt>
+</block_content>}</block></function>
+</unit>

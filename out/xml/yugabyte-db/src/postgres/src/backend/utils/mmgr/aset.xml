@@ -1,0 +1,1526 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<unit xmlns="http://www.srcML.org/srcML/src" xmlns:cpp="http://www.srcML.org/srcML/cpp" revision="1.0.0" language="C" filename="/cloned_projects/yugabyte-db/src/postgres/src/backend/utils/mmgr/aset.c"><comment type="block">/*-------------------------------------------------------------------------
+ *
+ * aset.c
+ *	  Allocation set definitions.
+ *
+ * AllocSet is our standard implementation of the abstract MemoryContext
+ * type.
+ *
+ *
+ * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1994, Regents of the University of California
+ *
+ * IDENTIFICATION
+ *	  src/backend/utils/mmgr/aset.c
+ *
+ * NOTE:
+ *	This is a new (Feb. 05, 1999) implementation of the allocation set
+ *	routines. AllocSet...() does not use OrderedSet...() any more.
+ *	Instead it manages allocations in a block pool by itself, combining
+ *	many small allocations in a few bigger blocks. AllocSetFree() normally
+ *	doesn't free() memory really. It just add's the free'd area to some
+ *	list for later reuse by AllocSetAlloc(). All memory blocks are free()'d
+ *	at once on AllocSetReset(), which happens when the memory context gets
+ *	destroyed.
+ *				Jan Wieck
+ *
+ *	Performance improvement from Tom Lane, 8/99: for extremely large request
+ *	sizes, we do want to be able to give the memory back to free() as soon
+ *	as it is pfree()'d.  Otherwise we risk tying up a lot of memory in
+ *	freelist entries that might never be usable.  This is specially needed
+ *	when the caller is repeatedly repalloc()'ing a block bigger and bigger;
+ *	the previous instances of the block were guaranteed to be wasted until
+ *	AllocSetReset() under the old way.
+ *
+ *	Further improvement 12/00: as the code stood, request sizes in the
+ *	midrange between "small" and "large" were handled very inefficiently,
+ *	because any sufficiently large free chunk would be used to satisfy a
+ *	request, even if it was much larger than necessary.  This led to more
+ *	and more wasted space in allocated chunks over time.  To fix, get rid
+ *	of the midrange behavior: we now handle only "small" power-of-2-size
+ *	chunks as chunks.  Anything "large" is passed off to malloc().  Change
+ *	the number of freelists to change the small/large boundary.
+ *
+ *-------------------------------------------------------------------------
+ */</comment>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"postgres.h"</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/memdebug.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/memutils.h"</cpp:file></cpp:include>
+
+<comment type="block">/* Define this to detail debug alloc information */</comment>
+<comment type="block">/* #define HAVE_ALLOCINFO */</comment>
+
+<comment type="block">/*--------------------
+ * Chunk freelist k holds chunks of size 1 &lt;&lt; (k + ALLOC_MINBITS),
+ * for k = 0 .. ALLOCSET_NUM_FREELISTS-1.
+ *
+ * Note that all chunks in the freelists have power-of-2 sizes.  This
+ * improves recyclability: we may waste some space, but the wasted space
+ * should stay pretty constant as requests are made and released.
+ *
+ * A request too large for the last freelist is handled by allocating a
+ * dedicated block from malloc().  The block still has a block header and
+ * chunk header, but when the chunk is freed we'll return the whole block
+ * to malloc(), not put it on our freelists.
+ *
+ * CAUTION: ALLOC_MINBITS must be large enough so that
+ * 1&lt;&lt;ALLOC_MINBITS is at least MAXALIGN,
+ * or we may fail to align the smallest chunks adequately.
+ * 8-byte alignment is enough on all currently known machines.
+ *
+ * With the current parameters, request sizes up to 8K are treated as chunks,
+ * larger requests go into dedicated blocks.  Change ALLOCSET_NUM_FREELISTS
+ * to adjust the boundary point; and adjust ALLOCSET_SEPARATE_THRESHOLD in
+ * memutils.h to agree.  (Note: in contexts with small maxBlockSize, we may
+ * set the allocChunkLimit to less than 8K, so as to avoid space wastage.)
+ *--------------------
+ */</comment>
+
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>ALLOC_MINBITS</name></cpp:macro>		<cpp:value>3</cpp:value></cpp:define>	<comment type="block">/* smallest chunk size is 8 bytes */</comment>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>ALLOCSET_NUM_FREELISTS</name></cpp:macro>	<cpp:value>11</cpp:value></cpp:define>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>ALLOC_CHUNK_LIMIT</name></cpp:macro>	<cpp:value>(1 &lt;&lt; (ALLOCSET_NUM_FREELISTS-1+ALLOC_MINBITS))</cpp:value></cpp:define>
+<comment type="block">/* Size of largest chunk that we use a fixed size for */</comment>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>ALLOC_CHUNK_FRACTION</name></cpp:macro>	<cpp:value>4</cpp:value></cpp:define>
+<comment type="block">/* We allow chunks to be at most 1/4 of maxBlockSize (less overhead) */</comment>
+
+<comment type="block">/*--------------------
+ * The first block allocated for an allocset has size initBlockSize.
+ * Each time we have to allocate another block, we double the block size
+ * (if possible, and without exceeding maxBlockSize), so as to reduce
+ * the bookkeeping load on malloc().
+ *
+ * Blocks allocated to hold oversize chunks do not follow this rule, however;
+ * they are just however big they need to be to hold that single chunk.
+ *
+ * Also, if a minContextSize is specified, the first block has that size,
+ * and then initBlockSize is used for the next one.
+ *--------------------
+ */</comment>
+
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>ALLOC_BLOCKHDRSZ</name></cpp:macro>	<cpp:value>MAXALIGN(sizeof(AllocBlockData))</cpp:value></cpp:define>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>ALLOC_CHUNKHDRSZ</name></cpp:macro>	<cpp:value>sizeof(struct AllocChunkData)</cpp:value></cpp:define>
+
+<comment type="block">/* Calculate the total allocated size for a block */</comment>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>ASET_BLOCK_TOTAL_SIZE</name><parameter_list>(<parameter><type><name>BLK</name></type></parameter>)</parameter_list></cpp:macro> <cpp:value>(BLK-&gt;endptr - ((char *)BLK))</cpp:value></cpp:define>
+<comment type="block">/*
+ * Calculate the total initial allocated size for a set. Note that the keeper
+ * block is always allocated along with the set header at the same time. It
+ * is never removed from the header or replaced.
+ */</comment>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>ASET_INITIAL_TOTAL_SIZE</name><parameter_list>(<parameter><type><name>SET</name></type></parameter>)</parameter_list></cpp:macro> <cpp:value>(((AllocSetContext *) SET)-&gt;keeper-&gt;endptr - ((char *) SET))</cpp:value></cpp:define>
+
+<typedef>typedef <type><name><name>struct</name> <name>AllocBlockData</name></name> <modifier>*</modifier></type><name>AllocBlock</name>;</typedef>	<comment type="block">/* forward reference */</comment>
+<typedef>typedef <type><name><name>struct</name> <name>AllocChunkData</name></name> <modifier>*</modifier></type><name>AllocChunk</name>;</typedef>
+
+<comment type="block">/*
+ * AllocPointer
+ *		Aligned pointer which may be a member of an allocation set.
+ */</comment>
+<typedef>typedef <type><name>void</name> <modifier>*</modifier></type><name>AllocPointer</name>;</typedef>
+
+<comment type="block">/*
+ * AllocSetContext is our standard implementation of MemoryContext.
+ *
+ * Note: header.isReset means there is nothing for AllocSetReset to do.
+ * This is different from the aset being physically empty (empty blocks list)
+ * because we will still have a keeper block.  It's also different from the set
+ * being logically empty, because we don't attempt to detect pfree'ing the
+ * last active chunk.
+ */</comment>
+<typedef>typedef <type><struct>struct <name>AllocSetContext</name>
+<block>{
+	<decl_stmt><decl><type><name>MemoryContextData</name></type> <name>header</name></decl>;</decl_stmt>	<comment type="block">/* Standard memory-context fields */</comment>
+	<comment type="block">/* Info about storage allocated in this context: */</comment>
+	<decl_stmt><decl><type><name>AllocBlock</name></type>	<name>blocks</name></decl>;</decl_stmt>			<comment type="block">/* head of list of blocks in this set */</comment>
+	<decl_stmt><decl><type><name>AllocChunk</name></type>	<name><name>freelist</name><index>[<expr><name>ALLOCSET_NUM_FREELISTS</name></expr>]</index></name></decl>;</decl_stmt>	<comment type="block">/* free chunk lists */</comment>
+	<comment type="block">/* Allocation parameters for this context: */</comment>
+	<decl_stmt><decl><type><name>Size</name></type>		<name>initBlockSize</name></decl>;</decl_stmt>	<comment type="block">/* initial block size */</comment>
+	<decl_stmt><decl><type><name>Size</name></type>		<name>maxBlockSize</name></decl>;</decl_stmt>	<comment type="block">/* maximum block size */</comment>
+	<decl_stmt><decl><type><name>Size</name></type>		<name>nextBlockSize</name></decl>;</decl_stmt>	<comment type="block">/* next block size to allocate */</comment>
+	<decl_stmt><decl><type><name>Size</name></type>		<name>allocChunkLimit</name></decl>;</decl_stmt>	<comment type="block">/* effective chunk size limit */</comment>
+	<decl_stmt><decl><type><name>AllocBlock</name></type>	<name>keeper</name></decl>;</decl_stmt>			<comment type="block">/* keep this block over resets */</comment>
+	<comment type="block">/* freelist this context could be put in, or -1 if not a candidate: */</comment>
+	<decl_stmt><decl><type><name>int</name></type>			<name>freeListIndex</name></decl>;</decl_stmt>	<comment type="block">/* index in context_freelists[], or -1 */</comment>
+}</block></struct></type> <name>AllocSetContext</name>;</typedef>
+
+<typedef>typedef <type><name>AllocSetContext</name> <modifier>*</modifier></type><name>AllocSet</name>;</typedef>
+
+<comment type="block">/*
+ * AllocBlock
+ *		An AllocBlock is the unit of memory that is obtained by aset.c
+ *		from malloc().  It contains one or more AllocChunks, which are
+ *		the units requested by palloc() and freed by pfree().  AllocChunks
+ *		cannot be returned to malloc() individually, instead they are put
+ *		on freelists by pfree() and re-used by the next palloc() that has
+ *		a matching request size.
+ *
+ *		AllocBlockData is the header data for a block --- the usable space
+ *		within the block begins at the next alignment boundary.
+ */</comment>
+<typedef>typedef <type><struct>struct <name>AllocBlockData</name>
+<block>{
+	<decl_stmt><decl><type><name>AllocSet</name></type>	<name>aset</name></decl>;</decl_stmt>			<comment type="block">/* aset that owns this block */</comment>
+	<decl_stmt><decl><type><name>AllocBlock</name></type>	<name>prev</name></decl>;</decl_stmt>			<comment type="block">/* prev block in aset's blocks list, if any */</comment>
+	<decl_stmt><decl><type><name>AllocBlock</name></type>	<name>next</name></decl>;</decl_stmt>			<comment type="block">/* next block in aset's blocks list, if any */</comment>
+	<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>freeptr</name></decl>;</decl_stmt>		<comment type="block">/* start of free space in this block */</comment>
+	<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>endptr</name></decl>;</decl_stmt>			<comment type="block">/* end of space in this block */</comment>
+}</block></struct></type>			<name>AllocBlockData</name>;</typedef>
+
+<comment type="block">/*
+ * AllocChunk
+ *		The prefix of each piece of memory in an AllocBlock
+ *
+ * Note: to meet the memory context APIs, the payload area of the chunk must
+ * be maxaligned, and the "aset" link must be immediately adjacent to the
+ * payload area (cf. GetMemoryChunkContext).  We simplify matters for this
+ * module by requiring sizeof(AllocChunkData) to be maxaligned, and then
+ * we can ensure things work by adding any required alignment padding before
+ * the "aset" field.  There is a static assertion below that the alignment
+ * is done correctly.
+ */</comment>
+<typedef>typedef <type><struct>struct <name>AllocChunkData</name>
+<block>{
+	<comment type="block">/* size is always the size of the usable space in the chunk */</comment>
+	<decl_stmt><decl><type><name>Size</name></type>		<name>size</name></decl>;</decl_stmt>
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>MEMORY_CONTEXT_CHECKING</name></cpp:ifdef>
+	<comment type="block">/* when debugging memory usage, also store actual requested size */</comment>
+	<comment type="block">/* this is zero in a free chunk */</comment>
+	<decl_stmt><decl><type><name>Size</name></type>		<name>requested_size</name></decl>;</decl_stmt>
+
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>ALLOCCHUNK_RAWSIZE</name></cpp:macro>  <cpp:value>(SIZEOF_SIZE_T * 2 + SIZEOF_VOID_P)</cpp:value></cpp:define>
+<cpp:else>#<cpp:directive>else</cpp:directive></cpp:else>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>ALLOCCHUNK_RAWSIZE</name></cpp:macro>  <cpp:value>(SIZEOF_SIZE_T + SIZEOF_VOID_P)</cpp:value></cpp:define>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>							<comment type="block">/* MEMORY_CONTEXT_CHECKING */</comment>
+
+	<comment type="block">/* ensure proper alignment by adding padding if needed */</comment>
+<cpp:if>#<cpp:directive>if</cpp:directive> <expr><operator>(</operator><name>ALLOCCHUNK_RAWSIZE</name> <operator>%</operator> <name>MAXIMUM_ALIGNOF</name><operator>)</operator> <operator>!=</operator> <literal type="number">0</literal></expr></cpp:if>
+	<decl_stmt><decl><type><name>char</name></type>		<name><name>padding</name><index>[<expr><name>MAXIMUM_ALIGNOF</name> <operator>-</operator> <name>ALLOCCHUNK_RAWSIZE</name> <operator>%</operator> <name>MAXIMUM_ALIGNOF</name></expr>]</index></name></decl>;</decl_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+	<comment type="block">/* aset is the owning aset if allocated, or the freelist link if free */</comment>
+	<decl_stmt><decl><type><name>void</name>	   <modifier>*</modifier></type><name>aset</name></decl>;</decl_stmt>
+	<comment type="block">/* there must not be any padding to reach a MAXALIGN boundary here! */</comment>
+}</block></struct></type>			<name>AllocChunkData</name>;</typedef>
+
+<comment type="block">/*
+ * Only the "aset" field should be accessed outside this module.
+ * We keep the rest of an allocated chunk's header marked NOACCESS when using
+ * valgrind.  But note that chunk headers that are in a freelist are kept
+ * accessible, for simplicity.
+ */</comment>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>ALLOCCHUNK_PRIVATE_LEN</name></cpp:macro>	<cpp:value>offsetof(AllocChunkData, aset)</cpp:value></cpp:define>
+
+<comment type="block">/*
+ * AllocPointerIsValid
+ *		True iff pointer is valid allocation pointer.
+ */</comment>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>AllocPointerIsValid</name><parameter_list>(<parameter><type><name>pointer</name></type></parameter>)</parameter_list></cpp:macro> <cpp:value>PointerIsValid(pointer)</cpp:value></cpp:define>
+
+<comment type="block">/*
+ * AllocSetIsValid
+ *		True iff set is valid allocation set.
+ */</comment>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>AllocSetIsValid</name><parameter_list>(<parameter><type><name>set</name></type></parameter>)</parameter_list></cpp:macro> <cpp:value>PointerIsValid(set)</cpp:value></cpp:define>
+
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>AllocPointerGetChunk</name><parameter_list>(<parameter><type><name>ptr</name></type></parameter>)</parameter_list></cpp:macro>	\
+					<cpp:value>((AllocChunk)(((char *)(ptr)) - ALLOC_CHUNKHDRSZ))</cpp:value></cpp:define>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>AllocChunkGetPointer</name><parameter_list>(<parameter><type><name>chk</name></type></parameter>)</parameter_list></cpp:macro>	\
+					<cpp:value>((AllocPointer)(((char *)(chk)) + ALLOC_CHUNKHDRSZ))</cpp:value></cpp:define>
+
+<comment type="block">/*
+ * Rather than repeatedly creating and deleting memory contexts, we keep some
+ * freed contexts in freelists so that we can hand them out again with little
+ * work.  Before putting a context in a freelist, we reset it so that it has
+ * only its initial malloc chunk and no others.  To be a candidate for a
+ * freelist, a context must have the same minContextSize/initBlockSize as
+ * other contexts in the list; but its maxBlockSize is irrelevant since that
+ * doesn't affect the size of the initial chunk.
+ *
+ * We currently provide one freelist for ALLOCSET_DEFAULT_SIZES contexts
+ * and one for ALLOCSET_SMALL_SIZES contexts; the latter works for
+ * ALLOCSET_START_SMALL_SIZES too, since only the maxBlockSize differs.
+ *
+ * Ordinarily, we re-use freelist contexts in last-in-first-out order, in
+ * hopes of improving locality of reference.  But if there get to be too
+ * many contexts in the list, we'd prefer to drop the most-recently-created
+ * contexts in hopes of keeping the process memory map compact.
+ * We approximate that by simply deleting all existing entries when the list
+ * overflows, on the assumption that queries that allocate a lot of contexts
+ * will probably free them in more or less reverse order of allocation.
+ *
+ * Contexts in a freelist are chained via their nextchild pointers.
+ */</comment>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>MAX_FREE_CONTEXTS</name></cpp:macro> <cpp:value>100</cpp:value></cpp:define>	<comment type="block">/* arbitrary limit on freelist length */</comment>
+
+<typedef>typedef <type><struct>struct <name>AllocSetFreeList</name>
+<block>{
+	<decl_stmt><decl><type><name>int</name></type>			<name>num_free</name></decl>;</decl_stmt>		<comment type="block">/* current list length */</comment>
+	<decl_stmt><decl><type><name>AllocSetContext</name> <modifier>*</modifier></type><name>first_free</name></decl>;</decl_stmt>	<comment type="block">/* list header */</comment>
+}</block></struct></type> <name>AllocSetFreeList</name>;</typedef>
+
+<comment type="block">/* context_freelists[0] is for default params, [1] for small params */</comment>
+<decl_stmt><decl><type><specifier>static</specifier> <name>AllocSetFreeList</name></type> <name><name>context_freelists</name><index>[<expr><literal type="number">2</literal></expr>]</index></name> <init>=
+<expr><block>{
+	<expr><block>{
+		<expr><literal type="number">0</literal></expr>, <expr><name>NULL</name></expr>
+	}</block></expr>,
+	<expr><block>{
+		<expr><literal type="number">0</literal></expr>, <expr><name>NULL</name></expr>
+	}</block></expr>
+}</block></expr></init></decl>;</decl_stmt>
+
+<comment type="block">/*
+ * These functions implement the MemoryContext API for AllocSet contexts.
+ */</comment>
+<function_decl><type><specifier>static</specifier> <name>void</name> <modifier>*</modifier></type><name>AllocSetAlloc</name><parameter_list>(<parameter><decl><type><name>MemoryContext</name></type> <name>context</name></decl></parameter>, <parameter><decl><type><name>Size</name></type> <name>size</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>AllocSetFree</name><parameter_list>(<parameter><decl><type><name>MemoryContext</name></type> <name>context</name></decl></parameter>, <parameter><decl><type><name>void</name> <modifier>*</modifier></type><name>pointer</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name> <modifier>*</modifier></type><name>AllocSetRealloc</name><parameter_list>(<parameter><decl><type><name>MemoryContext</name></type> <name>context</name></decl></parameter>, <parameter><decl><type><name>void</name> <modifier>*</modifier></type><name>pointer</name></decl></parameter>, <parameter><decl><type><name>Size</name></type> <name>size</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>AllocSetReset</name><parameter_list>(<parameter><decl><type><name>MemoryContext</name></type> <name>context</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>AllocSetDelete</name><parameter_list>(<parameter><decl><type><name>MemoryContext</name></type> <name>context</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>Size</name></type> <name>AllocSetGetChunkSpace</name><parameter_list>(<parameter><decl><type><name>MemoryContext</name></type> <name>context</name></decl></parameter>, <parameter><decl><type><name>void</name> <modifier>*</modifier></type><name>pointer</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>bool</name></type> <name>AllocSetIsEmpty</name><parameter_list>(<parameter><decl><type><name>MemoryContext</name></type> <name>context</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>AllocSetStats</name><parameter_list>(<parameter><decl><type><name>MemoryContext</name></type> <name>context</name></decl></parameter>,
+			  <parameter><decl><type><name>MemoryStatsPrintFunc</name></type> <name>printfunc</name></decl></parameter>, <parameter><decl><type><name>void</name> <modifier>*</modifier></type><name>passthru</name></decl></parameter>,
+			  <parameter><decl><type><name>MemoryContextCounters</name> <modifier>*</modifier></type><name>totals</name></decl></parameter>)</parameter_list>;</function_decl>
+
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>MEMORY_CONTEXT_CHECKING</name></cpp:ifdef>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>AllocSetCheck</name><parameter_list>(<parameter><decl><type><name>MemoryContext</name></type> <name>context</name></decl></parameter>)</parameter_list>;</function_decl>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+<comment type="block">/*
+ * This is the virtual function table for AllocSet contexts.
+ */</comment>
+<decl_stmt><decl><type><specifier>static</specifier> <specifier>const</specifier> <name>MemoryContextMethods</name></type> <name>AllocSetMethods</name> <init>= <expr><block>{
+	<expr><name>AllocSetAlloc</name></expr>,
+	<expr><name>AllocSetFree</name></expr>,
+	<expr><name>AllocSetRealloc</name></expr>,
+	<expr><name>AllocSetReset</name></expr>,
+	<expr><name>AllocSetDelete</name></expr>,
+	<expr><name>AllocSetGetChunkSpace</name></expr>,
+	<expr><name>AllocSetIsEmpty</name></expr>,
+	<expr><name>AllocSetStats</name></expr>
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>MEMORY_CONTEXT_CHECKING</name></cpp:ifdef>
+	,<expr><name>AllocSetCheck</name></expr>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+}</block></expr></init></decl>;</decl_stmt>
+
+<comment type="block">/*
+ * Table for AllocSetFreeIndex
+ */</comment>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>LT16</name><parameter_list>(<parameter><type><name>n</name></type></parameter>)</parameter_list></cpp:macro> <cpp:value>n, n, n, n, n, n, n, n, n, n, n, n, n, n, n, n</cpp:value></cpp:define>
+
+<decl_stmt><decl><type><specifier>static</specifier> <specifier>const</specifier> <name>unsigned</name> <name>char</name></type> <name><name>LogTable256</name><index>[<expr><literal type="number">256</literal></expr>]</index></name> <init>=
+<expr><block>{
+	<expr><literal type="number">0</literal></expr>, <expr><literal type="number">1</literal></expr>, <expr><literal type="number">2</literal></expr>, <expr><literal type="number">2</literal></expr>, <expr><literal type="number">3</literal></expr>, <expr><literal type="number">3</literal></expr>, <expr><literal type="number">3</literal></expr>, <expr><literal type="number">3</literal></expr>, <expr><literal type="number">4</literal></expr>, <expr><literal type="number">4</literal></expr>, <expr><literal type="number">4</literal></expr>, <expr><literal type="number">4</literal></expr>, <expr><literal type="number">4</literal></expr>, <expr><literal type="number">4</literal></expr>, <expr><literal type="number">4</literal></expr>, <expr><literal type="number">4</literal></expr>,
+	<expr><call><name>LT16</name><argument_list>(<argument><expr><literal type="number">5</literal></expr></argument>)</argument_list></call></expr>, <expr><call><name>LT16</name><argument_list>(<argument><expr><literal type="number">6</literal></expr></argument>)</argument_list></call></expr>, <expr><call><name>LT16</name><argument_list>(<argument><expr><literal type="number">6</literal></expr></argument>)</argument_list></call></expr>, <expr><call><name>LT16</name><argument_list>(<argument><expr><literal type="number">7</literal></expr></argument>)</argument_list></call></expr>, <expr><call><name>LT16</name><argument_list>(<argument><expr><literal type="number">7</literal></expr></argument>)</argument_list></call></expr>, <expr><call><name>LT16</name><argument_list>(<argument><expr><literal type="number">7</literal></expr></argument>)</argument_list></call></expr>, <expr><call><name>LT16</name><argument_list>(<argument><expr><literal type="number">7</literal></expr></argument>)</argument_list></call></expr>,
+	<expr><call><name>LT16</name><argument_list>(<argument><expr><literal type="number">8</literal></expr></argument>)</argument_list></call></expr>, <expr><call><name>LT16</name><argument_list>(<argument><expr><literal type="number">8</literal></expr></argument>)</argument_list></call></expr>, <expr><call><name>LT16</name><argument_list>(<argument><expr><literal type="number">8</literal></expr></argument>)</argument_list></call></expr>, <expr><call><name>LT16</name><argument_list>(<argument><expr><literal type="number">8</literal></expr></argument>)</argument_list></call></expr>, <expr><call><name>LT16</name><argument_list>(<argument><expr><literal type="number">8</literal></expr></argument>)</argument_list></call></expr>, <expr><call><name>LT16</name><argument_list>(<argument><expr><literal type="number">8</literal></expr></argument>)</argument_list></call></expr>, <expr><call><name>LT16</name><argument_list>(<argument><expr><literal type="number">8</literal></expr></argument>)</argument_list></call></expr>, <macro><name>LT16</name><argument_list>(<argument><literal type="number">8</literal></argument>)</argument_list></macro>
+}</block></expr></init></decl>;</decl_stmt>
+
+<comment type="block">/* ----------
+ * Debug macros
+ * ----------
+ */</comment>
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>HAVE_ALLOCINFO</name></cpp:ifdef>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>AllocFreeInfo</name><parameter_list>(<parameter><type><name>_cxt</name></type></parameter>, <parameter><type><name>_chunk</name></type></parameter>)</parameter_list></cpp:macro> \
+			<cpp:value>fprintf(stderr, "AllocFree: %s: %p, %zu\n", \
+				(_cxt)-&gt;header.name, (_chunk), (_chunk)-&gt;size)</cpp:value></cpp:define>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>AllocAllocInfo</name><parameter_list>(<parameter><type><name>_cxt</name></type></parameter>, <parameter><type><name>_chunk</name></type></parameter>)</parameter_list></cpp:macro> \
+			<cpp:value>fprintf(stderr, "AllocAlloc: %s: %p, %zu\n", \
+				(_cxt)-&gt;header.name, (_chunk), (_chunk)-&gt;size)</cpp:value></cpp:define>
+<cpp:else>#<cpp:directive>else</cpp:directive></cpp:else>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>AllocFreeInfo</name><parameter_list>(<parameter><type><name>_cxt</name></type></parameter>, <parameter><type><name>_chunk</name></type></parameter>)</parameter_list></cpp:macro></cpp:define>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>AllocAllocInfo</name><parameter_list>(<parameter><type><name>_cxt</name></type></parameter>, <parameter><type><name>_chunk</name></type></parameter>)</parameter_list></cpp:macro></cpp:define>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+<comment type="block">/* ----------
+ * AllocSetFreeIndex -
+ *
+ *		Depending on the size of an allocation compute which freechunk
+ *		list of the alloc set it belongs to.  Caller must have verified
+ *		that size &lt;= ALLOC_CHUNK_LIMIT.
+ * ----------
+ */</comment>
+<function><type><specifier>static</specifier> <specifier>inline</specifier> <name>int</name></type>
+<name>AllocSetFreeIndex</name><parameter_list>(<parameter><decl><type><name>Size</name></type> <name>size</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>int</name></type>			<name>idx</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>unsigned</name> <name>int</name></type> <name>t</name></decl>,
+				<decl><type ref="prev"/><name>tsize</name></decl>;</decl_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>size</name> <operator>&gt;</operator> <operator>(</operator><literal type="number">1</literal> <operator>&lt;&lt;</operator> <name>ALLOC_MINBITS</name><operator>)</operator></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name>tsize</name> <operator>=</operator> <operator>(</operator><name>size</name> <operator>-</operator> <literal type="number">1</literal><operator>)</operator> <operator>&gt;&gt;</operator> <name>ALLOC_MINBITS</name></expr>;</expr_stmt>
+
+		<comment type="block">/*
+		 * At this point we need to obtain log2(tsize)+1, ie, the number of
+		 * not-all-zero bits at the right.  We used to do this with a
+		 * shift-and-count loop, but this function is enough of a hotspot to
+		 * justify micro-optimization effort.  The best approach seems to be
+		 * to use a lookup table.  Note that this code assumes that
+		 * ALLOCSET_NUM_FREELISTS &lt;= 17, since we only cope with two bytes of
+		 * the tsize value.
+		 */</comment>
+		<expr_stmt><expr><name>t</name> <operator>=</operator> <name>tsize</name> <operator>&gt;&gt;</operator> <literal type="number">8</literal></expr>;</expr_stmt>
+		<expr_stmt><expr><name>idx</name> <operator>=</operator> <ternary><condition><expr><name>t</name></expr> ?</condition><then> <expr><name><name>LogTable256</name><index>[<expr><name>t</name></expr>]</index></name> <operator>+</operator> <literal type="number">8</literal></expr> </then><else>: <expr><name><name>LogTable256</name><index>[<expr><name>tsize</name></expr>]</index></name></expr></else></ternary></expr>;</expr_stmt>
+
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>idx</name> <operator>&lt;</operator> <name>ALLOCSET_NUM_FREELISTS</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<else>else<block type="pseudo"><block_content>
+		<expr_stmt><expr><name>idx</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt></block_content></block></else></if_stmt>
+
+	<return>return <expr><name>idx</name></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * Public routines
+ */</comment>
+
+
+<comment type="block">/*
+ * AllocSetContextCreateExtended
+ *		Create a new AllocSet context.
+ *
+ * parent: parent context, or NULL if top-level context
+ * name: name of context (must be statically allocated)
+ * minContextSize: minimum context size
+ * initBlockSize: initial allocation block size
+ * maxBlockSize: maximum allocation block size
+ *
+ * Most callers should abstract the context size parameters using a macro
+ * such as ALLOCSET_DEFAULT_SIZES.
+ *
+ * Note: don't call this directly; go through the wrapper macro
+ * AllocSetContextCreate.
+ */</comment>
+<function><type><name>MemoryContext</name></type>
+<name>AllocSetContextCreateExtended</name><parameter_list>(<parameter><decl><type><name>MemoryContext</name></type> <name>parent</name></decl></parameter>,
+							  <parameter><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>name</name></decl></parameter>,
+							  <parameter><decl><type><name>Size</name></type> <name>minContextSize</name></decl></parameter>,
+							  <parameter><decl><type><name>Size</name></type> <name>initBlockSize</name></decl></parameter>,
+							  <parameter><decl><type><name>Size</name></type> <name>maxBlockSize</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>int</name></type>			<name>freeListIndex</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Size</name></type>		<name>firstBlockSize</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>AllocSet</name></type>	<name>set</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>AllocBlock</name></type>	<name>block</name></decl>;</decl_stmt>
+
+	<comment type="block">/* Assert we padded AllocChunkData properly */</comment>
+	<expr_stmt><expr><call><name>StaticAssertStmt</name><argument_list>(<argument><expr><name>ALLOC_CHUNKHDRSZ</name> <operator>==</operator> <call><name>MAXALIGN</name><argument_list>(<argument><expr><name>ALLOC_CHUNKHDRSZ</name></expr></argument>)</argument_list></call></expr></argument>,
+					 <argument><expr><literal type="string">"sizeof(AllocChunkData) is not maxaligned"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>StaticAssertStmt</name><argument_list>(<argument><expr><call><name>offsetof</name><argument_list>(<argument><expr><name>AllocChunkData</name></expr></argument>, <argument><expr><name>aset</name></expr></argument>)</argument_list></call> <operator>+</operator> <sizeof>sizeof<argument_list>(<argument><expr><name>MemoryContext</name></expr></argument>)</argument_list></sizeof> <operator>==</operator>
+					 <name>ALLOC_CHUNKHDRSZ</name></expr></argument>,
+					 <argument><expr><literal type="string">"padding calculation in AllocChunkData is wrong"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * First, validate allocation parameters.  Once these were regular runtime
+	 * test and elog's, but in practice Asserts seem sufficient because nobody
+	 * varies their parameters at runtime.  We somewhat arbitrarily enforce a
+	 * minimum 1K block size.
+	 */</comment>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>initBlockSize</name> <operator>==</operator> <call><name>MAXALIGN</name><argument_list>(<argument><expr><name>initBlockSize</name></expr></argument>)</argument_list></call> <operator>&amp;&amp;</operator>
+		   <name>initBlockSize</name> <operator>&gt;=</operator> <literal type="number">1024</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>maxBlockSize</name> <operator>==</operator> <call><name>MAXALIGN</name><argument_list>(<argument><expr><name>maxBlockSize</name></expr></argument>)</argument_list></call> <operator>&amp;&amp;</operator>
+		   <name>maxBlockSize</name> <operator>&gt;=</operator> <name>initBlockSize</name> <operator>&amp;&amp;</operator>
+		   <call><name>AllocHugeSizeIsValid</name><argument_list>(<argument><expr><name>maxBlockSize</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt> <comment type="block">/* must be safe to double */</comment>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>minContextSize</name> <operator>==</operator> <literal type="number">0</literal> <operator>||</operator>
+		   <operator>(</operator><name>minContextSize</name> <operator>==</operator> <call><name>MAXALIGN</name><argument_list>(<argument><expr><name>minContextSize</name></expr></argument>)</argument_list></call> <operator>&amp;&amp;</operator>
+			<name>minContextSize</name> <operator>&gt;=</operator> <literal type="number">1024</literal> <operator>&amp;&amp;</operator>
+			<name>minContextSize</name> <operator>&lt;=</operator> <name>maxBlockSize</name><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Check whether the parameters match either available freelist.  We do
+	 * not need to demand a match of maxBlockSize.
+	 * Access to the freelist is not thread safe, so avoid it in multi-thread
+	 * mode.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><call><name>IsMultiThreadedMode</name><argument_list>()</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name>freeListIndex</name> <operator>=</operator> <operator>-</operator><literal type="number">1</literal></expr>;</expr_stmt></block_content></block></if>
+	<if type="elseif">else if <condition>(<expr><name>minContextSize</name> <operator>==</operator> <name>ALLOCSET_DEFAULT_MINSIZE</name> <operator>&amp;&amp;</operator>
+			 <name>initBlockSize</name> <operator>==</operator> <name>ALLOCSET_DEFAULT_INITSIZE</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name>freeListIndex</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt></block_content></block></if>
+	<if type="elseif">else if <condition>(<expr><name>minContextSize</name> <operator>==</operator> <name>ALLOCSET_SMALL_MINSIZE</name> <operator>&amp;&amp;</operator>
+			 <name>initBlockSize</name> <operator>==</operator> <name>ALLOCSET_SMALL_INITSIZE</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name>freeListIndex</name> <operator>=</operator> <literal type="number">1</literal></expr>;</expr_stmt></block_content></block></if>
+	<else>else<block type="pseudo"><block_content>
+		<expr_stmt><expr><name>freeListIndex</name> <operator>=</operator> <operator>-</operator><literal type="number">1</literal></expr>;</expr_stmt></block_content></block></else></if_stmt>
+
+	<comment type="block">/*
+	 * If a suitable freelist entry exists, just recycle that context.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name>freeListIndex</name> <operator>&gt;=</operator> <literal type="number">0</literal></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>AllocSetFreeList</name> <modifier>*</modifier></type><name>freelist</name> <init>= <expr><operator>&amp;</operator><name><name>context_freelists</name><index>[<expr><name>freeListIndex</name></expr>]</index></name></expr></init></decl>;</decl_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name><name>freelist</name><operator>-&gt;</operator><name>first_free</name></name> <operator>!=</operator> <name>NULL</name></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/* Remove entry from freelist */</comment>
+			<expr_stmt><expr><name>set</name> <operator>=</operator> <name><name>freelist</name><operator>-&gt;</operator><name>first_free</name></name></expr>;</expr_stmt>
+			<expr_stmt><expr><name><name>freelist</name><operator>-&gt;</operator><name>first_free</name></name> <operator>=</operator> <operator>(</operator><name>AllocSet</name><operator>)</operator> <name><name>set</name><operator>-&gt;</operator><name>header</name><operator>.</operator><name>nextchild</name></name></expr>;</expr_stmt>
+			<expr_stmt><expr><name><name>freelist</name><operator>-&gt;</operator><name>num_free</name></name><operator>--</operator></expr>;</expr_stmt>
+
+			<comment type="block">/* Update its maxBlockSize; everything else should be OK */</comment>
+			<expr_stmt><expr><name><name>set</name><operator>-&gt;</operator><name>maxBlockSize</name></name> <operator>=</operator> <name>maxBlockSize</name></expr>;</expr_stmt>
+
+			<comment type="block">/* Reinitialize its header, installing correct name and parent */</comment>
+			<expr_stmt><expr><call><name>MemoryContextCreate</name><argument_list>(<argument><expr><operator>(</operator><name>MemoryContext</name><operator>)</operator> <name>set</name></expr></argument>,
+								<argument><expr><name>T_AllocSetContext</name></expr></argument>,
+								<argument><expr><operator>&amp;</operator><name>AllocSetMethods</name></expr></argument>,
+								<argument><expr><name>parent</name></expr></argument>,
+								<argument><expr><name>name</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+			<return>return <expr><operator>(</operator><name>MemoryContext</name><operator>)</operator> <name>set</name></expr>;</return>
+		</block_content>}</block></if></if_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/* Determine size of initial block */</comment>
+	<expr_stmt><expr><name>firstBlockSize</name> <operator>=</operator> <call><name>MAXALIGN</name><argument_list>(<argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>AllocSetContext</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call> <operator>+</operator>
+		<name>ALLOC_BLOCKHDRSZ</name> <operator>+</operator> <name>ALLOC_CHUNKHDRSZ</name></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><name>minContextSize</name> <operator>!=</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name>firstBlockSize</name> <operator>=</operator> <call><name>Max</name><argument_list>(<argument><expr><name>firstBlockSize</name></expr></argument>, <argument><expr><name>minContextSize</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if>
+	<else>else<block type="pseudo"><block_content>
+		<expr_stmt><expr><name>firstBlockSize</name> <operator>=</operator> <call><name>Max</name><argument_list>(<argument><expr><name>firstBlockSize</name></expr></argument>, <argument><expr><name>initBlockSize</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></else></if_stmt>
+
+	<comment type="block">/*
+	 * Allocate the initial block.  Unlike other aset.c blocks, it starts with
+	 * the context header and its block header follows that.
+	 */</comment>
+	<expr_stmt><expr><name>set</name> <operator>=</operator> <operator>(</operator><name>AllocSet</name><operator>)</operator> <call><name>malloc</name><argument_list>(<argument><expr><name>firstBlockSize</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><name>set</name> <operator>==</operator> <name>NULL</name></expr>)</condition>
+	<block>{<block_content>
+		<if_stmt><if>if <condition>(<expr><name>TopMemoryContext</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>MemoryContextStats</name><argument_list>(<argument><expr><name>TopMemoryContext</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_OUT_OF_MEMORY</name></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"out of memory"</literal></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errdetail</name><argument_list>(<argument><expr><literal type="string">"Failed while creating memory context \"%s\"."</literal></expr></argument>,
+						   <argument><expr><name>name</name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>YbPgMemAddConsumption</name><argument_list>(<argument><expr><name>firstBlockSize</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Avoid writing code that can fail between here and MemoryContextCreate;
+	 * we'd leak the header/initial block if we ereport in this stretch.
+	 */</comment>
+
+	<comment type="block">/* Fill in the initial block's block header */</comment>
+	<expr_stmt><expr><name>block</name> <operator>=</operator> <operator>(</operator><name>AllocBlock</name><operator>)</operator> <operator>(</operator><operator>(</operator><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <name>set</name><operator>)</operator> <operator>+</operator> <call><name>MAXALIGN</name><argument_list>(<argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>AllocSetContext</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call><operator>)</operator></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>block</name><operator>-&gt;</operator><name>aset</name></name> <operator>=</operator> <name>set</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>block</name><operator>-&gt;</operator><name>freeptr</name></name> <operator>=</operator> <operator>(</operator><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <name>block</name><operator>)</operator> <operator>+</operator> <name>ALLOC_BLOCKHDRSZ</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>block</name><operator>-&gt;</operator><name>endptr</name></name> <operator>=</operator> <operator>(</operator><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <name>set</name><operator>)</operator> <operator>+</operator> <name>firstBlockSize</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>block</name><operator>-&gt;</operator><name>prev</name></name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>block</name><operator>-&gt;</operator><name>next</name></name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+
+	<comment type="block">/* Mark unallocated space NOACCESS; leave the block header alone. */</comment>
+	<expr_stmt><expr><call><name>VALGRIND_MAKE_MEM_NOACCESS</name><argument_list>(<argument><expr><name><name>block</name><operator>-&gt;</operator><name>freeptr</name></name></expr></argument>, <argument><expr><name><name>block</name><operator>-&gt;</operator><name>endptr</name></name> <operator>-</operator> <name><name>block</name><operator>-&gt;</operator><name>freeptr</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Remember block as part of block list */</comment>
+	<expr_stmt><expr><name><name>set</name><operator>-&gt;</operator><name>blocks</name></name> <operator>=</operator> <name>block</name></expr>;</expr_stmt>
+	<comment type="block">/* Mark block as not to be released at reset time */</comment>
+	<expr_stmt><expr><name><name>set</name><operator>-&gt;</operator><name>keeper</name></name> <operator>=</operator> <name>block</name></expr>;</expr_stmt>
+
+	<comment type="block">/* Finish filling in aset-specific parts of the context header */</comment>
+	<expr_stmt><expr><call><name>MemSetAligned</name><argument_list>(<argument><expr><name><name>set</name><operator>-&gt;</operator><name>freelist</name></name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name><name>set</name><operator>-&gt;</operator><name>freelist</name></name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name><name>set</name><operator>-&gt;</operator><name>initBlockSize</name></name> <operator>=</operator> <name>initBlockSize</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>set</name><operator>-&gt;</operator><name>maxBlockSize</name></name> <operator>=</operator> <name>maxBlockSize</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>set</name><operator>-&gt;</operator><name>nextBlockSize</name></name> <operator>=</operator> <name>initBlockSize</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>set</name><operator>-&gt;</operator><name>freeListIndex</name></name> <operator>=</operator> <name>freeListIndex</name></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Compute the allocation chunk size limit for this context.  It can't be
+	 * more than ALLOC_CHUNK_LIMIT because of the fixed number of freelists.
+	 * If maxBlockSize is small then requests exceeding the maxBlockSize, or
+	 * even a significant fraction of it, should be treated as large chunks
+	 * too.  For the typical case of maxBlockSize a power of 2, the chunk size
+	 * limit will be at most 1/8th maxBlockSize, so that given a stream of
+	 * requests that are all the maximum chunk size we will waste at most
+	 * 1/8th of the allocated space.
+	 *
+	 * We have to have allocChunkLimit a power of two, because the requested
+	 * and actually-allocated sizes of any chunk must be on the same side of
+	 * the limit, else we get confused about whether the chunk is "big".
+	 *
+	 * Also, allocChunkLimit must not exceed ALLOCSET_SEPARATE_THRESHOLD.
+	 */</comment>
+	<expr_stmt><expr><call><name>StaticAssertStmt</name><argument_list>(<argument><expr><name>ALLOC_CHUNK_LIMIT</name> <operator>==</operator> <name>ALLOCSET_SEPARATE_THRESHOLD</name></expr></argument>,
+					 <argument><expr><literal type="string">"ALLOC_CHUNK_LIMIT != ALLOCSET_SEPARATE_THRESHOLD"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name><name>set</name><operator>-&gt;</operator><name>allocChunkLimit</name></name> <operator>=</operator> <name>ALLOC_CHUNK_LIMIT</name></expr>;</expr_stmt>
+	<while>while <condition>(<expr><operator>(</operator><name>Size</name><operator>)</operator> <operator>(</operator><name><name>set</name><operator>-&gt;</operator><name>allocChunkLimit</name></name> <operator>+</operator> <name>ALLOC_CHUNKHDRSZ</name><operator>)</operator> <operator>&gt;</operator>
+		   <operator>(</operator><name>Size</name><operator>)</operator> <operator>(</operator><operator>(</operator><name>maxBlockSize</name> <operator>-</operator> <name>ALLOC_BLOCKHDRSZ</name><operator>)</operator> <operator>/</operator> <name>ALLOC_CHUNK_FRACTION</name><operator>)</operator></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name><name>set</name><operator>-&gt;</operator><name>allocChunkLimit</name></name> <operator>&gt;&gt;=</operator> <literal type="number">1</literal></expr>;</expr_stmt></block_content></block></while>
+
+	<comment type="block">/* Finally, do the type-independent part of context creation */</comment>
+	<expr_stmt><expr><call><name>MemoryContextCreate</name><argument_list>(<argument><expr><operator>(</operator><name>MemoryContext</name><operator>)</operator> <name>set</name></expr></argument>,
+						<argument><expr><name>T_AllocSetContext</name></expr></argument>,
+						<argument><expr><operator>&amp;</operator><name>AllocSetMethods</name></expr></argument>,
+						<argument><expr><name>parent</name></expr></argument>,
+						<argument><expr><name>name</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<return>return <expr><operator>(</operator><name>MemoryContext</name><operator>)</operator> <name>set</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * AllocSetReset
+ *		Frees all memory which is allocated in the given set.
+ *
+ * Actually, this routine has some discretion about what to do.
+ * It should mark all allocated chunks freed, but it need not necessarily
+ * give back all the resources the set owns.  Our actual implementation is
+ * that we give back all but the "keeper" block (which we must keep, since
+ * it shares a malloc chunk with the context header).  In this way, we don't
+ * thrash malloc() when a context is repeatedly reset after small allocations,
+ * which is typical behavior for per-tuple contexts.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>AllocSetReset</name><parameter_list>(<parameter><decl><type><name>MemoryContext</name></type> <name>context</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>AllocSet</name></type>	<name>set</name> <init>= <expr><operator>(</operator><name>AllocSet</name><operator>)</operator> <name>context</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>AllocBlock</name></type>	<name>block</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>AssertArg</name><argument_list>(<argument><expr><call><name>AllocSetIsValid</name><argument_list>(<argument><expr><name>set</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>MEMORY_CONTEXT_CHECKING</name></cpp:ifdef>
+	<comment type="block">/* Check for corruption and leaks before freeing */</comment>
+	<expr_stmt><expr><call><name>AllocSetCheck</name><argument_list>(<argument><expr><name>context</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+	<comment type="block">/* Clear chunk freelists */</comment>
+	<expr_stmt><expr><call><name>MemSetAligned</name><argument_list>(<argument><expr><name><name>set</name><operator>-&gt;</operator><name>freelist</name></name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name><name>set</name><operator>-&gt;</operator><name>freelist</name></name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>block</name> <operator>=</operator> <name><name>set</name><operator>-&gt;</operator><name>blocks</name></name></expr>;</expr_stmt>
+
+	<comment type="block">/* New blocks list will be just the keeper block */</comment>
+	<expr_stmt><expr><name><name>set</name><operator>-&gt;</operator><name>blocks</name></name> <operator>=</operator> <name><name>set</name><operator>-&gt;</operator><name>keeper</name></name></expr>;</expr_stmt>
+
+	<while>while <condition>(<expr><name>block</name> <operator>!=</operator> <name>NULL</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>AllocBlock</name></type>	<name>next</name> <init>= <expr><name><name>block</name><operator>-&gt;</operator><name>next</name></name></expr></init></decl>;</decl_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name>block</name> <operator>==</operator> <name><name>set</name><operator>-&gt;</operator><name>keeper</name></name></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/* Reset the block, but don't return it to malloc */</comment>
+			<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>datastart</name> <init>= <expr><operator>(</operator><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <name>block</name><operator>)</operator> <operator>+</operator> <name>ALLOC_BLOCKHDRSZ</name></expr></init></decl>;</decl_stmt>
+
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>CLOBBER_FREED_MEMORY</name></cpp:ifdef>
+			<expr_stmt><expr><call><name>wipe_mem</name><argument_list>(<argument><expr><name>datastart</name></expr></argument>, <argument><expr><name><name>block</name><operator>-&gt;</operator><name>freeptr</name></name> <operator>-</operator> <name>datastart</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+<cpp:else>#<cpp:directive>else</cpp:directive></cpp:else>
+			<comment type="block">/* wipe_mem() would have done this */</comment>
+			<expr_stmt><expr><call><name>VALGRIND_MAKE_MEM_NOACCESS</name><argument_list>(<argument><expr><name>datastart</name></expr></argument>, <argument><expr><name><name>block</name><operator>-&gt;</operator><name>freeptr</name></name> <operator>-</operator> <name>datastart</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+			<expr_stmt><expr><name><name>block</name><operator>-&gt;</operator><name>freeptr</name></name> <operator>=</operator> <name>datastart</name></expr>;</expr_stmt>
+			<expr_stmt><expr><name><name>block</name><operator>-&gt;</operator><name>prev</name></name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+			<expr_stmt><expr><name><name>block</name><operator>-&gt;</operator><name>next</name></name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+		</block_content>}</block></if>
+		<else>else
+		<block>{<block_content>
+			<comment type="block">/* Normal case, release the block */</comment>
+			<decl_stmt><decl><type><name>size_t</name></type> <name>freed_sz</name> <init>= <expr><call><name>ASET_BLOCK_TOTAL_SIZE</name><argument_list>(<argument><expr><name>block</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>CLOBBER_FREED_MEMORY</name></cpp:ifdef>
+			<expr_stmt><expr><call><name>wipe_mem</name><argument_list>(<argument><expr><name>block</name></expr></argument>, <argument><expr><name><name>block</name><operator>-&gt;</operator><name>freeptr</name></name> <operator>-</operator> <operator>(</operator><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <name>block</name><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+			<expr_stmt><expr><call><name>free</name><argument_list>(<argument><expr><name>block</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>YbPgMemSubConsumption</name><argument_list>(<argument><expr><name>freed_sz</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></else></if_stmt>
+		<expr_stmt><expr><name>block</name> <operator>=</operator> <name>next</name></expr>;</expr_stmt>
+	</block_content>}</block></while>
+
+	<comment type="block">/* Reset block size allocation sequence, too */</comment>
+	<expr_stmt><expr><name><name>set</name><operator>-&gt;</operator><name>nextBlockSize</name></name> <operator>=</operator> <name><name>set</name><operator>-&gt;</operator><name>initBlockSize</name></name></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * AllocSetDelete
+ *		Frees all memory which is allocated in the given set,
+ *		in preparation for deletion of the set.
+ *
+ * Unlike AllocSetReset, this *must* free all resources of the set.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>AllocSetDelete</name><parameter_list>(<parameter><decl><type><name>MemoryContext</name></type> <name>context</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>AllocSet</name></type>	<name>set</name> <init>= <expr><operator>(</operator><name>AllocSet</name><operator>)</operator> <name>context</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>AllocBlock</name></type>	<name>block</name> <init>= <expr><name><name>set</name><operator>-&gt;</operator><name>blocks</name></name></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>AssertArg</name><argument_list>(<argument><expr><call><name>AllocSetIsValid</name><argument_list>(<argument><expr><name>set</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>MEMORY_CONTEXT_CHECKING</name></cpp:ifdef>
+	<comment type="block">/* Check for corruption and leaks before freeing */</comment>
+	<expr_stmt><expr><call><name>AllocSetCheck</name><argument_list>(<argument><expr><name>context</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+	<comment type="block">/*
+	 * If the context is a candidate for a freelist, put it into that freelist
+	 * instead of destroying it.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>set</name><operator>-&gt;</operator><name>freeListIndex</name></name> <operator>&gt;=</operator> <literal type="number">0</literal></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>AllocSetFreeList</name> <modifier>*</modifier></type><name>freelist</name> <init>= <expr><operator>&amp;</operator><name><name>context_freelists</name><index>[<expr><name><name>set</name><operator>-&gt;</operator><name>freeListIndex</name></name></expr>]</index></name></expr></init></decl>;</decl_stmt>
+
+		<comment type="block">/*
+		 * Reset the context, if it needs it, so that we aren't hanging on to
+		 * more than the initial malloc chunk.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><name><name>context</name><operator>-&gt;</operator><name>isReset</name></name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>MemoryContextResetOnly</name><argument_list>(<argument><expr><name>context</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+		<comment type="block">/*
+		 * If the freelist is full, just discard what's already in it.  See
+		 * comments with context_freelists[].
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><name><name>freelist</name><operator>-&gt;</operator><name>num_free</name></name> <operator>&gt;=</operator> <name>MAX_FREE_CONTEXTS</name></expr>)</condition>
+		<block>{<block_content>
+			<while>while <condition>(<expr><name><name>freelist</name><operator>-&gt;</operator><name>first_free</name></name> <operator>!=</operator> <name>NULL</name></expr>)</condition>
+			<block>{<block_content>
+				<decl_stmt><decl><type><name>AllocSetContext</name> <modifier>*</modifier></type><name>oldset</name> <init>= <expr><name><name>freelist</name><operator>-&gt;</operator><name>first_free</name></name></expr></init></decl>;</decl_stmt>
+
+				<expr_stmt><expr><name><name>freelist</name><operator>-&gt;</operator><name>first_free</name></name> <operator>=</operator> <operator>(</operator><name>AllocSetContext</name> <operator>*</operator><operator>)</operator> <name><name>oldset</name><operator>-&gt;</operator><name>header</name><operator>.</operator><name>nextchild</name></name></expr>;</expr_stmt>
+				<expr_stmt><expr><name><name>freelist</name><operator>-&gt;</operator><name>num_free</name></name><operator>--</operator></expr>;</expr_stmt>
+
+				<decl_stmt><decl><type><name>size_t</name></type> <name>freed_sz</name> <init>= <expr><call><name>ASET_INITIAL_TOTAL_SIZE</name><argument_list>(<argument><expr><name>oldset</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+				<comment type="block">/* All that remains is to free the header/initial block */</comment>
+				<expr_stmt><expr><call><name>free</name><argument_list>(<argument><expr><name>oldset</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<expr_stmt><expr><call><name>YbPgMemSubConsumption</name><argument_list>(<argument><expr><name>freed_sz</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			</block_content>}</block></while>
+			<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>freelist</name><operator>-&gt;</operator><name>num_free</name></name> <operator>==</operator> <literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+
+		<comment type="block">/* Now add the just-deleted context to the freelist. */</comment>
+		<expr_stmt><expr><name><name>set</name><operator>-&gt;</operator><name>header</name><operator>.</operator><name>nextchild</name></name> <operator>=</operator> <operator>(</operator><name>MemoryContext</name><operator>)</operator> <name><name>freelist</name><operator>-&gt;</operator><name>first_free</name></name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>freelist</name><operator>-&gt;</operator><name>first_free</name></name> <operator>=</operator> <name>set</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>freelist</name><operator>-&gt;</operator><name>num_free</name></name><operator>++</operator></expr>;</expr_stmt>
+
+		<return>return;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/* Free all blocks, except the keeper which is part of context header */</comment>
+	<while>while <condition>(<expr><name>block</name> <operator>!=</operator> <name>NULL</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>AllocBlock</name></type>	<name>next</name> <init>= <expr><name><name>block</name><operator>-&gt;</operator><name>next</name></name></expr></init></decl>;</decl_stmt>
+
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>CLOBBER_FREED_MEMORY</name></cpp:ifdef>
+		<expr_stmt><expr><call><name>wipe_mem</name><argument_list>(<argument><expr><name>block</name></expr></argument>, <argument><expr><name><name>block</name><operator>-&gt;</operator><name>freeptr</name></name> <operator>-</operator> <operator>(</operator><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <name>block</name><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+		<if_stmt><if>if <condition>(<expr><name>block</name> <operator>!=</operator> <name><name>set</name><operator>-&gt;</operator><name>keeper</name></name></expr>)</condition>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>size_t</name></type> <name>freed_sz</name> <init>= <expr><call><name>ASET_BLOCK_TOTAL_SIZE</name><argument_list>(<argument><expr><name>block</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+			<expr_stmt><expr><call><name>free</name><argument_list>(<argument><expr><name>block</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>YbPgMemSubConsumption</name><argument_list>(<argument><expr><name>freed_sz</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+
+		<expr_stmt><expr><name>block</name> <operator>=</operator> <name>next</name></expr>;</expr_stmt>
+	</block_content>}</block></while>
+
+	<decl_stmt><decl><type><name>size_t</name></type> <name>freed_sz</name> <init>= <expr><call><name>ASET_INITIAL_TOTAL_SIZE</name><argument_list>(<argument><expr><name>set</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<comment type="block">/* Finally, free the context header, including the keeper block */</comment>
+	<expr_stmt><expr><call><name>free</name><argument_list>(<argument><expr><name>set</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>YbPgMemSubConsumption</name><argument_list>(<argument><expr><name>freed_sz</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * AllocSetAlloc
+ *		Returns pointer to allocated memory of given size or NULL if
+ *		request could not be completed; memory is added to the set.
+ *
+ * No request may exceed:
+ *		MAXALIGN_DOWN(SIZE_MAX) - ALLOC_BLOCKHDRSZ - ALLOC_CHUNKHDRSZ
+ * All callers use a much-lower limit.
+ *
+ * Note: when using valgrind, it doesn't matter how the returned allocation
+ * is marked, as mcxt.c will set it to UNDEFINED.  In some paths we will
+ * return space that is marked NOACCESS - AllocSetRealloc has to beware!
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name> <modifier>*</modifier></type>
+<name>AllocSetAlloc</name><parameter_list>(<parameter><decl><type><name>MemoryContext</name></type> <name>context</name></decl></parameter>, <parameter><decl><type><name>Size</name></type> <name>size</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>AllocSet</name></type>	<name>set</name> <init>= <expr><operator>(</operator><name>AllocSet</name><operator>)</operator> <name>context</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>AllocBlock</name></type>	<name>block</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>AllocChunk</name></type>	<name>chunk</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>fidx</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Size</name></type>		<name>chunk_size</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Size</name></type>		<name>blksize</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>AssertArg</name><argument_list>(<argument><expr><call><name>AllocSetIsValid</name><argument_list>(<argument><expr><name>set</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * If requested size exceeds maximum for chunks, allocate an entire block
+	 * for this request.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name>size</name> <operator>&gt;</operator> <name><name>set</name><operator>-&gt;</operator><name>allocChunkLimit</name></name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name>chunk_size</name> <operator>=</operator> <call><name>MAXALIGN</name><argument_list>(<argument><expr><name>size</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name>blksize</name> <operator>=</operator> <name>chunk_size</name> <operator>+</operator> <name>ALLOC_BLOCKHDRSZ</name> <operator>+</operator> <name>ALLOC_CHUNKHDRSZ</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name>block</name> <operator>=</operator> <operator>(</operator><name>AllocBlock</name><operator>)</operator> <call><name>malloc</name><argument_list>(<argument><expr><name>blksize</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<if_stmt><if>if <condition>(<expr><name>block</name> <operator>==</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+			<return>return <expr><name>NULL</name></expr>;</return></block_content></block></if></if_stmt>
+
+		<expr_stmt><expr><call><name>YbPgMemAddConsumption</name><argument_list>(<argument><expr><name>blksize</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><name><name>block</name><operator>-&gt;</operator><name>aset</name></name> <operator>=</operator> <name>set</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>block</name><operator>-&gt;</operator><name>freeptr</name></name> <operator>=</operator> <name><name>block</name><operator>-&gt;</operator><name>endptr</name></name> <operator>=</operator> <operator>(</operator><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <name>block</name><operator>)</operator> <operator>+</operator> <name>blksize</name></expr>;</expr_stmt>
+
+		<expr_stmt><expr><name>chunk</name> <operator>=</operator> <operator>(</operator><name>AllocChunk</name><operator>)</operator> <operator>(</operator><operator>(</operator><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <name>block</name><operator>)</operator> <operator>+</operator> <name>ALLOC_BLOCKHDRSZ</name><operator>)</operator></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>chunk</name><operator>-&gt;</operator><name>aset</name></name> <operator>=</operator> <name>set</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>chunk</name><operator>-&gt;</operator><name>size</name></name> <operator>=</operator> <name>chunk_size</name></expr>;</expr_stmt>
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>MEMORY_CONTEXT_CHECKING</name></cpp:ifdef>
+		<expr_stmt><expr><name><name>chunk</name><operator>-&gt;</operator><name>requested_size</name></name> <operator>=</operator> <name>size</name></expr>;</expr_stmt>
+		<comment type="block">/* set mark to catch clobber of "unused" space */</comment>
+		<if_stmt><if>if <condition>(<expr><name>size</name> <operator>&lt;</operator> <name>chunk_size</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>set_sentinel</name><argument_list>(<argument><expr><call><name>AllocChunkGetPointer</name><argument_list>(<argument><expr><name>chunk</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>size</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>RANDOMIZE_ALLOCATED_MEMORY</name></cpp:ifdef>
+		<comment type="block">/* fill the allocated space with junk */</comment>
+		<expr_stmt><expr><call><name>randomize_mem</name><argument_list>(<argument><expr><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <call><name>AllocChunkGetPointer</name><argument_list>(<argument><expr><name>chunk</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>size</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+		<comment type="block">/*
+		 * Stick the new block underneath the active allocation block, if any,
+		 * so that we don't lose the use of the space remaining therein.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><name><name>set</name><operator>-&gt;</operator><name>blocks</name></name> <operator>!=</operator> <name>NULL</name></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><name><name>block</name><operator>-&gt;</operator><name>prev</name></name> <operator>=</operator> <name><name>set</name><operator>-&gt;</operator><name>blocks</name></name></expr>;</expr_stmt>
+			<expr_stmt><expr><name><name>block</name><operator>-&gt;</operator><name>next</name></name> <operator>=</operator> <name><name>set</name><operator>-&gt;</operator><name>blocks</name><operator>-&gt;</operator><name>next</name></name></expr>;</expr_stmt>
+			<if_stmt><if>if <condition>(<expr><name><name>block</name><operator>-&gt;</operator><name>next</name></name></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><name><name>block</name><operator>-&gt;</operator><name>next</name><operator>-&gt;</operator><name>prev</name></name> <operator>=</operator> <name>block</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+			<expr_stmt><expr><name><name>set</name><operator>-&gt;</operator><name>blocks</name><operator>-&gt;</operator><name>next</name></name> <operator>=</operator> <name>block</name></expr>;</expr_stmt>
+		</block_content>}</block></if>
+		<else>else
+		<block>{<block_content>
+			<expr_stmt><expr><name><name>block</name><operator>-&gt;</operator><name>prev</name></name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+			<expr_stmt><expr><name><name>block</name><operator>-&gt;</operator><name>next</name></name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+			<expr_stmt><expr><name><name>set</name><operator>-&gt;</operator><name>blocks</name></name> <operator>=</operator> <name>block</name></expr>;</expr_stmt>
+		</block_content>}</block></else></if_stmt>
+
+		<expr_stmt><expr><call><name>AllocAllocInfo</name><argument_list>(<argument><expr><name>set</name></expr></argument>, <argument><expr><name>chunk</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/* Ensure any padding bytes are marked NOACCESS. */</comment>
+		<expr_stmt><expr><call><name>VALGRIND_MAKE_MEM_NOACCESS</name><argument_list>(<argument><expr><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <call><name>AllocChunkGetPointer</name><argument_list>(<argument><expr><name>chunk</name></expr></argument>)</argument_list></call> <operator>+</operator> <name>size</name></expr></argument>,
+								   <argument><expr><name>chunk_size</name> <operator>-</operator> <name>size</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/* Disallow external access to private part of chunk header. */</comment>
+		<expr_stmt><expr><call><name>VALGRIND_MAKE_MEM_NOACCESS</name><argument_list>(<argument><expr><name>chunk</name></expr></argument>, <argument><expr><name>ALLOCCHUNK_PRIVATE_LEN</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<return>return <expr><call><name>AllocChunkGetPointer</name><argument_list>(<argument><expr><name>chunk</name></expr></argument>)</argument_list></call></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/*
+	 * Request is small enough to be treated as a chunk.  Look in the
+	 * corresponding free list to see if there is a free chunk we could reuse.
+	 * If one is found, remove it from the free list, make it again a member
+	 * of the alloc set and return its data address.
+	 */</comment>
+	<expr_stmt><expr><name>fidx</name> <operator>=</operator> <call><name>AllocSetFreeIndex</name><argument_list>(<argument><expr><name>size</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>chunk</name> <operator>=</operator> <name><name>set</name><operator>-&gt;</operator><name>freelist</name><index>[<expr><name>fidx</name></expr>]</index></name></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><name>chunk</name> <operator>!=</operator> <name>NULL</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>chunk</name><operator>-&gt;</operator><name>size</name></name> <operator>&gt;=</operator> <name>size</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><name><name>set</name><operator>-&gt;</operator><name>freelist</name><index>[<expr><name>fidx</name></expr>]</index></name> <operator>=</operator> <operator>(</operator><name>AllocChunk</name><operator>)</operator> <name><name>chunk</name><operator>-&gt;</operator><name>aset</name></name></expr>;</expr_stmt>
+
+		<expr_stmt><expr><name><name>chunk</name><operator>-&gt;</operator><name>aset</name></name> <operator>=</operator> <operator>(</operator><name>void</name> <operator>*</operator><operator>)</operator> <name>set</name></expr>;</expr_stmt>
+
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>MEMORY_CONTEXT_CHECKING</name></cpp:ifdef>
+		<expr_stmt><expr><name><name>chunk</name><operator>-&gt;</operator><name>requested_size</name></name> <operator>=</operator> <name>size</name></expr>;</expr_stmt>
+		<comment type="block">/* set mark to catch clobber of "unused" space */</comment>
+		<if_stmt><if>if <condition>(<expr><name>size</name> <operator>&lt;</operator> <name><name>chunk</name><operator>-&gt;</operator><name>size</name></name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>set_sentinel</name><argument_list>(<argument><expr><call><name>AllocChunkGetPointer</name><argument_list>(<argument><expr><name>chunk</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>size</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>RANDOMIZE_ALLOCATED_MEMORY</name></cpp:ifdef>
+		<comment type="block">/* fill the allocated space with junk */</comment>
+		<expr_stmt><expr><call><name>randomize_mem</name><argument_list>(<argument><expr><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <call><name>AllocChunkGetPointer</name><argument_list>(<argument><expr><name>chunk</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>size</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+		<expr_stmt><expr><call><name>AllocAllocInfo</name><argument_list>(<argument><expr><name>set</name></expr></argument>, <argument><expr><name>chunk</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/* Ensure any padding bytes are marked NOACCESS. */</comment>
+		<expr_stmt><expr><call><name>VALGRIND_MAKE_MEM_NOACCESS</name><argument_list>(<argument><expr><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <call><name>AllocChunkGetPointer</name><argument_list>(<argument><expr><name>chunk</name></expr></argument>)</argument_list></call> <operator>+</operator> <name>size</name></expr></argument>,
+								   <argument><expr><name><name>chunk</name><operator>-&gt;</operator><name>size</name></name> <operator>-</operator> <name>size</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/* Disallow external access to private part of chunk header. */</comment>
+		<expr_stmt><expr><call><name>VALGRIND_MAKE_MEM_NOACCESS</name><argument_list>(<argument><expr><name>chunk</name></expr></argument>, <argument><expr><name>ALLOCCHUNK_PRIVATE_LEN</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<return>return <expr><call><name>AllocChunkGetPointer</name><argument_list>(<argument><expr><name>chunk</name></expr></argument>)</argument_list></call></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/*
+	 * Choose the actual chunk size to allocate.
+	 */</comment>
+	<expr_stmt><expr><name>chunk_size</name> <operator>=</operator> <operator>(</operator><literal type="number">1</literal> <operator>&lt;&lt;</operator> <name>ALLOC_MINBITS</name><operator>)</operator> <operator>&lt;&lt;</operator> <name>fidx</name></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>chunk_size</name> <operator>&gt;=</operator> <name>size</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * If there is enough room in the active allocation block, we will put the
+	 * chunk into that block.  Else must start a new one.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><operator>(</operator><name>block</name> <operator>=</operator> <name><name>set</name><operator>-&gt;</operator><name>blocks</name></name><operator>)</operator> <operator>!=</operator> <name>NULL</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>Size</name></type>		<name>availspace</name> <init>= <expr><name><name>block</name><operator>-&gt;</operator><name>endptr</name></name> <operator>-</operator> <name><name>block</name><operator>-&gt;</operator><name>freeptr</name></name></expr></init></decl>;</decl_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name>availspace</name> <operator>&lt;</operator> <operator>(</operator><name>chunk_size</name> <operator>+</operator> <name>ALLOC_CHUNKHDRSZ</name><operator>)</operator></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/*
+			 * The existing active (top) block does not have enough room for
+			 * the requested allocation, but it might still have a useful
+			 * amount of space in it.  Once we push it down in the block list,
+			 * we'll never try to allocate more space from it. So, before we
+			 * do that, carve up its free space into chunks that we can put on
+			 * the set's freelists.
+			 *
+			 * Because we can only get here when there's less than
+			 * ALLOC_CHUNK_LIMIT left in the block, this loop cannot iterate
+			 * more than ALLOCSET_NUM_FREELISTS-1 times.
+			 */</comment>
+			<while>while <condition>(<expr><name>availspace</name> <operator>&gt;=</operator> <operator>(</operator><operator>(</operator><literal type="number">1</literal> <operator>&lt;&lt;</operator> <name>ALLOC_MINBITS</name><operator>)</operator> <operator>+</operator> <name>ALLOC_CHUNKHDRSZ</name><operator>)</operator></expr>)</condition>
+			<block>{<block_content>
+				<decl_stmt><decl><type><name>Size</name></type>		<name>availchunk</name> <init>= <expr><name>availspace</name> <operator>-</operator> <name>ALLOC_CHUNKHDRSZ</name></expr></init></decl>;</decl_stmt>
+				<decl_stmt><decl><type><name>int</name></type>			<name>a_fidx</name> <init>= <expr><call><name>AllocSetFreeIndex</name><argument_list>(<argument><expr><name>availchunk</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+				<comment type="block">/*
+				 * In most cases, we'll get back the index of the next larger
+				 * freelist than the one we need to put this chunk on.  The
+				 * exception is when availchunk is exactly a power of 2.
+				 */</comment>
+				<if_stmt><if>if <condition>(<expr><name>availchunk</name> <operator>!=</operator> <operator>(</operator><operator>(</operator><name>Size</name><operator>)</operator> <literal type="number">1</literal> <operator>&lt;&lt;</operator> <operator>(</operator><name>a_fidx</name> <operator>+</operator> <name>ALLOC_MINBITS</name><operator>)</operator><operator>)</operator></expr>)</condition>
+				<block>{<block_content>
+					<expr_stmt><expr><name>a_fidx</name><operator>--</operator></expr>;</expr_stmt>
+					<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>a_fidx</name> <operator>&gt;=</operator> <literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+					<expr_stmt><expr><name>availchunk</name> <operator>=</operator> <operator>(</operator><operator>(</operator><name>Size</name><operator>)</operator> <literal type="number">1</literal> <operator>&lt;&lt;</operator> <operator>(</operator><name>a_fidx</name> <operator>+</operator> <name>ALLOC_MINBITS</name><operator>)</operator><operator>)</operator></expr>;</expr_stmt>
+				</block_content>}</block></if></if_stmt>
+
+				<expr_stmt><expr><name>chunk</name> <operator>=</operator> <operator>(</operator><name>AllocChunk</name><operator>)</operator> <operator>(</operator><name><name>block</name><operator>-&gt;</operator><name>freeptr</name></name><operator>)</operator></expr>;</expr_stmt>
+
+				<comment type="block">/* Prepare to initialize the chunk header. */</comment>
+				<expr_stmt><expr><call><name>VALGRIND_MAKE_MEM_UNDEFINED</name><argument_list>(<argument><expr><name>chunk</name></expr></argument>, <argument><expr><name>ALLOC_CHUNKHDRSZ</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+				<expr_stmt><expr><name><name>block</name><operator>-&gt;</operator><name>freeptr</name></name> <operator>+=</operator> <operator>(</operator><name>availchunk</name> <operator>+</operator> <name>ALLOC_CHUNKHDRSZ</name><operator>)</operator></expr>;</expr_stmt>
+				<expr_stmt><expr><name>availspace</name> <operator>-=</operator> <operator>(</operator><name>availchunk</name> <operator>+</operator> <name>ALLOC_CHUNKHDRSZ</name><operator>)</operator></expr>;</expr_stmt>
+
+				<expr_stmt><expr><name><name>chunk</name><operator>-&gt;</operator><name>size</name></name> <operator>=</operator> <name>availchunk</name></expr>;</expr_stmt>
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>MEMORY_CONTEXT_CHECKING</name></cpp:ifdef>
+				<expr_stmt><expr><name><name>chunk</name><operator>-&gt;</operator><name>requested_size</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>	<comment type="block">/* mark it free */</comment>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+				<expr_stmt><expr><name><name>chunk</name><operator>-&gt;</operator><name>aset</name></name> <operator>=</operator> <operator>(</operator><name>void</name> <operator>*</operator><operator>)</operator> <name><name>set</name><operator>-&gt;</operator><name>freelist</name><index>[<expr><name>a_fidx</name></expr>]</index></name></expr>;</expr_stmt>
+				<expr_stmt><expr><name><name>set</name><operator>-&gt;</operator><name>freelist</name><index>[<expr><name>a_fidx</name></expr>]</index></name> <operator>=</operator> <name>chunk</name></expr>;</expr_stmt>
+			</block_content>}</block></while>
+
+			<comment type="block">/* Mark that we need to create a new block */</comment>
+			<expr_stmt><expr><name>block</name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/*
+	 * Time to create a new regular (multi-chunk) block?
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name>block</name> <operator>==</operator> <name>NULL</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>Size</name></type>		<name>required_size</name></decl>;</decl_stmt>
+
+		<comment type="block">/*
+		 * The first such block has size initBlockSize, and we double the
+		 * space in each succeeding block, but not more than maxBlockSize.
+		 */</comment>
+		<expr_stmt><expr><name>blksize</name> <operator>=</operator> <name><name>set</name><operator>-&gt;</operator><name>nextBlockSize</name></name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>set</name><operator>-&gt;</operator><name>nextBlockSize</name></name> <operator>&lt;&lt;=</operator> <literal type="number">1</literal></expr>;</expr_stmt>
+		<if_stmt><if>if <condition>(<expr><name><name>set</name><operator>-&gt;</operator><name>nextBlockSize</name></name> <operator>&gt;</operator> <name><name>set</name><operator>-&gt;</operator><name>maxBlockSize</name></name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><name><name>set</name><operator>-&gt;</operator><name>nextBlockSize</name></name> <operator>=</operator> <name><name>set</name><operator>-&gt;</operator><name>maxBlockSize</name></name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+		<comment type="block">/*
+		 * If initBlockSize is less than ALLOC_CHUNK_LIMIT, we could need more
+		 * space... but try to keep it a power of 2.
+		 */</comment>
+		<expr_stmt><expr><name>required_size</name> <operator>=</operator> <name>chunk_size</name> <operator>+</operator> <name>ALLOC_BLOCKHDRSZ</name> <operator>+</operator> <name>ALLOC_CHUNKHDRSZ</name></expr>;</expr_stmt>
+		<while>while <condition>(<expr><name>blksize</name> <operator>&lt;</operator> <name>required_size</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><name>blksize</name> <operator>&lt;&lt;=</operator> <literal type="number">1</literal></expr>;</expr_stmt></block_content></block></while>
+
+		<comment type="block">/* Try to allocate it */</comment>
+		<expr_stmt><expr><name>block</name> <operator>=</operator> <operator>(</operator><name>AllocBlock</name><operator>)</operator> <call><name>malloc</name><argument_list>(<argument><expr><name>blksize</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/*
+		 * We could be asking for pretty big blocks here, so cope if malloc
+		 * fails.  But give up if there's less than a meg or so available...
+		 */</comment>
+		<while>while <condition>(<expr><name>block</name> <operator>==</operator> <name>NULL</name> <operator>&amp;&amp;</operator> <name>blksize</name> <operator>&gt;</operator> <literal type="number">1024</literal> <operator>*</operator> <literal type="number">1024</literal></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><name>blksize</name> <operator>&gt;&gt;=</operator> <literal type="number">1</literal></expr>;</expr_stmt>
+			<if_stmt><if>if <condition>(<expr><name>blksize</name> <operator>&lt;</operator> <name>required_size</name></expr>)</condition><block type="pseudo"><block_content>
+				<break>break;</break></block_content></block></if></if_stmt>
+			<expr_stmt><expr><name>block</name> <operator>=</operator> <operator>(</operator><name>AllocBlock</name><operator>)</operator> <call><name>malloc</name><argument_list>(<argument><expr><name>blksize</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></while>
+
+		<if_stmt><if>if <condition>(<expr><name>block</name> <operator>==</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+			<return>return <expr><name>NULL</name></expr>;</return></block_content></block></if></if_stmt>
+
+		<expr_stmt><expr><call><name>YbPgMemAddConsumption</name><argument_list>(<argument><expr><name>blksize</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><name><name>block</name><operator>-&gt;</operator><name>aset</name></name> <operator>=</operator> <name>set</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>block</name><operator>-&gt;</operator><name>freeptr</name></name> <operator>=</operator> <operator>(</operator><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <name>block</name><operator>)</operator> <operator>+</operator> <name>ALLOC_BLOCKHDRSZ</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>block</name><operator>-&gt;</operator><name>endptr</name></name> <operator>=</operator> <operator>(</operator><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <name>block</name><operator>)</operator> <operator>+</operator> <name>blksize</name></expr>;</expr_stmt>
+
+		<comment type="block">/* Mark unallocated space NOACCESS. */</comment>
+		<expr_stmt><expr><call><name>VALGRIND_MAKE_MEM_NOACCESS</name><argument_list>(<argument><expr><name><name>block</name><operator>-&gt;</operator><name>freeptr</name></name></expr></argument>,
+								   <argument><expr><name>blksize</name> <operator>-</operator> <name>ALLOC_BLOCKHDRSZ</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><name><name>block</name><operator>-&gt;</operator><name>prev</name></name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>block</name><operator>-&gt;</operator><name>next</name></name> <operator>=</operator> <name><name>set</name><operator>-&gt;</operator><name>blocks</name></name></expr>;</expr_stmt>
+		<if_stmt><if>if <condition>(<expr><name><name>block</name><operator>-&gt;</operator><name>next</name></name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><name><name>block</name><operator>-&gt;</operator><name>next</name><operator>-&gt;</operator><name>prev</name></name> <operator>=</operator> <name>block</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+		<expr_stmt><expr><name><name>set</name><operator>-&gt;</operator><name>blocks</name></name> <operator>=</operator> <name>block</name></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/*
+	 * OK, do the allocation
+	 */</comment>
+	<expr_stmt><expr><name>chunk</name> <operator>=</operator> <operator>(</operator><name>AllocChunk</name><operator>)</operator> <operator>(</operator><name><name>block</name><operator>-&gt;</operator><name>freeptr</name></name><operator>)</operator></expr>;</expr_stmt>
+
+	<comment type="block">/* Prepare to initialize the chunk header. */</comment>
+	<expr_stmt><expr><call><name>VALGRIND_MAKE_MEM_UNDEFINED</name><argument_list>(<argument><expr><name>chunk</name></expr></argument>, <argument><expr><name>ALLOC_CHUNKHDRSZ</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name><name>block</name><operator>-&gt;</operator><name>freeptr</name></name> <operator>+=</operator> <operator>(</operator><name>chunk_size</name> <operator>+</operator> <name>ALLOC_CHUNKHDRSZ</name><operator>)</operator></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>block</name><operator>-&gt;</operator><name>freeptr</name></name> <operator>&lt;=</operator> <name><name>block</name><operator>-&gt;</operator><name>endptr</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name><name>chunk</name><operator>-&gt;</operator><name>aset</name></name> <operator>=</operator> <operator>(</operator><name>void</name> <operator>*</operator><operator>)</operator> <name>set</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>chunk</name><operator>-&gt;</operator><name>size</name></name> <operator>=</operator> <name>chunk_size</name></expr>;</expr_stmt>
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>MEMORY_CONTEXT_CHECKING</name></cpp:ifdef>
+	<expr_stmt><expr><name><name>chunk</name><operator>-&gt;</operator><name>requested_size</name></name> <operator>=</operator> <name>size</name></expr>;</expr_stmt>
+	<comment type="block">/* set mark to catch clobber of "unused" space */</comment>
+	<if_stmt><if>if <condition>(<expr><name>size</name> <operator>&lt;</operator> <name><name>chunk</name><operator>-&gt;</operator><name>size</name></name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>set_sentinel</name><argument_list>(<argument><expr><call><name>AllocChunkGetPointer</name><argument_list>(<argument><expr><name>chunk</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>size</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>RANDOMIZE_ALLOCATED_MEMORY</name></cpp:ifdef>
+	<comment type="block">/* fill the allocated space with junk */</comment>
+	<expr_stmt><expr><call><name>randomize_mem</name><argument_list>(<argument><expr><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <call><name>AllocChunkGetPointer</name><argument_list>(<argument><expr><name>chunk</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>size</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+	<expr_stmt><expr><call><name>AllocAllocInfo</name><argument_list>(<argument><expr><name>set</name></expr></argument>, <argument><expr><name>chunk</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Ensure any padding bytes are marked NOACCESS. */</comment>
+	<expr_stmt><expr><call><name>VALGRIND_MAKE_MEM_NOACCESS</name><argument_list>(<argument><expr><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <call><name>AllocChunkGetPointer</name><argument_list>(<argument><expr><name>chunk</name></expr></argument>)</argument_list></call> <operator>+</operator> <name>size</name></expr></argument>,
+							   <argument><expr><name>chunk_size</name> <operator>-</operator> <name>size</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Disallow external access to private part of chunk header. */</comment>
+	<expr_stmt><expr><call><name>VALGRIND_MAKE_MEM_NOACCESS</name><argument_list>(<argument><expr><name>chunk</name></expr></argument>, <argument><expr><name>ALLOCCHUNK_PRIVATE_LEN</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<return>return <expr><call><name>AllocChunkGetPointer</name><argument_list>(<argument><expr><name>chunk</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * AllocSetFree
+ *		Frees allocated memory; memory is removed from the set.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>AllocSetFree</name><parameter_list>(<parameter><decl><type><name>MemoryContext</name></type> <name>context</name></decl></parameter>, <parameter><decl><type><name>void</name> <modifier>*</modifier></type><name>pointer</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>AllocSet</name></type>	<name>set</name> <init>= <expr><operator>(</operator><name>AllocSet</name><operator>)</operator> <name>context</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>AllocChunk</name></type>	<name>chunk</name> <init>= <expr><call><name>AllocPointerGetChunk</name><argument_list>(<argument><expr><name>pointer</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<comment type="block">/* Allow access to private part of chunk header. */</comment>
+	<expr_stmt><expr><call><name>VALGRIND_MAKE_MEM_DEFINED</name><argument_list>(<argument><expr><name>chunk</name></expr></argument>, <argument><expr><name>ALLOCCHUNK_PRIVATE_LEN</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>AllocFreeInfo</name><argument_list>(<argument><expr><name>set</name></expr></argument>, <argument><expr><name>chunk</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>MEMORY_CONTEXT_CHECKING</name></cpp:ifdef>
+	<comment type="block">/* Test for someone scribbling on unused space in chunk */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>chunk</name><operator>-&gt;</operator><name>requested_size</name></name> <operator>&lt;</operator> <name><name>chunk</name><operator>-&gt;</operator><name>size</name></name></expr>)</condition><block type="pseudo"><block_content>
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>sentinel_ok</name><argument_list>(<argument><expr><name>pointer</name></expr></argument>, <argument><expr><name><name>chunk</name><operator>-&gt;</operator><name>requested_size</name></name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>WARNING</name></expr></argument>, <argument><expr><literal type="string">"detected write past chunk end in %s %p"</literal></expr></argument>,
+				 <argument><expr><name><name>set</name><operator>-&gt;</operator><name>header</name><operator>.</operator><name>name</name></name></expr></argument>, <argument><expr><name>chunk</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt></block_content></block></if></if_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+	<if_stmt><if>if <condition>(<expr><name><name>chunk</name><operator>-&gt;</operator><name>size</name></name> <operator>&gt;</operator> <name><name>set</name><operator>-&gt;</operator><name>allocChunkLimit</name></name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/*
+		 * Big chunks are certain to have been allocated as single-chunk
+		 * blocks.  Just unlink that block and return it to malloc().
+		 */</comment>
+		<decl_stmt><decl><type><name>AllocBlock</name></type>	<name>block</name> <init>= <expr><operator>(</operator><name>AllocBlock</name><operator>)</operator> <operator>(</operator><operator>(</operator><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <name>chunk</name><operator>)</operator> <operator>-</operator> <name>ALLOC_BLOCKHDRSZ</name><operator>)</operator></expr></init></decl>;</decl_stmt>
+
+		<comment type="block">/*
+		 * Try to verify that we have a sane block pointer: it should
+		 * reference the correct aset, and freeptr and endptr should point
+		 * just past the chunk.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><name><name>block</name><operator>-&gt;</operator><name>aset</name></name> <operator>!=</operator> <name>set</name> <operator>||</operator>
+			<name><name>block</name><operator>-&gt;</operator><name>freeptr</name></name> <operator>!=</operator> <name><name>block</name><operator>-&gt;</operator><name>endptr</name></name> <operator>||</operator>
+			<name><name>block</name><operator>-&gt;</operator><name>freeptr</name></name> <operator>!=</operator> <operator>(</operator><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <name>block</name><operator>)</operator> <operator>+</operator>
+			<operator>(</operator><name><name>chunk</name><operator>-&gt;</operator><name>size</name></name> <operator>+</operator> <name>ALLOC_BLOCKHDRSZ</name> <operator>+</operator> <name>ALLOC_CHUNKHDRSZ</name><operator>)</operator></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"could not find block containing chunk %p"</literal></expr></argument>, <argument><expr><name>chunk</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+		<comment type="block">/* OK, remove block from aset's list and free it */</comment>
+		<if_stmt><if>if <condition>(<expr><name><name>block</name><operator>-&gt;</operator><name>prev</name></name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><name><name>block</name><operator>-&gt;</operator><name>prev</name><operator>-&gt;</operator><name>next</name></name> <operator>=</operator> <name><name>block</name><operator>-&gt;</operator><name>next</name></name></expr>;</expr_stmt></block_content></block></if>
+		<else>else<block type="pseudo"><block_content>
+			<expr_stmt><expr><name><name>set</name><operator>-&gt;</operator><name>blocks</name></name> <operator>=</operator> <name><name>block</name><operator>-&gt;</operator><name>next</name></name></expr>;</expr_stmt></block_content></block></else></if_stmt>
+		<if_stmt><if>if <condition>(<expr><name><name>block</name><operator>-&gt;</operator><name>next</name></name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><name><name>block</name><operator>-&gt;</operator><name>next</name><operator>-&gt;</operator><name>prev</name></name> <operator>=</operator> <name><name>block</name><operator>-&gt;</operator><name>prev</name></name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+		<comment type="block">/* Must be place before the wipe_mem wipes the content */</comment>
+		<decl_stmt><decl><type><name>size_t</name></type> <name>freed_sz</name> <init>= <expr><call><name>ASET_BLOCK_TOTAL_SIZE</name><argument_list>(<argument><expr><name>block</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>CLOBBER_FREED_MEMORY</name></cpp:ifdef>
+		<expr_stmt><expr><call><name>wipe_mem</name><argument_list>(<argument><expr><name>block</name></expr></argument>, <argument><expr><name><name>block</name><operator>-&gt;</operator><name>freeptr</name></name> <operator>-</operator> <operator>(</operator><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <name>block</name><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+		<expr_stmt><expr><call><name>free</name><argument_list>(<argument><expr><name>block</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>YbPgMemSubConsumption</name><argument_list>(<argument><expr><name>freed_sz</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<else>else
+	<block>{<block_content>
+		<comment type="block">/* Normal case, put the chunk into appropriate freelist */</comment>
+		<decl_stmt><decl><type><name>int</name></type>			<name>fidx</name> <init>= <expr><call><name>AllocSetFreeIndex</name><argument_list>(<argument><expr><name><name>chunk</name><operator>-&gt;</operator><name>size</name></name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+		<expr_stmt><expr><name><name>chunk</name><operator>-&gt;</operator><name>aset</name></name> <operator>=</operator> <operator>(</operator><name>void</name> <operator>*</operator><operator>)</operator> <name><name>set</name><operator>-&gt;</operator><name>freelist</name><index>[<expr><name>fidx</name></expr>]</index></name></expr>;</expr_stmt>
+
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>CLOBBER_FREED_MEMORY</name></cpp:ifdef>
+		<expr_stmt><expr><call><name>wipe_mem</name><argument_list>(<argument><expr><name>pointer</name></expr></argument>, <argument><expr><name><name>chunk</name><operator>-&gt;</operator><name>size</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>MEMORY_CONTEXT_CHECKING</name></cpp:ifdef>
+		<comment type="block">/* Reset requested_size to 0 in chunks that are on freelist */</comment>
+		<expr_stmt><expr><name><name>chunk</name><operator>-&gt;</operator><name>requested_size</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+		<expr_stmt><expr><name><name>set</name><operator>-&gt;</operator><name>freelist</name><index>[<expr><name>fidx</name></expr>]</index></name> <operator>=</operator> <name>chunk</name></expr>;</expr_stmt>
+	</block_content>}</block></else></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * AllocSetRealloc
+ *		Returns new pointer to allocated memory of given size or NULL if
+ *		request could not be completed; this memory is added to the set.
+ *		Memory associated with given pointer is copied into the new memory,
+ *		and the old memory is freed.
+ *
+ * Without MEMORY_CONTEXT_CHECKING, we don't know the old request size.  This
+ * makes our Valgrind client requests less-precise, hazarding false negatives.
+ * (In principle, we could use VALGRIND_GET_VBITS() to rediscover the old
+ * request size.)
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name> <modifier>*</modifier></type>
+<name>AllocSetRealloc</name><parameter_list>(<parameter><decl><type><name>MemoryContext</name></type> <name>context</name></decl></parameter>, <parameter><decl><type><name>void</name> <modifier>*</modifier></type><name>pointer</name></decl></parameter>, <parameter><decl><type><name>Size</name></type> <name>size</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>AllocSet</name></type>	<name>set</name> <init>= <expr><operator>(</operator><name>AllocSet</name><operator>)</operator> <name>context</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>AllocChunk</name></type>	<name>chunk</name> <init>= <expr><call><name>AllocPointerGetChunk</name><argument_list>(<argument><expr><name>pointer</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Size</name></type>		<name>oldsize</name></decl>;</decl_stmt>
+
+	<comment type="block">/* Allow access to private part of chunk header. */</comment>
+	<expr_stmt><expr><call><name>VALGRIND_MAKE_MEM_DEFINED</name><argument_list>(<argument><expr><name>chunk</name></expr></argument>, <argument><expr><name>ALLOCCHUNK_PRIVATE_LEN</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>oldsize</name> <operator>=</operator> <name><name>chunk</name><operator>-&gt;</operator><name>size</name></name></expr>;</expr_stmt>
+
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>MEMORY_CONTEXT_CHECKING</name></cpp:ifdef>
+	<comment type="block">/* Test for someone scribbling on unused space in chunk */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>chunk</name><operator>-&gt;</operator><name>requested_size</name></name> <operator>&lt;</operator> <name>oldsize</name></expr>)</condition><block type="pseudo"><block_content>
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>sentinel_ok</name><argument_list>(<argument><expr><name>pointer</name></expr></argument>, <argument><expr><name><name>chunk</name><operator>-&gt;</operator><name>requested_size</name></name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>WARNING</name></expr></argument>, <argument><expr><literal type="string">"detected write past chunk end in %s %p"</literal></expr></argument>,
+				 <argument><expr><name><name>set</name><operator>-&gt;</operator><name>header</name><operator>.</operator><name>name</name></name></expr></argument>, <argument><expr><name>chunk</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt></block_content></block></if></if_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+	<comment type="block">/*
+	 * Chunk sizes are aligned to power of 2 in AllocSetAlloc(). Maybe the
+	 * allocated area already is &gt;= the new size.  (In particular, we always
+	 * fall out here if the requested size is a decrease.)
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name>oldsize</name> <operator>&gt;=</operator> <name>size</name></expr>)</condition>
+	<block>{<block_content>
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>MEMORY_CONTEXT_CHECKING</name></cpp:ifdef>
+		<decl_stmt><decl><type><name>Size</name></type>		<name>oldrequest</name> <init>= <expr><name><name>chunk</name><operator>-&gt;</operator><name>requested_size</name></name></expr></init></decl>;</decl_stmt>
+
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>RANDOMIZE_ALLOCATED_MEMORY</name></cpp:ifdef>
+		<comment type="block">/* We can only fill the extra space if we know the prior request */</comment>
+		<if_stmt><if>if <condition>(<expr><name>size</name> <operator>&gt;</operator> <name>oldrequest</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>randomize_mem</name><argument_list>(<argument><expr><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <name>pointer</name> <operator>+</operator> <name>oldrequest</name></expr></argument>,
+						  <argument><expr><name>size</name> <operator>-</operator> <name>oldrequest</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+		<expr_stmt><expr><name><name>chunk</name><operator>-&gt;</operator><name>requested_size</name></name> <operator>=</operator> <name>size</name></expr>;</expr_stmt>
+
+		<comment type="block">/*
+		 * If this is an increase, mark any newly-available part UNDEFINED.
+		 * Otherwise, mark the obsolete part NOACCESS.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><name>size</name> <operator>&gt;</operator> <name>oldrequest</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>VALGRIND_MAKE_MEM_UNDEFINED</name><argument_list>(<argument><expr><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <name>pointer</name> <operator>+</operator> <name>oldrequest</name></expr></argument>,
+										<argument><expr><name>size</name> <operator>-</operator> <name>oldrequest</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if>
+		<else>else<block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>VALGRIND_MAKE_MEM_NOACCESS</name><argument_list>(<argument><expr><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <name>pointer</name> <operator>+</operator> <name>size</name></expr></argument>,
+									   <argument><expr><name>oldsize</name> <operator>-</operator> <name>size</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></else></if_stmt>
+
+		<comment type="block">/* set mark to catch clobber of "unused" space */</comment>
+		<if_stmt><if>if <condition>(<expr><name>size</name> <operator>&lt;</operator> <name>oldsize</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>set_sentinel</name><argument_list>(<argument><expr><name>pointer</name></expr></argument>, <argument><expr><name>size</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+<cpp:else>#<cpp:directive>else</cpp:directive></cpp:else>							<comment type="block">/* !MEMORY_CONTEXT_CHECKING */</comment>
+
+		<comment type="block">/*
+		 * We don't have the information to determine whether we're growing
+		 * the old request or shrinking it, so we conservatively mark the
+		 * entire new allocation DEFINED.
+		 */</comment>
+		<expr_stmt><expr><call><name>VALGRIND_MAKE_MEM_NOACCESS</name><argument_list>(<argument><expr><name>pointer</name></expr></argument>, <argument><expr><name>oldsize</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>VALGRIND_MAKE_MEM_DEFINED</name><argument_list>(<argument><expr><name>pointer</name></expr></argument>, <argument><expr><name>size</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+		<comment type="block">/* Disallow external access to private part of chunk header. */</comment>
+		<expr_stmt><expr><call><name>VALGRIND_MAKE_MEM_NOACCESS</name><argument_list>(<argument><expr><name>chunk</name></expr></argument>, <argument><expr><name>ALLOCCHUNK_PRIVATE_LEN</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<return>return <expr><name>pointer</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>oldsize</name> <operator>&gt;</operator> <name><name>set</name><operator>-&gt;</operator><name>allocChunkLimit</name></name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/*
+		 * The chunk must have been allocated as a single-chunk block.  Use
+		 * realloc() to make the containing block bigger with minimum space
+		 * wastage.
+		 */</comment>
+		<decl_stmt><decl><type><name>AllocBlock</name></type>	<name>block</name> <init>= <expr><operator>(</operator><name>AllocBlock</name><operator>)</operator> <operator>(</operator><operator>(</operator><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <name>chunk</name><operator>)</operator> <operator>-</operator> <name>ALLOC_BLOCKHDRSZ</name><operator>)</operator></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>Size</name></type>		<name>chksize</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>Size</name></type>		<name>blksize</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>Size</name></type>		<name>oldblksize</name></decl>;</decl_stmt>
+
+		<comment type="block">/*
+		 * Try to verify that we have a sane block pointer: it should
+		 * reference the correct aset, and freeptr and endptr should point
+		 * just past the chunk.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><name><name>block</name><operator>-&gt;</operator><name>aset</name></name> <operator>!=</operator> <name>set</name> <operator>||</operator>
+			<name><name>block</name><operator>-&gt;</operator><name>freeptr</name></name> <operator>!=</operator> <name><name>block</name><operator>-&gt;</operator><name>endptr</name></name> <operator>||</operator>
+			<name><name>block</name><operator>-&gt;</operator><name>freeptr</name></name> <operator>!=</operator> <operator>(</operator><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <name>block</name><operator>)</operator> <operator>+</operator>
+			<operator>(</operator><name><name>chunk</name><operator>-&gt;</operator><name>size</name></name> <operator>+</operator> <name>ALLOC_BLOCKHDRSZ</name> <operator>+</operator> <name>ALLOC_CHUNKHDRSZ</name><operator>)</operator></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"could not find block containing chunk %p"</literal></expr></argument>, <argument><expr><name>chunk</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+		<comment type="block">/* Do the realloc */</comment>
+		<expr_stmt><expr><name>chksize</name> <operator>=</operator> <call><name>MAXALIGN</name><argument_list>(<argument><expr><name>size</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name>blksize</name> <operator>=</operator> <name>chksize</name> <operator>+</operator> <name>ALLOC_BLOCKHDRSZ</name> <operator>+</operator> <name>ALLOC_CHUNKHDRSZ</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name>oldblksize</name> <operator>=</operator> <name><name>block</name><operator>-&gt;</operator><name>endptr</name></name> <operator>-</operator> <operator>(</operator><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <name>block</name><operator>)</operator></expr>;</expr_stmt>
+
+		<expr_stmt><expr><name>block</name> <operator>=</operator> <operator>(</operator><name>AllocBlock</name><operator>)</operator> <call><name>realloc</name><argument_list>(<argument><expr><name>block</name></expr></argument>, <argument><expr><name>blksize</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<if_stmt><if>if <condition>(<expr><name>block</name> <operator>==</operator> <name>NULL</name></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/* Disallow external access to private part of chunk header. */</comment>
+			<expr_stmt><expr><call><name>VALGRIND_MAKE_MEM_NOACCESS</name><argument_list>(<argument><expr><name>chunk</name></expr></argument>, <argument><expr><name>ALLOCCHUNK_PRIVATE_LEN</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<return>return <expr><name>NULL</name></expr>;</return>
+		</block_content>}</block></if></if_stmt>
+		<expr_stmt><expr><name><name>block</name><operator>-&gt;</operator><name>freeptr</name></name> <operator>=</operator> <name><name>block</name><operator>-&gt;</operator><name>endptr</name></name> <operator>=</operator> <operator>(</operator><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <name>block</name><operator>)</operator> <operator>+</operator> <name>blksize</name></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>YbPgMemSubConsumption</name><argument_list>(<argument><expr><name>oldblksize</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>YbPgMemAddConsumption</name><argument_list>(<argument><expr><name>blksize</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/* Update pointers since block has likely been moved */</comment>
+		<expr_stmt><expr><name>chunk</name> <operator>=</operator> <operator>(</operator><name>AllocChunk</name><operator>)</operator> <operator>(</operator><operator>(</operator><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <name>block</name><operator>)</operator> <operator>+</operator> <name>ALLOC_BLOCKHDRSZ</name><operator>)</operator></expr>;</expr_stmt>
+		<expr_stmt><expr><name>pointer</name> <operator>=</operator> <call><name>AllocChunkGetPointer</name><argument_list>(<argument><expr><name>chunk</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<if_stmt><if>if <condition>(<expr><name><name>block</name><operator>-&gt;</operator><name>prev</name></name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><name><name>block</name><operator>-&gt;</operator><name>prev</name><operator>-&gt;</operator><name>next</name></name> <operator>=</operator> <name>block</name></expr>;</expr_stmt></block_content></block></if>
+		<else>else<block type="pseudo"><block_content>
+			<expr_stmt><expr><name><name>set</name><operator>-&gt;</operator><name>blocks</name></name> <operator>=</operator> <name>block</name></expr>;</expr_stmt></block_content></block></else></if_stmt>
+		<if_stmt><if>if <condition>(<expr><name><name>block</name><operator>-&gt;</operator><name>next</name></name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><name><name>block</name><operator>-&gt;</operator><name>next</name><operator>-&gt;</operator><name>prev</name></name> <operator>=</operator> <name>block</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+		<expr_stmt><expr><name><name>chunk</name><operator>-&gt;</operator><name>size</name></name> <operator>=</operator> <name>chksize</name></expr>;</expr_stmt>
+
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>MEMORY_CONTEXT_CHECKING</name></cpp:ifdef>
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>RANDOMIZE_ALLOCATED_MEMORY</name></cpp:ifdef>
+		<comment type="block">/* We can only fill the extra space if we know the prior request */</comment>
+		<expr_stmt><expr><call><name>randomize_mem</name><argument_list>(<argument><expr><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <name>pointer</name> <operator>+</operator> <name><name>chunk</name><operator>-&gt;</operator><name>requested_size</name></name></expr></argument>,
+					  <argument><expr><name>size</name> <operator>-</operator> <name><name>chunk</name><operator>-&gt;</operator><name>requested_size</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+		<comment type="block">/*
+		 * realloc() (or randomize_mem()) will have left the newly-allocated
+		 * part UNDEFINED, but we may need to adjust trailing bytes from the
+		 * old allocation.
+		 */</comment>
+		<expr_stmt><expr><call><name>VALGRIND_MAKE_MEM_UNDEFINED</name><argument_list>(<argument><expr><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <name>pointer</name> <operator>+</operator> <name><name>chunk</name><operator>-&gt;</operator><name>requested_size</name></name></expr></argument>,
+									<argument><expr><name>oldsize</name> <operator>-</operator> <name><name>chunk</name><operator>-&gt;</operator><name>requested_size</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><name><name>chunk</name><operator>-&gt;</operator><name>requested_size</name></name> <operator>=</operator> <name>size</name></expr>;</expr_stmt>
+
+		<comment type="block">/* set mark to catch clobber of "unused" space */</comment>
+		<if_stmt><if>if <condition>(<expr><name>size</name> <operator>&lt;</operator> <name><name>chunk</name><operator>-&gt;</operator><name>size</name></name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>set_sentinel</name><argument_list>(<argument><expr><name>pointer</name></expr></argument>, <argument><expr><name>size</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+<cpp:else>#<cpp:directive>else</cpp:directive></cpp:else>							<comment type="block">/* !MEMORY_CONTEXT_CHECKING */</comment>
+
+		<comment type="block">/*
+		 * We don't know how much of the old chunk size was the actual
+		 * allocation; it could have been as small as one byte.  We have to be
+		 * conservative and just mark the entire old portion DEFINED.
+		 */</comment>
+		<expr_stmt><expr><call><name>VALGRIND_MAKE_MEM_DEFINED</name><argument_list>(<argument><expr><name>pointer</name></expr></argument>, <argument><expr><name>oldsize</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+		<comment type="block">/* Ensure any padding bytes are marked NOACCESS. */</comment>
+		<expr_stmt><expr><call><name>VALGRIND_MAKE_MEM_NOACCESS</name><argument_list>(<argument><expr><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <name>pointer</name> <operator>+</operator> <name>size</name></expr></argument>, <argument><expr><name>chksize</name> <operator>-</operator> <name>size</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/* Disallow external access to private part of chunk header. */</comment>
+		<expr_stmt><expr><call><name>VALGRIND_MAKE_MEM_NOACCESS</name><argument_list>(<argument><expr><name>chunk</name></expr></argument>, <argument><expr><name>ALLOCCHUNK_PRIVATE_LEN</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<return>return <expr><name>pointer</name></expr>;</return>
+	</block_content>}</block></if>
+	<else>else
+	<block>{<block_content>
+		<comment type="block">/*
+		 * Small-chunk case.  We just do this by brute force, ie, allocate a
+		 * new chunk and copy the data.  Since we know the existing data isn't
+		 * huge, this won't involve any great memcpy expense, so it's not
+		 * worth being smarter.  (At one time we tried to avoid memcpy when it
+		 * was possible to enlarge the chunk in-place, but that turns out to
+		 * misbehave unpleasantly for repeated cycles of
+		 * palloc/repalloc/pfree: the eventually freed chunks go into the
+		 * wrong freelist for the next initial palloc request, and so we leak
+		 * memory indefinitely.  See pgsql-hackers archives for 2007-08-11.)
+		 */</comment>
+		<decl_stmt><decl><type><name>AllocPointer</name></type> <name>newPointer</name></decl>;</decl_stmt>
+
+		<comment type="block">/* allocate new chunk */</comment>
+		<expr_stmt><expr><name>newPointer</name> <operator>=</operator> <call><name>AllocSetAlloc</name><argument_list>(<argument><expr><operator>(</operator><name>MemoryContext</name><operator>)</operator> <name>set</name></expr></argument>, <argument><expr><name>size</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/* leave immediately if request was not completed */</comment>
+		<if_stmt><if>if <condition>(<expr><name>newPointer</name> <operator>==</operator> <name>NULL</name></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/* Disallow external access to private part of chunk header. */</comment>
+			<expr_stmt><expr><call><name>VALGRIND_MAKE_MEM_NOACCESS</name><argument_list>(<argument><expr><name>chunk</name></expr></argument>, <argument><expr><name>ALLOCCHUNK_PRIVATE_LEN</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<return>return <expr><name>NULL</name></expr>;</return>
+		</block_content>}</block></if></if_stmt>
+
+		<comment type="block">/*
+		 * AllocSetAlloc() may have returned a region that is still NOACCESS.
+		 * Change it to UNDEFINED for the moment; memcpy() will then transfer
+		 * definedness from the old allocation to the new.  If we know the old
+		 * allocation, copy just that much.  Otherwise, make the entire old
+		 * chunk defined to avoid errors as we copy the currently-NOACCESS
+		 * trailing bytes.
+		 */</comment>
+		<expr_stmt><expr><call><name>VALGRIND_MAKE_MEM_UNDEFINED</name><argument_list>(<argument><expr><name>newPointer</name></expr></argument>, <argument><expr><name>size</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>MEMORY_CONTEXT_CHECKING</name></cpp:ifdef>
+		<expr_stmt><expr><name>oldsize</name> <operator>=</operator> <name><name>chunk</name><operator>-&gt;</operator><name>requested_size</name></name></expr>;</expr_stmt>
+<cpp:else>#<cpp:directive>else</cpp:directive></cpp:else>
+		<expr_stmt><expr><call><name>VALGRIND_MAKE_MEM_DEFINED</name><argument_list>(<argument><expr><name>pointer</name></expr></argument>, <argument><expr><name>oldsize</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+		<comment type="block">/* transfer existing data (certain to fit) */</comment>
+		<expr_stmt><expr><call><name>memcpy</name><argument_list>(<argument><expr><name>newPointer</name></expr></argument>, <argument><expr><name>pointer</name></expr></argument>, <argument><expr><name>oldsize</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/* free old chunk */</comment>
+		<expr_stmt><expr><call><name>AllocSetFree</name><argument_list>(<argument><expr><operator>(</operator><name>MemoryContext</name><operator>)</operator> <name>set</name></expr></argument>, <argument><expr><name>pointer</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<return>return <expr><name>newPointer</name></expr>;</return>
+	</block_content>}</block></else></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * AllocSetGetChunkSpace
+ *		Given a currently-allocated chunk, determine the total space
+ *		it occupies (including all memory-allocation overhead).
+ */</comment>
+<function><type><specifier>static</specifier> <name>Size</name></type>
+<name>AllocSetGetChunkSpace</name><parameter_list>(<parameter><decl><type><name>MemoryContext</name></type> <name>context</name></decl></parameter>, <parameter><decl><type><name>void</name> <modifier>*</modifier></type><name>pointer</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>AllocChunk</name></type>	<name>chunk</name> <init>= <expr><call><name>AllocPointerGetChunk</name><argument_list>(<argument><expr><name>pointer</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Size</name></type>		<name>result</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>VALGRIND_MAKE_MEM_DEFINED</name><argument_list>(<argument><expr><name>chunk</name></expr></argument>, <argument><expr><name>ALLOCCHUNK_PRIVATE_LEN</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>result</name> <operator>=</operator> <name><name>chunk</name><operator>-&gt;</operator><name>size</name></name> <operator>+</operator> <name>ALLOC_CHUNKHDRSZ</name></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>VALGRIND_MAKE_MEM_NOACCESS</name><argument_list>(<argument><expr><name>chunk</name></expr></argument>, <argument><expr><name>ALLOCCHUNK_PRIVATE_LEN</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<return>return <expr><name>result</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * AllocSetIsEmpty
+ *		Is an allocset empty of any allocated space?
+ */</comment>
+<function><type><specifier>static</specifier> <name>bool</name></type>
+<name>AllocSetIsEmpty</name><parameter_list>(<parameter><decl><type><name>MemoryContext</name></type> <name>context</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<comment type="block">/*
+	 * For now, we say "empty" only if the context is new or just reset. We
+	 * could examine the freelists to determine if all space has been freed,
+	 * but it's not really worth the trouble for present uses of this
+	 * functionality.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>context</name><operator>-&gt;</operator><name>isReset</name></name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>true</name></expr>;</return></block_content></block></if></if_stmt>
+	<return>return <expr><name>false</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * AllocSetStats
+ *		Compute stats about memory consumption of an allocset.
+ *
+ * printfunc: if not NULL, pass a human-readable stats string to this.
+ * passthru: pass this pointer through to printfunc.
+ * totals: if not NULL, add stats about this context into *totals.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>AllocSetStats</name><parameter_list>(<parameter><decl><type><name>MemoryContext</name></type> <name>context</name></decl></parameter>,
+			  <parameter><decl><type><name>MemoryStatsPrintFunc</name></type> <name>printfunc</name></decl></parameter>, <parameter><decl><type><name>void</name> <modifier>*</modifier></type><name>passthru</name></decl></parameter>,
+			  <parameter><decl><type><name>MemoryContextCounters</name> <modifier>*</modifier></type><name>totals</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>AllocSet</name></type>	<name>set</name> <init>= <expr><operator>(</operator><name>AllocSet</name><operator>)</operator> <name>context</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Size</name></type>		<name>nblocks</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Size</name></type>		<name>freechunks</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Size</name></type>		<name>totalspace</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Size</name></type>		<name>freespace</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>AllocBlock</name></type>	<name>block</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>fidx</name></decl>;</decl_stmt>
+
+	<comment type="block">/* Include context header in totalspace */</comment>
+	<expr_stmt><expr><name>totalspace</name> <operator>=</operator> <call><name>MAXALIGN</name><argument_list>(<argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>AllocSetContext</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<for>for <control>(<init><expr><name>block</name> <operator>=</operator> <name><name>set</name><operator>-&gt;</operator><name>blocks</name></name></expr>;</init> <condition><expr><name>block</name> <operator>!=</operator> <name>NULL</name></expr>;</condition> <incr><expr><name>block</name> <operator>=</operator> <name><name>block</name><operator>-&gt;</operator><name>next</name></name></expr></incr>)</control>
+	<block>{<block_content>
+		<expr_stmt><expr><name>nblocks</name><operator>++</operator></expr>;</expr_stmt>
+		<expr_stmt><expr><name>totalspace</name> <operator>+=</operator> <name><name>block</name><operator>-&gt;</operator><name>endptr</name></name> <operator>-</operator> <operator>(</operator><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <name>block</name><operator>)</operator></expr>;</expr_stmt>
+		<expr_stmt><expr><name>freespace</name> <operator>+=</operator> <name><name>block</name><operator>-&gt;</operator><name>endptr</name></name> <operator>-</operator> <name><name>block</name><operator>-&gt;</operator><name>freeptr</name></name></expr>;</expr_stmt>
+	</block_content>}</block></for>
+	<for>for <control>(<init><expr><name>fidx</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>fidx</name> <operator>&lt;</operator> <name>ALLOCSET_NUM_FREELISTS</name></expr>;</condition> <incr><expr><name>fidx</name><operator>++</operator></expr></incr>)</control>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>AllocChunk</name></type>	<name>chunk</name></decl>;</decl_stmt>
+
+		<for>for <control>(<init><expr><name>chunk</name> <operator>=</operator> <name><name>set</name><operator>-&gt;</operator><name>freelist</name><index>[<expr><name>fidx</name></expr>]</index></name></expr>;</init> <condition><expr><name>chunk</name> <operator>!=</operator> <name>NULL</name></expr>;</condition>
+			 <incr><expr><name>chunk</name> <operator>=</operator> <operator>(</operator><name>AllocChunk</name><operator>)</operator> <name><name>chunk</name><operator>-&gt;</operator><name>aset</name></name></expr></incr>)</control>
+		<block>{<block_content>
+			<expr_stmt><expr><name>freechunks</name><operator>++</operator></expr>;</expr_stmt>
+			<expr_stmt><expr><name>freespace</name> <operator>+=</operator> <name><name>chunk</name><operator>-&gt;</operator><name>size</name></name> <operator>+</operator> <name>ALLOC_CHUNKHDRSZ</name></expr>;</expr_stmt>
+		</block_content>}</block></for>
+	</block_content>}</block></for>
+
+	<if_stmt><if>if <condition>(<expr><name>printfunc</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>char</name></type>		<name><name>stats_string</name><index>[<expr><literal type="number">200</literal></expr>]</index></name></decl>;</decl_stmt>
+
+		<expr_stmt><expr><call><name>snprintf</name><argument_list>(<argument><expr><name>stats_string</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>stats_string</name></expr></argument>)</argument_list></sizeof></expr></argument>,
+				 <argument><expr><literal type="string">"%zu total in %zd blocks; %zu free (%zd chunks); %zu used"</literal></expr></argument>,
+				 <argument><expr><name>totalspace</name></expr></argument>, <argument><expr><name>nblocks</name></expr></argument>, <argument><expr><name>freespace</name></expr></argument>, <argument><expr><name>freechunks</name></expr></argument>,
+				 <argument><expr><name>totalspace</name> <operator>-</operator> <name>freespace</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>printfunc</name><argument_list>(<argument><expr><name>context</name></expr></argument>, <argument><expr><name>passthru</name></expr></argument>, <argument><expr><name>stats_string</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>totals</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name><name>totals</name><operator>-&gt;</operator><name>nblocks</name></name> <operator>+=</operator> <name>nblocks</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>totals</name><operator>-&gt;</operator><name>freechunks</name></name> <operator>+=</operator> <name>freechunks</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>totals</name><operator>-&gt;</operator><name>totalspace</name></name> <operator>+=</operator> <name>totalspace</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>totals</name><operator>-&gt;</operator><name>freespace</name></name> <operator>+=</operator> <name>freespace</name></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+</block_content>}</block></function>
+
+
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>MEMORY_CONTEXT_CHECKING</name></cpp:ifdef>
+
+<comment type="block">/*
+ * AllocSetCheck
+ *		Walk through chunks and check consistency of memory.
+ *
+ * NOTE: report errors as WARNING, *not* ERROR or FATAL.  Otherwise you'll
+ * find yourself in an infinite loop when trouble occurs, because this
+ * routine will be entered again when elog cleanup tries to release memory!
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>AllocSetCheck</name><parameter_list>(<parameter><decl><type><name>MemoryContext</name></type> <name>context</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>AllocSet</name></type>	<name>set</name> <init>= <expr><operator>(</operator><name>AllocSet</name><operator>)</operator> <name>context</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>name</name> <init>= <expr><name><name>set</name><operator>-&gt;</operator><name>header</name><operator>.</operator><name>name</name></name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>AllocBlock</name></type>	<name>prevblock</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>AllocBlock</name></type>	<name>block</name></decl>;</decl_stmt>
+
+	<for>for <control>(<init><expr><name>prevblock</name> <operator>=</operator> <name>NULL</name></expr><operator>,</operator> <expr><name>block</name> <operator>=</operator> <name><name>set</name><operator>-&gt;</operator><name>blocks</name></name></expr>;</init>
+		 <condition><expr><name>block</name> <operator>!=</operator> <name>NULL</name></expr>;</condition>
+		 <incr><expr><name>prevblock</name> <operator>=</operator> <name>block</name></expr><operator>,</operator> <expr><name>block</name> <operator>=</operator> <name><name>block</name><operator>-&gt;</operator><name>next</name></name></expr></incr>)</control>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>bpoz</name> <init>= <expr><operator>(</operator><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <name>block</name><operator>)</operator> <operator>+</operator> <name>ALLOC_BLOCKHDRSZ</name></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>long</name></type>		<name>blk_used</name> <init>= <expr><name><name>block</name><operator>-&gt;</operator><name>freeptr</name></name> <operator>-</operator> <name>bpoz</name></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>long</name></type>		<name>blk_data</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>long</name></type>		<name>nchunks</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+
+		<comment type="block">/*
+		 * Empty block - empty can be keeper-block only
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><name>blk_used</name></expr>)</condition>
+		<block>{<block_content>
+			<if_stmt><if>if <condition>(<expr><name><name>set</name><operator>-&gt;</operator><name>keeper</name></name> <operator>!=</operator> <name>block</name></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>WARNING</name></expr></argument>, <argument><expr><literal type="string">"problem in alloc set %s: empty block %p"</literal></expr></argument>,
+					 <argument><expr><name>name</name></expr></argument>, <argument><expr><name>block</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+		</block_content>}</block></if></if_stmt>
+
+		<comment type="block">/*
+		 * Check block header fields
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><name><name>block</name><operator>-&gt;</operator><name>aset</name></name> <operator>!=</operator> <name>set</name> <operator>||</operator>
+			<name><name>block</name><operator>-&gt;</operator><name>prev</name></name> <operator>!=</operator> <name>prevblock</name> <operator>||</operator>
+			<name><name>block</name><operator>-&gt;</operator><name>freeptr</name></name> <operator>&lt;</operator> <name>bpoz</name> <operator>||</operator>
+			<name><name>block</name><operator>-&gt;</operator><name>freeptr</name></name> <operator>&gt;</operator> <name><name>block</name><operator>-&gt;</operator><name>endptr</name></name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>WARNING</name></expr></argument>, <argument><expr><literal type="string">"problem in alloc set %s: corrupt header in block %p"</literal></expr></argument>,
+				 <argument><expr><name>name</name></expr></argument>, <argument><expr><name>block</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+		<comment type="block">/*
+		 * Chunk walker
+		 */</comment>
+		<while>while <condition>(<expr><name>bpoz</name> <operator>&lt;</operator> <name><name>block</name><operator>-&gt;</operator><name>freeptr</name></name></expr>)</condition>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>AllocChunk</name></type>	<name>chunk</name> <init>= <expr><operator>(</operator><name>AllocChunk</name><operator>)</operator> <name>bpoz</name></expr></init></decl>;</decl_stmt>
+			<decl_stmt><decl><type><name>Size</name></type>		<name>chsize</name></decl>,
+						<decl><type ref="prev"/><name>dsize</name></decl>;</decl_stmt>
+
+			<comment type="block">/* Allow access to private part of chunk header. */</comment>
+			<expr_stmt><expr><call><name>VALGRIND_MAKE_MEM_DEFINED</name><argument_list>(<argument><expr><name>chunk</name></expr></argument>, <argument><expr><name>ALLOCCHUNK_PRIVATE_LEN</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+			<expr_stmt><expr><name>chsize</name> <operator>=</operator> <name><name>chunk</name><operator>-&gt;</operator><name>size</name></name></expr>;</expr_stmt>	<comment type="block">/* aligned chunk size */</comment>
+			<expr_stmt><expr><name>dsize</name> <operator>=</operator> <name><name>chunk</name><operator>-&gt;</operator><name>requested_size</name></name></expr>;</expr_stmt>	<comment type="block">/* real data */</comment>
+
+			<comment type="block">/*
+			 * Check chunk size
+			 */</comment>
+			<if_stmt><if>if <condition>(<expr><name>dsize</name> <operator>&gt;</operator> <name>chsize</name></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>WARNING</name></expr></argument>, <argument><expr><literal type="string">"problem in alloc set %s: req size &gt; alloc size for chunk %p in block %p"</literal></expr></argument>,
+					 <argument><expr><name>name</name></expr></argument>, <argument><expr><name>chunk</name></expr></argument>, <argument><expr><name>block</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+			<if_stmt><if>if <condition>(<expr><name>chsize</name> <operator>&lt;</operator> <operator>(</operator><literal type="number">1</literal> <operator>&lt;&lt;</operator> <name>ALLOC_MINBITS</name><operator>)</operator></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>WARNING</name></expr></argument>, <argument><expr><literal type="string">"problem in alloc set %s: bad size %zu for chunk %p in block %p"</literal></expr></argument>,
+					 <argument><expr><name>name</name></expr></argument>, <argument><expr><name>chsize</name></expr></argument>, <argument><expr><name>chunk</name></expr></argument>, <argument><expr><name>block</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+			<comment type="block">/* single-chunk block? */</comment>
+			<if_stmt><if>if <condition>(<expr><name>chsize</name> <operator>&gt;</operator> <name><name>set</name><operator>-&gt;</operator><name>allocChunkLimit</name></name> <operator>&amp;&amp;</operator>
+				<name>chsize</name> <operator>+</operator> <name>ALLOC_CHUNKHDRSZ</name> <operator>!=</operator> <name>blk_used</name></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>WARNING</name></expr></argument>, <argument><expr><literal type="string">"problem in alloc set %s: bad single-chunk %p in block %p"</literal></expr></argument>,
+					 <argument><expr><name>name</name></expr></argument>, <argument><expr><name>chunk</name></expr></argument>, <argument><expr><name>block</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+			<comment type="block">/*
+			 * If chunk is allocated, check for correct aset pointer. (If it's
+			 * free, the aset is the freelist pointer, which we can't check as
+			 * easily...)  Note this is an incomplete test, since palloc(0)
+			 * produces an allocated chunk with requested_size == 0.
+			 */</comment>
+			<if_stmt><if>if <condition>(<expr><name>dsize</name> <operator>&gt;</operator> <literal type="number">0</literal> <operator>&amp;&amp;</operator> <name><name>chunk</name><operator>-&gt;</operator><name>aset</name></name> <operator>!=</operator> <operator>(</operator><name>void</name> <operator>*</operator><operator>)</operator> <name>set</name></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>WARNING</name></expr></argument>, <argument><expr><literal type="string">"problem in alloc set %s: bogus aset link in block %p, chunk %p"</literal></expr></argument>,
+					 <argument><expr><name>name</name></expr></argument>, <argument><expr><name>block</name></expr></argument>, <argument><expr><name>chunk</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+			<comment type="block">/*
+			 * Check for overwrite of padding space in an allocated chunk.
+			 */</comment>
+			<if_stmt><if>if <condition>(<expr><name><name>chunk</name><operator>-&gt;</operator><name>aset</name></name> <operator>==</operator> <operator>(</operator><name>void</name> <operator>*</operator><operator>)</operator> <name>set</name> <operator>&amp;&amp;</operator> <name>dsize</name> <operator>&lt;</operator> <name>chsize</name> <operator>&amp;&amp;</operator>
+				<operator>!</operator><call><name>sentinel_ok</name><argument_list>(<argument><expr><name>chunk</name></expr></argument>, <argument><expr><name>ALLOC_CHUNKHDRSZ</name> <operator>+</operator> <name>dsize</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>WARNING</name></expr></argument>, <argument><expr><literal type="string">"problem in alloc set %s: detected write past chunk end in block %p, chunk %p"</literal></expr></argument>,
+					 <argument><expr><name>name</name></expr></argument>, <argument><expr><name>block</name></expr></argument>, <argument><expr><name>chunk</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+			<comment type="block">/*
+			 * If chunk is allocated, disallow external access to private part
+			 * of chunk header.
+			 */</comment>
+			<if_stmt><if>if <condition>(<expr><name><name>chunk</name><operator>-&gt;</operator><name>aset</name></name> <operator>==</operator> <operator>(</operator><name>void</name> <operator>*</operator><operator>)</operator> <name>set</name></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><call><name>VALGRIND_MAKE_MEM_NOACCESS</name><argument_list>(<argument><expr><name>chunk</name></expr></argument>, <argument><expr><name>ALLOCCHUNK_PRIVATE_LEN</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+			<expr_stmt><expr><name>blk_data</name> <operator>+=</operator> <name>chsize</name></expr>;</expr_stmt>
+			<expr_stmt><expr><name>nchunks</name><operator>++</operator></expr>;</expr_stmt>
+
+			<expr_stmt><expr><name>bpoz</name> <operator>+=</operator> <name>ALLOC_CHUNKHDRSZ</name> <operator>+</operator> <name>chsize</name></expr>;</expr_stmt>
+		</block_content>}</block></while>
+
+		<if_stmt><if>if <condition>(<expr><operator>(</operator><name>blk_data</name> <operator>+</operator> <operator>(</operator><name>nchunks</name> <operator>*</operator> <name>ALLOC_CHUNKHDRSZ</name><operator>)</operator><operator>)</operator> <operator>!=</operator> <name>blk_used</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>WARNING</name></expr></argument>, <argument><expr><literal type="string">"problem in alloc set %s: found inconsistent memory block %p"</literal></expr></argument>,
+				 <argument><expr><name>name</name></expr></argument>, <argument><expr><name>block</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	</block_content>}</block></for>
+</block_content>}</block></function>
+
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>							<comment type="block">/* MEMORY_CONTEXT_CHECKING */</comment>
+</unit>

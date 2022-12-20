@@ -1,0 +1,911 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<unit xmlns="http://www.srcML.org/srcML/src" xmlns:cpp="http://www.srcML.org/srcML/cpp" revision="1.0.0" language="C" filename="/cloned_projects/citus/src/backend/distributed/transaction/transaction_management.c"><comment type="block">/*-------------------------------------------------------------------------
+ *
+ * transaction_management.c
+ *
+ *   Transaction management for Citus.  Most of the work is delegated to other
+ *   subsystems, this files, and especially CoordinatedTransactionCallback,
+ *   coordinates the work between them.
+ *
+ * Copyright (c) Citus Data, Inc.
+ *
+ *-------------------------------------------------------------------------
+ */</comment>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"postgres.h"</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"libpq-fe.h"</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"miscadmin.h"</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/twophase.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/xact.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/backend_data.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/citus_safe_lib.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/connection_management.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/distributed_planner.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/function_call_delegation.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/hash_helpers.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/intermediate_results.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/listutils.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/local_executor.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/locally_reserved_shared_connections.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/maintenanced.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/multi_executor.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/multi_logical_replication.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/multi_explain.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/repartition_join_execution.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/transaction_management.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/placement_connection.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/relation_access_tracking.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/shared_connection_stats.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/shard_cleaner.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/subplan_execution.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/version_compat.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/worker_log_messages.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/commands.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/metadata_cache.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/hsearch.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/guc.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/memutils.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/datum.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/fd.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"nodes/print.h"</cpp:file></cpp:include>
+
+
+<decl_stmt><decl><type><name>CoordinatedTransactionState</name></type> <name>CurrentCoordinatedTransactionState</name> <init>= <expr><name>COORD_TRANS_NONE</name></expr></init></decl>;</decl_stmt>
+
+<comment type="block">/*
+ * GUC that determines whether a SELECT in a transaction block should also run in
+ * a transaction block on the worker even if no writes have occurred yet.
+ */</comment>
+<decl_stmt><decl><type><name>bool</name></type> <name>SelectOpensTransactionBlock</name> <init>= <expr><name>true</name></expr></init></decl>;</decl_stmt>
+
+<comment type="block">/* controls use of locks to enforce safe commutativity */</comment>
+<decl_stmt><decl><type><name>bool</name></type> <name>AllModificationsCommutative</name> <init>= <expr><name>false</name></expr></init></decl>;</decl_stmt>
+
+<comment type="block">/* we've deprecated this flag, keeping here for some time not to break existing users */</comment>
+<decl_stmt><decl><type><name>bool</name></type> <name>EnableDeadlockPrevention</name> <init>= <expr><name>true</name></expr></init></decl>;</decl_stmt>
+
+<comment type="block">/* number of nested stored procedure call levels we are currently in */</comment>
+<decl_stmt><decl><type><name>int</name></type> <name>StoredProcedureLevel</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+
+<comment type="block">/* number of nested DO block levels we are currently in */</comment>
+<decl_stmt><decl><type><name>int</name></type> <name>DoBlockLevel</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+
+<comment type="block">/* state needed to keep track of operations used during a transaction */</comment>
+<decl_stmt><decl><type><name>XactModificationType</name></type> <name>XactModificationLevel</name> <init>= <expr><name>XACT_MODIFICATION_NONE</name></expr></init></decl>;</decl_stmt>
+
+<comment type="block">/* list of connections that are part of the current coordinated transaction */</comment>
+<decl_stmt><decl><type><name>dlist_head</name></type> <name>InProgressTransactions</name> <init>= <expr><call><name>DLIST_STATIC_INIT</name><argument_list>(<argument><expr><name>InProgressTransactions</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+<comment type="block">/*
+ * activeSetStmts keeps track of SET LOCAL statements executed within the current
+ * subxact and will be set to NULL when pushing into new subxact or ending top xact.
+ */</comment>
+<decl_stmt><decl><type><name>StringInfo</name></type> <name>activeSetStmts</name></decl>;</decl_stmt>
+
+<comment type="block">/*
+ * Though a list, we treat this as a stack, pushing on subxact contexts whenever
+ * e.g. a SAVEPOINT is executed (though this is actually performed by providing
+ * PostgreSQL with a sub-xact callback). At present, the context of a subxact
+ * includes a subxact identifier as well as any SET LOCAL statements propagated
+ * to workers during the sub-transaction.
+ *
+ * To be clear, last item of activeSubXactContexts list corresponds to top of
+ * stack.
+ */</comment>
+<decl_stmt><decl><type><specifier>static</specifier> <name>List</name> <modifier>*</modifier></type><name>activeSubXactContexts</name> <init>= <expr><name>NIL</name></expr></init></decl>;</decl_stmt>
+
+<comment type="block">/* some pre-allocated memory so we don't need to call malloc() during callbacks */</comment>
+<decl_stmt><decl><type><name>MemoryContext</name></type> <name>CitusXactCallbackContext</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+
+<comment type="block">/*
+ * Should this coordinated transaction use 2PC? Set by
+ * CoordinatedTransactionUse2PC(), e.g. if any modification
+ * is issued and us 2PC. But, even if this flag is set,
+ * the transaction manager is smart enough to only
+ * do 2PC on the remote connections that did a modification.
+ *
+ * As a variable name ShouldCoordinatedTransactionUse2PC could
+ * be improved. We use Use2PCForCoordinatedTransaction() as the
+ * public API function, hence couldn't come up with a better name
+ * for the underlying variable at the moment.
+ */</comment>
+<decl_stmt><decl><type><name>bool</name></type> <name>ShouldCoordinatedTransactionUse2PC</name> <init>= <expr><name>false</name></expr></init></decl>;</decl_stmt>
+
+<comment type="block">/*
+ * Distribution function argument (along with colocationId) when delegated
+ * using forceDelegation flag.
+ */</comment>
+<decl_stmt><decl><type><name>AllowedDistributionColumn</name></type> <name>AllowedDistributionColumnValue</name></decl>;</decl_stmt>
+
+<comment type="block">/* if disabled, distributed statements in a function may run as separate transactions */</comment>
+<decl_stmt><decl><type><name>bool</name></type> <name>FunctionOpensTransactionBlock</name> <init>= <expr><name>true</name></expr></init></decl>;</decl_stmt>
+
+<comment type="block">/* if true, we should trigger node metadata sync on commit */</comment>
+<decl_stmt><decl><type><name>bool</name></type> <name>NodeMetadataSyncOnCommit</name> <init>= <expr><name>false</name></expr></init></decl>;</decl_stmt>
+
+<comment type="block">/*
+ * In an explicit BEGIN ...; we keep track of top-level transaction characteristics
+ * specified by the user.
+ */</comment>
+<decl_stmt><decl><type><name>BeginXactReadOnlyState</name></type> <name>BeginXactReadOnly</name> <init>= <expr><name>BeginXactReadOnly_NotSet</name></expr></init></decl>;</decl_stmt>
+<decl_stmt><decl><type><name>BeginXactDeferrableState</name></type> <name>BeginXactDeferrable</name> <init>= <expr><name>BeginXactDeferrable_NotSet</name></expr></init></decl>;</decl_stmt>
+
+
+<comment type="block">/* transaction management functions */</comment>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>CoordinatedTransactionCallback</name><parameter_list>(<parameter><decl><type><name>XactEvent</name></type> <name>event</name></decl></parameter>, <parameter><decl><type><name>void</name> <modifier>*</modifier></type><name>arg</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>CoordinatedSubTransactionCallback</name><parameter_list>(<parameter><decl><type><name>SubXactEvent</name></type> <name>event</name></decl></parameter>, <parameter><decl><type><name>SubTransactionId</name></type> <name>subId</name></decl></parameter>,
+											  <parameter><decl><type><name>SubTransactionId</name></type> <name>parentSubid</name></decl></parameter>, <parameter><decl><type><name>void</name> <modifier>*</modifier></type><name>arg</name></decl></parameter>)</parameter_list>;</function_decl>
+
+<comment type="block">/* remaining functions */</comment>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>AdjustMaxPreparedTransactions</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>PushSubXact</name><parameter_list>(<parameter><decl><type><name>SubTransactionId</name></type> <name>subId</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>PopSubXact</name><parameter_list>(<parameter><decl><type><name>SubTransactionId</name></type> <name>subId</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>ResetGlobalVariables</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>bool</name></type> <name>SwallowErrors</name><parameter_list>(<parameter><function_decl><type><name>void</name></type> (<modifier>*</modifier><name>func</name>)<parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list></function_decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>ForceAllInProgressConnectionsToClose</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>EnsurePrepareTransactionIsAllowed</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>;</function_decl>
+
+
+<comment type="block">/*
+ * UseCoordinatedTransaction sets up the necessary variables to use
+ * a coordinated transaction, unless one is already in progress.
+ */</comment>
+<function><type><name>void</name></type>
+<name>UseCoordinatedTransaction</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<if_stmt><if>if <condition>(<expr><name>CurrentCoordinatedTransactionState</name> <operator>==</operator> <name>COORD_TRANS_STARTED</name></expr>)</condition>
+	<block>{<block_content>
+		<return>return;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>CurrentCoordinatedTransactionState</name> <operator>!=</operator> <name>COORD_TRANS_NONE</name> <operator>&amp;&amp;</operator>
+		<name>CurrentCoordinatedTransactionState</name> <operator>!=</operator> <name>COORD_TRANS_IDLE</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><operator>(</operator><call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"starting transaction in wrong state"</literal></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<expr_stmt><expr><name>CurrentCoordinatedTransactionState</name> <operator>=</operator> <name>COORD_TRANS_STARTED</name></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * If assign_distributed_transaction_id() has been called, we should reuse
+	 * that identifier so distributed deadlock detection works properly.
+	 */</comment>
+	<decl_stmt><decl><type><name>DistributedTransactionId</name> <modifier>*</modifier></type><name>transactionId</name> <init>= <expr><call><name>GetCurrentDistributedTransactionId</name><argument_list>()</argument_list></call></expr></init></decl>;</decl_stmt>
+	<if_stmt><if>if <condition>(<expr><name><name>transactionId</name><operator>-&gt;</operator><name>transactionNumber</name></name> <operator>==</operator> <literal type="number">0</literal></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>AssignDistributedTransactionId</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * EnsureDistributedTransactionId makes sure that the current transaction
+ * has a distributed transaction id. It is either assigned by a previous
+ * call of assign_distributed_transaction_id(), or by starting a coordinated
+ * transaction.
+ */</comment>
+<function><type><name>void</name></type>
+<name>EnsureDistributedTransactionId</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>DistributedTransactionId</name> <modifier>*</modifier></type><name>transactionId</name> <init>= <expr><call><name>GetCurrentDistributedTransactionId</name><argument_list>()</argument_list></call></expr></init></decl>;</decl_stmt>
+	<if_stmt><if>if <condition>(<expr><name><name>transactionId</name><operator>-&gt;</operator><name>transactionNumber</name></name> <operator>==</operator> <literal type="number">0</literal></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>UseCoordinatedTransaction</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * InCoordinatedTransaction returns whether a coordinated transaction has been
+ * started.
+ */</comment>
+<function><type><name>bool</name></type>
+<name>InCoordinatedTransaction</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<return>return <expr><name>CurrentCoordinatedTransactionState</name> <operator>!=</operator> <name>COORD_TRANS_NONE</name> <operator>&amp;&amp;</operator>
+		   <name>CurrentCoordinatedTransactionState</name> <operator>!=</operator> <name>COORD_TRANS_IDLE</name></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * Use2PCForCoordinatedTransaction() signals that the current coordinated
+ * transaction should use 2PC to commit.
+ *
+ * Note that even if 2PC is enabled, it is only used for connections that make
+ * modification (DML or DDL).
+ */</comment>
+<function><type><name>void</name></type>
+<name>Use2PCForCoordinatedTransaction</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<comment type="block">/*
+	 * If this transaction is also a coordinated
+	 * transaction, use 2PC. Otherwise, this
+	 * state change does nothing.
+	 *
+	 * In other words, when this flag is set,
+	 * we "should" use 2PC when needed (e.g.,
+	 * we are in a coordinated transaction and
+	 * the coordinated transaction does a remote
+	 * modification).
+	 */</comment>
+	<expr_stmt><expr><name>ShouldCoordinatedTransactionUse2PC</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * GetCoordinatedTransactionShouldUse2PC is a wrapper function to read the value
+ * of CoordinatedTransactionShouldUse2PCFlag.
+ */</comment>
+<function><type><name>bool</name></type>
+<name>GetCoordinatedTransactionShouldUse2PC</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<return>return <expr><name>ShouldCoordinatedTransactionUse2PC</name></expr>;</return>
+</block_content>}</block></function>
+
+
+<function><type><name>void</name></type>
+<name>InitializeTransactionManagement</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<comment type="block">/* hook into transaction machinery */</comment>
+	<expr_stmt><expr><call><name>RegisterXactCallback</name><argument_list>(<argument><expr><name>CoordinatedTransactionCallback</name></expr></argument>, <argument><expr><name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>RegisterSubXactCallback</name><argument_list>(<argument><expr><name>CoordinatedSubTransactionCallback</name></expr></argument>, <argument><expr><name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>AdjustMaxPreparedTransactions</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* set aside 8kb of memory for use in CoordinatedTransactionCallback */</comment>
+	<expr_stmt><expr><name>CitusXactCallbackContext</name> <operator>=</operator> <call><name>AllocSetContextCreateInternal</name><argument_list>(<argument><expr><name>TopMemoryContext</name></expr></argument>,
+															 <argument><expr><literal type="string">"CitusXactCallbackContext"</literal></expr></argument>,
+															 <argument><expr><literal type="number">8</literal> <operator>*</operator> <literal type="number">1024</literal></expr></argument>,
+															 <argument><expr><literal type="number">8</literal> <operator>*</operator> <literal type="number">1024</literal></expr></argument>,
+															 <argument><expr><literal type="number">8</literal> <operator>*</operator> <literal type="number">1024</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * Transaction management callback, handling coordinated transaction, and
+ * transaction independent connection management.
+ *
+ * NB: There should only ever be a single transaction callback in citus, the
+ * ordering between the callbacks and the actions within those callbacks
+ * otherwise becomes too undeterministic / hard to reason about.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>CoordinatedTransactionCallback</name><parameter_list>(<parameter><decl><type><name>XactEvent</name></type> <name>event</name></decl></parameter>, <parameter><decl><type><name>void</name> <modifier>*</modifier></type><name>arg</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<switch>switch <condition>(<expr><name>event</name></expr>)</condition>
+	<block>{<block_content>
+		<case>case <expr><name>XACT_EVENT_COMMIT</name></expr>:</case>
+		<block>{<block_content>
+			<comment type="block">/*
+			 * ERRORs thrown during XACT_EVENT_COMMIT will cause postgres to abort, at
+			 * this point enough work has been done that it's not possible to rollback.
+			 *
+			 * One possible source of errors is memory allocation failures. To minimize
+			 * the chance of those happening we've pre-allocated some memory in the
+			 * CitusXactCallbackContext, it has 8kb of memory that we're allowed to use.
+			 *
+			 * We only do this in the COMMIT callback because:
+			 * - Errors thrown in other callbacks (such as PRE_COMMIT) won't cause
+			 *   crashes, they will simply cause the ABORT handler to be called.
+			 * - The exception is ABORT, errors thrown there could also cause crashes, but
+			 *   postgres already creates a TransactionAbortContext which performs this
+			 *   trick, so there's no need for us to do it again.
+			 */</comment>
+			<decl_stmt><decl><type><name>MemoryContext</name></type> <name>previousContext</name> <init>=
+				<expr><call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>CitusXactCallbackContext</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+			<if_stmt><if>if <condition>(<expr><name>CurrentCoordinatedTransactionState</name> <operator>==</operator> <name>COORD_TRANS_PREPARED</name></expr>)</condition>
+			<block>{<block_content>
+				<comment type="block">/* handles both already prepared and open transactions */</comment>
+				<expr_stmt><expr><call><name>CoordinatedRemoteTransactionsCommit</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+			</block_content>}</block></if></if_stmt>
+
+			<comment type="block">/* close connections etc. */</comment>
+			<if_stmt><if>if <condition>(<expr><name>CurrentCoordinatedTransactionState</name> <operator>!=</operator> <name>COORD_TRANS_NONE</name></expr>)</condition>
+			<block>{<block_content>
+				<expr_stmt><expr><call><name>ResetPlacementConnectionManagement</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+				<expr_stmt><expr><call><name>AfterXactConnectionHandling</name><argument_list>(<argument><expr><name>true</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			</block_content>}</block></if></if_stmt>
+
+			<comment type="block">/*
+			 * Changes to catalog tables are now visible to the metadata sync
+			 * daemon, so we can trigger node metadata sync if necessary.
+			 */</comment>
+			<if_stmt><if>if <condition>(<expr><name>NodeMetadataSyncOnCommit</name></expr>)</condition>
+			<block>{<block_content>
+				<expr_stmt><expr><call><name>TriggerNodeMetadataSync</name><argument_list>(<argument><expr><name>MyDatabaseId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			</block_content>}</block></if></if_stmt>
+
+			<expr_stmt><expr><call><name>ResetGlobalVariables</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>ResetRelationAccessHash</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+			<comment type="block">/*
+			 * Make sure that we give the shared connections back to the shared
+			 * pool if any. This operation is a no-op if the reserved connections
+			 * are already given away.
+			 */</comment>
+			<expr_stmt><expr><call><name>DeallocateReservedConnections</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+			<expr_stmt><expr><call><name>UnSetDistributedTransactionId</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+			<expr_stmt><expr><name>PlacementMovedUsingLogicalReplicationInTX</name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+
+			<comment type="block">/* empty the CitusXactCallbackContext to ensure we're not leaking memory */</comment>
+			<expr_stmt><expr><call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>previousContext</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>MemoryContextReset</name><argument_list>(<argument><expr><name>CitusXactCallbackContext</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+			<comment type="block">/* Set CreateCitusTransactionLevel to 0 since original transaction is about to be
+			 * committed.
+			 */</comment>
+
+			<if_stmt><if>if <condition>(<expr><call><name>GetCitusCreationLevel</name><argument_list>()</argument_list></call> <operator>&gt;</operator> <literal type="number">0</literal></expr>)</condition>
+			<block>{<block_content>
+				<comment type="block">/* Check CitusCreationLevel was correctly decremented to 1 */</comment>
+				<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>GetCitusCreationLevel</name><argument_list>()</argument_list></call> <operator>==</operator> <literal type="number">1</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<expr_stmt><expr><call><name>SetCreateCitusTransactionLevel</name><argument_list>(<argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			</block_content>}</block></if></if_stmt>
+			<break>break;</break>
+		</block_content>}</block>
+
+		<case>case <expr><name>XACT_EVENT_ABORT</name></expr>:</case>
+		<block>{<block_content>
+			<comment type="block">/* stop propagating notices from workers, we know the query is failed */</comment>
+			<expr_stmt><expr><call><name>DisableWorkerMessagePropagation</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+			<expr_stmt><expr><call><name>RemoveIntermediateResultsDirectories</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+			<comment type="block">/* handles both already prepared and open transactions */</comment>
+			<if_stmt><if>if <condition>(<expr><name>CurrentCoordinatedTransactionState</name> <operator>&gt;</operator> <name>COORD_TRANS_IDLE</name></expr>)</condition>
+			<block>{<block_content>
+				<comment type="block">/*
+				 * Since CoordinateRemoteTransactionsAbort may cause an error and it is
+				 * not allowed to error out at that point, swallow the error if any.
+				 *
+				 * Particular error we've observed was CreateWaitEventSet throwing an error
+				 * when out of file descriptor.
+				 *
+				 * If an error is swallowed, connections of all active transactions must
+				 * be forced to close at the end of the transaction explicitly.
+				 */</comment>
+				<decl_stmt><decl><type><name>bool</name></type> <name>errorSwallowed</name> <init>= <expr><call><name>SwallowErrors</name><argument_list>(<argument><expr><name>CoordinatedRemoteTransactionsAbort</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+				<if_stmt><if>if <condition>(<expr><name>errorSwallowed</name> <operator>==</operator> <name>true</name></expr>)</condition>
+				<block>{<block_content>
+					<expr_stmt><expr><call><name>ForceAllInProgressConnectionsToClose</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+				</block_content>}</block></if></if_stmt>
+			</block_content>}</block></if></if_stmt>
+
+			<comment type="block">/*
+			 * Close connections etc. Contrary to a successful transaction we reset the
+			 * placement connection management irregardless of state of the statemachine
+			 * as recorded in CurrentCoordinatedTransactionState.
+			 * The hashmaps recording the connection management live a memory context
+			 * higher compared to most of the data referenced in the hashmap. This causes
+			 * use after free errors when the contents are retained due to an error caused
+			 * before the CurrentCoordinatedTransactionState changed.
+			 */</comment>
+			<expr_stmt><expr><call><name>ResetPlacementConnectionManagement</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>AfterXactConnectionHandling</name><argument_list>(<argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+			<expr_stmt><expr><call><name>ResetGlobalVariables</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>ResetRelationAccessHash</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+			<comment type="block">/* empty the CitusXactCallbackContext to ensure we're not leaking memory */</comment>
+			<expr_stmt><expr><call><name>MemoryContextReset</name><argument_list>(<argument><expr><name>CitusXactCallbackContext</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+			<comment type="block">/*
+			 * Clear MetadataCache table if we're aborting from a CREATE EXTENSION Citus
+			 * so that any created OIDs from the table are cleared and invalidated. We
+			 * also set CreateCitusTransactionLevel to 0 since that process has been aborted
+			 */</comment>
+			<if_stmt><if>if <condition>(<expr><call><name>GetCitusCreationLevel</name><argument_list>()</argument_list></call> <operator>&gt;</operator> <literal type="number">0</literal></expr>)</condition>
+			<block>{<block_content>
+				<comment type="block">/* Checks CitusCreationLevel correctly decremented to 1 */</comment>
+				<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>GetCitusCreationLevel</name><argument_list>()</argument_list></call> <operator>==</operator> <literal type="number">1</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+				<expr_stmt><expr><call><name>InvalidateMetadataSystemCache</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+				<expr_stmt><expr><call><name>SetCreateCitusTransactionLevel</name><argument_list>(<argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			</block_content>}</block></if></if_stmt>
+
+			<comment type="block">/*
+			 * Make sure that we give the shared connections back to the shared
+			 * pool if any. This operation is a no-op if the reserved connections
+			 * are already given away.
+			 */</comment>
+			<expr_stmt><expr><call><name>DeallocateReservedConnections</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+			<comment type="block">/*
+			 * We reset these mainly for posterity. The only way we would normally
+			 * get here with ExecutorLevel or PlannerLevel &gt; 0 is during a fatal
+			 * error when the process is about to end.
+			 */</comment>
+			<expr_stmt><expr><name>ExecutorLevel</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+			<expr_stmt><expr><name>PlannerLevel</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+
+			<comment type="block">/*
+			 * We should reset SubPlanLevel in case a transaction is aborted,
+			 * otherwise this variable would stay +ve if the transaction is
+			 * aborted in the middle of a CTE/complex subquery execution
+			 * which would cause the subsequent queries to error out in
+			 * case the copy size is greater than
+			 * citus.max_intermediate_result_size
+			 */</comment>
+			<expr_stmt><expr><name>SubPlanLevel</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>UnSetDistributedTransactionId</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+			<expr_stmt><expr><name>PlacementMovedUsingLogicalReplicationInTX</name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+			<break>break;</break>
+		</block_content>}</block>
+
+		<case>case <expr><name>XACT_EVENT_PARALLEL_COMMIT</name></expr>:</case>
+		<case>case <expr><name>XACT_EVENT_PARALLEL_ABORT</name></expr>:</case>
+		<block>{<block_content>
+			<break>break;</break>
+		</block_content>}</block>
+
+		<case>case <expr><name>XACT_EVENT_PREPARE</name></expr>:</case>
+		<block>{<block_content>
+			<comment type="block">/* we need to reset SavedExplainPlan before TopTransactionContext is deleted */</comment>
+			<expr_stmt><expr><call><name>FreeSavedExplainPlan</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+			<comment type="block">/*
+			 * This callback is only relevant for worker queries since
+			 * distributed queries cannot be executed with 2PC, see
+			 * XACT_EVENT_PRE_PREPARE.
+			 *
+			 * We should remove the intermediate results before unsetting the
+			 * distributed transaction id. That is necessary, otherwise Citus
+			 * would try to remove a non-existing folder and leak some of the
+			 * existing folders that are associated with distributed transaction
+			 * ids on the worker nodes.
+			 */</comment>
+			<expr_stmt><expr><call><name>RemoveIntermediateResultsDirectories</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+			<expr_stmt><expr><call><name>UnSetDistributedTransactionId</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+			<break>break;</break>
+		</block_content>}</block>
+
+		<case>case <expr><name>XACT_EVENT_PRE_COMMIT</name></expr>:</case>
+		<block>{<block_content>
+			<comment type="block">/*
+			 * If the distributed query involves 2PC, we already removed
+			 * the intermediate result directory on XACT_EVENT_PREPARE. However,
+			 * if not, we should remove it here on the COMMIT. Since
+			 * RemoveIntermediateResultsDirectories() is idempotent, we're safe
+			 * to call it here again even if the transaction involves 2PC.
+			 */</comment>
+			<expr_stmt><expr><call><name>RemoveIntermediateResultsDirectories</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+			<comment type="block">/* nothing further to do if there's no managed remote xacts */</comment>
+			<if_stmt><if>if <condition>(<expr><name>CurrentCoordinatedTransactionState</name> <operator>==</operator> <name>COORD_TRANS_NONE</name></expr>)</condition>
+			<block>{<block_content>
+				<break>break;</break>
+			</block_content>}</block></if></if_stmt>
+
+			<comment type="block">/*
+			 * TODO: It'd probably be a good idea to force constraints and
+			 * such to 'immediate' here. Deferred triggers might try to send
+			 * stuff to the remote side, which'd not be good.  Doing so
+			 * remotely would also catch a class of errors where committing
+			 * fails, which can lead to divergence when not using 2PC.
+			 */</comment>
+
+			<if_stmt><if>if <condition>(<expr><name>ShouldCoordinatedTransactionUse2PC</name></expr>)</condition>
+			<block>{<block_content>
+				<expr_stmt><expr><call><name>CoordinatedRemoteTransactionsPrepare</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+				<expr_stmt><expr><name>CurrentCoordinatedTransactionState</name> <operator>=</operator> <name>COORD_TRANS_PREPARED</name></expr>;</expr_stmt>
+
+				<comment type="block">/*
+				 * Make sure we did not have any failures on connections marked as
+				 * critical before committing.
+				 */</comment>
+				<expr_stmt><expr><call><name>CheckRemoteTransactionsHealth</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+			</block_content>}</block></if>
+			<else>else
+			<block>{<block_content>
+				<expr_stmt><expr><call><name>CheckRemoteTransactionsHealth</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+				<comment type="block">/*
+				 * Have to commit remote transactions in PRE_COMMIT, to allow
+				 * us to mark failed placements as invalid.  Better don't use
+				 * this for anything important (i.e. DDL/metadata).
+				 */</comment>
+				<expr_stmt><expr><call><name>CoordinatedRemoteTransactionsCommit</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+				<expr_stmt><expr><name>CurrentCoordinatedTransactionState</name> <operator>=</operator> <name>COORD_TRANS_COMMITTED</name></expr>;</expr_stmt>
+			</block_content>}</block></else></if_stmt>
+
+			<comment type="block">/*
+			 * Check again whether shards/placement successfully
+			 * committed. This handles failure at COMMIT time.
+			 */</comment>
+			<expr_stmt><expr><call><name>ErrorIfPostCommitFailedShardPlacements</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+			<break>break;</break>
+		</block_content>}</block>
+
+		<case>case <expr><name>XACT_EVENT_PARALLEL_PRE_COMMIT</name></expr>:</case>
+		<case>case <expr><name>XACT_EVENT_PRE_PREPARE</name></expr>:</case>
+		<block>{<block_content>
+			<expr_stmt><expr><call><name>EnsurePrepareTransactionIsAllowed</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+			<break>break;</break>
+		</block_content>}</block>
+	</block_content>}</block></switch>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * ForceAllInProgressConnectionsToClose forces all connections of in progress transactions
+ * to close at the end of the transaction.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>ForceAllInProgressConnectionsToClose</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>dlist_iter</name></type> <name>iter</name></decl>;</decl_stmt>
+	<macro><name>dlist_foreach</name><argument_list>(<argument>iter</argument>, <argument>&amp;InProgressTransactions</argument>)</argument_list></macro>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>MultiConnection</name> <modifier>*</modifier></type><name>connection</name> <init>= <expr><call><name>dlist_container</name><argument_list>(<argument><expr><name>MultiConnection</name></expr></argument>,
+													  <argument><expr><name>transactionNode</name></expr></argument>,
+													  <argument><expr><name><name>iter</name><operator>.</operator><name>cur</name></name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+		<expr_stmt><expr><name><name>connection</name><operator>-&gt;</operator><name>forceCloseAtTransactionEnd</name></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+	</block_content>}</block>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * If an ERROR is thrown while processing a transaction the ABORT handler is called.
+ * ERRORS thrown during ABORT are not treated any differently, the ABORT handler is also
+ * called during processing of those. If an ERROR was raised the first time through it's
+ * unlikely that the second try will succeed; more likely that an ERROR will be thrown
+ * again. This loop continues until Postgres notices and PANICs, complaining about a stack
+ * overflow.
+ *
+ * Instead of looping and crashing, SwallowErrors lets us attempt to continue running the
+ * ABORT logic. This wouldn't be safe in most other parts of the codebase, in
+ * approximately none of the places where we emit ERROR do we first clean up after
+ * ourselves! It's fine inside the ABORT handler though; Postgres is going to clean
+ * everything up before control passes back to us.
+ *
+ * If it swallows any error, returns true. Otherwise, returns false.
+ */</comment>
+<function><type><specifier>static</specifier> <name>bool</name></type>
+<name>SwallowErrors</name><parameter_list>(<parameter><function_decl><type><name>void</name></type> (<modifier>*</modifier><name>func</name>)<parameter_list>()</parameter_list></function_decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>MemoryContext</name></type> <name>savedContext</name> <init>= <expr><name>CurrentMemoryContext</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><specifier>volatile</specifier> <name>bool</name></type> <name>anyErrorSwallowed</name> <init>= <expr><name>false</name></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>PG_TRY</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>func</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block>
+	<expr_stmt><expr><call><name>PG_CATCH</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>savedContext</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<decl_stmt><decl><type><name>ErrorData</name> <modifier>*</modifier></type><name>edata</name> <init>= <expr><call><name>CopyErrorData</name><argument_list>()</argument_list></call></expr></init></decl>;</decl_stmt>
+		<expr_stmt><expr><call><name>FlushErrorState</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/* rethrow as WARNING */</comment>
+		<expr_stmt><expr><name><name>edata</name><operator>-&gt;</operator><name>elevel</name></name> <operator>=</operator> <name>WARNING</name></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>ThrowErrorData</name><argument_list>(<argument><expr><name>edata</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><name>anyErrorSwallowed</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+	</block_content>}</block>
+	<expr_stmt><expr><call><name>PG_END_TRY</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+	<return>return <expr><name>anyErrorSwallowed</name></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * ResetGlobalVariables resets global variables that
+ * might be changed during the execution of queries.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>ResetGlobalVariables</name><parameter_list>()</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><name>CurrentCoordinatedTransactionState</name> <operator>=</operator> <name>COORD_TRANS_NONE</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name>XactModificationLevel</name> <operator>=</operator> <name>XACT_MODIFICATION_NONE</name></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>SetLocalExecutionStatus</name><argument_list>(<argument><expr><name>LOCAL_EXECUTION_OPTIONAL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>FreeSavedExplainPlan</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>dlist_init</name><argument_list>(<argument><expr><operator>&amp;</operator><name>InProgressTransactions</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>activeSetStmts</name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name>ShouldCoordinatedTransactionUse2PC</name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name>TransactionModifiedNodeMetadata</name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name>NodeMetadataSyncOnCommit</name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name>InTopLevelDelegatedFunctionCall</name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name>InTableTypeConversionFunctionCall</name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name>CurrentOperationId</name> <operator>=</operator> <name>INVALID_OPERATION_ID</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name>BeginXactReadOnly</name> <operator>=</operator> <name>BeginXactReadOnly_NotSet</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name>BeginXactDeferrable</name> <operator>=</operator> <name>BeginXactDeferrable_NotSet</name></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>ResetWorkerErrorIndication</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><operator>&amp;</operator><name>AllowedDistributionColumnValue</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>,
+		   <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>AllowedDistributionColumn</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * CoordinatedSubTransactionCallback is the callback used to implement
+ * distributed ROLLBACK TO SAVEPOINT.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>CoordinatedSubTransactionCallback</name><parameter_list>(<parameter><decl><type><name>SubXactEvent</name></type> <name>event</name></decl></parameter>, <parameter><decl><type><name>SubTransactionId</name></type> <name>subId</name></decl></parameter>,
+								  <parameter><decl><type><name>SubTransactionId</name></type> <name>parentSubid</name></decl></parameter>, <parameter><decl><type><name>void</name> <modifier>*</modifier></type><name>arg</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<switch>switch <condition>(<expr><name>event</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/*
+		 * Our subtransaction stack should be consistent with postgres' internal
+		 * transaction stack. In case of subxact begin, postgres calls our
+		 * callback after it has pushed the transaction into stack, so we have to
+		 * do the same even if worker commands fail, so we PushSubXact() first.
+		 * In case of subxact commit, callback is called before pushing subxact to
+		 * the postgres transaction stack, so we call PopSubXact() after making sure
+		 * worker commands didn't fail. Otherwise, Postgres would roll back that
+		 * would cause us to call PopSubXact again.
+		 */</comment>
+		<case>case <expr><name>SUBXACT_EVENT_START_SUB</name></expr>:</case>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>MemoryContext</name></type> <name>previousContext</name> <init>=
+				<expr><call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>CitusXactCallbackContext</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+			<expr_stmt><expr><call><name>PushSubXact</name><argument_list>(<argument><expr><name>subId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<if_stmt><if>if <condition>(<expr><call><name>InCoordinatedTransaction</name><argument_list>()</argument_list></call></expr>)</condition>
+			<block>{<block_content>
+				<expr_stmt><expr><call><name>CoordinatedRemoteTransactionsSavepointBegin</name><argument_list>(<argument><expr><name>subId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			</block_content>}</block></if></if_stmt>
+
+			<expr_stmt><expr><call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>previousContext</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+			<break>break;</break>
+		</block_content>}</block>
+
+		<case>case <expr><name>SUBXACT_EVENT_COMMIT_SUB</name></expr>:</case>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>MemoryContext</name></type> <name>previousContext</name> <init>=
+				<expr><call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>CitusXactCallbackContext</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+			<if_stmt><if>if <condition>(<expr><call><name>InCoordinatedTransaction</name><argument_list>()</argument_list></call></expr>)</condition>
+			<block>{<block_content>
+				<expr_stmt><expr><call><name>CoordinatedRemoteTransactionsSavepointRelease</name><argument_list>(<argument><expr><name>subId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			</block_content>}</block></if></if_stmt>
+			<expr_stmt><expr><call><name>PopSubXact</name><argument_list>(<argument><expr><name>subId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+			<comment type="block">/* Set CachedDuringCitusCreation to one level lower to represent citus creation is done */</comment>
+
+			<if_stmt><if>if <condition>(<expr><call><name>GetCitusCreationLevel</name><argument_list>()</argument_list></call> <operator>==</operator> <call><name>GetCurrentTransactionNestLevel</name><argument_list>()</argument_list></call></expr>)</condition>
+			<block>{<block_content>
+				<expr_stmt><expr><call><name>SetCreateCitusTransactionLevel</name><argument_list>(<argument><expr><call><name>GetCitusCreationLevel</name><argument_list>()</argument_list></call> <operator>-</operator> <literal type="number">1</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			</block_content>}</block></if></if_stmt>
+
+			<expr_stmt><expr><call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>previousContext</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+			<break>break;</break>
+		</block_content>}</block>
+
+		<case>case <expr><name>SUBXACT_EVENT_ABORT_SUB</name></expr>:</case>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>MemoryContext</name></type> <name>previousContext</name> <init>=
+				<expr><call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>CitusXactCallbackContext</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+			<comment type="block">/*
+			 * Stop showing message for now, will re-enable when executing
+			 * the next statement.
+			 */</comment>
+			<expr_stmt><expr><call><name>DisableWorkerMessagePropagation</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+			<comment type="block">/*
+			 * Given that we aborted, worker error indications can be ignored.
+			 */</comment>
+			<expr_stmt><expr><call><name>ResetWorkerErrorIndication</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+			<if_stmt><if>if <condition>(<expr><call><name>InCoordinatedTransaction</name><argument_list>()</argument_list></call></expr>)</condition>
+			<block>{<block_content>
+				<expr_stmt><expr><call><name>CoordinatedRemoteTransactionsSavepointRollback</name><argument_list>(<argument><expr><name>subId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			</block_content>}</block></if></if_stmt>
+			<expr_stmt><expr><call><name>PopSubXact</name><argument_list>(<argument><expr><name>subId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+			<comment type="block">/*
+			 * Clear MetadataCache table if we're aborting from a CREATE EXTENSION Citus
+			 * so that any created OIDs from the table are cleared and invalidated. We
+			 * also set CreateCitusTransactionLevel to 0 since subtransaction has been aborted
+			 */</comment>
+			<if_stmt><if>if <condition>(<expr><call><name>GetCitusCreationLevel</name><argument_list>()</argument_list></call> <operator>==</operator> <call><name>GetCurrentTransactionNestLevel</name><argument_list>()</argument_list></call></expr>)</condition>
+			<block>{<block_content>
+				<expr_stmt><expr><call><name>InvalidateMetadataSystemCache</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+				<expr_stmt><expr><call><name>SetCreateCitusTransactionLevel</name><argument_list>(<argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			</block_content>}</block></if></if_stmt>
+
+			<expr_stmt><expr><call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>previousContext</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+			<break>break;</break>
+		</block_content>}</block>
+
+		<case>case <expr><name>SUBXACT_EVENT_PRE_COMMIT_SUB</name></expr>:</case>
+		<block>{<block_content>
+			<comment type="block">/* nothing to do */</comment>
+			<break>break;</break>
+		</block_content>}</block>
+	</block_content>}</block></switch>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * AdjustMaxPreparedTransactions configures the number of available prepared
+ * transaction slots at startup.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>AdjustMaxPreparedTransactions</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<comment type="block">/*
+	 * As Citus uses 2PC internally, there always should be some available. As
+	 * the default is 0, we increase it to something appropriate
+	 * (connections * 2 currently).  If the user explicitly configured 2PC, we
+	 * leave the configuration alone - there might have been intent behind the
+	 * decision.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name>max_prepared_xacts</name> <operator>==</operator> <literal type="number">0</literal></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>char</name></type> <name><name>newvalue</name><index>[<expr><literal type="number">12</literal></expr>]</index></name></decl>;</decl_stmt>
+
+		<expr_stmt><expr><call><name>SafeSnprintf</name><argument_list>(<argument><expr><name>newvalue</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>newvalue</name></expr></argument>)</argument_list></sizeof></expr></argument>, <argument><expr><literal type="string">"%d"</literal></expr></argument>, <argument><expr><name>MaxConnections</name> <operator>*</operator> <literal type="number">2</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><call><name>SetConfigOption</name><argument_list>(<argument><expr><literal type="string">"max_prepared_transactions"</literal></expr></argument>, <argument><expr><name>newvalue</name></expr></argument>, <argument><expr><name>PGC_POSTMASTER</name></expr></argument>,
+						<argument><expr><name>PGC_S_OVERRIDE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>LOG</name></expr></argument>, <argument><expr><operator>(</operator><call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"number of prepared transactions has not been "</literal>
+							 <literal type="string">"configured, overriding"</literal></expr></argument>)</argument_list></call><operator>,</operator>
+					  <call><name>errdetail</name><argument_list>(<argument><expr><literal type="string">"max_prepared_transactions is now set to %s"</literal></expr></argument>,
+								<argument><expr><name>newvalue</name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+</block_content>}</block></function>
+
+
+<comment type="block">/* PushSubXact pushes subId to the stack of active sub-transactions. */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>PushSubXact</name><parameter_list>(<parameter><decl><type><name>SubTransactionId</name></type> <name>subId</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<comment type="block">/* save provided subId as well as propagated SET LOCAL stmts */</comment>
+	<decl_stmt><decl><type><name>SubXactContext</name> <modifier>*</modifier></type><name>state</name> <init>= <expr><call><name>palloc</name><argument_list>(<argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>SubXactContext</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<expr_stmt><expr><name><name>state</name><operator>-&gt;</operator><name>subId</name></name> <operator>=</operator> <name>subId</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>state</name><operator>-&gt;</operator><name>setLocalCmds</name></name> <operator>=</operator> <name>activeSetStmts</name></expr>;</expr_stmt>
+
+	<comment type="block">/* append to list and reset active set stmts for upcoming sub-xact */</comment>
+	<expr_stmt><expr><name>activeSubXactContexts</name> <operator>=</operator> <call><name>lappend</name><argument_list>(<argument><expr><name>activeSubXactContexts</name></expr></argument>, <argument><expr><name>state</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>activeSetStmts</name> <operator>=</operator> <call><name>makeStringInfo</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+
+<comment type="block">/* PopSubXact pops subId from the stack of active sub-transactions. */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>PopSubXact</name><parameter_list>(<parameter><decl><type><name>SubTransactionId</name></type> <name>subId</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>SubXactContext</name> <modifier>*</modifier></type><name>state</name> <init>= <expr><call><name>llast</name><argument_list>(<argument><expr><name>activeSubXactContexts</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>state</name><operator>-&gt;</operator><name>subId</name></name> <operator>==</operator> <name>subId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Free activeSetStmts to avoid memory leaks when we create subxacts
+	 * for each row, e.g. in exception handling of UDFs.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name>activeSetStmts</name> <operator>!=</operator> <name>NULL</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>pfree</name><argument_list>(<argument><expr><name><name>activeSetStmts</name><operator>-&gt;</operator><name>data</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>pfree</name><argument_list>(<argument><expr><name>activeSetStmts</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/*
+	 * SET LOCAL commands are local to subxact blocks. When a subxact commits
+	 * or rolls back, we should roll back our set of SET LOCAL commands to the
+	 * ones we had in the upper commit.
+	 */</comment>
+	<expr_stmt><expr><name>activeSetStmts</name> <operator>=</operator> <name><name>state</name><operator>-&gt;</operator><name>setLocalCmds</name></name></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Free state to avoid memory leaks when we create subxacts for each row,
+	 * e.g. in exception handling of UDFs.
+	 */</comment>
+	<expr_stmt><expr><call><name>pfree</name><argument_list>(<argument><expr><name>state</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>activeSubXactContexts</name> <operator>=</operator> <call><name>list_delete_last</name><argument_list>(<argument><expr><name>activeSubXactContexts</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+
+<comment type="block">/* ActiveSubXactContexts returns the list of active sub-xact context in temporal order. */</comment>
+<function><type><name>List</name> <modifier>*</modifier></type>
+<name>ActiveSubXactContexts</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<return>return <expr><name>activeSubXactContexts</name></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * IsMultiStatementTransaction determines whether the current statement is
+ * part of a bigger multi-statement transaction. This is the case when the
+ * statement is wrapped in a transaction block (comes after BEGIN), or it
+ * is called from a stored procedure or function.
+ */</comment>
+<function><type><name>bool</name></type>
+<name>IsMultiStatementTransaction</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<if_stmt><if>if <condition>(<expr><call><name>IsTransactionBlock</name><argument_list>()</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* in a BEGIN...END block */</comment>
+		<return>return <expr><name>true</name></expr>;</return>
+	</block_content>}</block></if>
+	<if type="elseif">else if <condition>(<expr><name>DoBlockLevel</name> <operator>&gt;</operator> <literal type="number">0</literal></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* in (a transaction within) a do block */</comment>
+		<return>return <expr><name>true</name></expr>;</return>
+	</block_content>}</block></if>
+	<if type="elseif">else if <condition>(<expr><name>StoredProcedureLevel</name> <operator>&gt;</operator> <literal type="number">0</literal></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* in (a transaction within) a stored procedure */</comment>
+		<return>return <expr><name>true</name></expr>;</return>
+	</block_content>}</block></if>
+	<if type="elseif">else if <condition>(<expr><call><name>MaybeExecutingUDF</name><argument_list>()</argument_list></call> <operator>&amp;&amp;</operator> <name>FunctionOpensTransactionBlock</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* in a language-handler function call, open a transaction if configured to do so */</comment>
+		<return>return <expr><name>true</name></expr>;</return>
+	</block_content>}</block></if>
+	<else>else
+	<block>{<block_content>
+		<return>return <expr><name>false</name></expr>;</return>
+	</block_content>}</block></else></if_stmt>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * MaybeExecutingUDF returns true if we are possibly executing a function call.
+ * We use nested level of executor to check this, so this can return true for
+ * CTEs, etc. which also start nested executors.
+ *
+ * If the planner is being called from the executor, then we may also be in
+ * a UDF.
+ */</comment>
+<function><type><name>bool</name></type>
+<name>MaybeExecutingUDF</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<return>return <expr><name>ExecutorLevel</name> <operator>&gt;</operator> <literal type="number">1</literal> <operator>||</operator> <operator>(</operator><name>ExecutorLevel</name> <operator>==</operator> <literal type="number">1</literal> <operator>&amp;&amp;</operator> <name>PlannerLevel</name> <operator>&gt;</operator> <literal type="number">0</literal><operator>)</operator></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * TriggerNodeMetadataSyncOnCommit sets a flag to do node metadata sync
+ * on commit. This is because new metadata only becomes visible to the
+ * metadata sync daemon after commit happens.
+ */</comment>
+<function><type><name>void</name></type>
+<name>TriggerNodeMetadataSyncOnCommit</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><name>NodeMetadataSyncOnCommit</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * Function raises an exception, if the current backend started a coordinated
+ * transaction and got a PREPARE event to become a participant in a 2PC
+ * transaction coordinated by another node.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>EnsurePrepareTransactionIsAllowed</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>InCoordinatedTransaction</name><argument_list>()</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* If the backend has not started a coordinated transaction. */</comment>
+		<return>return;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><call><name>IsCitusInternalBackend</name><argument_list>()</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/*
+		 * If this is a Citus-initiated backend.
+		 */</comment>
+		<return>return;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_FEATURE_NOT_SUPPORTED</name></expr></argument>)</argument_list></call><operator>,</operator>
+					<call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"cannot use 2PC in transactions involving "</literal>
+						   <literal type="string">"multiple servers"</literal></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+</unit>

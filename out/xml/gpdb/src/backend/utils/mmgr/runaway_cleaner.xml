@@ -1,0 +1,349 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<unit xmlns="http://www.srcML.org/srcML/src" xmlns:cpp="http://www.srcML.org/srcML/cpp" revision="1.0.0" language="C" filename="/cloned_projects/gpdb/src/backend/utils/mmgr/runaway_cleaner.c"><comment type="block">/*-------------------------------------------------------------------------
+ *
+ * runaway_cleaner.c
+ *	 Implementation of the runaway cleaner that checks if a session is marked
+ *	 as runaway (i.e., consuming too much vmem) by the red-zone handler
+ *	 (redzone_handler.c). The runaway cleaner cleans up such session by triggering
+ *	 an elog(ERROR, ...) which rolls back transaction and releases memory. Once
+ *	 cleanup is finished, the runaway cleaner also informs the red zone handler
+ *	 so that a new runaway session can be chosen if necessary.
+ *
+ * Copyright (c) 2014-Present VMware, Inc. or its affiliates.
+ *
+ *
+ * IDENTIFICATION
+ *	    src/backend/utils/mmgr/runaway_cleaner.c
+ *
+ *-------------------------------------------------------------------------
+ */</comment>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"postgres.h"</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/xact.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"cdb/cdbvars.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"miscadmin.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"port/atomics.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/faultinjector.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/resgroup.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/resource_manager.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/session_state.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/vmem_tracker.h"</cpp:file></cpp:include>
+
+<comment type="block">/* External dependencies within the runaway cleanup framework */</comment>
+<decl_stmt><decl><type><specifier>extern</specifier> <name>bool</name></type> <name>vmemTrackerInited</name></decl>;</decl_stmt>
+<decl_stmt><decl><type><specifier>extern</specifier> <name>bool</name></type> <name>isProcessActive</name></decl>;</decl_stmt>
+<decl_stmt><decl><type><specifier>extern</specifier> <name>EventVersion</name></type> <name>activationVersion</name></decl>;</decl_stmt>
+<decl_stmt><decl><type><specifier>extern</specifier> <name>EventVersion</name></type> <name>deactivationVersion</name></decl>;</decl_stmt>
+<decl_stmt><decl><type><specifier>extern</specifier> <specifier>volatile</specifier> <name>uint32</name> <modifier>*</modifier></type><name>isRunawayDetector</name></decl>;</decl_stmt>
+<decl_stmt><decl><type><specifier>extern</specifier> <specifier>volatile</specifier> <name>EventVersion</name> <modifier>*</modifier></type><name>latestRunawayVersion</name></decl>;</decl_stmt>
+
+<comment type="block">/*
+ * The cleanupCountdown in the SessionState determines how many
+ * processes we need to cleanup to declare a session clean. If it
+ * reaches 0, we mark the session clean. However, -1 indicates
+ * that the session is either done cleaning previous runaway event
+ * or it never started a cleaning.
+ */</comment>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>CLEANUP_COUNTDOWN_BEFORE_RUNAWAY</name></cpp:macro> <cpp:value>-1</cpp:value></cpp:define>
+
+<comment type="block">/* The runaway version for which this process started cleaning up */</comment>
+<decl_stmt><decl><type><specifier>static</specifier> <name>EventVersion</name></type> <name>beginCleanupRunawayVersion</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+
+<comment type="block">/* The runaway version for which this process finished cleaning up */</comment>
+<decl_stmt><decl><type><specifier>static</specifier> <name>EventVersion</name></type> <name>endCleanupRunawayVersion</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+
+<function_decl><type><name>void</name></type> <name>RunawayCleaner_Init</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><name>void</name></type> <name>RunawayCleaner_StartCleanup</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><name>bool</name></type> <name>RunawayCleaner_IsCleanupInProgress</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>;</function_decl>
+
+<comment type="block">/*
+ * Initializes the per-process states of the runaway cleaner.
+ */</comment>
+<function><type><name>void</name></type>
+<name>RunawayCleaner_Init</name><parameter_list>()</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><name>beginCleanupRunawayVersion</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+	<expr_stmt><expr><name>endCleanupRunawayVersion</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/* Returns true if the current process should start a runaway cleanup */</comment>
+<function><type><specifier>static</specifier> <name>bool</name></type>
+<name>RunawayCleaner_ShouldStartRunawayCleanup</name><parameter_list>()</parameter_list>
+<block>{<block_content>
+	<if_stmt><if>if <condition>(<expr><name>NULL</name> <operator>!=</operator> <name>MySessionState</name> <operator>&amp;&amp;</operator> <name><name>MySessionState</name><operator>-&gt;</operator><name>runawayStatus</name></name> <operator>!=</operator> <name>RunawayStatus_NotRunaway</name> <operator>&amp;&amp;</operator>
+			<name>beginCleanupRunawayVersion</name> <operator>!=</operator> <operator>*</operator><name>latestRunawayVersion</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>AssertImply</name><argument_list>(<argument><expr><name>isProcessActive</name></expr></argument>, <argument><expr><name>activationVersion</name> <operator>&gt;=</operator> <name>deactivationVersion</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>AssertImply</name><argument_list>(<argument><expr><operator>!</operator><name>isProcessActive</name></expr></argument>, <argument><expr><name>deactivationVersion</name> <operator>&gt;=</operator> <name>activationVersion</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/*
+		 * We are marked as runaway. Therefore, if the runaway event happened before deactivation,
+		 * we must have a version counter increment
+		 */</comment>
+		<expr_stmt><expr><call><name>AssertImply</name><argument_list>(<argument><expr><operator>*</operator><name>latestRunawayVersion</name> <operator>&lt;</operator> <name>deactivationVersion</name> <operator>&amp;&amp;</operator> <operator>!</operator><name>isProcessActive</name></expr></argument>, <argument><expr><name>activationVersion</name> <operator>&lt;</operator> <name>deactivationVersion</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name>isProcessActive</name> <operator>&amp;&amp;</operator> <operator>*</operator><name>latestRunawayVersion</name> <operator>&gt;</operator> <name>activationVersion</name></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/* Active process and the runaway event came after the activation */</comment>
+			<return>return <expr><name>true</name></expr>;</return>
+		</block_content>}</block></if>
+		<if type="elseif">else if <condition>(<expr><operator>!</operator><name>isProcessActive</name> <operator>&amp;&amp;</operator> <operator>*</operator><name><name>latestRunawayVersion</name> <argument_list type="generic">&lt; <argument><expr><name>deactivationVersion</name> <operator>&amp;&amp;</operator>
+				<operator>*</operator><name>latestRunawayVersion</name></expr></argument> &gt;</argument_list></name> <name>activationVersion</name></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/*
+			 * The process is deactivated, but there is a pending runaway event before
+			 * the deactivation for which this process never cleaned up
+			 */</comment>
+			<return>return <expr><name>true</name></expr>;</return>
+		</block_content>}</block></if></if_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<return>return <expr><name>false</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Determine if the runaway cleanup should be handled by aborting the current
+ * query or must be ignored. Since the cleanup can be attempted from multiple
+ * places, it is important to first validate if calling elog(ERROR) is safe and
+ * of value.
+ */</comment>
+<function><type><specifier>static</specifier> <name>bool</name></type>
+<name>RunawayCleaner_ShouldCancelQuery</name><parameter_list>()</parameter_list>
+<block>{<block_content>
+	<comment type="block">/* VMEM tracker not being used */</comment>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><name>vmemTrackerInited</name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>false</name></expr>;</return></block_content></block></if></if_stmt>
+
+	<comment type="block">/* In critical section or when holding off on handling interrupts */</comment>
+	<if_stmt><if>if <condition>(<expr><name>CritSectionCount</name> <operator>!=</operator> <literal type="number">0</literal> <operator>||</operator> <name>InterruptHoldoffCount</name> <operator>!=</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>false</name></expr>;</return></block_content></block></if></if_stmt>
+
+	<comment type="block">/*
+	 * Cleaning up QEs that are not executing a valid command may cause the QD to
+	 * get stuck [MPP-24950]
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name>gp_command_count</name> <operator>&lt;=</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>false</name></expr>;</return></block_content></block></if></if_stmt>
+
+	<comment type="block">/*
+	 * If not currently executing a transaction, aborting it won't release any
+	 * more resources.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>IsTransactionState</name><argument_list>()</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>false</name></expr>;</return></block_content></block></if></if_stmt>
+
+	<comment type="block">/* Ok, we are actively executing a query */</comment>
+
+	<if_stmt><if>if <condition>(<expr><name><name>MySessionState</name><operator>-&gt;</operator><name>runawayStatus</name></name> <operator>==</operator> <name>RunawayStatus_PrimaryRunawaySession</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/*
+		 * Abort the query if it is actively executing and has been flagged as
+		 * consuming the most memory
+		 */</comment>
+		<return>return <expr><name>true</name></expr>;</return>
+	</block_content>}</block></if>
+	<else>else
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>MySessionState</name><operator>-&gt;</operator><name>runawayStatus</name></name> <operator>==</operator> <name>RunawayStatus_SecondaryRunawaySession</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/*
+		 * If this process was flagged as a runaway session inspite another session
+		 * using more memory, only abort this query if the current user is not a
+		 * superuser. This is to ensure that critical administrative commands (such
+		 * as database restarts), which are done as superuser, are not interrupted
+		 * by the runaway cleaner.
+		 */</comment>
+		<return>return <expr><operator>!</operator><call><name>superuser</name><argument_list>()</argument_list></call></expr>;</return>
+	</block_content>}</block></else></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Starts a runaway cleanup by triggering an ERROR if the VMEM tracker is active
+ * and a commit is not already in progress. Otherwise, it marks the process as clean
+ */</comment>
+<function><type><name>void</name></type>
+<name>RunawayCleaner_StartCleanup</name><parameter_list>()</parameter_list>
+<block>{<block_content>
+	<comment type="block">/*
+	 * Cleanup can be attempted from multiple places, such as before deactivating
+	 * a process (if a pending runaway event) or periodically from CHECK_FOR_INTERRUPTS
+	 * (indirectly via RedZoneHandler_DetectRunaway). We don't carry multiple cleanup
+	 * for a single runaway event. Every time we *start* a cleanup process, we set the
+	 * beginCleanupRunawayVersion to the runaway version for which we started cleaning
+	 * up. Later on, if we reenter this method (e.g., another CHECK_FOR_INTERRUPTS()
+	 * during cleanup), we can observe that the cleanup already started from this runaway
+	 * event, and therefore we skip duplicate cleanup
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><call><name>RunawayCleaner_ShouldStartRunawayCleanup</name><argument_list>()</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>beginCleanupRunawayVersion</name> <operator>&lt;</operator> <operator>*</operator><name>latestRunawayVersion</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>endCleanupRunawayVersion</name> <operator>&lt;</operator> <operator>*</operator><name>latestRunawayVersion</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/* We don't want to cleanup multiple times for same runaway event */</comment>
+		<expr_stmt><expr><name>beginCleanupRunawayVersion</name> <operator>=</operator> <operator>*</operator><name>latestRunawayVersion</name></expr>;</expr_stmt>
+
+		<if_stmt><if>if <condition>(<expr><call><name>RunawayCleaner_ShouldCancelQuery</name><argument_list>()</argument_list></call></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><call><name>SIMPLE_FAULT_INJECTOR</name><argument_list>(<argument><expr><literal type="string">"runaway_cleanup"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+			<if_stmt><if>if <condition>(<expr><call><name>IsResGroupEnabled</name><argument_list>()</argument_list></call></expr>)</condition>
+			<block>{<block_content>
+				<decl_stmt><decl><type><name>StringInfoData</name></type>    <name>str</name></decl>;</decl_stmt>
+				<expr_stmt><expr><call><name>initStringInfo</name><argument_list>(<argument><expr><operator>&amp;</operator><name>str</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			
+				<expr_stmt><expr><call><name>LWLockAcquire</name><argument_list>(<argument><expr><name>ResGroupLock</name></expr></argument>, <argument><expr><name>LW_SHARED</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<expr_stmt><expr><call><name>ResGroupGetMemoryRunawayInfo</name><argument_list>(<argument><expr><operator>&amp;</operator><name>str</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><name>ResGroupLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><operator>(</operator><call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"Canceling query because of high VMEM usage. %s"</literal></expr></argument>, <argument><expr><name><name>str</name><operator>.</operator><name>data</name></name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			</block_content>}</block></if>
+			<else>else<block type="pseudo"><block_content>
+				<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><operator>(</operator><call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"Canceling query because of high VMEM usage. Used: %dMB, available %dMB, red zone: %dMB"</literal></expr></argument>,
+					<argument><expr><call><name>VmemTracker_ConvertVmemChunksToMB</name><argument_list>(<argument><expr><name><name>MySessionState</name><operator>-&gt;</operator><name>sessionVmem</name></name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><call><name>VmemTracker_GetAvailableVmemMB</name><argument_list>()</argument_list></call></expr></argument>,
+					<argument><expr><call><name>RedZoneHandler_GetRedZoneLimitMB</name><argument_list>()</argument_list></call></expr></argument>)</argument_list></call><operator>,</operator> <call><name>errprintstack</name><argument_list>(<argument><expr><name>true</name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></else></if_stmt>
+		</block_content>}</block></if></if_stmt>
+
+		<comment type="block">/*
+		 * If we cannot error out because of a critical section or because we are a super user
+		 * or for some other reason (such as the QE is not running any valid command, i.e.,
+		 * gp_command_count is not positive) simply declare this process as clean
+		 */</comment>
+		<expr_stmt><expr><call><name>RunawayCleaner_RunawayCleanupDoneForProcess</name><argument_list>(<argument><expr><name>true</name></expr></argument> <comment type="block">/* ignoredCleanup */</comment>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Resets the runaway flag and enables runaway detector.
+ *
+ * Note: this method should not need any additional locks.
+ * Either the MySessionState entry is being released, and
+ * we already have a lock on SessionState, and therefore,
+ * no new runaway detector can run until the lock is released.
+ *
+ * Alternatively, we may reset this while still in a live
+ * session. In such case, our runaway event versioning should
+ * ensure that every process of this session would do another round
+ * of cleanup if it is detected as a runaway session again.
+ */</comment>
+<function><type><name>void</name></type>
+<name>RunawayCleaner_RunawayCleanupDoneForSession</name><parameter_list>()</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>NULL</name> <operator>!=</operator> <name>MySessionState</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><name><name>MySessionState</name><operator>-&gt;</operator><name>runawayStatus</name></name> <operator>!=</operator> <name>RunawayStatus_NotRunaway</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* The last runaway cleanup should have finished */</comment>
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>endCleanupRunawayVersion</name> <operator>==</operator> <name>beginCleanupRunawayVersion</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>endCleanupRunawayVersion</name> <operator>==</operator> <operator>*</operator><name>latestRunawayVersion</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>CLEANUP_COUNTDOWN_BEFORE_RUNAWAY</name> <operator>==</operator> <name><name>MySessionState</name><operator>-&gt;</operator><name>cleanupCountdown</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><name><name>MySessionState</name><operator>-&gt;</operator><name>runawayStatus</name></name> <operator>=</operator> <name>RunawayStatus_NotRunaway</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>MySessionState</name><operator>-&gt;</operator><name>sessionVmemRunaway</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>MySessionState</name><operator>-&gt;</operator><name>commandCountRunaway</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+
+		<comment type="block">/*
+		 * Reset the exclusive runaway detector flag so that
+		 * another runaway detector can be chosen
+		 */</comment>
+		<expr_stmt><expr><operator>*</operator><name>isRunawayDetector</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Marks the current process as clean. If all the processes are marked
+ * as clean for this session (i.e., cleanupCountdown == 0 in the
+ * MySessionState) then we reset session's runaway status as well as
+ * the runaway detector flag (i.e., a new runaway detector can run).
+ *
+ * Parameters:
+ * 		ignoredCleanup: whether the cleanup was ignored, i.e., no elog(ERROR, ...)
+ * 		was thrown. In such case a deactivated process is not reactivated as the
+ * 		deactivation didn't get interrupted.
+ */</comment>
+<function><type><name>void</name></type>
+<name>RunawayCleaner_RunawayCleanupDoneForProcess</name><parameter_list>(<parameter><decl><type><name>bool</name></type> <name>ignoredCleanup</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<comment type="block">/*
+	 * We don't do anything if we don't have an ongoing cleanup, or we already finished
+	 * cleanup once for the current runaway event
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name>beginCleanupRunawayVersion</name> <operator>!=</operator> <operator>*</operator><name>latestRunawayVersion</name> <operator>||</operator>
+			<name>endCleanupRunawayVersion</name> <operator>==</operator> <name>beginCleanupRunawayVersion</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* Either we never started cleanup, or we already finished */</comment>
+		<return>return;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/* Disable repeating call */</comment>
+	<expr_stmt><expr><name>endCleanupRunawayVersion</name> <operator>=</operator> <name>beginCleanupRunawayVersion</name></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>NULL</name> <operator>!=</operator> <name>MySessionState</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<comment type="block">/*
+	 * As the current cleanup holds leverage on the  cleanupCountdown,
+	 * the session must stay as runaway at least until the current
+	 * process marks itself clean
+	 */</comment>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>MySessionState</name><operator>-&gt;</operator><name>runawayStatus</name></name> <operator>!=</operator> <name>RunawayStatus_NotRunaway</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* We only cleanup if we were active when the runaway event happened */</comment>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><operator>(</operator><operator>!</operator><name>isProcessActive</name> <operator>&amp;&amp;</operator> <operator>*</operator><name><name>latestRunawayVersion</name> <argument_list type="generic">&lt; <argument><expr><name>deactivationVersion</name> <operator>&amp;&amp;</operator>
+			<operator>*</operator><name>latestRunawayVersion</name></expr></argument> &gt;</argument_list></name> <name>activationVersion</name><operator>)</operator> <operator>||</operator>
+			<operator>(</operator><operator>*</operator><name>latestRunawayVersion</name> <operator>&gt;</operator> <name>activationVersion</name> <operator>&amp;&amp;</operator>
+			<operator>(</operator><name>activationVersion</name> <operator>&gt;=</operator> <name>deactivationVersion</name> <operator>&amp;&amp;</operator> <name>isProcessActive</name><operator>)</operator><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * We don't reactivate if the process is already active or a deactivated
+	 * process never errored out during deactivation (i.e., failed to complete
+	 * deactivation)
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><name>isProcessActive</name> <operator>&amp;&amp;</operator> <operator>!</operator><name>ignoredCleanup</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><literal type="number">1</literal> <operator>==</operator> <operator>*</operator><name>isRunawayDetector</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><literal type="number">0</literal> <operator>&lt;</operator> <name><name>MySessionState</name><operator>-&gt;</operator><name>cleanupCountdown</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<comment type="block">/*
+		 * As the process threw ERROR instead of going into ReadCommand() blocking
+		 * state, we have to reactivate the process from its current Deactivated
+		 * state
+		 */</comment>
+		<expr_stmt><expr><call><name>IdleTracker_ActivateProcess</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><literal type="number">0</literal> <operator>&lt;</operator> <name><name>MySessionState</name><operator>-&gt;</operator><name>cleanupCountdown</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+<cpp:if>#<cpp:directive>if</cpp:directive> <expr><name>USE_ASSERT_CHECKING</name></expr></cpp:if>
+	<decl_stmt><decl><type><name>int</name></type> <name>cleanProgress</name> <init>=
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+			<expr><call><name>pg_atomic_add_fetch_u32</name><argument_list>(<argument><expr><operator>(</operator><name>pg_atomic_uint32</name> <operator>*</operator><operator>)</operator><operator>&amp;</operator><name><name>MySessionState</name><operator>-&gt;</operator><name>cleanupCountdown</name></name></expr></argument>, <argument><expr><operator>-</operator><literal type="number">1</literal></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><literal type="number">0</literal> <operator>&lt;=</operator> <name>cleanProgress</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<decl_stmt><decl><type><name>uint32</name></type> <name>expected</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type> <name>finalCleaner</name> <init>= <expr><call><name>pg_atomic_compare_exchange_u32</name><argument_list>(<argument><expr><operator>(</operator><name>pg_atomic_uint32</name> <operator>*</operator><operator>)</operator> <operator>&amp;</operator><name><name>MySessionState</name><operator>-&gt;</operator><name>cleanupCountdown</name></name></expr></argument>,
+			<argument><expr><operator>&amp;</operator><name>expected</name></expr></argument>, <argument><expr><name>CLEANUP_COUNTDOWN_BEFORE_RUNAWAY</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>finalCleaner</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/*
+		 * The final cleaner is responsible to reset the runaway flag,
+		 * and enable the runaway detection process.
+		 */</comment>
+		<expr_stmt><expr><call><name>RunawayCleaner_RunawayCleanupDoneForSession</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/*
+	 * Finally we are done with all critical cleanup, which includes releasing all our memory and
+	 * releasing our cleanup counter so that another session can be marked as runaway, if needed.
+	 * Now, we have some head room to actually record our usage.
+	 */</comment>
+	<expr_stmt><expr><call><name>write_stderr</name><argument_list>(<argument><expr><literal type="string">"Logging memory usage because of runaway cleanup. Note, this is a post-cleanup logging and may be incomplete."</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>MemoryContextStats</name><argument_list>(<argument><expr><name>TopMemoryContext</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Returns true if a cleanup is in progress (i.e., endCleanupRunawayVersion
+ * is smaller than beginCleanupRunawayVersion).
+ */</comment>
+<function><type><name>bool</name></type>
+<name>RunawayCleaner_IsCleanupInProgress</name><parameter_list>()</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>endCleanupRunawayVersion</name> <operator>&lt;=</operator> <name>beginCleanupRunawayVersion</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<return>return <expr><name>endCleanupRunawayVersion</name> <operator>&lt;</operator> <name>beginCleanupRunawayVersion</name></expr>;</return>
+</block_content>}</block></function>
+</unit>

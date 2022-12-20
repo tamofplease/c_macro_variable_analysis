@@ -1,0 +1,1374 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<unit xmlns="http://www.srcML.org/srcML/src" xmlns:cpp="http://www.srcML.org/srcML/cpp" revision="1.0.0" language="C" filename="/cloned_projects/gpdb/src/backend/libpq/auth-scram.c"><comment type="block">/*-------------------------------------------------------------------------
+ *
+ * auth-scram.c
+ *	  Server-side implementation of the SASL SCRAM-SHA-256 mechanism.
+ *
+ * See the following RFCs for more details:
+ * - RFC 5802: https://tools.ietf.org/html/rfc5802
+ * - RFC 5803: https://tools.ietf.org/html/rfc5803
+ * - RFC 7677: https://tools.ietf.org/html/rfc7677
+ *
+ * Here are some differences:
+ *
+ * - Username from the authentication exchange is not used. The client
+ *	 should send an empty string as the username.
+ *
+ * - If the password isn't valid UTF-8, or contains characters prohibited
+ *	 by the SASLprep profile, we skip the SASLprep pre-processing and use
+ *	 the raw bytes in calculating the hash.
+ *
+ * - If channel binding is used, the channel binding type is always
+ *	 "tls-server-end-point".  The spec says the default is "tls-unique"
+ *	 (RFC 5802, section 6.1. Default Channel Binding), but there are some
+ *	 problems with that.  Firstly, not all SSL libraries provide an API to
+ *	 get the TLS Finished message, required to use "tls-unique".  Secondly,
+ *	 "tls-unique" is not specified for TLS v1.3, and as of this writing,
+ *	 it's not clear if there will be a replacement.  We could support both
+ *	 "tls-server-end-point" and "tls-unique", but for our use case,
+ *	 "tls-unique" doesn't really have any advantages.  The main advantage
+ *	 of "tls-unique" would be that it works even if the server doesn't
+ *	 have a certificate, but PostgreSQL requires a server certificate
+ *	 whenever SSL is used, anyway.
+ *
+ *
+ * The password stored in pg_authid consists of the iteration count, salt,
+ * StoredKey and ServerKey.
+ *
+ * SASLprep usage
+ * --------------
+ *
+ * One notable difference to the SCRAM specification is that while the
+ * specification dictates that the password is in UTF-8, and prohibits
+ * certain characters, we are more lenient.  If the password isn't a valid
+ * UTF-8 string, or contains prohibited characters, the raw bytes are used
+ * to calculate the hash instead, without SASLprep processing.  This is
+ * because PostgreSQL supports other encodings too, and the encoding being
+ * used during authentication is undefined (client_encoding isn't set until
+ * after authentication).  In effect, we try to interpret the password as
+ * UTF-8 and apply SASLprep processing, but if it looks invalid, we assume
+ * that it's in some other encoding.
+ *
+ * In the worst case, we misinterpret a password that's in a different
+ * encoding as being Unicode, because it happens to consists entirely of
+ * valid UTF-8 bytes, and we apply Unicode normalization to it.  As long
+ * as we do that consistently, that will not lead to failed logins.
+ * Fortunately, the UTF-8 byte sequences that are ignored by SASLprep
+ * don't correspond to any commonly used characters in any of the other
+ * supported encodings, so it should not lead to any significant loss in
+ * entropy, even if the normalization is incorrectly applied to a
+ * non-UTF-8 password.
+ *
+ * Error handling
+ * --------------
+ *
+ * Don't reveal user information to an unauthenticated client.  We don't
+ * want an attacker to be able to probe whether a particular username is
+ * valid.  In SCRAM, the server has to read the salt and iteration count
+ * from the user's password verifier, and send it to the client.  To avoid
+ * revealing whether a user exists, when the client tries to authenticate
+ * with a username that doesn't exist, or doesn't have a valid SCRAM
+ * verifier in pg_authid, we create a fake salt and iteration count
+ * on-the-fly, and proceed with the authentication with that.  In the end,
+ * we'll reject the attempt, as if an incorrect password was given.  When
+ * we are performing a "mock" authentication, the 'doomed' flag in
+ * scram_state is set.
+ *
+ * In the error messages, avoid printing strings from the client, unless
+ * you check that they are pure ASCII.  We don't want an unauthenticated
+ * attacker to be able to spam the logs with characters that are not valid
+ * to the encoding being used, whatever that is.  We cannot avoid that in
+ * general, after logging in, but let's do what we can here.
+ *
+ *
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1994, Regents of the University of California
+ *
+ * src/backend/libpq/auth-scram.c
+ *
+ *-------------------------------------------------------------------------
+ */</comment>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"postgres.h"</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;unistd.h&gt;</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/xlog.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/pg_authid.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/pg_control.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"common/base64.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"common/saslprep.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"common/scram-common.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"common/sha2.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"libpq/auth.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"libpq/crypt.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"libpq/scram.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"miscadmin.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/builtins.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/timestamp.h"</cpp:file></cpp:include>
+
+<comment type="block">/*
+ * Status data for a SCRAM authentication exchange.  This should be kept
+ * internal to this file.
+ */</comment>
+<typedef>typedef <type><enum>enum
+<block>{
+	<decl><name>SCRAM_AUTH_INIT</name></decl>,
+	<decl><name>SCRAM_AUTH_SALT_SENT</name></decl>,
+	<decl><name>SCRAM_AUTH_FINISHED</name></decl>
+}</block></enum></type> <name>scram_state_enum</name>;</typedef>
+
+<typedef>typedef <type><struct>struct
+<block>{
+	<decl_stmt><decl><type><name>scram_state_enum</name></type> <name>state</name></decl>;</decl_stmt>
+
+	<decl_stmt><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>username</name></decl>;</decl_stmt>		<comment type="block">/* username from startup packet */</comment>
+
+	<decl_stmt><decl><type><name>Port</name>	   <modifier>*</modifier></type><name>port</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type>		<name>channel_binding_in_use</name></decl>;</decl_stmt>
+
+	<decl_stmt><decl><type><name>int</name></type>			<name>iterations</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>salt</name></decl>;</decl_stmt>			<comment type="block">/* base64-encoded */</comment>
+	<decl_stmt><decl><type><name>uint8</name></type>		<name><name>StoredKey</name><index>[<expr><name>SCRAM_KEY_LEN</name></expr>]</index></name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>uint8</name></type>		<name><name>ServerKey</name><index>[<expr><name>SCRAM_KEY_LEN</name></expr>]</index></name></decl>;</decl_stmt>
+
+	<comment type="block">/* Fields of the first message from client */</comment>
+	<decl_stmt><decl><type><name>char</name></type>		<name>cbind_flag</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>client_first_message_bare</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>client_username</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>client_nonce</name></decl>;</decl_stmt>
+
+	<comment type="block">/* Fields from the last message from client */</comment>
+	<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>client_final_message_without_proof</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>client_final_nonce</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>char</name></type>		<name><name>ClientProof</name><index>[<expr><name>SCRAM_KEY_LEN</name></expr>]</index></name></decl>;</decl_stmt>
+
+	<comment type="block">/* Fields generated in the server */</comment>
+	<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>server_first_message</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>server_nonce</name></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * If something goes wrong during the authentication, or we are performing
+	 * a "mock" authentication (see comments at top of file), the 'doomed'
+	 * flag is set.  A reason for the failure, for the server log, is put in
+	 * 'logdetail'.
+	 */</comment>
+	<decl_stmt><decl><type><name>bool</name></type>		<name>doomed</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>logdetail</name></decl>;</decl_stmt>
+}</block></struct></type> <name>scram_state</name>;</typedef>
+
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>read_client_first_message</name><parameter_list>(<parameter><decl><type><name>scram_state</name> <modifier>*</modifier></type><name>state</name></decl></parameter>, <parameter><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>input</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>read_client_final_message</name><parameter_list>(<parameter><decl><type><name>scram_state</name> <modifier>*</modifier></type><name>state</name></decl></parameter>, <parameter><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>input</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>char</name> <modifier>*</modifier></type><name>build_server_first_message</name><parameter_list>(<parameter><decl><type><name>scram_state</name> <modifier>*</modifier></type><name>state</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>char</name> <modifier>*</modifier></type><name>build_server_final_message</name><parameter_list>(<parameter><decl><type><name>scram_state</name> <modifier>*</modifier></type><name>state</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>bool</name></type> <name>verify_client_proof</name><parameter_list>(<parameter><decl><type><name>scram_state</name> <modifier>*</modifier></type><name>state</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>bool</name></type> <name>verify_final_nonce</name><parameter_list>(<parameter><decl><type><name>scram_state</name> <modifier>*</modifier></type><name>state</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>mock_scram_verifier</name><parameter_list>(<parameter><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>username</name></decl></parameter>, <parameter><decl><type><name>int</name> <modifier>*</modifier></type><name>iterations</name></decl></parameter>,
+								<parameter><decl><type><name>char</name> <modifier>*</modifier><modifier>*</modifier></type><name>salt</name></decl></parameter>, <parameter><decl><type><name>uint8</name> <modifier>*</modifier></type><name>stored_key</name></decl></parameter>, <parameter><decl><type><name>uint8</name> <modifier>*</modifier></type><name>server_key</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>bool</name></type> <name>is_scram_printable</name><parameter_list>(<parameter><decl><type><name>char</name> <modifier>*</modifier></type><name>p</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>char</name> <modifier>*</modifier></type><name>sanitize_char</name><parameter_list>(<parameter><decl><type><name>char</name></type> <name>c</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>char</name> <modifier>*</modifier></type><name>sanitize_str</name><parameter_list>(<parameter><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>s</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>char</name> <modifier>*</modifier></type><name>scram_mock_salt</name><parameter_list>(<parameter><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>username</name></decl></parameter>)</parameter_list>;</function_decl>
+
+<comment type="block">/*
+ * pg_be_scram_get_mechanisms
+ *
+ * Get a list of SASL mechanisms that this module supports.
+ *
+ * For the convenience of building the FE/BE packet that lists the
+ * mechanisms, the names are appended to the given StringInfo buffer,
+ * separated by '\0' bytes.
+ */</comment>
+<function><type><name>void</name></type>
+<name>pg_be_scram_get_mechanisms</name><parameter_list>(<parameter><decl><type><name>Port</name> <modifier>*</modifier></type><name>port</name></decl></parameter>, <parameter><decl><type><name>StringInfo</name></type> <name>buf</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<comment type="block">/*
+	 * Advertise the mechanisms in decreasing order of importance.  So the
+	 * channel-binding variants go first, if they are supported.  Channel
+	 * binding is only supported with SSL, and only if the SSL implementation
+	 * has a function to get the certificate's hash.
+	 */</comment>
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>HAVE_BE_TLS_GET_CERTIFICATE_HASH</name></cpp:ifdef>
+	<if_stmt><if>if <condition>(<expr><name><name>port</name><operator>-&gt;</operator><name>ssl_in_use</name></name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>appendStringInfoString</name><argument_list>(<argument><expr><name>buf</name></expr></argument>, <argument><expr><name>SCRAM_SHA_256_PLUS_NAME</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>appendStringInfoChar</name><argument_list>(<argument><expr><name>buf</name></expr></argument>, <argument><expr><literal type="char">'\0'</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+	<expr_stmt><expr><call><name>appendStringInfoString</name><argument_list>(<argument><expr><name>buf</name></expr></argument>, <argument><expr><name>SCRAM_SHA_256_NAME</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>appendStringInfoChar</name><argument_list>(<argument><expr><name>buf</name></expr></argument>, <argument><expr><literal type="char">'\0'</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * pg_be_scram_init
+ *
+ * Initialize a new SCRAM authentication exchange status tracker.  This
+ * needs to be called before doing any exchange.  It will be filled later
+ * after the beginning of the exchange with verifier data.
+ *
+ * 'selected_mech' identifies the SASL mechanism that the client selected.
+ * It should be one of the mechanisms that we support, as returned by
+ * pg_be_scram_get_mechanisms().
+ *
+ * 'shadow_pass' is the role's password verifier, from pg_authid.rolpassword.
+ * The username was provided by the client in the startup message, and is
+ * available in port-&gt;user_name.  If 'shadow_pass' is NULL, we still perform
+ * an authentication exchange, but it will fail, as if an incorrect password
+ * was given.
+ */</comment>
+<function><type><name>void</name> <modifier>*</modifier></type>
+<name>pg_be_scram_init</name><parameter_list>(<parameter><decl><type><name>Port</name> <modifier>*</modifier></type><name>port</name></decl></parameter>,
+				 <parameter><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>selected_mech</name></decl></parameter>,
+				 <parameter><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>shadow_pass</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>scram_state</name> <modifier>*</modifier></type><name>state</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type>		<name>got_verifier</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name>state</name> <operator>=</operator> <operator>(</operator><name>scram_state</name> <operator>*</operator><operator>)</operator> <call><name>palloc0</name><argument_list>(<argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>scram_state</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>state</name><operator>-&gt;</operator><name>port</name></name> <operator>=</operator> <name>port</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>state</name><operator>-&gt;</operator><name>state</name></name> <operator>=</operator> <name>SCRAM_AUTH_INIT</name></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Parse the selected mechanism.
+	 *
+	 * Note that if we don't support channel binding, either because the SSL
+	 * implementation doesn't support it or we're not using SSL at all, we
+	 * would not have advertised the PLUS variant in the first place.  If the
+	 * client nevertheless tries to select it, it's a protocol violation like
+	 * selecting any other SASL mechanism we don't support.
+	 */</comment>
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>HAVE_BE_TLS_GET_CERTIFICATE_HASH</name></cpp:ifdef>
+	<if_stmt><if>if <condition>(<expr><call><name>strcmp</name><argument_list>(<argument><expr><name>selected_mech</name></expr></argument>, <argument><expr><name>SCRAM_SHA_256_PLUS_NAME</name></expr></argument>)</argument_list></call> <operator>==</operator> <literal type="number">0</literal> <operator>&amp;&amp;</operator> <name><name>port</name><operator>-&gt;</operator><name>ssl_in_use</name></name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name><name>state</name><operator>-&gt;</operator><name>channel_binding_in_use</name></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt></block_content></block></if>
+	<if type="elseif">else
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+	if <condition>(<expr><call><name>strcmp</name><argument_list>(<argument><expr><name>selected_mech</name></expr></argument>, <argument><expr><name>SCRAM_SHA_256_NAME</name></expr></argument>)</argument_list></call> <operator>==</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name><name>state</name><operator>-&gt;</operator><name>channel_binding_in_use</name></name> <operator>=</operator> <name>false</name></expr>;</expr_stmt></block_content></block></if>
+	<else>else<block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_PROTOCOL_VIOLATION</name></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"client selected an invalid SASL authentication mechanism"</literal></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></else></if_stmt>
+
+	<comment type="block">/*
+	 * Parse the stored password verifier.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name>shadow_pass</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>int</name></type>			<name>password_type</name> <init>= <expr><call><name>get_password_type</name><argument_list>(<argument><expr><name>shadow_pass</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name>password_type</name> <operator>==</operator> <name>PASSWORD_TYPE_SCRAM_SHA_256</name></expr>)</condition>
+		<block>{<block_content>
+			<if_stmt><if>if <condition>(<expr><call><name>parse_scram_verifier</name><argument_list>(<argument><expr><name>shadow_pass</name></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>state</name><operator>-&gt;</operator><name>iterations</name></name></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>state</name><operator>-&gt;</operator><name>salt</name></name></expr></argument>,
+									 <argument><expr><name><name>state</name><operator>-&gt;</operator><name>StoredKey</name></name></expr></argument>, <argument><expr><name><name>state</name><operator>-&gt;</operator><name>ServerKey</name></name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><name>got_verifier</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt></block_content></block></if>
+			<else>else
+			<block>{<block_content>
+				<comment type="block">/*
+				 * The password looked like a SCRAM verifier, but could not be
+				 * parsed.
+				 */</comment>
+				<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>LOG</name></expr></argument>,
+						<argument><expr><operator>(</operator><call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"invalid SCRAM verifier for user \"%s\""</literal></expr></argument>,
+								<argument><expr><name><name>state</name><operator>-&gt;</operator><name>port</name><operator>-&gt;</operator><name>user_name</name></name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<expr_stmt><expr><name>got_verifier</name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+			</block_content>}</block></else></if_stmt>
+		</block_content>}</block></if>
+		<else>else
+		<block>{<block_content>
+			<comment type="block">/*
+			 * The user doesn't have SCRAM verifier. (You cannot do SCRAM
+			 * authentication with an MD5 hash.)
+			 */</comment>
+			<expr_stmt><expr><name><name>state</name><operator>-&gt;</operator><name>logdetail</name></name> <operator>=</operator> <call><name>psprintf</name><argument_list>(<argument><expr><call><name>_</name><argument_list>(<argument><expr><literal type="string">"User \"%s\" does not have a valid SCRAM verifier."</literal></expr></argument>)</argument_list></call></expr></argument>,
+										<argument><expr><name><name>state</name><operator>-&gt;</operator><name>port</name><operator>-&gt;</operator><name>user_name</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><name>got_verifier</name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+		</block_content>}</block></else></if_stmt>
+	</block_content>}</block></if>
+	<else>else
+	<block>{<block_content>
+		<comment type="block">/*
+		 * The caller requested us to perform a dummy authentication.  This is
+		 * considered normal, since the caller requested it, so don't set log
+		 * detail.
+		 */</comment>
+		<expr_stmt><expr><name>got_verifier</name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+	</block_content>}</block></else></if_stmt>
+
+	<comment type="block">/*
+	 * If the user did not have a valid SCRAM verifier, we still go through
+	 * the motions with a mock one, and fail as if the client supplied an
+	 * incorrect password.  This is to avoid revealing information to an
+	 * attacker.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><name>got_verifier</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>mock_scram_verifier</name><argument_list>(<argument><expr><name><name>state</name><operator>-&gt;</operator><name>port</name><operator>-&gt;</operator><name>user_name</name></name></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>state</name><operator>-&gt;</operator><name>iterations</name></name></expr></argument>,
+							<argument><expr><operator>&amp;</operator><name><name>state</name><operator>-&gt;</operator><name>salt</name></name></expr></argument>, <argument><expr><name><name>state</name><operator>-&gt;</operator><name>StoredKey</name></name></expr></argument>, <argument><expr><name><name>state</name><operator>-&gt;</operator><name>ServerKey</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>state</name><operator>-&gt;</operator><name>doomed</name></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<return>return <expr><name>state</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Continue a SCRAM authentication exchange.
+ *
+ * 'input' is the SCRAM payload sent by the client.  On the first call,
+ * 'input' contains the "Initial Client Response" that the client sent as
+ * part of the SASLInitialResponse message, or NULL if no Initial Client
+ * Response was given.  (The SASL specification distinguishes between an
+ * empty response and non-existing one.)  On subsequent calls, 'input'
+ * cannot be NULL.  For convenience in this function, the caller must
+ * ensure that there is a null terminator at input[inputlen].
+ *
+ * The next message to send to client is saved in 'output', for a length
+ * of 'outputlen'.  In the case of an error, optionally store a palloc'd
+ * string at *logdetail that will be sent to the postmaster log (but not
+ * the client).
+ */</comment>
+<function><type><name>int</name></type>
+<name>pg_be_scram_exchange</name><parameter_list>(<parameter><decl><type><name>void</name> <modifier>*</modifier></type><name>opaq</name></decl></parameter>, <parameter><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>input</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>inputlen</name></decl></parameter>,
+					 <parameter><decl><type><name>char</name> <modifier>*</modifier><modifier>*</modifier></type><name>output</name></decl></parameter>, <parameter><decl><type><name>int</name> <modifier>*</modifier></type><name>outputlen</name></decl></parameter>, <parameter><decl><type><name>char</name> <modifier>*</modifier><modifier>*</modifier></type><name>logdetail</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>scram_state</name> <modifier>*</modifier></type><name>state</name> <init>= <expr><operator>(</operator><name>scram_state</name> <operator>*</operator><operator>)</operator> <name>opaq</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>result</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><operator>*</operator><name>output</name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * If the client didn't include an "Initial Client Response" in the
+	 * SASLInitialResponse message, send an empty challenge, to which the
+	 * client will respond with the same data that usually comes in the
+	 * Initial Client Response.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name>input</name> <operator>==</operator> <name>NULL</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>state</name><operator>-&gt;</operator><name>state</name></name> <operator>==</operator> <name>SCRAM_AUTH_INIT</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><operator>*</operator><name>output</name> <operator>=</operator> <call><name>pstrdup</name><argument_list>(<argument><expr><literal type="string">""</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><operator>*</operator><name>outputlen</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+		<return>return <expr><name>SASL_EXCHANGE_CONTINUE</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/*
+	 * Check that the input length agrees with the string length of the input.
+	 * We can ignore inputlen after this.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name>inputlen</name> <operator>==</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_PROTOCOL_VIOLATION</name></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"malformed SCRAM message"</literal></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errdetail</name><argument_list>(<argument><expr><literal type="string">"The message is empty."</literal></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	<if_stmt><if>if <condition>(<expr><name>inputlen</name> <operator>!=</operator> <call><name>strlen</name><argument_list>(<argument><expr><name>input</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_PROTOCOL_VIOLATION</name></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"malformed SCRAM message"</literal></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errdetail</name><argument_list>(<argument><expr><literal type="string">"Message length does not match input length."</literal></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<switch>switch <condition>(<expr><name><name>state</name><operator>-&gt;</operator><name>state</name></name></expr>)</condition>
+	<block>{<block_content>
+		<case>case <expr><name>SCRAM_AUTH_INIT</name></expr>:</case>
+
+			<comment type="block">/*
+			 * Initialization phase.  Receive the first message from client
+			 * and be sure that it parsed correctly.  Then send the challenge
+			 * to the client.
+			 */</comment>
+			<expr_stmt><expr><call><name>read_client_first_message</name><argument_list>(<argument><expr><name>state</name></expr></argument>, <argument><expr><name>input</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+			<comment type="block">/* prepare message to send challenge */</comment>
+			<expr_stmt><expr><operator>*</operator><name>output</name> <operator>=</operator> <call><name>build_server_first_message</name><argument_list>(<argument><expr><name>state</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+			<expr_stmt><expr><name><name>state</name><operator>-&gt;</operator><name>state</name></name> <operator>=</operator> <name>SCRAM_AUTH_SALT_SENT</name></expr>;</expr_stmt>
+			<expr_stmt><expr><name>result</name> <operator>=</operator> <name>SASL_EXCHANGE_CONTINUE</name></expr>;</expr_stmt>
+			<break>break;</break>
+
+		<case>case <expr><name>SCRAM_AUTH_SALT_SENT</name></expr>:</case>
+
+			<comment type="block">/*
+			 * Final phase for the server.  Receive the response to the
+			 * challenge previously sent, verify, and let the client know that
+			 * everything went well (or not).
+			 */</comment>
+			<expr_stmt><expr><call><name>read_client_final_message</name><argument_list>(<argument><expr><name>state</name></expr></argument>, <argument><expr><name>input</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+			<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>verify_final_nonce</name><argument_list>(<argument><expr><name>state</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+						<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_PROTOCOL_VIOLATION</name></expr></argument>)</argument_list></call><operator>,</operator>
+						 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"invalid SCRAM response"</literal></expr></argument>)</argument_list></call><operator>,</operator>
+						 <call><name>errdetail</name><argument_list>(<argument><expr><literal type="string">"Nonce does not match."</literal></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+			<comment type="block">/*
+			 * Now check the final nonce and the client proof.
+			 *
+			 * If we performed a "mock" authentication that we knew would fail
+			 * from the get go, this is where we fail.
+			 *
+			 * The SCRAM specification includes an error code,
+			 * "invalid-proof", for authentication failure, but it also allows
+			 * erroring out in an application-specific way.  We choose to do
+			 * the latter, so that the error message for invalid password is
+			 * the same for all authentication methods.  The caller will call
+			 * ereport(), when we return SASL_EXCHANGE_FAILURE with no output.
+			 *
+			 * NB: the order of these checks is intentional.  We calculate the
+			 * client proof even in a mock authentication, even though it's
+			 * bound to fail, to thwart timing attacks to determine if a role
+			 * with the given name exists or not.
+			 */</comment>
+			<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>verify_client_proof</name><argument_list>(<argument><expr><name>state</name></expr></argument>)</argument_list></call> <operator>||</operator> <name><name>state</name><operator>-&gt;</operator><name>doomed</name></name></expr>)</condition>
+			<block>{<block_content>
+				<expr_stmt><expr><name>result</name> <operator>=</operator> <name>SASL_EXCHANGE_FAILURE</name></expr>;</expr_stmt>
+				<break>break;</break>
+			</block_content>}</block></if></if_stmt>
+
+			<comment type="block">/* Build final message for client */</comment>
+			<expr_stmt><expr><operator>*</operator><name>output</name> <operator>=</operator> <call><name>build_server_final_message</name><argument_list>(<argument><expr><name>state</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+			<comment type="block">/* Success! */</comment>
+			<expr_stmt><expr><name>result</name> <operator>=</operator> <name>SASL_EXCHANGE_SUCCESS</name></expr>;</expr_stmt>
+			<expr_stmt><expr><name><name>state</name><operator>-&gt;</operator><name>state</name></name> <operator>=</operator> <name>SCRAM_AUTH_FINISHED</name></expr>;</expr_stmt>
+			<break>break;</break>
+
+		<default>default:</default>
+			<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"invalid SCRAM exchange state"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><name>result</name> <operator>=</operator> <name>SASL_EXCHANGE_FAILURE</name></expr>;</expr_stmt>
+	</block_content>}</block></switch>
+
+	<if_stmt><if>if <condition>(<expr><name>result</name> <operator>==</operator> <name>SASL_EXCHANGE_FAILURE</name> <operator>&amp;&amp;</operator> <name><name>state</name><operator>-&gt;</operator><name>logdetail</name></name> <operator>&amp;&amp;</operator> <name>logdetail</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><operator>*</operator><name>logdetail</name> <operator>=</operator> <name><name>state</name><operator>-&gt;</operator><name>logdetail</name></name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><operator>*</operator><name>output</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><operator>*</operator><name>outputlen</name> <operator>=</operator> <call><name>strlen</name><argument_list>(<argument><expr><operator>*</operator><name>output</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<return>return <expr><name>result</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Construct a verifier string for SCRAM, stored in pg_authid.rolpassword.
+ *
+ * The result is palloc'd, so caller is responsible for freeing it.
+ */</comment>
+<function><type><name>char</name> <modifier>*</modifier></type>
+<name>pg_be_scram_build_verifier</name><parameter_list>(<parameter><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>password</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>prep_password</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>pg_saslprep_rc</name></type> <name>rc</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>char</name></type>		<name><name>saltbuf</name><index>[<expr><name>SCRAM_DEFAULT_SALT_LEN</name></expr>]</index></name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>result</name></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * Normalize the password with SASLprep.  If that doesn't work, because
+	 * the password isn't valid UTF-8 or contains prohibited characters, just
+	 * proceed with the original password.  (See comments at top of file.)
+	 */</comment>
+	<expr_stmt><expr><name>rc</name> <operator>=</operator> <call><name>pg_saslprep</name><argument_list>(<argument><expr><name>password</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>prep_password</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><name>rc</name> <operator>==</operator> <name>SASLPREP_SUCCESS</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name>password</name> <operator>=</operator> <operator>(</operator><specifier>const</specifier> <name>char</name> <operator>*</operator><operator>)</operator> <name>prep_password</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<comment type="block">/* Generate random salt */</comment>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>pg_strong_random</name><argument_list>(<argument><expr><name>saltbuf</name></expr></argument>, <argument><expr><name>SCRAM_DEFAULT_SALT_LEN</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_INTERNAL_ERROR</name></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"could not generate random salt"</literal></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><name>result</name> <operator>=</operator> <call><name>scram_build_verifier</name><argument_list>(<argument><expr><name>saltbuf</name></expr></argument>, <argument><expr><name>SCRAM_DEFAULT_SALT_LEN</name></expr></argument>,
+								  <argument><expr><name>SCRAM_DEFAULT_ITERATIONS</name></expr></argument>, <argument><expr><name>password</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>prep_password</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>pfree</name><argument_list>(<argument><expr><name>prep_password</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<return>return <expr><name>result</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Verify a plaintext password against a SCRAM verifier.  This is used when
+ * performing plaintext password authentication for a user that has a SCRAM
+ * verifier stored in pg_authid.
+ */</comment>
+<function><type><name>bool</name></type>
+<name>scram_verify_plain_password</name><parameter_list>(<parameter><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>username</name></decl></parameter>, <parameter><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>password</name></decl></parameter>,
+							<parameter><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>verifier</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>encoded_salt</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>salt</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>saltlen</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>iterations</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>uint8</name></type>		<name><name>salted_password</name><index>[<expr><name>SCRAM_KEY_LEN</name></expr>]</index></name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>uint8</name></type>		<name><name>stored_key</name><index>[<expr><name>SCRAM_KEY_LEN</name></expr>]</index></name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>uint8</name></type>		<name><name>server_key</name><index>[<expr><name>SCRAM_KEY_LEN</name></expr>]</index></name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>uint8</name></type>		<name><name>computed_key</name><index>[<expr><name>SCRAM_KEY_LEN</name></expr>]</index></name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>prep_password</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>pg_saslprep_rc</name></type> <name>rc</name></decl>;</decl_stmt>
+
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>parse_scram_verifier</name><argument_list>(<argument><expr><name>verifier</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>iterations</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>encoded_salt</name></expr></argument>,
+							  <argument><expr><name>stored_key</name></expr></argument>, <argument><expr><name>server_key</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/*
+		 * The password looked like a SCRAM verifier, but could not be parsed.
+		 */</comment>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>LOG</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"invalid SCRAM verifier for user \"%s\""</literal></expr></argument>, <argument><expr><name>username</name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<return>return <expr><name>false</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<expr_stmt><expr><name>salt</name> <operator>=</operator> <call><name>palloc</name><argument_list>(<argument><expr><call><name>pg_b64_dec_len</name><argument_list>(<argument><expr><call><name>strlen</name><argument_list>(<argument><expr><name>encoded_salt</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>saltlen</name> <operator>=</operator> <call><name>pg_b64_decode</name><argument_list>(<argument><expr><name>encoded_salt</name></expr></argument>, <argument><expr><call><name>strlen</name><argument_list>(<argument><expr><name>encoded_salt</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>salt</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><name>saltlen</name> <operator>==</operator> <operator>-</operator><literal type="number">1</literal></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>LOG</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"invalid SCRAM verifier for user \"%s\""</literal></expr></argument>, <argument><expr><name>username</name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<return>return <expr><name>false</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/* Normalize the password */</comment>
+	<expr_stmt><expr><name>rc</name> <operator>=</operator> <call><name>pg_saslprep</name><argument_list>(<argument><expr><name>password</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>prep_password</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><name>rc</name> <operator>==</operator> <name>SASLPREP_SUCCESS</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name>password</name> <operator>=</operator> <name>prep_password</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<comment type="block">/* Compute Server Key based on the user-supplied plaintext password */</comment>
+	<expr_stmt><expr><call><name>scram_SaltedPassword</name><argument_list>(<argument><expr><name>password</name></expr></argument>, <argument><expr><name>salt</name></expr></argument>, <argument><expr><name>saltlen</name></expr></argument>, <argument><expr><name>iterations</name></expr></argument>, <argument><expr><name>salted_password</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>scram_ServerKey</name><argument_list>(<argument><expr><name>salted_password</name></expr></argument>, <argument><expr><name>computed_key</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>prep_password</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>pfree</name><argument_list>(<argument><expr><name>prep_password</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<comment type="block">/*
+	 * Compare the verifier's Server Key with the one computed from the
+	 * user-supplied password.
+	 */</comment>
+	<return>return <expr><call><name>memcmp</name><argument_list>(<argument><expr><name>computed_key</name></expr></argument>, <argument><expr><name>server_key</name></expr></argument>, <argument><expr><name>SCRAM_KEY_LEN</name></expr></argument>)</argument_list></call> <operator>==</operator> <literal type="number">0</literal></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * Parse and validate format of given SCRAM verifier.
+ *
+ * On success, the iteration count, salt, stored key, and server key are
+ * extracted from the verifier, and returned to the caller.  For 'stored_key'
+ * and 'server_key', the caller must pass pre-allocated buffers of size
+ * SCRAM_KEY_LEN.  Salt is returned as a base64-encoded, null-terminated
+ * string.  The buffer for the salt is palloc'd by this function.
+ *
+ * Returns true if the SCRAM verifier has been parsed, and false otherwise.
+ */</comment>
+<function><type><name>bool</name></type>
+<name>parse_scram_verifier</name><parameter_list>(<parameter><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>verifier</name></decl></parameter>, <parameter><decl><type><name>int</name> <modifier>*</modifier></type><name>iterations</name></decl></parameter>, <parameter><decl><type><name>char</name> <modifier>*</modifier><modifier>*</modifier></type><name>salt</name></decl></parameter>,
+					 <parameter><decl><type><name>uint8</name> <modifier>*</modifier></type><name>stored_key</name></decl></parameter>, <parameter><decl><type><name>uint8</name> <modifier>*</modifier></type><name>server_key</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>v</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>p</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>scheme_str</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>salt_str</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>iterations_str</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>storedkey_str</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>serverkey_str</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>decoded_len</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>decoded_salt_buf</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>decoded_stored_buf</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>decoded_server_buf</name></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * The verifier is of form:
+	 *
+	 * SCRAM-SHA-256$&lt;iterations&gt;:&lt;salt&gt;$&lt;storedkey&gt;:&lt;serverkey&gt;
+	 */</comment>
+	<expr_stmt><expr><name>v</name> <operator>=</operator> <call><name>pstrdup</name><argument_list>(<argument><expr><name>verifier</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><operator>(</operator><name>scheme_str</name> <operator>=</operator> <call><name>strtok</name><argument_list>(<argument><expr><name>v</name></expr></argument>, <argument><expr><literal type="string">"$"</literal></expr></argument>)</argument_list></call><operator>)</operator> <operator>==</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+		<goto>goto <name>invalid_verifier</name>;</goto></block_content></block></if></if_stmt>
+	<if_stmt><if>if <condition>(<expr><operator>(</operator><name>iterations_str</name> <operator>=</operator> <call><name>strtok</name><argument_list>(<argument><expr><name>NULL</name></expr></argument>, <argument><expr><literal type="string">":"</literal></expr></argument>)</argument_list></call><operator>)</operator> <operator>==</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+		<goto>goto <name>invalid_verifier</name>;</goto></block_content></block></if></if_stmt>
+	<if_stmt><if>if <condition>(<expr><operator>(</operator><name>salt_str</name> <operator>=</operator> <call><name>strtok</name><argument_list>(<argument><expr><name>NULL</name></expr></argument>, <argument><expr><literal type="string">"$"</literal></expr></argument>)</argument_list></call><operator>)</operator> <operator>==</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+		<goto>goto <name>invalid_verifier</name>;</goto></block_content></block></if></if_stmt>
+	<if_stmt><if>if <condition>(<expr><operator>(</operator><name>storedkey_str</name> <operator>=</operator> <call><name>strtok</name><argument_list>(<argument><expr><name>NULL</name></expr></argument>, <argument><expr><literal type="string">":"</literal></expr></argument>)</argument_list></call><operator>)</operator> <operator>==</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+		<goto>goto <name>invalid_verifier</name>;</goto></block_content></block></if></if_stmt>
+	<if_stmt><if>if <condition>(<expr><operator>(</operator><name>serverkey_str</name> <operator>=</operator> <call><name>strtok</name><argument_list>(<argument><expr><name>NULL</name></expr></argument>, <argument><expr><literal type="string">""</literal></expr></argument>)</argument_list></call><operator>)</operator> <operator>==</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+		<goto>goto <name>invalid_verifier</name>;</goto></block_content></block></if></if_stmt>
+
+	<comment type="block">/* Parse the fields */</comment>
+	<if_stmt><if>if <condition>(<expr><call><name>strcmp</name><argument_list>(<argument><expr><name>scheme_str</name></expr></argument>, <argument><expr><literal type="string">"SCRAM-SHA-256"</literal></expr></argument>)</argument_list></call> <operator>!=</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+		<goto>goto <name>invalid_verifier</name>;</goto></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><name>errno</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+	<expr_stmt><expr><operator>*</operator><name>iterations</name> <operator>=</operator> <call><name>strtol</name><argument_list>(<argument><expr><name>iterations_str</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>p</name></expr></argument>, <argument><expr><literal type="number">10</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><operator>*</operator><name>p</name> <operator>||</operator> <name>errno</name> <operator>!=</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+		<goto>goto <name>invalid_verifier</name>;</goto></block_content></block></if></if_stmt>
+
+	<comment type="block">/*
+	 * Verify that the salt is in Base64-encoded format, by decoding it,
+	 * although we return the encoded version to the caller.
+	 */</comment>
+	<expr_stmt><expr><name>decoded_salt_buf</name> <operator>=</operator> <call><name>palloc</name><argument_list>(<argument><expr><call><name>pg_b64_dec_len</name><argument_list>(<argument><expr><call><name>strlen</name><argument_list>(<argument><expr><name>salt_str</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>decoded_len</name> <operator>=</operator> <call><name>pg_b64_decode</name><argument_list>(<argument><expr><name>salt_str</name></expr></argument>, <argument><expr><call><name>strlen</name><argument_list>(<argument><expr><name>salt_str</name></expr></argument>)</argument_list></call></expr></argument>,
+								<argument><expr><name>decoded_salt_buf</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><name>decoded_len</name> <operator>&lt;</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+		<goto>goto <name>invalid_verifier</name>;</goto></block_content></block></if></if_stmt>
+	<expr_stmt><expr><operator>*</operator><name>salt</name> <operator>=</operator> <call><name>pstrdup</name><argument_list>(<argument><expr><name>salt_str</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Decode StoredKey and ServerKey.
+	 */</comment>
+	<expr_stmt><expr><name>decoded_stored_buf</name> <operator>=</operator> <call><name>palloc</name><argument_list>(<argument><expr><call><name>pg_b64_dec_len</name><argument_list>(<argument><expr><call><name>strlen</name><argument_list>(<argument><expr><name>storedkey_str</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>decoded_len</name> <operator>=</operator> <call><name>pg_b64_decode</name><argument_list>(<argument><expr><name>storedkey_str</name></expr></argument>, <argument><expr><call><name>strlen</name><argument_list>(<argument><expr><name>storedkey_str</name></expr></argument>)</argument_list></call></expr></argument>,
+								<argument><expr><name>decoded_stored_buf</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><name>decoded_len</name> <operator>!=</operator> <name>SCRAM_KEY_LEN</name></expr>)</condition><block type="pseudo"><block_content>
+		<goto>goto <name>invalid_verifier</name>;</goto></block_content></block></if></if_stmt>
+	<expr_stmt><expr><call><name>memcpy</name><argument_list>(<argument><expr><name>stored_key</name></expr></argument>, <argument><expr><name>decoded_stored_buf</name></expr></argument>, <argument><expr><name>SCRAM_KEY_LEN</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>decoded_server_buf</name> <operator>=</operator> <call><name>palloc</name><argument_list>(<argument><expr><call><name>pg_b64_dec_len</name><argument_list>(<argument><expr><call><name>strlen</name><argument_list>(<argument><expr><name>serverkey_str</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>decoded_len</name> <operator>=</operator> <call><name>pg_b64_decode</name><argument_list>(<argument><expr><name>serverkey_str</name></expr></argument>, <argument><expr><call><name>strlen</name><argument_list>(<argument><expr><name>serverkey_str</name></expr></argument>)</argument_list></call></expr></argument>,
+								<argument><expr><name>decoded_server_buf</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><name>decoded_len</name> <operator>!=</operator> <name>SCRAM_KEY_LEN</name></expr>)</condition><block type="pseudo"><block_content>
+		<goto>goto <name>invalid_verifier</name>;</goto></block_content></block></if></if_stmt>
+	<expr_stmt><expr><call><name>memcpy</name><argument_list>(<argument><expr><name>server_key</name></expr></argument>, <argument><expr><name>decoded_server_buf</name></expr></argument>, <argument><expr><name>SCRAM_KEY_LEN</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<return>return <expr><name>true</name></expr>;</return>
+
+<label><name>invalid_verifier</name>:</label>
+	<expr_stmt><expr><operator>*</operator><name>salt</name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+	<return>return <expr><name>false</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Generate plausible SCRAM verifier parameters for mock authentication.
+ *
+ * In a normal authentication, these are extracted from the verifier
+ * stored in the server.  This function generates values that look
+ * realistic, for when there is no stored verifier.
+ *
+ * Like in parse_scram_verifier(), for 'stored_key' and 'server_key', the
+ * caller must pass pre-allocated buffers of size SCRAM_KEY_LEN, and
+ * the buffer for the salt is palloc'd by this function.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>mock_scram_verifier</name><parameter_list>(<parameter><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>username</name></decl></parameter>, <parameter><decl><type><name>int</name> <modifier>*</modifier></type><name>iterations</name></decl></parameter>, <parameter><decl><type><name>char</name> <modifier>*</modifier><modifier>*</modifier></type><name>salt</name></decl></parameter>,
+					<parameter><decl><type><name>uint8</name> <modifier>*</modifier></type><name>stored_key</name></decl></parameter>, <parameter><decl><type><name>uint8</name> <modifier>*</modifier></type><name>server_key</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>raw_salt</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>encoded_salt</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>encoded_len</name></decl>;</decl_stmt>
+
+	<comment type="block">/* Generate deterministic salt */</comment>
+	<expr_stmt><expr><name>raw_salt</name> <operator>=</operator> <call><name>scram_mock_salt</name><argument_list>(<argument><expr><name>username</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>encoded_salt</name> <operator>=</operator> <operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <call><name>palloc</name><argument_list>(<argument><expr><call><name>pg_b64_enc_len</name><argument_list>(<argument><expr><name>SCRAM_DEFAULT_SALT_LEN</name></expr></argument>)</argument_list></call> <operator>+</operator> <literal type="number">1</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>encoded_len</name> <operator>=</operator> <call><name>pg_b64_encode</name><argument_list>(<argument><expr><name>raw_salt</name></expr></argument>, <argument><expr><name>SCRAM_DEFAULT_SALT_LEN</name></expr></argument>, <argument><expr><name>encoded_salt</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>encoded_salt</name><index>[<expr><name>encoded_len</name></expr>]</index></name> <operator>=</operator> <literal type="char">'\0'</literal></expr>;</expr_stmt>
+
+	<expr_stmt><expr><operator>*</operator><name>salt</name> <operator>=</operator> <name>encoded_salt</name></expr>;</expr_stmt>
+	<expr_stmt><expr><operator>*</operator><name>iterations</name> <operator>=</operator> <name>SCRAM_DEFAULT_ITERATIONS</name></expr>;</expr_stmt>
+
+	<comment type="block">/* StoredKey and ServerKey are not used in a doomed authentication */</comment>
+	<expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><name>stored_key</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><name>SCRAM_KEY_LEN</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><name>server_key</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><name>SCRAM_KEY_LEN</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Read the value in a given SCRAM exchange message for given attribute.
+ */</comment>
+<function><type><specifier>static</specifier> <name>char</name> <modifier>*</modifier></type>
+<name>read_attr_value</name><parameter_list>(<parameter><decl><type><name>char</name> <modifier>*</modifier><modifier>*</modifier></type><name>input</name></decl></parameter>, <parameter><decl><type><name>char</name></type> <name>attr</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>begin</name> <init>= <expr><operator>*</operator><name>input</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>end</name></decl>;</decl_stmt>
+
+	<if_stmt><if>if <condition>(<expr><operator>*</operator><name>begin</name> <operator>!=</operator> <name>attr</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_PROTOCOL_VIOLATION</name></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"malformed SCRAM message"</literal></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errdetail</name><argument_list>(<argument><expr><literal type="string">"Expected attribute \"%c\" but found \"%s\"."</literal></expr></argument>,
+						   <argument><expr><name>attr</name></expr></argument>, <argument><expr><call><name>sanitize_char</name><argument_list>(<argument><expr><operator>*</operator><name>begin</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	<expr_stmt><expr><name>begin</name><operator>++</operator></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><operator>*</operator><name>begin</name> <operator>!=</operator> <literal type="char">'='</literal></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_PROTOCOL_VIOLATION</name></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"malformed SCRAM message"</literal></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errdetail</name><argument_list>(<argument><expr><literal type="string">"Expected character \"=\" for attribute \"%c\"."</literal></expr></argument>, <argument><expr><name>attr</name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	<expr_stmt><expr><name>begin</name><operator>++</operator></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>end</name> <operator>=</operator> <name>begin</name></expr>;</expr_stmt>
+	<while>while <condition>(<expr><operator>*</operator><name>end</name> <operator>&amp;&amp;</operator> <operator>*</operator><name>end</name> <operator>!=</operator> <literal type="char">','</literal></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name>end</name><operator>++</operator></expr>;</expr_stmt></block_content></block></while>
+
+	<if_stmt><if>if <condition>(<expr><operator>*</operator><name>end</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><operator>*</operator><name>end</name> <operator>=</operator> <literal type="char">'\0'</literal></expr>;</expr_stmt>
+		<expr_stmt><expr><operator>*</operator><name>input</name> <operator>=</operator> <name>end</name> <operator>+</operator> <literal type="number">1</literal></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<else>else<block type="pseudo"><block_content>
+		<expr_stmt><expr><operator>*</operator><name>input</name> <operator>=</operator> <name>end</name></expr>;</expr_stmt></block_content></block></else></if_stmt>
+
+	<return>return <expr><name>begin</name></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><specifier>static</specifier> <name>bool</name></type>
+<name>is_scram_printable</name><parameter_list>(<parameter><decl><type><name>char</name> <modifier>*</modifier></type><name>p</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<comment type="block">/*------
+	 * Printable characters, as defined by SCRAM spec: (RFC 5802)
+	 *
+	 *	printable		= %x21-2B / %x2D-7E
+	 *					  ;; Printable ASCII except ",".
+	 *					  ;; Note that any "printable" is also
+	 *					  ;; a valid "value".
+	 *------
+	 */</comment>
+	<for>for <control>(<init>;</init> <condition><expr><operator>*</operator><name>p</name></expr>;</condition> <incr><expr><name>p</name><operator>++</operator></expr></incr>)</control>
+	<block>{<block_content>
+		<if_stmt><if>if <condition>(<expr><operator>*</operator><name><name>p</name> <argument_list type="generic">&lt; <argument><expr><literal type="number">0x21</literal> <operator>||</operator> <operator>*</operator><name>p</name></expr></argument> &gt;</argument_list></name> <literal type="number">0x7E</literal> <operator>||</operator> <operator>*</operator><name>p</name> <operator>==</operator> <literal type="number">0x2C</literal></expr> <comment type="block">/* comma */</comment> )</condition><block type="pseudo"><block_content>
+			<return>return <expr><name>false</name></expr>;</return></block_content></block></if></if_stmt>
+	</block_content>}</block></for>
+	<return>return <expr><name>true</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Convert an arbitrary byte to printable form.  For error messages.
+ *
+ * If it's a printable ASCII character, print it as a single character.
+ * otherwise, print it in hex.
+ *
+ * The returned pointer points to a static buffer.
+ */</comment>
+<function><type><specifier>static</specifier> <name>char</name> <modifier>*</modifier></type>
+<name>sanitize_char</name><parameter_list>(<parameter><decl><type><name>char</name></type> <name>c</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><specifier>static</specifier> <name>char</name></type> <name><name>buf</name><index>[<expr><literal type="number">5</literal></expr>]</index></name></decl>;</decl_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>c</name> <operator>&gt;=</operator> <literal type="number">0x21</literal> <operator>&amp;&amp;</operator> <name>c</name> <operator>&lt;=</operator> <literal type="number">0x7E</literal></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>snprintf</name><argument_list>(<argument><expr><name>buf</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>buf</name></expr></argument>)</argument_list></sizeof></expr></argument>, <argument><expr><literal type="string">"'%c'"</literal></expr></argument>, <argument><expr><name>c</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if>
+	<else>else<block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>snprintf</name><argument_list>(<argument><expr><name>buf</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>buf</name></expr></argument>)</argument_list></sizeof></expr></argument>, <argument><expr><literal type="string">"0x%02x"</literal></expr></argument>, <argument><expr><operator>(</operator><name>unsigned</name> <name>char</name><operator>)</operator> <name>c</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></else></if_stmt>
+	<return>return <expr><name>buf</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Convert an arbitrary string to printable form, for error messages.
+ *
+ * Anything that's not a printable ASCII character is replaced with
+ * '?', and the string is truncated at 30 characters.
+ *
+ * The returned pointer points to a static buffer.
+ */</comment>
+<function><type><specifier>static</specifier> <name>char</name> <modifier>*</modifier></type>
+<name>sanitize_str</name><parameter_list>(<parameter><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>s</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><specifier>static</specifier> <name>char</name></type> <name><name>buf</name><index>[<expr><literal type="number">30</literal> <operator>+</operator> <literal type="number">1</literal></expr>]</index></name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>i</name></decl>;</decl_stmt>
+
+	<for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <sizeof>sizeof<argument_list>(<argument><expr><name>buf</name></expr></argument>)</argument_list></sizeof> <operator>-</operator> <literal type="number">1</literal></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>char</name></type>		<name>c</name> <init>= <expr><name><name>s</name><index>[<expr><name>i</name></expr>]</index></name></expr></init></decl>;</decl_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name>c</name> <operator>==</operator> <literal type="char">'\0'</literal></expr>)</condition><block type="pseudo"><block_content>
+			<break>break;</break></block_content></block></if></if_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name>c</name> <operator>&gt;=</operator> <literal type="number">0x21</literal> <operator>&amp;&amp;</operator> <name>c</name> <operator>&lt;=</operator> <literal type="number">0x7E</literal></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><name><name>buf</name><index>[<expr><name>i</name></expr>]</index></name> <operator>=</operator> <name>c</name></expr>;</expr_stmt></block_content></block></if>
+		<else>else<block type="pseudo"><block_content>
+			<expr_stmt><expr><name><name>buf</name><index>[<expr><name>i</name></expr>]</index></name> <operator>=</operator> <literal type="char">'?'</literal></expr>;</expr_stmt></block_content></block></else></if_stmt>
+	</block_content>}</block></for>
+	<expr_stmt><expr><name><name>buf</name><index>[<expr><name>i</name></expr>]</index></name> <operator>=</operator> <literal type="char">'\0'</literal></expr>;</expr_stmt>
+	<return>return <expr><name>buf</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Read the next attribute and value in a SCRAM exchange message.
+ *
+ * Returns NULL if there is attribute.
+ */</comment>
+<function><type><specifier>static</specifier> <name>char</name> <modifier>*</modifier></type>
+<name>read_any_attr</name><parameter_list>(<parameter><decl><type><name>char</name> <modifier>*</modifier><modifier>*</modifier></type><name>input</name></decl></parameter>, <parameter><decl><type><name>char</name> <modifier>*</modifier></type><name>attr_p</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>begin</name> <init>= <expr><operator>*</operator><name>input</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>end</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>char</name></type>		<name>attr</name> <init>= <expr><operator>*</operator><name>begin</name></expr></init></decl>;</decl_stmt>
+
+	<comment type="block">/*------
+	 * attr-val		   = ALPHA "=" value
+	 *					 ;; Generic syntax of any attribute sent
+	 *					 ;; by server or client
+	 *------
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><operator>(</operator><operator>(</operator><name>attr</name> <operator>&gt;=</operator> <literal type="char">'A'</literal> <operator>&amp;&amp;</operator> <name>attr</name> <operator>&lt;=</operator> <literal type="char">'Z'</literal><operator>)</operator> <operator>||</operator>
+		  <operator>(</operator><name>attr</name> <operator>&gt;=</operator> <literal type="char">'a'</literal> <operator>&amp;&amp;</operator> <name>attr</name> <operator>&lt;=</operator> <literal type="char">'z'</literal><operator>)</operator><operator>)</operator></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_PROTOCOL_VIOLATION</name></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"malformed SCRAM message"</literal></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errdetail</name><argument_list>(<argument><expr><literal type="string">"Attribute expected, but found invalid character \"%s\"."</literal></expr></argument>,
+						   <argument><expr><call><name>sanitize_char</name><argument_list>(<argument><expr><name>attr</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	<if_stmt><if>if <condition>(<expr><name>attr_p</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><operator>*</operator><name>attr_p</name> <operator>=</operator> <name>attr</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	<expr_stmt><expr><name>begin</name><operator>++</operator></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><operator>*</operator><name>begin</name> <operator>!=</operator> <literal type="char">'='</literal></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_PROTOCOL_VIOLATION</name></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"malformed SCRAM message"</literal></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errdetail</name><argument_list>(<argument><expr><literal type="string">"Expected character \"=\" for attribute \"%c\"."</literal></expr></argument>, <argument><expr><name>attr</name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	<expr_stmt><expr><name>begin</name><operator>++</operator></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>end</name> <operator>=</operator> <name>begin</name></expr>;</expr_stmt>
+	<while>while <condition>(<expr><operator>*</operator><name>end</name> <operator>&amp;&amp;</operator> <operator>*</operator><name>end</name> <operator>!=</operator> <literal type="char">','</literal></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name>end</name><operator>++</operator></expr>;</expr_stmt></block_content></block></while>
+
+	<if_stmt><if>if <condition>(<expr><operator>*</operator><name>end</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><operator>*</operator><name>end</name> <operator>=</operator> <literal type="char">'\0'</literal></expr>;</expr_stmt>
+		<expr_stmt><expr><operator>*</operator><name>input</name> <operator>=</operator> <name>end</name> <operator>+</operator> <literal type="number">1</literal></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<else>else<block type="pseudo"><block_content>
+		<expr_stmt><expr><operator>*</operator><name>input</name> <operator>=</operator> <name>end</name></expr>;</expr_stmt></block_content></block></else></if_stmt>
+
+	<return>return <expr><name>begin</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Read and parse the first message from client in the context of a SCRAM
+ * authentication exchange message.
+ *
+ * At this stage, any errors will be reported directly with ereport(ERROR).
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>read_client_first_message</name><parameter_list>(<parameter><decl><type><name>scram_state</name> <modifier>*</modifier></type><name>state</name></decl></parameter>, <parameter><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>input</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>p</name> <init>= <expr><call><name>pstrdup</name><argument_list>(<argument><expr><name>input</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>channel_binding_type</name></decl>;</decl_stmt>
+
+
+	<comment type="block">/*------
+	 * The syntax for the client-first-message is: (RFC 5802)
+	 *
+	 * saslname		   = 1*(value-safe-char / "=2C" / "=3D")
+	 *					 ;; Conforms to &lt;value&gt;.
+	 *
+	 * authzid		   = "a=" saslname
+	 *					 ;; Protocol specific.
+	 *
+	 * cb-name		   = 1*(ALPHA / DIGIT / "." / "-")
+	 *					  ;; See RFC 5056, Section 7.
+	 *					  ;; E.g., "tls-server-end-point" or
+	 *					  ;; "tls-unique".
+	 *
+	 * gs2-cbind-flag  = ("p=" cb-name) / "n" / "y"
+	 *					 ;; "n" -&gt; client doesn't support channel binding.
+	 *					 ;; "y" -&gt; client does support channel binding
+	 *					 ;;		   but thinks the server does not.
+	 *					 ;; "p" -&gt; client requires channel binding.
+	 *					 ;; The selected channel binding follows "p=".
+	 *
+	 * gs2-header	   = gs2-cbind-flag "," [ authzid ] ","
+	 *					 ;; GS2 header for SCRAM
+	 *					 ;; (the actual GS2 header includes an optional
+	 *					 ;; flag to indicate that the GSS mechanism is not
+	 *					 ;; "standard", but since SCRAM is "standard", we
+	 *					 ;; don't include that flag).
+	 *
+	 * username		   = "n=" saslname
+	 *					 ;; Usernames are prepared using SASLprep.
+	 *
+	 * reserved-mext  = "m=" 1*(value-char)
+	 *					 ;; Reserved for signaling mandatory extensions.
+	 *					 ;; The exact syntax will be defined in
+	 *					 ;; the future.
+	 *
+	 * nonce		   = "r=" c-nonce [s-nonce]
+	 *					 ;; Second part provided by server.
+	 *
+	 * c-nonce		   = printable
+	 *
+	 * client-first-message-bare =
+	 *					 [reserved-mext ","]
+	 *					 username "," nonce ["," extensions]
+	 *
+	 * client-first-message =
+	 *					 gs2-header client-first-message-bare
+	 *
+	 * For example:
+	 * n,,n=user,r=fyko+d2lbbFgONRv9qkxdawL
+	 *
+	 * The "n,," in the beginning means that the client doesn't support
+	 * channel binding, and no authzid is given.  "n=user" is the username.
+	 * However, in PostgreSQL the username is sent in the startup packet, and
+	 * the username in the SCRAM exchange is ignored.  libpq always sends it
+	 * as an empty string.  The last part, "r=fyko+d2lbbFgONRv9qkxdawL" is
+	 * the client nonce.
+	 *------
+	 */</comment>
+
+	<comment type="block">/*
+	 * Read gs2-cbind-flag.  (For details see also RFC 5802 Section 6 "Channel
+	 * Binding".)
+	 */</comment>
+	<expr_stmt><expr><name><name>state</name><operator>-&gt;</operator><name>cbind_flag</name></name> <operator>=</operator> <operator>*</operator><name>p</name></expr>;</expr_stmt>
+	<switch>switch <condition>(<expr><operator>*</operator><name>p</name></expr>)</condition>
+	<block>{<block_content>
+		<case>case <expr><literal type="char">'n'</literal></expr>:</case>
+
+			<comment type="block">/*
+			 * The client does not support channel binding or has simply
+			 * decided to not use it.  In that case just let it go.
+			 */</comment>
+			<if_stmt><if>if <condition>(<expr><name><name>state</name><operator>-&gt;</operator><name>channel_binding_in_use</name></name></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+						<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_PROTOCOL_VIOLATION</name></expr></argument>)</argument_list></call><operator>,</operator>
+						 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"malformed SCRAM message"</literal></expr></argument>)</argument_list></call><operator>,</operator>
+						 <call><name>errdetail</name><argument_list>(<argument><expr><literal type="string">"The client selected SCRAM-SHA-256-PLUS, but the SCRAM message does not include channel binding data."</literal></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+			<expr_stmt><expr><name>p</name><operator>++</operator></expr>;</expr_stmt>
+			<if_stmt><if>if <condition>(<expr><operator>*</operator><name>p</name> <operator>!=</operator> <literal type="char">','</literal></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+						<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_PROTOCOL_VIOLATION</name></expr></argument>)</argument_list></call><operator>,</operator>
+						 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"malformed SCRAM message"</literal></expr></argument>)</argument_list></call><operator>,</operator>
+						 <call><name>errdetail</name><argument_list>(<argument><expr><literal type="string">"Comma expected, but found character \"%s\"."</literal></expr></argument>,
+								   <argument><expr><call><name>sanitize_char</name><argument_list>(<argument><expr><operator>*</operator><name>p</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+			<expr_stmt><expr><name>p</name><operator>++</operator></expr>;</expr_stmt>
+			<break>break;</break>
+		<case>case <expr><literal type="char">'y'</literal></expr>:</case>
+
+			<comment type="block">/*
+			 * The client supports channel binding and thinks that the server
+			 * does not.  In this case, the server must fail authentication if
+			 * it supports channel binding.
+			 */</comment>
+			<if_stmt><if>if <condition>(<expr><name><name>state</name><operator>-&gt;</operator><name>channel_binding_in_use</name></name></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+						<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_PROTOCOL_VIOLATION</name></expr></argument>)</argument_list></call><operator>,</operator>
+						 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"malformed SCRAM message"</literal></expr></argument>)</argument_list></call><operator>,</operator>
+						 <call><name>errdetail</name><argument_list>(<argument><expr><literal type="string">"The client selected SCRAM-SHA-256-PLUS, but the SCRAM message does not include channel binding data."</literal></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>HAVE_BE_TLS_GET_CERTIFICATE_HASH</name></cpp:ifdef>
+			<if_stmt><if>if <condition>(<expr><name><name>state</name><operator>-&gt;</operator><name>port</name><operator>-&gt;</operator><name>ssl_in_use</name></name></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+						<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION</name></expr></argument>)</argument_list></call><operator>,</operator>
+						 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"SCRAM channel binding negotiation error"</literal></expr></argument>)</argument_list></call><operator>,</operator>
+						 <call><name>errdetail</name><argument_list>(<argument><expr><literal type="string">"The client supports SCRAM channel binding but thinks the server does not.  "</literal>
+								   <literal type="string">"However, this server does support channel binding."</literal></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+			<expr_stmt><expr><name>p</name><operator>++</operator></expr>;</expr_stmt>
+			<if_stmt><if>if <condition>(<expr><operator>*</operator><name>p</name> <operator>!=</operator> <literal type="char">','</literal></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+						<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_PROTOCOL_VIOLATION</name></expr></argument>)</argument_list></call><operator>,</operator>
+						 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"malformed SCRAM message"</literal></expr></argument>)</argument_list></call><operator>,</operator>
+						 <call><name>errdetail</name><argument_list>(<argument><expr><literal type="string">"Comma expected, but found character \"%s\"."</literal></expr></argument>,
+								   <argument><expr><call><name>sanitize_char</name><argument_list>(<argument><expr><operator>*</operator><name>p</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+			<expr_stmt><expr><name>p</name><operator>++</operator></expr>;</expr_stmt>
+			<break>break;</break>
+		<case>case <expr><literal type="char">'p'</literal></expr>:</case>
+
+			<comment type="block">/*
+			 * The client requires channel binding.  Channel binding type
+			 * follows, e.g., "p=tls-server-end-point".
+			 */</comment>
+			<if_stmt><if>if <condition>(<expr><operator>!</operator><name><name>state</name><operator>-&gt;</operator><name>channel_binding_in_use</name></name></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+						<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_PROTOCOL_VIOLATION</name></expr></argument>)</argument_list></call><operator>,</operator>
+						 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"malformed SCRAM message"</literal></expr></argument>)</argument_list></call><operator>,</operator>
+						 <call><name>errdetail</name><argument_list>(<argument><expr><literal type="string">"The client selected SCRAM-SHA-256 without channel binding, but the SCRAM message includes channel binding data."</literal></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+			<expr_stmt><expr><name>channel_binding_type</name> <operator>=</operator> <call><name>read_attr_value</name><argument_list>(<argument><expr><operator>&amp;</operator><name>p</name></expr></argument>, <argument><expr><literal type="char">'p'</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+			<comment type="block">/*
+			 * The only channel binding type we support is
+			 * tls-server-end-point.
+			 */</comment>
+			<if_stmt><if>if <condition>(<expr><call><name>strcmp</name><argument_list>(<argument><expr><name>channel_binding_type</name></expr></argument>, <argument><expr><literal type="string">"tls-server-end-point"</literal></expr></argument>)</argument_list></call> <operator>!=</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+						<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_PROTOCOL_VIOLATION</name></expr></argument>)</argument_list></call><operator>,</operator>
+						 <operator>(</operator><call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"unsupported SCRAM channel-binding type \"%s\""</literal></expr></argument>,
+								 <argument><expr><call><name>sanitize_str</name><argument_list>(<argument><expr><name>channel_binding_type</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call><operator>)</operator><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+			<break>break;</break>
+		<default>default:</default>
+			<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+					<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_PROTOCOL_VIOLATION</name></expr></argument>)</argument_list></call><operator>,</operator>
+					 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"malformed SCRAM message"</literal></expr></argument>)</argument_list></call><operator>,</operator>
+					 <call><name>errdetail</name><argument_list>(<argument><expr><literal type="string">"Unexpected channel-binding flag \"%s\"."</literal></expr></argument>,
+							   <argument><expr><call><name>sanitize_char</name><argument_list>(<argument><expr><operator>*</operator><name>p</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></switch>
+
+	<comment type="block">/*
+	 * Forbid optional authzid (authorization identity).  We don't support it.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><operator>*</operator><name>p</name> <operator>==</operator> <literal type="char">'a'</literal></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_FEATURE_NOT_SUPPORTED</name></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"client uses authorization identity, but it is not supported"</literal></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	<if_stmt><if>if <condition>(<expr><operator>*</operator><name>p</name> <operator>!=</operator> <literal type="char">','</literal></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_PROTOCOL_VIOLATION</name></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"malformed SCRAM message"</literal></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errdetail</name><argument_list>(<argument><expr><literal type="string">"Unexpected attribute \"%s\" in client-first-message."</literal></expr></argument>,
+						   <argument><expr><call><name>sanitize_char</name><argument_list>(<argument><expr><operator>*</operator><name>p</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	<expr_stmt><expr><name>p</name><operator>++</operator></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name><name>state</name><operator>-&gt;</operator><name>client_first_message_bare</name></name> <operator>=</operator> <call><name>pstrdup</name><argument_list>(<argument><expr><name>p</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Any mandatory extensions would go here.  We don't support any.
+	 *
+	 * RFC 5802 specifies error code "e=extensions-not-supported" for this,
+	 * but it can only be sent in the server-final message.  We prefer to fail
+	 * immediately (which the RFC also allows).
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><operator>*</operator><name>p</name> <operator>==</operator> <literal type="char">'m'</literal></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_FEATURE_NOT_SUPPORTED</name></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"client requires an unsupported SCRAM extension"</literal></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<comment type="block">/*
+	 * Read username.  Note: this is ignored.  We use the username from the
+	 * startup message instead, still it is kept around if provided as it
+	 * proves to be useful for debugging purposes.
+	 */</comment>
+	<expr_stmt><expr><name><name>state</name><operator>-&gt;</operator><name>client_username</name></name> <operator>=</operator> <call><name>read_attr_value</name><argument_list>(<argument><expr><operator>&amp;</operator><name>p</name></expr></argument>, <argument><expr><literal type="char">'n'</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* read nonce and check that it is made of only printable characters */</comment>
+	<expr_stmt><expr><name><name>state</name><operator>-&gt;</operator><name>client_nonce</name></name> <operator>=</operator> <call><name>read_attr_value</name><argument_list>(<argument><expr><operator>&amp;</operator><name>p</name></expr></argument>, <argument><expr><literal type="char">'r'</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>is_scram_printable</name><argument_list>(<argument><expr><name><name>state</name><operator>-&gt;</operator><name>client_nonce</name></name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_PROTOCOL_VIOLATION</name></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"non-printable characters in SCRAM nonce"</literal></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<comment type="block">/*
+	 * There can be any number of optional extensions after this.  We don't
+	 * support any extensions, so ignore them.
+	 */</comment>
+	<while>while <condition>(<expr><operator>*</operator><name>p</name> <operator>!=</operator> <literal type="char">'\0'</literal></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>read_any_attr</name><argument_list>(<argument><expr><operator>&amp;</operator><name>p</name></expr></argument>, <argument><expr><name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></while>
+
+	<comment type="block">/* success! */</comment>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Verify the final nonce contained in the last message received from
+ * client in an exchange.
+ */</comment>
+<function><type><specifier>static</specifier> <name>bool</name></type>
+<name>verify_final_nonce</name><parameter_list>(<parameter><decl><type><name>scram_state</name> <modifier>*</modifier></type><name>state</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>int</name></type>			<name>client_nonce_len</name> <init>= <expr><call><name>strlen</name><argument_list>(<argument><expr><name><name>state</name><operator>-&gt;</operator><name>client_nonce</name></name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>server_nonce_len</name> <init>= <expr><call><name>strlen</name><argument_list>(<argument><expr><name><name>state</name><operator>-&gt;</operator><name>server_nonce</name></name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>final_nonce_len</name> <init>= <expr><call><name>strlen</name><argument_list>(<argument><expr><name><name>state</name><operator>-&gt;</operator><name>client_final_nonce</name></name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>final_nonce_len</name> <operator>!=</operator> <name>client_nonce_len</name> <operator>+</operator> <name>server_nonce_len</name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>false</name></expr>;</return></block_content></block></if></if_stmt>
+	<if_stmt><if>if <condition>(<expr><call><name>memcmp</name><argument_list>(<argument><expr><name><name>state</name><operator>-&gt;</operator><name>client_final_nonce</name></name></expr></argument>, <argument><expr><name><name>state</name><operator>-&gt;</operator><name>client_nonce</name></name></expr></argument>, <argument><expr><name>client_nonce_len</name></expr></argument>)</argument_list></call> <operator>!=</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>false</name></expr>;</return></block_content></block></if></if_stmt>
+	<if_stmt><if>if <condition>(<expr><call><name>memcmp</name><argument_list>(<argument><expr><name><name>state</name><operator>-&gt;</operator><name>client_final_nonce</name></name> <operator>+</operator> <name>client_nonce_len</name></expr></argument>, <argument><expr><name><name>state</name><operator>-&gt;</operator><name>server_nonce</name></name></expr></argument>, <argument><expr><name>server_nonce_len</name></expr></argument>)</argument_list></call> <operator>!=</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>false</name></expr>;</return></block_content></block></if></if_stmt>
+
+	<return>return <expr><name>true</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Verify the client proof contained in the last message received from
+ * client in an exchange.
+ */</comment>
+<function><type><specifier>static</specifier> <name>bool</name></type>
+<name>verify_client_proof</name><parameter_list>(<parameter><decl><type><name>scram_state</name> <modifier>*</modifier></type><name>state</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>uint8</name></type>		<name><name>ClientSignature</name><index>[<expr><name>SCRAM_KEY_LEN</name></expr>]</index></name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>uint8</name></type>		<name><name>ClientKey</name><index>[<expr><name>SCRAM_KEY_LEN</name></expr>]</index></name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>uint8</name></type>		<name><name>client_StoredKey</name><index>[<expr><name>SCRAM_KEY_LEN</name></expr>]</index></name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>scram_HMAC_ctx</name></type> <name>ctx</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>i</name></decl>;</decl_stmt>
+
+	<comment type="block">/* calculate ClientSignature */</comment>
+	<expr_stmt><expr><call><name>scram_HMAC_init</name><argument_list>(<argument><expr><operator>&amp;</operator><name>ctx</name></expr></argument>, <argument><expr><name><name>state</name><operator>-&gt;</operator><name>StoredKey</name></name></expr></argument>, <argument><expr><name>SCRAM_KEY_LEN</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>scram_HMAC_update</name><argument_list>(<argument><expr><operator>&amp;</operator><name>ctx</name></expr></argument>,
+					  <argument><expr><name><name>state</name><operator>-&gt;</operator><name>client_first_message_bare</name></name></expr></argument>,
+					  <argument><expr><call><name>strlen</name><argument_list>(<argument><expr><name><name>state</name><operator>-&gt;</operator><name>client_first_message_bare</name></name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>scram_HMAC_update</name><argument_list>(<argument><expr><operator>&amp;</operator><name>ctx</name></expr></argument>, <argument><expr><literal type="string">","</literal></expr></argument>, <argument><expr><literal type="number">1</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>scram_HMAC_update</name><argument_list>(<argument><expr><operator>&amp;</operator><name>ctx</name></expr></argument>,
+					  <argument><expr><name><name>state</name><operator>-&gt;</operator><name>server_first_message</name></name></expr></argument>,
+					  <argument><expr><call><name>strlen</name><argument_list>(<argument><expr><name><name>state</name><operator>-&gt;</operator><name>server_first_message</name></name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>scram_HMAC_update</name><argument_list>(<argument><expr><operator>&amp;</operator><name>ctx</name></expr></argument>, <argument><expr><literal type="string">","</literal></expr></argument>, <argument><expr><literal type="number">1</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>scram_HMAC_update</name><argument_list>(<argument><expr><operator>&amp;</operator><name>ctx</name></expr></argument>,
+					  <argument><expr><name><name>state</name><operator>-&gt;</operator><name>client_final_message_without_proof</name></name></expr></argument>,
+					  <argument><expr><call><name>strlen</name><argument_list>(<argument><expr><name><name>state</name><operator>-&gt;</operator><name>client_final_message_without_proof</name></name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>scram_HMAC_final</name><argument_list>(<argument><expr><name>ClientSignature</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>ctx</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Extract the ClientKey that the client calculated from the proof */</comment>
+	<for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name>SCRAM_KEY_LEN</name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control><block type="pseudo"><block_content>
+		<expr_stmt><expr><name><name>ClientKey</name><index>[<expr><name>i</name></expr>]</index></name> <operator>=</operator> <name><name>state</name><operator>-&gt;</operator><name>ClientProof</name><index>[<expr><name>i</name></expr>]</index></name> <operator>^</operator> <name><name>ClientSignature</name><index>[<expr><name>i</name></expr>]</index></name></expr>;</expr_stmt></block_content></block></for>
+
+	<comment type="block">/* Hash it one more time, and compare with StoredKey */</comment>
+	<expr_stmt><expr><call><name>scram_H</name><argument_list>(<argument><expr><name>ClientKey</name></expr></argument>, <argument><expr><name>SCRAM_KEY_LEN</name></expr></argument>, <argument><expr><name>client_StoredKey</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><call><name>memcmp</name><argument_list>(<argument><expr><name>client_StoredKey</name></expr></argument>, <argument><expr><name><name>state</name><operator>-&gt;</operator><name>StoredKey</name></name></expr></argument>, <argument><expr><name>SCRAM_KEY_LEN</name></expr></argument>)</argument_list></call> <operator>!=</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>false</name></expr>;</return></block_content></block></if></if_stmt>
+
+	<return>return <expr><name>true</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Build the first server-side message sent to the client in a SCRAM
+ * communication exchange.
+ */</comment>
+<function><type><specifier>static</specifier> <name>char</name> <modifier>*</modifier></type>
+<name>build_server_first_message</name><parameter_list>(<parameter><decl><type><name>scram_state</name> <modifier>*</modifier></type><name>state</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<comment type="block">/*------
+	 * The syntax for the server-first-message is: (RFC 5802)
+	 *
+	 * server-first-message =
+	 *					 [reserved-mext ","] nonce "," salt ","
+	 *					 iteration-count ["," extensions]
+	 *
+	 * nonce		   = "r=" c-nonce [s-nonce]
+	 *					 ;; Second part provided by server.
+	 *
+	 * c-nonce		   = printable
+	 *
+	 * s-nonce		   = printable
+	 *
+	 * salt			   = "s=" base64
+	 *
+	 * iteration-count = "i=" posit-number
+	 *					 ;; A positive number.
+	 *
+	 * Example:
+	 *
+	 * r=fyko+d2lbbFgONRv9qkxdawL3rfcNHYJY1ZVvWVs7j,s=QSXCR+Q6sek8bf92,i=4096
+	 *------
+	 */</comment>
+
+	<comment type="block">/*
+	 * Per the spec, the nonce may consist of any printable ASCII characters.
+	 * For convenience, however, we don't use the whole range available,
+	 * rather, we generate some random bytes, and base64 encode them.
+	 */</comment>
+	<decl_stmt><decl><type><name>char</name></type>		<name><name>raw_nonce</name><index>[<expr><name>SCRAM_RAW_NONCE_LEN</name></expr>]</index></name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>encoded_len</name></decl>;</decl_stmt>
+
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>pg_strong_random</name><argument_list>(<argument><expr><name>raw_nonce</name></expr></argument>, <argument><expr><name>SCRAM_RAW_NONCE_LEN</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_INTERNAL_ERROR</name></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"could not generate random nonce"</literal></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><name><name>state</name><operator>-&gt;</operator><name>server_nonce</name></name> <operator>=</operator> <call><name>palloc</name><argument_list>(<argument><expr><call><name>pg_b64_enc_len</name><argument_list>(<argument><expr><name>SCRAM_RAW_NONCE_LEN</name></expr></argument>)</argument_list></call> <operator>+</operator> <literal type="number">1</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>encoded_len</name> <operator>=</operator> <call><name>pg_b64_encode</name><argument_list>(<argument><expr><name>raw_nonce</name></expr></argument>, <argument><expr><name>SCRAM_RAW_NONCE_LEN</name></expr></argument>, <argument><expr><name><name>state</name><operator>-&gt;</operator><name>server_nonce</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>state</name><operator>-&gt;</operator><name>server_nonce</name><index>[<expr><name>encoded_len</name></expr>]</index></name> <operator>=</operator> <literal type="char">'\0'</literal></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name><name>state</name><operator>-&gt;</operator><name>server_first_message</name></name> <operator>=</operator>
+		<call><name>psprintf</name><argument_list>(<argument><expr><literal type="string">"r=%s%s,s=%s,i=%u"</literal></expr></argument>,
+				 <argument><expr><name><name>state</name><operator>-&gt;</operator><name>client_nonce</name></name></expr></argument>, <argument><expr><name><name>state</name><operator>-&gt;</operator><name>server_nonce</name></name></expr></argument>,
+				 <argument><expr><name><name>state</name><operator>-&gt;</operator><name>salt</name></name></expr></argument>, <argument><expr><name><name>state</name><operator>-&gt;</operator><name>iterations</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<return>return <expr><call><name>pstrdup</name><argument_list>(<argument><expr><name><name>state</name><operator>-&gt;</operator><name>server_first_message</name></name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * Read and parse the final message received from client.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>read_client_final_message</name><parameter_list>(<parameter><decl><type><name>scram_state</name> <modifier>*</modifier></type><name>state</name></decl></parameter>, <parameter><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>input</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>char</name></type>		<name>attr</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>channel_binding</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>value</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>begin</name></decl>,
+			   <decl><type ref="prev"><modifier>*</modifier></type><name>proof</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>p</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>client_proof</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name>begin</name> <operator>=</operator> <name>p</name> <operator>=</operator> <call><name>pstrdup</name><argument_list>(<argument><expr><name>input</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*------
+	 * The syntax for the server-first-message is: (RFC 5802)
+	 *
+	 * gs2-header	   = gs2-cbind-flag "," [ authzid ] ","
+	 *					 ;; GS2 header for SCRAM
+	 *					 ;; (the actual GS2 header includes an optional
+	 *					 ;; flag to indicate that the GSS mechanism is not
+	 *					 ;; "standard", but since SCRAM is "standard", we
+	 *					 ;; don't include that flag).
+	 *
+	 * cbind-input	 = gs2-header [ cbind-data ]
+	 *					 ;; cbind-data MUST be present for
+	 *					 ;; gs2-cbind-flag of "p" and MUST be absent
+	 *					 ;; for "y" or "n".
+	 *
+	 * channel-binding = "c=" base64
+	 *					 ;; base64 encoding of cbind-input.
+	 *
+	 * proof		   = "p=" base64
+	 *
+	 * client-final-message-without-proof =
+	 *					 channel-binding "," nonce [","
+	 *					 extensions]
+	 *
+	 * client-final-message =
+	 *					 client-final-message-without-proof "," proof
+	 *------
+	 */</comment>
+
+	<comment type="block">/*
+	 * Read channel binding.  This repeats the channel-binding flags and is
+	 * then followed by the actual binding data depending on the type.
+	 */</comment>
+	<expr_stmt><expr><name>channel_binding</name> <operator>=</operator> <call><name>read_attr_value</name><argument_list>(<argument><expr><operator>&amp;</operator><name>p</name></expr></argument>, <argument><expr><literal type="char">'c'</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><name><name>state</name><operator>-&gt;</operator><name>channel_binding_in_use</name></name></expr>)</condition>
+	<block>{<block_content>
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>HAVE_BE_TLS_GET_CERTIFICATE_HASH</name></cpp:ifdef>
+		<decl_stmt><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>cbind_data</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>size_t</name></type>		<name>cbind_data_len</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>size_t</name></type>		<name>cbind_header_len</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>cbind_input</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>size_t</name></type>		<name>cbind_input_len</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>b64_message</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>int</name></type>			<name>b64_message_len</name></decl>;</decl_stmt>
+
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>state</name><operator>-&gt;</operator><name>cbind_flag</name></name> <operator>==</operator> <literal type="char">'p'</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/* Fetch hash data of server's SSL certificate */</comment>
+		<expr_stmt><expr><name>cbind_data</name> <operator>=</operator> <call><name>be_tls_get_certificate_hash</name><argument_list>(<argument><expr><name><name>state</name><operator>-&gt;</operator><name>port</name></name></expr></argument>,
+												 <argument><expr><operator>&amp;</operator><name>cbind_data_len</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/* should not happen */</comment>
+		<if_stmt><if>if <condition>(<expr><name>cbind_data</name> <operator>==</operator> <name>NULL</name> <operator>||</operator> <name>cbind_data_len</name> <operator>==</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"could not get server certificate hash"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+		<expr_stmt><expr><name>cbind_header_len</name> <operator>=</operator> <call><name>strlen</name><argument_list>(<argument><expr><literal type="string">"p=tls-server-end-point,,"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>	<comment type="block">/* p=type,, */</comment>
+		<expr_stmt><expr><name>cbind_input_len</name> <operator>=</operator> <name>cbind_header_len</name> <operator>+</operator> <name>cbind_data_len</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name>cbind_input</name> <operator>=</operator> <call><name>palloc</name><argument_list>(<argument><expr><name>cbind_input_len</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>snprintf</name><argument_list>(<argument><expr><name>cbind_input</name></expr></argument>, <argument><expr><name>cbind_input_len</name></expr></argument>, <argument><expr><literal type="string">"p=tls-server-end-point,,"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>memcpy</name><argument_list>(<argument><expr><name>cbind_input</name> <operator>+</operator> <name>cbind_header_len</name></expr></argument>, <argument><expr><name>cbind_data</name></expr></argument>, <argument><expr><name>cbind_data_len</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><name>b64_message</name> <operator>=</operator> <call><name>palloc</name><argument_list>(<argument><expr><call><name>pg_b64_enc_len</name><argument_list>(<argument><expr><name>cbind_input_len</name></expr></argument>)</argument_list></call> <operator>+</operator> <literal type="number">1</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name>b64_message_len</name> <operator>=</operator> <call><name>pg_b64_encode</name><argument_list>(<argument><expr><name>cbind_input</name></expr></argument>, <argument><expr><name>cbind_input_len</name></expr></argument>,
+										<argument><expr><name>b64_message</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>b64_message</name><index>[<expr><name>b64_message_len</name></expr>]</index></name> <operator>=</operator> <literal type="char">'\0'</literal></expr>;</expr_stmt>
+
+		<comment type="block">/*
+		 * Compare the value sent by the client with the value expected by the
+		 * server.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><call><name>strcmp</name><argument_list>(<argument><expr><name>channel_binding</name></expr></argument>, <argument><expr><name>b64_message</name></expr></argument>)</argument_list></call> <operator>!=</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+					<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION</name></expr></argument>)</argument_list></call><operator>,</operator>
+					 <operator>(</operator><call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"SCRAM channel binding check failed"</literal></expr></argument>)</argument_list></call><operator>)</operator><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+<cpp:else>#<cpp:directive>else</cpp:directive></cpp:else>
+		<comment type="block">/* shouldn't happen, because we checked this earlier already */</comment>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"channel binding not supported by this build"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+	</block_content>}</block></if>
+	<else>else
+	<block>{<block_content>
+		<comment type="block">/*
+		 * If we are not using channel binding, the binding data is expected
+		 * to always be "biws", which is "n,," base64-encoded, or "eSws",
+		 * which is "y,,".  We also have to check whether the flag is the same
+		 * one that the client originally sent.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><operator>(</operator><call><name>strcmp</name><argument_list>(<argument><expr><name>channel_binding</name></expr></argument>, <argument><expr><literal type="string">"biws"</literal></expr></argument>)</argument_list></call> <operator>==</operator> <literal type="number">0</literal> <operator>&amp;&amp;</operator> <name><name>state</name><operator>-&gt;</operator><name>cbind_flag</name></name> <operator>==</operator> <literal type="char">'n'</literal><operator>)</operator> <operator>&amp;&amp;</operator>
+			<operator>!</operator><operator>(</operator><call><name>strcmp</name><argument_list>(<argument><expr><name>channel_binding</name></expr></argument>, <argument><expr><literal type="string">"eSws"</literal></expr></argument>)</argument_list></call> <operator>==</operator> <literal type="number">0</literal> <operator>&amp;&amp;</operator> <name><name>state</name><operator>-&gt;</operator><name>cbind_flag</name></name> <operator>==</operator> <literal type="char">'y'</literal><operator>)</operator></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+					<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_PROTOCOL_VIOLATION</name></expr></argument>)</argument_list></call><operator>,</operator>
+					 <operator>(</operator><call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"unexpected SCRAM channel-binding attribute in client-final-message"</literal></expr></argument>)</argument_list></call><operator>)</operator><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	</block_content>}</block></else></if_stmt>
+
+	<expr_stmt><expr><name><name>state</name><operator>-&gt;</operator><name>client_final_nonce</name></name> <operator>=</operator> <call><name>read_attr_value</name><argument_list>(<argument><expr><operator>&amp;</operator><name>p</name></expr></argument>, <argument><expr><literal type="char">'r'</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* ignore optional extensions */</comment>
+	<do>do
+	<block>{<block_content>
+		<expr_stmt><expr><name>proof</name> <operator>=</operator> <name>p</name> <operator>-</operator> <literal type="number">1</literal></expr>;</expr_stmt>
+		<expr_stmt><expr><name>value</name> <operator>=</operator> <call><name>read_any_attr</name><argument_list>(<argument><expr><operator>&amp;</operator><name>p</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>attr</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block> while <condition>(<expr><name>attr</name> <operator>!=</operator> <literal type="char">'p'</literal></expr>)</condition>;</do>
+
+	<expr_stmt><expr><name>client_proof</name> <operator>=</operator> <call><name>palloc</name><argument_list>(<argument><expr><call><name>pg_b64_dec_len</name><argument_list>(<argument><expr><call><name>strlen</name><argument_list>(<argument><expr><name>value</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><call><name>pg_b64_decode</name><argument_list>(<argument><expr><name>value</name></expr></argument>, <argument><expr><call><name>strlen</name><argument_list>(<argument><expr><name>value</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>client_proof</name></expr></argument>)</argument_list></call> <operator>!=</operator> <name>SCRAM_KEY_LEN</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_PROTOCOL_VIOLATION</name></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"malformed SCRAM message"</literal></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errdetail</name><argument_list>(<argument><expr><literal type="string">"Malformed proof in client-final-message."</literal></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	<expr_stmt><expr><call><name>memcpy</name><argument_list>(<argument><expr><name><name>state</name><operator>-&gt;</operator><name>ClientProof</name></name></expr></argument>, <argument><expr><name>client_proof</name></expr></argument>, <argument><expr><name>SCRAM_KEY_LEN</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>pfree</name><argument_list>(<argument><expr><name>client_proof</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><operator>*</operator><name>p</name> <operator>!=</operator> <literal type="char">'\0'</literal></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_PROTOCOL_VIOLATION</name></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"malformed SCRAM message"</literal></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errdetail</name><argument_list>(<argument><expr><literal type="string">"Garbage found at the end of client-final-message."</literal></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><name><name>state</name><operator>-&gt;</operator><name>client_final_message_without_proof</name></name> <operator>=</operator> <call><name>palloc</name><argument_list>(<argument><expr><name>proof</name> <operator>-</operator> <name>begin</name> <operator>+</operator> <literal type="number">1</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>memcpy</name><argument_list>(<argument><expr><name><name>state</name><operator>-&gt;</operator><name>client_final_message_without_proof</name></name></expr></argument>, <argument><expr><name>input</name></expr></argument>, <argument><expr><name>proof</name> <operator>-</operator> <name>begin</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>state</name><operator>-&gt;</operator><name>client_final_message_without_proof</name><index>[<expr><name>proof</name> <operator>-</operator> <name>begin</name></expr>]</index></name> <operator>=</operator> <literal type="char">'\0'</literal></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Build the final server-side message of an exchange.
+ */</comment>
+<function><type><specifier>static</specifier> <name>char</name> <modifier>*</modifier></type>
+<name>build_server_final_message</name><parameter_list>(<parameter><decl><type><name>scram_state</name> <modifier>*</modifier></type><name>state</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>uint8</name></type>		<name><name>ServerSignature</name><index>[<expr><name>SCRAM_KEY_LEN</name></expr>]</index></name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>server_signature_base64</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>siglen</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>scram_HMAC_ctx</name></type> <name>ctx</name></decl>;</decl_stmt>
+
+	<comment type="block">/* calculate ServerSignature */</comment>
+	<expr_stmt><expr><call><name>scram_HMAC_init</name><argument_list>(<argument><expr><operator>&amp;</operator><name>ctx</name></expr></argument>, <argument><expr><name><name>state</name><operator>-&gt;</operator><name>ServerKey</name></name></expr></argument>, <argument><expr><name>SCRAM_KEY_LEN</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>scram_HMAC_update</name><argument_list>(<argument><expr><operator>&amp;</operator><name>ctx</name></expr></argument>,
+					  <argument><expr><name><name>state</name><operator>-&gt;</operator><name>client_first_message_bare</name></name></expr></argument>,
+					  <argument><expr><call><name>strlen</name><argument_list>(<argument><expr><name><name>state</name><operator>-&gt;</operator><name>client_first_message_bare</name></name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>scram_HMAC_update</name><argument_list>(<argument><expr><operator>&amp;</operator><name>ctx</name></expr></argument>, <argument><expr><literal type="string">","</literal></expr></argument>, <argument><expr><literal type="number">1</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>scram_HMAC_update</name><argument_list>(<argument><expr><operator>&amp;</operator><name>ctx</name></expr></argument>,
+					  <argument><expr><name><name>state</name><operator>-&gt;</operator><name>server_first_message</name></name></expr></argument>,
+					  <argument><expr><call><name>strlen</name><argument_list>(<argument><expr><name><name>state</name><operator>-&gt;</operator><name>server_first_message</name></name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>scram_HMAC_update</name><argument_list>(<argument><expr><operator>&amp;</operator><name>ctx</name></expr></argument>, <argument><expr><literal type="string">","</literal></expr></argument>, <argument><expr><literal type="number">1</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>scram_HMAC_update</name><argument_list>(<argument><expr><operator>&amp;</operator><name>ctx</name></expr></argument>,
+					  <argument><expr><name><name>state</name><operator>-&gt;</operator><name>client_final_message_without_proof</name></name></expr></argument>,
+					  <argument><expr><call><name>strlen</name><argument_list>(<argument><expr><name><name>state</name><operator>-&gt;</operator><name>client_final_message_without_proof</name></name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>scram_HMAC_final</name><argument_list>(<argument><expr><name>ServerSignature</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>ctx</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>server_signature_base64</name> <operator>=</operator> <call><name>palloc</name><argument_list>(<argument><expr><call><name>pg_b64_enc_len</name><argument_list>(<argument><expr><name>SCRAM_KEY_LEN</name></expr></argument>)</argument_list></call> <operator>+</operator> <literal type="number">1</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>siglen</name> <operator>=</operator> <call><name>pg_b64_encode</name><argument_list>(<argument><expr><operator>(</operator><specifier>const</specifier> <name>char</name> <operator>*</operator><operator>)</operator> <name>ServerSignature</name></expr></argument>,
+						   <argument><expr><name>SCRAM_KEY_LEN</name></expr></argument>, <argument><expr><name>server_signature_base64</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>server_signature_base64</name><index>[<expr><name>siglen</name></expr>]</index></name> <operator>=</operator> <literal type="char">'\0'</literal></expr>;</expr_stmt>
+
+	<comment type="block">/*------
+	 * The syntax for the server-final-message is: (RFC 5802)
+	 *
+	 * verifier		   = "v=" base64
+	 *					 ;; base-64 encoded ServerSignature.
+	 *
+	 * server-final-message = (server-error / verifier)
+	 *					 ["," extensions]
+	 *
+	 *------
+	 */</comment>
+	<return>return <expr><call><name>psprintf</name><argument_list>(<argument><expr><literal type="string">"v=%s"</literal></expr></argument>, <argument><expr><name>server_signature_base64</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * Deterministically generate salt for mock authentication, using a SHA256
+ * hash based on the username and a cluster-level secret key.  Returns a
+ * pointer to a static buffer of size SCRAM_DEFAULT_SALT_LEN.
+ */</comment>
+<function><type><specifier>static</specifier> <name>char</name> <modifier>*</modifier></type>
+<name>scram_mock_salt</name><parameter_list>(<parameter><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>username</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>pg_sha256_ctx</name></type> <name>ctx</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><specifier>static</specifier> <name>uint8</name></type> <name><name>sha_digest</name><index>[<expr><name>PG_SHA256_DIGEST_LENGTH</name></expr>]</index></name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>mock_auth_nonce</name> <init>= <expr><call><name>GetMockAuthenticationNonce</name><argument_list>()</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * Generate salt using a SHA256 hash of the username and the cluster's
+	 * mock authentication nonce.  (This works as long as the salt length is
+	 * not larger the SHA256 digest length. If the salt is smaller, the caller
+	 * will just ignore the extra data.)
+	 */</comment>
+	<expr_stmt><expr><call><name>StaticAssertStmt</name><argument_list>(<argument><expr><name>PG_SHA256_DIGEST_LENGTH</name> <operator>&gt;=</operator> <name>SCRAM_DEFAULT_SALT_LEN</name></expr></argument>,
+					 <argument><expr><literal type="string">"salt length greater than SHA256 digest length"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>pg_sha256_init</name><argument_list>(<argument><expr><operator>&amp;</operator><name>ctx</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>pg_sha256_update</name><argument_list>(<argument><expr><operator>&amp;</operator><name>ctx</name></expr></argument>, <argument><expr><operator>(</operator><name>uint8</name> <operator>*</operator><operator>)</operator> <name>username</name></expr></argument>, <argument><expr><call><name>strlen</name><argument_list>(<argument><expr><name>username</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>pg_sha256_update</name><argument_list>(<argument><expr><operator>&amp;</operator><name>ctx</name></expr></argument>, <argument><expr><operator>(</operator><name>uint8</name> <operator>*</operator><operator>)</operator> <name>mock_auth_nonce</name></expr></argument>, <argument><expr><name>MOCK_AUTH_NONCE_LEN</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>pg_sha256_final</name><argument_list>(<argument><expr><operator>&amp;</operator><name>ctx</name></expr></argument>, <argument><expr><name>sha_digest</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<return>return <expr><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <name>sha_digest</name></expr>;</return>
+</block_content>}</block></function>
+</unit>

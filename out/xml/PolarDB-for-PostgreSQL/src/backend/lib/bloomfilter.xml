@@ -1,0 +1,342 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<unit xmlns="http://www.srcML.org/srcML/src" xmlns:cpp="http://www.srcML.org/srcML/cpp" revision="1.0.0" language="C" filename="/cloned_projects/PolarDB-for-PostgreSQL/src/backend/lib/bloomfilter.c"><comment type="block">/*-------------------------------------------------------------------------
+ *
+ * bloomfilter.c
+ *		Space-efficient set membership testing
+ *
+ * A Bloom filter is a probabilistic data structure that is used to test an
+ * element's membership of a set.  False positives are possible, but false
+ * negatives are not; a test of membership of the set returns either "possibly
+ * in set" or "definitely not in set".  This is typically very space efficient,
+ * which can be a decisive advantage.
+ *
+ * Elements can be added to the set, but not removed.  The more elements that
+ * are added, the larger the probability of false positives.  Caller must hint
+ * an estimated total size of the set when the Bloom filter is initialized.
+ * This is used to balance the use of memory against the final false positive
+ * rate.
+ *
+ * The implementation is well suited to data synchronization problems between
+ * unordered sets, especially where predictable performance is important and
+ * some false positives are acceptable.  It's also well suited to cache
+ * filtering problems where a relatively small and/or low cardinality set is
+ * fingerprinted, especially when many subsequent membership tests end up
+ * indicating that values of interest are not present.  That should save the
+ * caller many authoritative lookups, such as expensive probes of a much larger
+ * on-disk structure.
+ *
+ * Copyright (c) 2018, PostgreSQL Global Development Group
+ *
+ * IDENTIFICATION
+ *	  src/backend/lib/bloomfilter.c
+ *
+ *-------------------------------------------------------------------------
+ */</comment>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"postgres.h"</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;math.h&gt;</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/hash.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"lib/bloomfilter.h"</cpp:file></cpp:include>
+
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>MAX_HASH_FUNCS</name></cpp:macro>		<cpp:value>10</cpp:value></cpp:define>
+
+<struct>struct <name>bloom_filter</name>
+<block>{
+	<comment type="block">/* K hash functions are used, seeded by caller's seed */</comment>
+	<decl_stmt><decl><type><name>int</name></type>			<name>k_hash_funcs</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>uint64</name></type>		<name>seed</name></decl>;</decl_stmt>
+	<comment type="block">/* m is bitset size, in bits.  Must be a power of two &lt;= 2^32.  */</comment>
+	<decl_stmt><decl><type><name>uint64</name></type>		<name>m</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>unsigned</name> <name>char</name></type> <name><name>bitset</name><index>[<expr><name>FLEXIBLE_ARRAY_MEMBER</name></expr>]</index></name></decl>;</decl_stmt>
+}</block>;</struct>
+
+<function_decl><type><specifier>static</specifier> <name>int</name></type>	<name>my_bloom_power</name><parameter_list>(<parameter><decl><type><name>uint64</name></type> <name>target_bitset_bits</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>int</name></type>	<name>optimal_k</name><parameter_list>(<parameter><decl><type><name>uint64</name></type> <name>bitset_bits</name></decl></parameter>, <parameter><decl><type><name>int64</name></type> <name>total_elems</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>k_hashes</name><parameter_list>(<parameter><decl><type><name>bloom_filter</name> <modifier>*</modifier></type><name>filter</name></decl></parameter>, <parameter><decl><type><name>uint32</name> <modifier>*</modifier></type><name>hashes</name></decl></parameter>, <parameter><decl><type><name>unsigned</name> <name>char</name> <modifier>*</modifier></type><name>elem</name></decl></parameter>,
+		 <parameter><decl><type><name>size_t</name></type> <name>len</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <specifier>inline</specifier> <name>uint32</name></type> <name>mod_m</name><parameter_list>(<parameter><decl><type><name>uint32</name></type> <name>a</name></decl></parameter>, <parameter><decl><type><name>uint64</name></type> <name>m</name></decl></parameter>)</parameter_list>;</function_decl>
+
+<comment type="block">/*
+ * Create Bloom filter in caller's memory context.  We aim for a false positive
+ * rate of between 1% and 2% when bitset size is not constrained by memory
+ * availability.
+ *
+ * total_elems is an estimate of the final size of the set.  It should be
+ * approximately correct, but the implementation can cope well with it being
+ * off by perhaps a factor of five or more.  See "Bloom Filters in
+ * Probabilistic Verification" (Dillinger &amp; Manolios, 2004) for details of why
+ * this is the case.
+ *
+ * bloom_work_mem is sized in KB, in line with the general work_mem convention.
+ * This determines the size of the underlying bitset (trivial bookkeeping space
+ * isn't counted).  The bitset is always sized as a power of two number of
+ * bits, and the largest possible bitset is 512MB (2^32 bits).  The
+ * implementation allocates only enough memory to target its standard false
+ * positive rate, using a simple formula with caller's total_elems estimate as
+ * an input.  The bitset might be as small as 1MB, even when bloom_work_mem is
+ * much higher.
+ *
+ * The Bloom filter is seeded using a value provided by the caller.  Using a
+ * distinct seed value on every call makes it unlikely that the same false
+ * positives will reoccur when the same set is fingerprinted a second time.
+ * Callers that don't care about this pass a constant as their seed, typically
+ * 0.  Callers can use a pseudo-random seed in the range of 0 - INT_MAX by
+ * calling random().
+ */</comment>
+<function><type><name>bloom_filter</name> <modifier>*</modifier></type>
+<name>bloom_create</name><parameter_list>(<parameter><decl><type><name>int64</name></type> <name>total_elems</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>bloom_work_mem</name></decl></parameter>, <parameter><decl><type><name>uint64</name></type> <name>seed</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>bloom_filter</name> <modifier>*</modifier></type><name>filter</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>bloom_power</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>uint64</name></type>		<name>bitset_bytes</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>uint64</name></type>		<name>bitset_bits</name></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * Aim for two bytes per element; this is sufficient to get a false
+	 * positive rate below 1%, independent of the size of the bitset or total
+	 * number of elements.  Also, if rounding down the size of the bitset to
+	 * the next lowest power of two turns out to be a significant drop, the
+	 * false positive rate still won't exceed 2% in almost all cases.
+	 */</comment>
+	<expr_stmt><expr><name>bitset_bytes</name> <operator>=</operator> <call><name>Min</name><argument_list>(<argument><expr><name>bloom_work_mem</name> <operator>*</operator> <call><name>UINT64CONST</name><argument_list>(<argument><expr><literal type="number">1024</literal></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>total_elems</name> <operator>*</operator> <literal type="number">2</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>bitset_bytes</name> <operator>=</operator> <call><name>Max</name><argument_list>(<argument><expr><literal type="number">1024</literal> <operator>*</operator> <literal type="number">1024</literal></expr></argument>, <argument><expr><name>bitset_bytes</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Size in bits should be the highest power of two &lt;= target.  bitset_bits
+	 * is uint64 because PG_UINT32_MAX is 2^32 - 1, not 2^32
+	 */</comment>
+	<expr_stmt><expr><name>bloom_power</name> <operator>=</operator> <call><name>my_bloom_power</name><argument_list>(<argument><expr><name>bitset_bytes</name> <operator>*</operator> <name>BITS_PER_BYTE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>bitset_bits</name> <operator>=</operator> <call><name>UINT64CONST</name><argument_list>(<argument><expr><literal type="number">1</literal></expr></argument>)</argument_list></call> <operator>&lt;&lt;</operator> <name>bloom_power</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name>bitset_bytes</name> <operator>=</operator> <name>bitset_bits</name> <operator>/</operator> <name>BITS_PER_BYTE</name></expr>;</expr_stmt>
+
+	<comment type="block">/* Allocate bloom filter with unset bitset */</comment>
+	<expr_stmt><expr><name>filter</name> <operator>=</operator> <call><name>palloc0</name><argument_list>(<argument><expr><call><name>offsetof</name><argument_list>(<argument><expr><name>bloom_filter</name></expr></argument>, <argument><expr><name>bitset</name></expr></argument>)</argument_list></call> <operator>+</operator>
+					 sizeof<operator>(</operator><name>unsigned</name> <name>char</name><operator>)</operator> <operator>*</operator> <name>bitset_bytes</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>filter</name><operator>-&gt;</operator><name>k_hash_funcs</name></name> <operator>=</operator> <call><name>optimal_k</name><argument_list>(<argument><expr><name>bitset_bits</name></expr></argument>, <argument><expr><name>total_elems</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>filter</name><operator>-&gt;</operator><name>seed</name></name> <operator>=</operator> <name>seed</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>filter</name><operator>-&gt;</operator><name>m</name></name> <operator>=</operator> <name>bitset_bits</name></expr>;</expr_stmt>
+
+	<return>return <expr><name>filter</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Free Bloom filter
+ */</comment>
+<function><type><name>void</name></type>
+<name>bloom_free</name><parameter_list>(<parameter><decl><type><name>bloom_filter</name> <modifier>*</modifier></type><name>filter</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>pfree</name><argument_list>(<argument><expr><name>filter</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Add element to Bloom filter
+ */</comment>
+<function><type><name>void</name></type>
+<name>bloom_add_element</name><parameter_list>(<parameter><decl><type><name>bloom_filter</name> <modifier>*</modifier></type><name>filter</name></decl></parameter>, <parameter><decl><type><name>unsigned</name> <name>char</name> <modifier>*</modifier></type><name>elem</name></decl></parameter>, <parameter><decl><type><name>size_t</name></type> <name>len</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>uint32</name></type>		<name><name>hashes</name><index>[<expr><name>MAX_HASH_FUNCS</name></expr>]</index></name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>i</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>k_hashes</name><argument_list>(<argument><expr><name>filter</name></expr></argument>, <argument><expr><name>hashes</name></expr></argument>, <argument><expr><name>elem</name></expr></argument>, <argument><expr><name>len</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Map a bit-wise address to a byte-wise address + bit offset */</comment>
+	<for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name><name>filter</name><operator>-&gt;</operator><name>k_hash_funcs</name></name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control>
+	<block>{<block_content>
+		<expr_stmt><expr><name><name>filter</name><operator>-&gt;</operator><name>bitset</name><index>[<expr><name><name>hashes</name><index>[<expr><name>i</name></expr>]</index></name> <operator>&gt;&gt;</operator> <literal type="number">3</literal></expr>]</index></name> <operator>|=</operator> <literal type="number">1</literal> <operator>&lt;&lt;</operator> <operator>(</operator><name><name>hashes</name><index>[<expr><name>i</name></expr>]</index></name> <operator>&amp;</operator> <literal type="number">7</literal><operator>)</operator></expr>;</expr_stmt>
+	</block_content>}</block></for>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Test if Bloom filter definitely lacks element.
+ *
+ * Returns true if the element is definitely not in the set of elements
+ * observed by bloom_add_element().  Otherwise, returns false, indicating that
+ * element is probably present in set.
+ */</comment>
+<function><type><name>bool</name></type>
+<name>bloom_lacks_element</name><parameter_list>(<parameter><decl><type><name>bloom_filter</name> <modifier>*</modifier></type><name>filter</name></decl></parameter>, <parameter><decl><type><name>unsigned</name> <name>char</name> <modifier>*</modifier></type><name>elem</name></decl></parameter>, <parameter><decl><type><name>size_t</name></type> <name>len</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>uint32</name></type>		<name><name>hashes</name><index>[<expr><name>MAX_HASH_FUNCS</name></expr>]</index></name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>i</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>k_hashes</name><argument_list>(<argument><expr><name>filter</name></expr></argument>, <argument><expr><name>hashes</name></expr></argument>, <argument><expr><name>elem</name></expr></argument>, <argument><expr><name>len</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Map a bit-wise address to a byte-wise address + bit offset */</comment>
+	<for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name><name>filter</name><operator>-&gt;</operator><name>k_hash_funcs</name></name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control>
+	<block>{<block_content>
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><operator>(</operator><name><name>filter</name><operator>-&gt;</operator><name>bitset</name><index>[<expr><name><name>hashes</name><index>[<expr><name>i</name></expr>]</index></name> <operator>&gt;&gt;</operator> <literal type="number">3</literal></expr>]</index></name> <operator>&amp;</operator> <operator>(</operator><literal type="number">1</literal> <operator>&lt;&lt;</operator> <operator>(</operator><name><name>hashes</name><index>[<expr><name>i</name></expr>]</index></name> <operator>&amp;</operator> <literal type="number">7</literal><operator>)</operator><operator>)</operator><operator>)</operator></expr>)</condition><block type="pseudo"><block_content>
+			<return>return <expr><name>true</name></expr>;</return></block_content></block></if></if_stmt>
+	</block_content>}</block></for>
+
+	<return>return <expr><name>false</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * What proportion of bits are currently set?
+ *
+ * Returns proportion, expressed as a multiplier of filter size.  That should
+ * generally be close to 0.5, even when we have more than enough memory to
+ * ensure a false positive rate within target 1% to 2% band, since more hash
+ * functions are used as more memory is available per element.
+ *
+ * This is the only instrumentation that is low overhead enough to appear in
+ * debug traces.  When debugging Bloom filter code, it's likely to be far more
+ * interesting to directly test the false positive rate.
+ */</comment>
+<function><type><name>double</name></type>
+<name>bloom_prop_bits_set</name><parameter_list>(<parameter><decl><type><name>bloom_filter</name> <modifier>*</modifier></type><name>filter</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>int</name></type>			<name>bitset_bytes</name> <init>= <expr><name><name>filter</name><operator>-&gt;</operator><name>m</name></name> <operator>/</operator> <name>BITS_PER_BYTE</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>uint64</name></type>		<name>bits_set</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>i</name></decl>;</decl_stmt>
+
+	<for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name>bitset_bytes</name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>unsigned</name> <name>char</name></type> <name>byte</name> <init>= <expr><name><name>filter</name><operator>-&gt;</operator><name>bitset</name><index>[<expr><name>i</name></expr>]</index></name></expr></init></decl>;</decl_stmt>
+
+		<while>while <condition>(<expr><name>byte</name></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><name>bits_set</name><operator>++</operator></expr>;</expr_stmt>
+			<expr_stmt><expr><name>byte</name> <operator>&amp;=</operator> <operator>(</operator><name>byte</name> <operator>-</operator> <literal type="number">1</literal><operator>)</operator></expr>;</expr_stmt>
+		</block_content>}</block></while>
+	</block_content>}</block></for>
+
+	<return>return <expr><name>bits_set</name> <operator>/</operator> <operator>(</operator><name>double</name><operator>)</operator> <name><name>filter</name><operator>-&gt;</operator><name>m</name></name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Which element in the sequence of powers of two is less than or equal to
+ * target_bitset_bits?
+ *
+ * Value returned here must be generally safe as the basis for actual bitset
+ * size.
+ *
+ * Bitset is never allowed to exceed 2 ^ 32 bits (512MB).  This is sufficient
+ * for the needs of all current callers, and allows us to use 32-bit hash
+ * functions.  It also makes it easy to stay under the MaxAllocSize restriction
+ * (caller needs to leave room for non-bitset fields that appear before
+ * flexible array member, so a 1GB bitset would use an allocation that just
+ * exceeds MaxAllocSize).
+ */</comment>
+<function><type><specifier>static</specifier> <name>int</name></type>
+<name>my_bloom_power</name><parameter_list>(<parameter><decl><type><name>uint64</name></type> <name>target_bitset_bits</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>int</name></type>			<name>bloom_power</name> <init>= <expr><operator>-</operator><literal type="number">1</literal></expr></init></decl>;</decl_stmt>
+
+	<while>while <condition>(<expr><name>target_bitset_bits</name> <operator>&gt;</operator> <literal type="number">0</literal> <operator>&amp;&amp;</operator> <name>bloom_power</name> <operator>&lt;</operator> <literal type="number">32</literal></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name>bloom_power</name><operator>++</operator></expr>;</expr_stmt>
+		<expr_stmt><expr><name>target_bitset_bits</name> <operator>&gt;&gt;=</operator> <literal type="number">1</literal></expr>;</expr_stmt>
+	</block_content>}</block></while>
+
+	<return>return <expr><name>bloom_power</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Determine optimal number of hash functions based on size of filter in bits,
+ * and projected total number of elements.  The optimal number is the number
+ * that minimizes the false positive rate.
+ */</comment>
+<function><type><specifier>static</specifier> <name>int</name></type>
+<name>optimal_k</name><parameter_list>(<parameter><decl><type><name>uint64</name></type> <name>bitset_bits</name></decl></parameter>, <parameter><decl><type><name>int64</name></type> <name>total_elems</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>int</name></type>			<name>k</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>total_elems</name> <operator>!=</operator> <literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>k</name> <operator>=</operator> <call><name>rint</name><argument_list>(<argument><expr><call><name>log</name><argument_list>(<argument><expr><literal type="number">2.0</literal></expr></argument>)</argument_list></call> <operator>*</operator> <name>bitset_bits</name> <operator>/</operator> <name>total_elems</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<return>return <expr><call><name>Max</name><argument_list>(<argument><expr><literal type="number">1</literal></expr></argument>, <argument><expr><call><name>Min</name><argument_list>(<argument><expr><name>k</name></expr></argument>, <argument><expr><name>MAX_HASH_FUNCS</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Generate k hash values for element.
+ *
+ * Caller passes array, which is filled-in with k values determined by hashing
+ * caller's element.
+ *
+ * Only 2 real independent hash functions are actually used to support an
+ * interface of up to MAX_HASH_FUNCS hash functions; enhanced double hashing is
+ * used to make this work.  The main reason we prefer enhanced double hashing
+ * to classic double hashing is that the latter has an issue with collisions
+ * when using power of two sized bitsets.  See Dillinger &amp; Manolios for full
+ * details.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>k_hashes</name><parameter_list>(<parameter><decl><type><name>bloom_filter</name> <modifier>*</modifier></type><name>filter</name></decl></parameter>, <parameter><decl><type><name>uint32</name> <modifier>*</modifier></type><name>hashes</name></decl></parameter>, <parameter><decl><type><name>unsigned</name> <name>char</name> <modifier>*</modifier></type><name>elem</name></decl></parameter>, <parameter><decl><type><name>size_t</name></type> <name>len</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>uint64</name></type>		<name>hash</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>uint32</name></type>		<name>x</name></decl>,
+				<decl><type ref="prev"/><name>y</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>uint64</name></type>		<name>m</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>i</name></decl>;</decl_stmt>
+
+	<comment type="block">/* Use 64-bit hashing to get two independent 32-bit hashes */</comment>
+	<expr_stmt><expr><name>hash</name> <operator>=</operator> <call><name>DatumGetUInt64</name><argument_list>(<argument><expr><call><name>hash_any_extended</name><argument_list>(<argument><expr><name>elem</name></expr></argument>, <argument><expr><name>len</name></expr></argument>, <argument><expr><name><name>filter</name><operator>-&gt;</operator><name>seed</name></name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>x</name> <operator>=</operator> <operator>(</operator><name>uint32</name><operator>)</operator> <name>hash</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name>y</name> <operator>=</operator> <operator>(</operator><name>uint32</name><operator>)</operator> <operator>(</operator><name>hash</name> <operator>&gt;&gt;</operator> <literal type="number">32</literal><operator>)</operator></expr>;</expr_stmt>
+	<expr_stmt><expr><name>m</name> <operator>=</operator> <name><name>filter</name><operator>-&gt;</operator><name>m</name></name></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>x</name> <operator>=</operator> <call><name>mod_m</name><argument_list>(<argument><expr><name>x</name></expr></argument>, <argument><expr><name>m</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>y</name> <operator>=</operator> <call><name>mod_m</name><argument_list>(<argument><expr><name>y</name></expr></argument>, <argument><expr><name>m</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Accumulate hashes */</comment>
+	<expr_stmt><expr><name><name>hashes</name><index>[<expr><literal type="number">0</literal></expr>]</index></name> <operator>=</operator> <name>x</name></expr>;</expr_stmt>
+	<for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">1</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name><name>filter</name><operator>-&gt;</operator><name>k_hash_funcs</name></name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control>
+	<block>{<block_content>
+		<expr_stmt><expr><name>x</name> <operator>=</operator> <call><name>mod_m</name><argument_list>(<argument><expr><name>x</name> <operator>+</operator> <name>y</name></expr></argument>, <argument><expr><name>m</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name>y</name> <operator>=</operator> <call><name>mod_m</name><argument_list>(<argument><expr><name>y</name> <operator>+</operator> <name>i</name></expr></argument>, <argument><expr><name>m</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><name><name>hashes</name><index>[<expr><name>i</name></expr>]</index></name> <operator>=</operator> <name>x</name></expr>;</expr_stmt>
+	</block_content>}</block></for>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Calculate "val MOD m" inexpensively.
+ *
+ * Assumes that m (which is bitset size) is a power of two.
+ *
+ * Using a power of two number of bits for bitset size allows us to use bitwise
+ * AND operations to calculate the modulo of a hash value.  It's also a simple
+ * way of avoiding the modulo bias effect.
+ */</comment>
+<function><type><specifier>static</specifier> <specifier>inline</specifier> <name>uint32</name></type>
+<name>mod_m</name><parameter_list>(<parameter><decl><type><name>uint32</name></type> <name>val</name></decl></parameter>, <parameter><decl><type><name>uint64</name></type> <name>m</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>m</name> <operator>&lt;=</operator> <name>PG_UINT32_MAX</name> <operator>+</operator> <call><name>UINT64CONST</name><argument_list>(<argument><expr><literal type="number">1</literal></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><operator>(</operator><operator>(</operator><name>m</name> <operator>-</operator> <literal type="number">1</literal><operator>)</operator> <operator>&amp;</operator> <name>m</name><operator>)</operator> <operator>==</operator> <literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<return>return <expr><name>val</name> <operator>&amp;</operator> <operator>(</operator><name>m</name> <operator>-</operator> <literal type="number">1</literal><operator>)</operator></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * POLAR: Initialize bloom_filter structure base on allocated buffer
+ */</comment>
+<function><type><name>bloom_filter</name> <modifier>*</modifier></type>
+<name>bloom_init_struct</name><parameter_list>(<parameter><decl><type><name>uint8</name> <modifier>*</modifier></type><name>bloom_buf</name></decl></parameter>, <parameter><decl><type><name>size_t</name></type> <name>bloom_buf_size</name></decl></parameter>,
+				  <parameter><decl><type><name>int64</name></type> <name>total_elems</name></decl></parameter>, <parameter><decl><type><name>uint64</name></type> <name>seed</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>bloom_filter</name> <modifier>*</modifier></type><name>filter</name> <init>= <expr><operator>(</operator><name>bloom_filter</name> <operator>*</operator><operator>)</operator><operator>(</operator><name>bloom_buf</name><operator>)</operator></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>uint64</name></type>      <name>bitset_bytes</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>         <name>bloom_power</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>uint64</name></type>      <name>bitset_bits</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>bloom_buf_size</name> <operator>&gt;</operator> <operator>(</operator><call><name>offsetof</name><argument_list>(<argument><expr><name>bloom_filter</name></expr></argument>, <argument><expr><name>bitset</name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>bitset_bytes</name> <operator>=</operator> <name>bloom_buf_size</name> <operator>-</operator> <call><name>offsetof</name><argument_list>(<argument><expr><name>bloom_filter</name></expr></argument>, <argument><expr><name>bitset</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>bloom_power</name> <operator>=</operator> <call><name>my_bloom_power</name><argument_list>(<argument><expr><name>bitset_bytes</name> <operator>*</operator> <name>BITS_PER_BYTE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>bitset_bits</name> <operator>=</operator> <call><name>UINT64CONST</name><argument_list>(<argument><expr><literal type="number">1</literal></expr></argument>)</argument_list></call> <operator>&lt;&lt;</operator> <name>bloom_power</name></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * The bitset size should be large enouth for totale_elems multiply MAX_HASH_FUNCS
+	 */</comment>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>bitset_bits</name> <operator>&gt;=</operator> <name>total_elems</name> <operator>*</operator> <name>MAX_HASH_FUNCS</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name><name>filter</name><operator>-&gt;</operator><name>k_hash_funcs</name></name> <operator>=</operator> <call><name>optimal_k</name><argument_list>(<argument><expr><name>bitset_bits</name></expr></argument>, <argument><expr><name>total_elems</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>filter</name><operator>-&gt;</operator><name>seed</name></name> <operator>=</operator> <name>seed</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>filter</name><operator>-&gt;</operator><name>m</name></name> <operator>=</operator> <name>bitset_bits</name></expr>;</expr_stmt>
+
+	<return>return <expr><name>filter</name></expr>;</return>
+</block_content>}</block></function>
+
+</unit>

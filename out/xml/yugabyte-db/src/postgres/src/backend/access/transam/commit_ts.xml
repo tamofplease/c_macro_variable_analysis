@@ -1,0 +1,1026 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<unit xmlns="http://www.srcML.org/srcML/src" xmlns:cpp="http://www.srcML.org/srcML/cpp" revision="1.0.0" language="C" filename="/cloned_projects/yugabyte-db/src/postgres/src/backend/access/transam/commit_ts.c"><comment type="block">/*-------------------------------------------------------------------------
+ *
+ * commit_ts.c
+ *		PostgreSQL commit timestamp manager
+ *
+ * This module is a pg_xact-like system that stores the commit timestamp
+ * for each transaction.
+ *
+ * XLOG interactions: this module generates an XLOG record whenever a new
+ * CommitTs page is initialized to zeroes.  Also, one XLOG record is
+ * generated for setting of values when the caller requests it; this allows
+ * us to support values coming from places other than transaction commit.
+ * Other writes of CommitTS come from recording of transaction commit in
+ * xact.c, which generates its own XLOG records for these events and will
+ * re-perform the status update on redo; so we need make no additional XLOG
+ * entry here.
+ *
+ * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1994, Regents of the University of California
+ *
+ * src/backend/access/transam/commit_ts.c
+ *
+ *-------------------------------------------------------------------------
+ */</comment>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"postgres.h"</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/commit_ts.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/htup_details.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/slru.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/transam.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/pg_type.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"funcapi.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"miscadmin.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"pg_trace.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/shmem.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/builtins.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/snapmgr.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/timestamp.h"</cpp:file></cpp:include>
+
+<comment type="block">/*
+ * Defines for CommitTs page sizes.  A page is the same BLCKSZ as is used
+ * everywhere else in Postgres.
+ *
+ * Note: because TransactionIds are 32 bits and wrap around at 0xFFFFFFFF,
+ * CommitTs page numbering also wraps around at
+ * 0xFFFFFFFF/COMMIT_TS_XACTS_PER_PAGE, and CommitTs segment numbering at
+ * 0xFFFFFFFF/COMMIT_TS_XACTS_PER_PAGE/SLRU_PAGES_PER_SEGMENT.  We need take no
+ * explicit notice of that fact in this module, except when comparing segment
+ * and page numbers in TruncateCommitTs (see CommitTsPagePrecedes).
+ */</comment>
+
+<comment type="block">/*
+ * We need 8+2 bytes per xact.  Note that enlarging this struct might mean
+ * the largest possible file name is more than 5 chars long; see
+ * SlruScanDirectory.
+ */</comment>
+<typedef>typedef <type><struct>struct <name>CommitTimestampEntry</name>
+<block>{
+	<decl_stmt><decl><type><name>TimestampTz</name></type> <name>time</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>RepOriginId</name></type> <name>nodeid</name></decl>;</decl_stmt>
+}</block></struct></type> <name>CommitTimestampEntry</name>;</typedef>
+
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>SizeOfCommitTimestampEntry</name></cpp:macro> <cpp:value>(offsetof(CommitTimestampEntry, nodeid) + \
+									sizeof(RepOriginId))</cpp:value></cpp:define>
+
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>COMMIT_TS_XACTS_PER_PAGE</name></cpp:macro> \
+	<cpp:value>(BLCKSZ / SizeOfCommitTimestampEntry)</cpp:value></cpp:define>
+
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>TransactionIdToCTsPage</name><parameter_list>(<parameter><type><name>xid</name></type></parameter>)</parameter_list></cpp:macro> \
+	<cpp:value>((xid) / (TransactionId) COMMIT_TS_XACTS_PER_PAGE)</cpp:value></cpp:define>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>TransactionIdToCTsEntry</name><parameter_list>(<parameter><type><name>xid</name></type></parameter>)</parameter_list></cpp:macro>	\
+	<cpp:value>((xid) % (TransactionId) COMMIT_TS_XACTS_PER_PAGE)</cpp:value></cpp:define>
+
+<comment type="block">/*
+ * Link to shared-memory data structures for CommitTs control
+ */</comment>
+<decl_stmt><decl><type><specifier>static</specifier> <name>SlruCtlData</name></type> <name>CommitTsCtlData</name></decl>;</decl_stmt>
+
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>CommitTsCtl</name></cpp:macro> <cpp:value>(&amp;CommitTsCtlData)</cpp:value></cpp:define>
+
+<comment type="block">/*
+ * We keep a cache of the last value set in shared memory.
+ *
+ * This is also good place to keep the activation status.  We keep this
+ * separate from the GUC so that the standby can activate the module if the
+ * primary has it active independently of the value of the GUC.
+ *
+ * This is protected by CommitTsLock.  In some places, we use commitTsActive
+ * without acquiring the lock; where this happens, a comment explains the
+ * rationale for it.
+ */</comment>
+<typedef>typedef <type><struct>struct <name>CommitTimestampShared</name>
+<block>{
+	<decl_stmt><decl><type><name>TransactionId</name></type> <name>xidLastCommit</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>CommitTimestampEntry</name></type> <name>dataLastCommit</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type>		<name>commitTsActive</name></decl>;</decl_stmt>
+}</block></struct></type> <name>CommitTimestampShared</name>;</typedef>
+
+<decl_stmt><decl><type><name>CommitTimestampShared</name> <modifier>*</modifier></type><name>commitTsShared</name></decl>;</decl_stmt>
+
+
+<comment type="block">/* GUC variable */</comment>
+<decl_stmt><decl><type><name>bool</name></type>		<name>track_commit_timestamp</name></decl>;</decl_stmt>
+
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>SetXidCommitTsInPage</name><parameter_list>(<parameter><decl><type><name>TransactionId</name></type> <name>xid</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>nsubxids</name></decl></parameter>,
+					 <parameter><decl><type><name>TransactionId</name> <modifier>*</modifier></type><name>subxids</name></decl></parameter>, <parameter><decl><type><name>TimestampTz</name></type> <name>ts</name></decl></parameter>,
+					 <parameter><decl><type><name>RepOriginId</name></type> <name>nodeid</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>pageno</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>TransactionIdSetCommitTs</name><parameter_list>(<parameter><decl><type><name>TransactionId</name></type> <name>xid</name></decl></parameter>, <parameter><decl><type><name>TimestampTz</name></type> <name>ts</name></decl></parameter>,
+						 <parameter><decl><type><name>RepOriginId</name></type> <name>nodeid</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>slotno</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>error_commit_ts_disabled</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>int</name></type>	<name>ZeroCommitTsPage</name><parameter_list>(<parameter><decl><type><name>int</name></type> <name>pageno</name></decl></parameter>, <parameter><decl><type><name>bool</name></type> <name>writeXlog</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>bool</name></type> <name>CommitTsPagePrecedes</name><parameter_list>(<parameter><decl><type><name>int</name></type> <name>page1</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>page2</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>ActivateCommitTs</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>DeactivateCommitTs</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>WriteZeroPageXlogRec</name><parameter_list>(<parameter><decl><type><name>int</name></type> <name>pageno</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>WriteTruncateXlogRec</name><parameter_list>(<parameter><decl><type><name>int</name></type> <name>pageno</name></decl></parameter>, <parameter><decl><type><name>TransactionId</name></type> <name>oldestXid</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>WriteSetTimestampXlogRec</name><parameter_list>(<parameter><decl><type><name>TransactionId</name></type> <name>mainxid</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>nsubxids</name></decl></parameter>,
+						 <parameter><decl><type><name>TransactionId</name> <modifier>*</modifier></type><name>subxids</name></decl></parameter>, <parameter><decl><type><name>TimestampTz</name></type> <name>timestamp</name></decl></parameter>,
+						 <parameter><decl><type><name>RepOriginId</name></type> <name>nodeid</name></decl></parameter>)</parameter_list>;</function_decl>
+
+<comment type="block">/*
+ * TransactionTreeSetCommitTsData
+ *
+ * Record the final commit timestamp of transaction entries in the commit log
+ * for a transaction and its subtransaction tree, as efficiently as possible.
+ *
+ * xid is the top level transaction id.
+ *
+ * subxids is an array of xids of length nsubxids, representing subtransactions
+ * in the tree of xid. In various cases nsubxids may be zero.
+ * The reason why tracking just the parent xid commit timestamp is not enough
+ * is that the subtrans SLRU does not stay valid across crashes (it's not
+ * permanent) so we need to keep the information about them here. If the
+ * subtrans implementation changes in the future, we might want to revisit the
+ * decision of storing timestamp info for each subxid.
+ *
+ * The write_xlog parameter tells us whether to include an XLog record of this
+ * or not.  Normally, this is called from transaction commit routines (both
+ * normal and prepared) and the information will be stored in the transaction
+ * commit XLog record, and so they should pass "false" for this.  The XLog redo
+ * code should use "false" here as well.  Other callers probably want to pass
+ * true, so that the given values persist in case of crashes.
+ */</comment>
+<function><type><name>void</name></type>
+<name>TransactionTreeSetCommitTsData</name><parameter_list>(<parameter><decl><type><name>TransactionId</name></type> <name>xid</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>nsubxids</name></decl></parameter>,
+							   <parameter><decl><type><name>TransactionId</name> <modifier>*</modifier></type><name>subxids</name></decl></parameter>, <parameter><decl><type><name>TimestampTz</name></type> <name>timestamp</name></decl></parameter>,
+							   <parameter><decl><type><name>RepOriginId</name></type> <name>nodeid</name></decl></parameter>, <parameter><decl><type><name>bool</name></type> <name>write_xlog</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>int</name></type>			<name>i</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>TransactionId</name></type> <name>headxid</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>TransactionId</name></type> <name>newestXact</name></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * No-op if the module is not active.
+	 *
+	 * An unlocked read here is fine, because in a standby (the only place
+	 * where the flag can change in flight) this routine is only called by the
+	 * recovery process, which is also the only process which can change the
+	 * flag.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><name><name>commitTsShared</name><operator>-&gt;</operator><name>commitTsActive</name></name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return;</return></block_content></block></if></if_stmt>
+
+	<comment type="block">/*
+	 * Comply with the WAL-before-data rule: if caller specified it wants this
+	 * value to be recorded in WAL, do so before touching the data.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name>write_xlog</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>WriteSetTimestampXlogRec</name><argument_list>(<argument><expr><name>xid</name></expr></argument>, <argument><expr><name>nsubxids</name></expr></argument>, <argument><expr><name>subxids</name></expr></argument>, <argument><expr><name>timestamp</name></expr></argument>, <argument><expr><name>nodeid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<comment type="block">/*
+	 * Figure out the latest Xid in this batch: either the last subxid if
+	 * there's any, otherwise the parent xid.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name>nsubxids</name> <operator>&gt;</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name>newestXact</name> <operator>=</operator> <name><name>subxids</name><index>[<expr><name>nsubxids</name> <operator>-</operator> <literal type="number">1</literal></expr>]</index></name></expr>;</expr_stmt></block_content></block></if>
+	<else>else<block type="pseudo"><block_content>
+		<expr_stmt><expr><name>newestXact</name> <operator>=</operator> <name>xid</name></expr>;</expr_stmt></block_content></block></else></if_stmt>
+
+	<comment type="block">/*
+	 * We split the xids to set the timestamp to in groups belonging to the
+	 * same SLRU page; the first element in each such set is its head.  The
+	 * first group has the main XID as the head; subsequent sets use the first
+	 * subxid not on the previous page as head.  This way, we only have to
+	 * lock/modify each SLRU page once.
+	 */</comment>
+	<for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr><operator>,</operator> <expr><name>headxid</name> <operator>=</operator> <name>xid</name></expr>;</init><condition>;</condition><incr/>)</control>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>int</name></type>			<name>pageno</name> <init>= <expr><call><name>TransactionIdToCTsPage</name><argument_list>(<argument><expr><name>headxid</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>int</name></type>			<name>j</name></decl>;</decl_stmt>
+
+		<for>for <control>(<init><expr><name>j</name> <operator>=</operator> <name>i</name></expr>;</init> <condition><expr><name>j</name> <operator>&lt;</operator> <name>nsubxids</name></expr>;</condition> <incr><expr><name>j</name><operator>++</operator></expr></incr>)</control>
+		<block>{<block_content>
+			<if_stmt><if>if <condition>(<expr><call><name>TransactionIdToCTsPage</name><argument_list>(<argument><expr><name><name>subxids</name><index>[<expr><name>j</name></expr>]</index></name></expr></argument>)</argument_list></call> <operator>!=</operator> <name>pageno</name></expr>)</condition><block type="pseudo"><block_content>
+				<break>break;</break></block_content></block></if></if_stmt>
+		</block_content>}</block></for>
+		<comment type="block">/* subxids[i..j] are on the same page as the head */</comment>
+
+		<expr_stmt><expr><call><name>SetXidCommitTsInPage</name><argument_list>(<argument><expr><name>headxid</name></expr></argument>, <argument><expr><name>j</name> <operator>-</operator> <name>i</name></expr></argument>, <argument><expr><name>subxids</name> <operator>+</operator> <name>i</name></expr></argument>, <argument><expr><name>timestamp</name></expr></argument>, <argument><expr><name>nodeid</name></expr></argument>,
+							 <argument><expr><name>pageno</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/* if we wrote out all subxids, we're done. */</comment>
+		<if_stmt><if>if <condition>(<expr><name>j</name> <operator>+</operator> <literal type="number">1</literal> <operator>&gt;=</operator> <name>nsubxids</name></expr>)</condition><block type="pseudo"><block_content>
+			<break>break;</break></block_content></block></if></if_stmt>
+
+		<comment type="block">/*
+		 * Set the new head and skip over it, as well as over the subxids we
+		 * just wrote.
+		 */</comment>
+		<expr_stmt><expr><name>headxid</name> <operator>=</operator> <name><name>subxids</name><index>[<expr><name>j</name></expr>]</index></name></expr>;</expr_stmt>
+		<expr_stmt><expr><name>i</name> <operator>+=</operator> <name>j</name> <operator>-</operator> <name>i</name> <operator>+</operator> <literal type="number">1</literal></expr>;</expr_stmt>
+	</block_content>}</block></for>
+
+	<comment type="block">/* update the cached value in shared memory */</comment>
+	<expr_stmt><expr><call><name>LWLockAcquire</name><argument_list>(<argument><expr><name>CommitTsLock</name></expr></argument>, <argument><expr><name>LW_EXCLUSIVE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>commitTsShared</name><operator>-&gt;</operator><name>xidLastCommit</name></name> <operator>=</operator> <name>xid</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>commitTsShared</name><operator>-&gt;</operator><name>dataLastCommit</name><operator>.</operator><name>time</name></name> <operator>=</operator> <name>timestamp</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>commitTsShared</name><operator>-&gt;</operator><name>dataLastCommit</name><operator>.</operator><name>nodeid</name></name> <operator>=</operator> <name>nodeid</name></expr>;</expr_stmt>
+
+	<comment type="block">/* and move forwards our endpoint, if needed */</comment>
+	<if_stmt><if>if <condition>(<expr><call><name>TransactionIdPrecedes</name><argument_list>(<argument><expr><name><name>ShmemVariableCache</name><operator>-&gt;</operator><name>newestCommitTsXid</name></name></expr></argument>, <argument><expr><name>newestXact</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name><name>ShmemVariableCache</name><operator>-&gt;</operator><name>newestCommitTsXid</name></name> <operator>=</operator> <name>newestXact</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	<expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><name>CommitTsLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Record the commit timestamp of transaction entries in the commit log for all
+ * entries on a single page.  Atomic only on this page.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>SetXidCommitTsInPage</name><parameter_list>(<parameter><decl><type><name>TransactionId</name></type> <name>xid</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>nsubxids</name></decl></parameter>,
+					 <parameter><decl><type><name>TransactionId</name> <modifier>*</modifier></type><name>subxids</name></decl></parameter>, <parameter><decl><type><name>TimestampTz</name></type> <name>ts</name></decl></parameter>,
+					 <parameter><decl><type><name>RepOriginId</name></type> <name>nodeid</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>pageno</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>int</name></type>			<name>slotno</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>i</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>LWLockAcquire</name><argument_list>(<argument><expr><name>CommitTsControlLock</name></expr></argument>, <argument><expr><name>LW_EXCLUSIVE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>slotno</name> <operator>=</operator> <call><name>SimpleLruReadPage</name><argument_list>(<argument><expr><name>CommitTsCtl</name></expr></argument>, <argument><expr><name>pageno</name></expr></argument>, <argument><expr><name>true</name></expr></argument>, <argument><expr><name>xid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>TransactionIdSetCommitTs</name><argument_list>(<argument><expr><name>xid</name></expr></argument>, <argument><expr><name>ts</name></expr></argument>, <argument><expr><name>nodeid</name></expr></argument>, <argument><expr><name>slotno</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name>nsubxids</name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>TransactionIdSetCommitTs</name><argument_list>(<argument><expr><name><name>subxids</name><index>[<expr><name>i</name></expr>]</index></name></expr></argument>, <argument><expr><name>ts</name></expr></argument>, <argument><expr><name>nodeid</name></expr></argument>, <argument><expr><name>slotno</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></for>
+
+	<expr_stmt><expr><name><name>CommitTsCtl</name><operator>-&gt;</operator><name>shared</name><operator>-&gt;</operator><name>page_dirty</name><index>[<expr><name>slotno</name></expr>]</index></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><name>CommitTsControlLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Sets the commit timestamp of a single transaction.
+ *
+ * Must be called with CommitTsControlLock held
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>TransactionIdSetCommitTs</name><parameter_list>(<parameter><decl><type><name>TransactionId</name></type> <name>xid</name></decl></parameter>, <parameter><decl><type><name>TimestampTz</name></type> <name>ts</name></decl></parameter>,
+						 <parameter><decl><type><name>RepOriginId</name></type> <name>nodeid</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>slotno</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>int</name></type>			<name>entryno</name> <init>= <expr><call><name>TransactionIdToCTsEntry</name><argument_list>(<argument><expr><name>xid</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>CommitTimestampEntry</name></type> <name>entry</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>TransactionIdIsNormal</name><argument_list>(<argument><expr><name>xid</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name><name>entry</name><operator>.</operator><name>time</name></name> <operator>=</operator> <name>ts</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>entry</name><operator>.</operator><name>nodeid</name></name> <operator>=</operator> <name>nodeid</name></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>memcpy</name><argument_list>(<argument><expr><name><name>CommitTsCtl</name><operator>-&gt;</operator><name>shared</name><operator>-&gt;</operator><name>page_buffer</name><index>[<expr><name>slotno</name></expr>]</index></name> <operator>+</operator>
+		   <name>SizeOfCommitTimestampEntry</name> <operator>*</operator> <name>entryno</name></expr></argument>,
+		   <argument><expr><operator>&amp;</operator><name>entry</name></expr></argument>, <argument><expr><name>SizeOfCommitTimestampEntry</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Interrogate the commit timestamp of a transaction.
+ *
+ * The return value indicates whether a commit timestamp record was found for
+ * the given xid.  The timestamp value is returned in *ts (which may not be
+ * null), and the origin node for the Xid is returned in *nodeid, if it's not
+ * null.
+ */</comment>
+<function><type><name>bool</name></type>
+<name>TransactionIdGetCommitTsData</name><parameter_list>(<parameter><decl><type><name>TransactionId</name></type> <name>xid</name></decl></parameter>, <parameter><decl><type><name>TimestampTz</name> <modifier>*</modifier></type><name>ts</name></decl></parameter>,
+							 <parameter><decl><type><name>RepOriginId</name> <modifier>*</modifier></type><name>nodeid</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>int</name></type>			<name>pageno</name> <init>= <expr><call><name>TransactionIdToCTsPage</name><argument_list>(<argument><expr><name>xid</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>entryno</name> <init>= <expr><call><name>TransactionIdToCTsEntry</name><argument_list>(<argument><expr><name>xid</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>slotno</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>CommitTimestampEntry</name></type> <name>entry</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>TransactionId</name></type> <name>oldestCommitTsXid</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>TransactionId</name></type> <name>newestCommitTsXid</name></decl>;</decl_stmt>
+
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>TransactionIdIsValid</name><argument_list>(<argument><expr><name>xid</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_INVALID_PARAMETER_VALUE</name></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"cannot retrieve commit timestamp for transaction %u"</literal></expr></argument>, <argument><expr><name>xid</name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if>
+	<if type="elseif">else if <condition>(<expr><operator>!</operator><call><name>TransactionIdIsNormal</name><argument_list>(<argument><expr><name>xid</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* frozen and bootstrap xids are always committed far in the past */</comment>
+		<expr_stmt><expr><operator>*</operator><name>ts</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+		<if_stmt><if>if <condition>(<expr><name>nodeid</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><operator>*</operator><name>nodeid</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt></block_content></block></if></if_stmt>
+		<return>return <expr><name>false</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>LWLockAcquire</name><argument_list>(<argument><expr><name>CommitTsLock</name></expr></argument>, <argument><expr><name>LW_SHARED</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Error if module not enabled */</comment>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><name><name>commitTsShared</name><operator>-&gt;</operator><name>commitTsActive</name></name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>error_commit_ts_disabled</name><argument_list>()</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<comment type="block">/*
+	 * If we're asked for the cached value, return that.  Otherwise, fall
+	 * through to read from SLRU.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>commitTsShared</name><operator>-&gt;</operator><name>xidLastCommit</name></name> <operator>==</operator> <name>xid</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><operator>*</operator><name>ts</name> <operator>=</operator> <name><name>commitTsShared</name><operator>-&gt;</operator><name>dataLastCommit</name><operator>.</operator><name>time</name></name></expr>;</expr_stmt>
+		<if_stmt><if>if <condition>(<expr><name>nodeid</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><operator>*</operator><name>nodeid</name> <operator>=</operator> <name><name>commitTsShared</name><operator>-&gt;</operator><name>dataLastCommit</name><operator>.</operator><name>nodeid</name></name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+		<expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><name>CommitTsLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<return>return <expr><operator>*</operator><name>ts</name> <operator>!=</operator> <literal type="number">0</literal></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<expr_stmt><expr><name>oldestCommitTsXid</name> <operator>=</operator> <name><name>ShmemVariableCache</name><operator>-&gt;</operator><name>oldestCommitTsXid</name></name></expr>;</expr_stmt>
+	<expr_stmt><expr><name>newestCommitTsXid</name> <operator>=</operator> <name><name>ShmemVariableCache</name><operator>-&gt;</operator><name>newestCommitTsXid</name></name></expr>;</expr_stmt>
+	<comment type="block">/* neither is invalid, or both are */</comment>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>TransactionIdIsValid</name><argument_list>(<argument><expr><name>oldestCommitTsXid</name></expr></argument>)</argument_list></call> <operator>==</operator> <call><name>TransactionIdIsValid</name><argument_list>(<argument><expr><name>newestCommitTsXid</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><name>CommitTsLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Return empty if the requested value is outside our valid range.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>TransactionIdIsValid</name><argument_list>(<argument><expr><name>oldestCommitTsXid</name></expr></argument>)</argument_list></call> <operator>||</operator>
+		<call><name>TransactionIdPrecedes</name><argument_list>(<argument><expr><name>xid</name></expr></argument>, <argument><expr><name>oldestCommitTsXid</name></expr></argument>)</argument_list></call> <operator>||</operator>
+		<call><name>TransactionIdPrecedes</name><argument_list>(<argument><expr><name>newestCommitTsXid</name></expr></argument>, <argument><expr><name>xid</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><operator>*</operator><name>ts</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+		<if_stmt><if>if <condition>(<expr><name>nodeid</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><operator>*</operator><name>nodeid</name> <operator>=</operator> <name>InvalidRepOriginId</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+		<return>return <expr><name>false</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/* lock is acquired by SimpleLruReadPage_ReadOnly */</comment>
+	<expr_stmt><expr><name>slotno</name> <operator>=</operator> <call><name>SimpleLruReadPage_ReadOnly</name><argument_list>(<argument><expr><name>CommitTsCtl</name></expr></argument>, <argument><expr><name>pageno</name></expr></argument>, <argument><expr><name>xid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>memcpy</name><argument_list>(<argument><expr><operator>&amp;</operator><name>entry</name></expr></argument>,
+		   <argument><expr><name><name>CommitTsCtl</name><operator>-&gt;</operator><name>shared</name><operator>-&gt;</operator><name>page_buffer</name><index>[<expr><name>slotno</name></expr>]</index></name> <operator>+</operator>
+		   <name>SizeOfCommitTimestampEntry</name> <operator>*</operator> <name>entryno</name></expr></argument>,
+		   <argument><expr><name>SizeOfCommitTimestampEntry</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><operator>*</operator><name>ts</name> <operator>=</operator> <name><name>entry</name><operator>.</operator><name>time</name></name></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><name>nodeid</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><operator>*</operator><name>nodeid</name> <operator>=</operator> <name><name>entry</name><operator>.</operator><name>nodeid</name></name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><name>CommitTsControlLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<return>return <expr><operator>*</operator><name>ts</name> <operator>!=</operator> <literal type="number">0</literal></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Return the Xid of the latest committed transaction.  (As far as this module
+ * is concerned, anyway; it's up to the caller to ensure the value is useful
+ * for its purposes.)
+ *
+ * ts and extra are filled with the corresponding data; they can be passed
+ * as NULL if not wanted.
+ */</comment>
+<function><type><name>TransactionId</name></type>
+<name>GetLatestCommitTsData</name><parameter_list>(<parameter><decl><type><name>TimestampTz</name> <modifier>*</modifier></type><name>ts</name></decl></parameter>, <parameter><decl><type><name>RepOriginId</name> <modifier>*</modifier></type><name>nodeid</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>TransactionId</name></type> <name>xid</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>LWLockAcquire</name><argument_list>(<argument><expr><name>CommitTsLock</name></expr></argument>, <argument><expr><name>LW_SHARED</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Error if module not enabled */</comment>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><name><name>commitTsShared</name><operator>-&gt;</operator><name>commitTsActive</name></name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>error_commit_ts_disabled</name><argument_list>()</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><name>xid</name> <operator>=</operator> <name><name>commitTsShared</name><operator>-&gt;</operator><name>xidLastCommit</name></name></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><name>ts</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><operator>*</operator><name>ts</name> <operator>=</operator> <name><name>commitTsShared</name><operator>-&gt;</operator><name>dataLastCommit</name><operator>.</operator><name>time</name></name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	<if_stmt><if>if <condition>(<expr><name>nodeid</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><operator>*</operator><name>nodeid</name> <operator>=</operator> <name><name>commitTsShared</name><operator>-&gt;</operator><name>dataLastCommit</name><operator>.</operator><name>nodeid</name></name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	<expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><name>CommitTsLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<return>return <expr><name>xid</name></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>error_commit_ts_disabled</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+			<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE</name></expr></argument>)</argument_list></call><operator>,</operator>
+			 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"could not get commit timestamp data"</literal></expr></argument>)</argument_list></call><operator>,</operator>
+			 <ternary><condition><expr><call><name>RecoveryInProgress</name><argument_list>()</argument_list></call></expr> ?</condition><then>
+			 <expr><call><name>errhint</name><argument_list>(<argument><expr><literal type="string">"Make sure the configuration parameter \"%s\" is set on the master server."</literal></expr></argument>,
+					 <argument><expr><literal type="string">"track_commit_timestamp"</literal></expr></argument>)</argument_list></call></expr> </then><else>:
+			 <expr><call><name>errhint</name><argument_list>(<argument><expr><literal type="string">"Make sure the configuration parameter \"%s\" is set."</literal></expr></argument>,
+					 <argument><expr><literal type="string">"track_commit_timestamp"</literal></expr></argument>)</argument_list></call></expr></else></ternary><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * SQL-callable wrapper to obtain commit time of a transaction
+ */</comment>
+<function><type><name>Datum</name></type>
+<name>pg_xact_commit_timestamp</name><parameter_list>(<parameter><decl><type><name>PG_FUNCTION_ARGS</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>TransactionId</name></type> <name>xid</name> <init>= <expr><call><name>PG_GETARG_UINT32</name><argument_list>(<argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>TimestampTz</name></type> <name>ts</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type>		<name>found</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name>found</name> <operator>=</operator> <call><name>TransactionIdGetCommitTsData</name><argument_list>(<argument><expr><name>xid</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>ts</name></expr></argument>, <argument><expr><name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><name>found</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>PG_RETURN_NULL</name><argument_list>()</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>PG_RETURN_TIMESTAMPTZ</name><argument_list>(<argument><expr><name>ts</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+
+<function><type><name>Datum</name></type>
+<name>pg_last_committed_xact</name><parameter_list>(<parameter><decl><type><name>PG_FUNCTION_ARGS</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>TransactionId</name></type> <name>xid</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>TimestampTz</name></type> <name>ts</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Datum</name></type>		<name><name>values</name><index>[<expr><literal type="number">2</literal></expr>]</index></name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type>		<name><name>nulls</name><index>[<expr><literal type="number">2</literal></expr>]</index></name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>TupleDesc</name></type>	<name>tupdesc</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>HeapTuple</name></type>	<name>htup</name></decl>;</decl_stmt>
+
+	<comment type="block">/* and construct a tuple with our data */</comment>
+	<expr_stmt><expr><name>xid</name> <operator>=</operator> <call><name>GetLatestCommitTsData</name><argument_list>(<argument><expr><operator>&amp;</operator><name>ts</name></expr></argument>, <argument><expr><name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Construct a tuple descriptor for the result row.  This must match this
+	 * function's pg_proc entry!
+	 */</comment>
+	<expr_stmt><expr><name>tupdesc</name> <operator>=</operator> <call><name>CreateTemplateTupleDesc</name><argument_list>(<argument><expr><literal type="number">2</literal></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>TupleDescInitEntry</name><argument_list>(<argument><expr><name>tupdesc</name></expr></argument>, <argument><expr><operator>(</operator><name>AttrNumber</name><operator>)</operator> <literal type="number">1</literal></expr></argument>, <argument><expr><literal type="string">"xid"</literal></expr></argument>,
+					   <argument><expr><name>XIDOID</name></expr></argument>, <argument><expr><operator>-</operator><literal type="number">1</literal></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>TupleDescInitEntry</name><argument_list>(<argument><expr><name>tupdesc</name></expr></argument>, <argument><expr><operator>(</operator><name>AttrNumber</name><operator>)</operator> <literal type="number">2</literal></expr></argument>, <argument><expr><literal type="string">"timestamp"</literal></expr></argument>,
+					   <argument><expr><name>TIMESTAMPTZOID</name></expr></argument>, <argument><expr><operator>-</operator><literal type="number">1</literal></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>tupdesc</name> <operator>=</operator> <call><name>BlessTupleDesc</name><argument_list>(<argument><expr><name>tupdesc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>TransactionIdIsNormal</name><argument_list>(<argument><expr><name>xid</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><name>nulls</name></expr></argument>, <argument><expr><name>true</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>nulls</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<else>else
+	<block>{<block_content>
+		<expr_stmt><expr><name><name>values</name><index>[<expr><literal type="number">0</literal></expr>]</index></name> <operator>=</operator> <call><name>TransactionIdGetDatum</name><argument_list>(<argument><expr><name>xid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>nulls</name><index>[<expr><literal type="number">0</literal></expr>]</index></name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+
+		<expr_stmt><expr><name><name>values</name><index>[<expr><literal type="number">1</literal></expr>]</index></name> <operator>=</operator> <call><name>TimestampTzGetDatum</name><argument_list>(<argument><expr><name>ts</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>nulls</name><index>[<expr><literal type="number">1</literal></expr>]</index></name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+	</block_content>}</block></else></if_stmt>
+
+	<expr_stmt><expr><name>htup</name> <operator>=</operator> <call><name>heap_form_tuple</name><argument_list>(<argument><expr><name>tupdesc</name></expr></argument>, <argument><expr><name>values</name></expr></argument>, <argument><expr><name>nulls</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>PG_RETURN_DATUM</name><argument_list>(<argument><expr><call><name>HeapTupleGetDatum</name><argument_list>(<argument><expr><name>htup</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * Number of shared CommitTS buffers.
+ *
+ * We use a very similar logic as for the number of CLOG buffers; see comments
+ * in CLOGShmemBuffers.
+ */</comment>
+<function><type><name>Size</name></type>
+<name>CommitTsShmemBuffers</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<return>return <expr><call><name>Min</name><argument_list>(<argument><expr><literal type="number">16</literal></expr></argument>, <argument><expr><call><name>Max</name><argument_list>(<argument><expr><literal type="number">4</literal></expr></argument>, <argument><expr><name>NBuffers</name> <operator>/</operator> <literal type="number">1024</literal></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Shared memory sizing for CommitTs
+ */</comment>
+<function><type><name>Size</name></type>
+<name>CommitTsShmemSize</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<return>return <expr><call><name>SimpleLruShmemSize</name><argument_list>(<argument><expr><call><name>CommitTsShmemBuffers</name><argument_list>()</argument_list></call></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call> <operator>+</operator>
+		<sizeof>sizeof<argument_list>(<argument><expr><name>CommitTimestampShared</name></expr></argument>)</argument_list></sizeof></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Initialize CommitTs at system startup (postmaster start or standalone
+ * backend)
+ */</comment>
+<function><type><name>void</name></type>
+<name>CommitTsShmemInit</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>bool</name></type>		<name>found</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name><name>CommitTsCtl</name><operator>-&gt;</operator><name>PagePrecedes</name></name> <operator>=</operator> <name>CommitTsPagePrecedes</name></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>SimpleLruInit</name><argument_list>(<argument><expr><name>CommitTsCtl</name></expr></argument>, <argument><expr><literal type="string">"commit_timestamp"</literal></expr></argument>, <argument><expr><call><name>CommitTsShmemBuffers</name><argument_list>()</argument_list></call></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>,
+				  <argument><expr><name>CommitTsControlLock</name></expr></argument>, <argument><expr><literal type="string">"pg_commit_ts"</literal></expr></argument>,
+				  <argument><expr><name>LWTRANCHE_COMMITTS_BUFFERS</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>commitTsShared</name> <operator>=</operator> <call><name>ShmemInitStruct</name><argument_list>(<argument><expr><literal type="string">"CommitTs shared"</literal></expr></argument>,
+									 <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>CommitTimestampShared</name></expr></argument>)</argument_list></sizeof></expr></argument>,
+									 <argument><expr><operator>&amp;</operator><name>found</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><name>IsUnderPostmaster</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><operator>!</operator><name>found</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><name><name>commitTsShared</name><operator>-&gt;</operator><name>xidLastCommit</name></name> <operator>=</operator> <name>InvalidTransactionId</name></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>TIMESTAMP_NOBEGIN</name><argument_list>(<argument><expr><name><name>commitTsShared</name><operator>-&gt;</operator><name>dataLastCommit</name><operator>.</operator><name>time</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>commitTsShared</name><operator>-&gt;</operator><name>dataLastCommit</name><operator>.</operator><name>nodeid</name></name> <operator>=</operator> <name>InvalidRepOriginId</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>commitTsShared</name><operator>-&gt;</operator><name>commitTsActive</name></name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<else>else<block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>found</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></else></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * This function must be called ONCE on system install.
+ *
+ * (The CommitTs directory is assumed to have been created by initdb, and
+ * CommitTsShmemInit must have been called already.)
+ */</comment>
+<function><type><name>void</name></type>
+<name>BootStrapCommitTs</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<comment type="block">/*
+	 * Nothing to do here at present, unlike most other SLRU modules; segments
+	 * are created when the server is started with this module enabled. See
+	 * ActivateCommitTs.
+	 */</comment>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Initialize (or reinitialize) a page of CommitTs to zeroes.
+ * If writeXlog is true, also emit an XLOG record saying we did this.
+ *
+ * The page is not actually written, just set up in shared memory.
+ * The slot number of the new page is returned.
+ *
+ * Control lock must be held at entry, and will be held at exit.
+ */</comment>
+<function><type><specifier>static</specifier> <name>int</name></type>
+<name>ZeroCommitTsPage</name><parameter_list>(<parameter><decl><type><name>int</name></type> <name>pageno</name></decl></parameter>, <parameter><decl><type><name>bool</name></type> <name>writeXlog</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>int</name></type>			<name>slotno</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name>slotno</name> <operator>=</operator> <call><name>SimpleLruZeroPage</name><argument_list>(<argument><expr><name>CommitTsCtl</name></expr></argument>, <argument><expr><name>pageno</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>writeXlog</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>WriteZeroPageXlogRec</name><argument_list>(<argument><expr><name>pageno</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<return>return <expr><name>slotno</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * This must be called ONCE during postmaster or standalone-backend startup,
+ * after StartupXLOG has initialized ShmemVariableCache-&gt;nextXid.
+ */</comment>
+<function><type><name>void</name></type>
+<name>StartupCommitTs</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>ActivateCommitTs</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * This must be called ONCE during postmaster or standalone-backend startup,
+ * after recovery has finished.
+ */</comment>
+<function><type><name>void</name></type>
+<name>CompleteCommitTsInitialization</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<comment type="block">/*
+	 * If the feature is not enabled, turn it off for good.  This also removes
+	 * any leftover data.
+	 *
+	 * Conversely, we activate the module if the feature is enabled.  This is
+	 * necessary for primary and standby as the activation depends on the
+	 * control file contents at the beginning of recovery or when a
+	 * XLOG_PARAMETER_CHANGE is replayed.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><name>track_commit_timestamp</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>DeactivateCommitTs</name><argument_list>()</argument_list></call></expr>;</expr_stmt></block_content></block></if>
+	<else>else<block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ActivateCommitTs</name><argument_list>()</argument_list></call></expr>;</expr_stmt></block_content></block></else></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Activate or deactivate CommitTs' upon reception of a XLOG_PARAMETER_CHANGE
+ * XLog record during recovery.
+ */</comment>
+<function><type><name>void</name></type>
+<name>CommitTsParameterChange</name><parameter_list>(<parameter><decl><type><name>bool</name></type> <name>newvalue</name></decl></parameter>, <parameter><decl><type><name>bool</name></type> <name>oldvalue</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<comment type="block">/*
+	 * If the commit_ts module is disabled in this server and we get word from
+	 * the master server that it is enabled there, activate it so that we can
+	 * replay future WAL records involving it; also mark it as active on
+	 * pg_control.  If the old value was already set, we already did this, so
+	 * don't do anything.
+	 *
+	 * If the module is disabled in the master, disable it here too, unless
+	 * the module is enabled locally.
+	 *
+	 * Note this only runs in the recovery process, so an unlocked read is
+	 * fine.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name>newvalue</name></expr>)</condition>
+	<block>{<block_content>
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><name><name>commitTsShared</name><operator>-&gt;</operator><name>commitTsActive</name></name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>ActivateCommitTs</name><argument_list>()</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	</block_content>}</block></if>
+	<if type="elseif">else if <condition>(<expr><name><name>commitTsShared</name><operator>-&gt;</operator><name>commitTsActive</name></name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>DeactivateCommitTs</name><argument_list>()</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Activate this module whenever necessary.
+ *		This must happen during postmaster or standalone-backend startup,
+ *		or during WAL replay anytime the track_commit_timestamp setting is
+ *		changed in the master.
+ *
+ * The reason why this SLRU needs separate activation/deactivation functions is
+ * that it can be enabled/disabled during start and the activation/deactivation
+ * on master is propagated to standby via replay. Other SLRUs don't have this
+ * property and they can be just initialized during normal startup.
+ *
+ * This is in charge of creating the currently active segment, if it's not
+ * already there.  The reason for this is that the server might have been
+ * running with this module disabled for a while and thus might have skipped
+ * the normal creation point.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>ActivateCommitTs</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>TransactionId</name></type> <name>xid</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>pageno</name></decl>;</decl_stmt>
+
+	<comment type="block">/* If we've done this already, there's nothing to do */</comment>
+	<expr_stmt><expr><call><name>LWLockAcquire</name><argument_list>(<argument><expr><name>CommitTsLock</name></expr></argument>, <argument><expr><name>LW_EXCLUSIVE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><name><name>commitTsShared</name><operator>-&gt;</operator><name>commitTsActive</name></name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><name>CommitTsLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<return>return;</return>
+	</block_content>}</block></if></if_stmt>
+	<expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><name>CommitTsLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>xid</name> <operator>=</operator> <name><name>ShmemVariableCache</name><operator>-&gt;</operator><name>nextXid</name></name></expr>;</expr_stmt>
+	<expr_stmt><expr><name>pageno</name> <operator>=</operator> <call><name>TransactionIdToCTsPage</name><argument_list>(<argument><expr><name>xid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Re-Initialize our idea of the latest page number.
+	 */</comment>
+	<expr_stmt><expr><call><name>LWLockAcquire</name><argument_list>(<argument><expr><name>CommitTsControlLock</name></expr></argument>, <argument><expr><name>LW_EXCLUSIVE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>CommitTsCtl</name><operator>-&gt;</operator><name>shared</name><operator>-&gt;</operator><name>latest_page_number</name></name> <operator>=</operator> <name>pageno</name></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><name>CommitTsControlLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * If CommitTs is enabled, but it wasn't in the previous server run, we
+	 * need to set the oldest and newest values to the next Xid; that way, we
+	 * will not try to read data that might not have been set.
+	 *
+	 * XXX does this have a problem if a server is started with commitTs
+	 * enabled, then started with commitTs disabled, then restarted with it
+	 * enabled again?  It doesn't look like it does, because there should be a
+	 * checkpoint that sets the value to InvalidTransactionId at end of
+	 * recovery; and so any chance of injecting new transactions without
+	 * CommitTs values would occur after the oldestCommitTsXid has been set to
+	 * Invalid temporarily.
+	 */</comment>
+	<expr_stmt><expr><call><name>LWLockAcquire</name><argument_list>(<argument><expr><name>CommitTsLock</name></expr></argument>, <argument><expr><name>LW_EXCLUSIVE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><name><name>ShmemVariableCache</name><operator>-&gt;</operator><name>oldestCommitTsXid</name></name> <operator>==</operator> <name>InvalidTransactionId</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name><name>ShmemVariableCache</name><operator>-&gt;</operator><name>oldestCommitTsXid</name></name> <operator>=</operator>
+			<name><name>ShmemVariableCache</name><operator>-&gt;</operator><name>newestCommitTsXid</name></name> <operator>=</operator> <call><name>ReadNewTransactionId</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+	<expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><name>CommitTsLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Create the current segment file, if necessary */</comment>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>SimpleLruDoesPhysicalPageExist</name><argument_list>(<argument><expr><name>CommitTsCtl</name></expr></argument>, <argument><expr><name>pageno</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>int</name></type>			<name>slotno</name></decl>;</decl_stmt>
+
+		<expr_stmt><expr><call><name>LWLockAcquire</name><argument_list>(<argument><expr><name>CommitTsControlLock</name></expr></argument>, <argument><expr><name>LW_EXCLUSIVE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name>slotno</name> <operator>=</operator> <call><name>ZeroCommitTsPage</name><argument_list>(<argument><expr><name>pageno</name></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>SimpleLruWritePage</name><argument_list>(<argument><expr><name>CommitTsCtl</name></expr></argument>, <argument><expr><name>slotno</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><operator>!</operator><name><name>CommitTsCtl</name><operator>-&gt;</operator><name>shared</name><operator>-&gt;</operator><name>page_dirty</name><index>[<expr><name>slotno</name></expr>]</index></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><name>CommitTsControlLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/* Change the activation status in shared memory. */</comment>
+	<expr_stmt><expr><call><name>LWLockAcquire</name><argument_list>(<argument><expr><name>CommitTsLock</name></expr></argument>, <argument><expr><name>LW_EXCLUSIVE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>commitTsShared</name><operator>-&gt;</operator><name>commitTsActive</name></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><name>CommitTsLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Deactivate this module.
+ *
+ * This must be called when the track_commit_timestamp parameter is turned off.
+ * This happens during postmaster or standalone-backend startup, or during WAL
+ * replay.
+ *
+ * Resets CommitTs into invalid state to make sure we don't hand back
+ * possibly-invalid data; also removes segments of old data.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>DeactivateCommitTs</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<comment type="block">/*
+	 * Cleanup the status in the shared memory.
+	 *
+	 * We reset everything in the commitTsShared record to prevent user from
+	 * getting confusing data about last committed transaction on the standby
+	 * when the module was activated repeatedly on the primary.
+	 */</comment>
+	<expr_stmt><expr><call><name>LWLockAcquire</name><argument_list>(<argument><expr><name>CommitTsLock</name></expr></argument>, <argument><expr><name>LW_EXCLUSIVE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name><name>commitTsShared</name><operator>-&gt;</operator><name>commitTsActive</name></name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>commitTsShared</name><operator>-&gt;</operator><name>xidLastCommit</name></name> <operator>=</operator> <name>InvalidTransactionId</name></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>TIMESTAMP_NOBEGIN</name><argument_list>(<argument><expr><name><name>commitTsShared</name><operator>-&gt;</operator><name>dataLastCommit</name><operator>.</operator><name>time</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>commitTsShared</name><operator>-&gt;</operator><name>dataLastCommit</name><operator>.</operator><name>nodeid</name></name> <operator>=</operator> <name>InvalidRepOriginId</name></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name><name>ShmemVariableCache</name><operator>-&gt;</operator><name>oldestCommitTsXid</name></name> <operator>=</operator> <name>InvalidTransactionId</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>ShmemVariableCache</name><operator>-&gt;</operator><name>newestCommitTsXid</name></name> <operator>=</operator> <name>InvalidTransactionId</name></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><name>CommitTsLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Remove *all* files.  This is necessary so that there are no leftover
+	 * files; in the case where this feature is later enabled after running
+	 * with it disabled for some time there may be a gap in the file sequence.
+	 * (We can probably tolerate out-of-sequence files, as they are going to
+	 * be overwritten anyway when we wrap around, but it seems better to be
+	 * tidy.)
+	 */</comment>
+	<expr_stmt><expr><call><name>LWLockAcquire</name><argument_list>(<argument><expr><name>CommitTsControlLock</name></expr></argument>, <argument><expr><name>LW_EXCLUSIVE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><operator>(</operator><name>void</name><operator>)</operator> <call><name>SlruScanDirectory</name><argument_list>(<argument><expr><name>CommitTsCtl</name></expr></argument>, <argument><expr><name>SlruScanDirCbDeleteAll</name></expr></argument>, <argument><expr><name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><name>CommitTsControlLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * This must be called ONCE during postmaster or standalone-backend shutdown
+ */</comment>
+<function><type><name>void</name></type>
+<name>ShutdownCommitTs</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<comment type="block">/* Flush dirty CommitTs pages to disk */</comment>
+	<expr_stmt><expr><call><name>SimpleLruFlush</name><argument_list>(<argument><expr><name>CommitTsCtl</name></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * fsync pg_commit_ts to ensure that any files flushed previously are
+	 * durably on disk.
+	 */</comment>
+	<expr_stmt><expr><call><name>fsync_fname</name><argument_list>(<argument><expr><literal type="string">"pg_commit_ts"</literal></expr></argument>, <argument><expr><name>true</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Perform a checkpoint --- either during shutdown, or on-the-fly
+ */</comment>
+<function><type><name>void</name></type>
+<name>CheckPointCommitTs</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<comment type="block">/* Flush dirty CommitTs pages to disk */</comment>
+	<expr_stmt><expr><call><name>SimpleLruFlush</name><argument_list>(<argument><expr><name>CommitTsCtl</name></expr></argument>, <argument><expr><name>true</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * fsync pg_commit_ts to ensure that any files flushed previously are
+	 * durably on disk.
+	 */</comment>
+	<expr_stmt><expr><call><name>fsync_fname</name><argument_list>(<argument><expr><literal type="string">"pg_commit_ts"</literal></expr></argument>, <argument><expr><name>true</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Make sure that CommitTs has room for a newly-allocated XID.
+ *
+ * NB: this is called while holding XidGenLock.  We want it to be very fast
+ * most of the time; even when it's not so fast, no actual I/O need happen
+ * unless we're forced to write out a dirty CommitTs or xlog page to make room
+ * in shared memory.
+ *
+ * NB: the current implementation relies on track_commit_timestamp being
+ * PGC_POSTMASTER.
+ */</comment>
+<function><type><name>void</name></type>
+<name>ExtendCommitTs</name><parameter_list>(<parameter><decl><type><name>TransactionId</name></type> <name>newestXact</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>int</name></type>			<name>pageno</name></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * Nothing to do if module not enabled.  Note we do an unlocked read of
+	 * the flag here, which is okay because this routine is only called from
+	 * GetNewTransactionId, which is never called in a standby.
+	 */</comment>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><operator>!</operator><name>InRecovery</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><name><name>commitTsShared</name><operator>-&gt;</operator><name>commitTsActive</name></name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return;</return></block_content></block></if></if_stmt>
+
+	<comment type="block">/*
+	 * No work except at first XID of a page.  But beware: just after
+	 * wraparound, the first XID of page zero is FirstNormalTransactionId.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><call><name>TransactionIdToCTsEntry</name><argument_list>(<argument><expr><name>newestXact</name></expr></argument>)</argument_list></call> <operator>!=</operator> <literal type="number">0</literal> <operator>&amp;&amp;</operator>
+		<operator>!</operator><call><name>TransactionIdEquals</name><argument_list>(<argument><expr><name>newestXact</name></expr></argument>, <argument><expr><name>FirstNormalTransactionId</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<return>return;</return></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><name>pageno</name> <operator>=</operator> <call><name>TransactionIdToCTsPage</name><argument_list>(<argument><expr><name>newestXact</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>LWLockAcquire</name><argument_list>(<argument><expr><name>CommitTsControlLock</name></expr></argument>, <argument><expr><name>LW_EXCLUSIVE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Zero the page and make an XLOG entry about it */</comment>
+	<expr_stmt><expr><call><name>ZeroCommitTsPage</name><argument_list>(<argument><expr><name>pageno</name></expr></argument>, <argument><expr><operator>!</operator><name>InRecovery</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><name>CommitTsControlLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Remove all CommitTs segments before the one holding the passed
+ * transaction ID.
+ *
+ * Note that we don't need to flush XLOG here.
+ */</comment>
+<function><type><name>void</name></type>
+<name>TruncateCommitTs</name><parameter_list>(<parameter><decl><type><name>TransactionId</name></type> <name>oldestXact</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>int</name></type>			<name>cutoffPage</name></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * The cutoff point is the start of the segment containing oldestXact. We
+	 * pass the *page* containing oldestXact to SimpleLruTruncate.
+	 */</comment>
+	<expr_stmt><expr><name>cutoffPage</name> <operator>=</operator> <call><name>TransactionIdToCTsPage</name><argument_list>(<argument><expr><name>oldestXact</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Check to see if there's any files that could be removed */</comment>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>SlruScanDirectory</name><argument_list>(<argument><expr><name>CommitTsCtl</name></expr></argument>, <argument><expr><name>SlruScanDirCbReportPresence</name></expr></argument>,
+						   <argument><expr><operator>&amp;</operator><name>cutoffPage</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<return>return;</return></block_content></block></if></if_stmt>					<comment type="block">/* nothing to remove */</comment>
+
+	<comment type="block">/* Write XLOG record */</comment>
+	<expr_stmt><expr><call><name>WriteTruncateXlogRec</name><argument_list>(<argument><expr><name>cutoffPage</name></expr></argument>, <argument><expr><name>oldestXact</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Now we can remove the old CommitTs segment(s) */</comment>
+	<expr_stmt><expr><call><name>SimpleLruTruncate</name><argument_list>(<argument><expr><name>CommitTsCtl</name></expr></argument>, <argument><expr><name>cutoffPage</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Set the limit values between which commit TS can be consulted.
+ */</comment>
+<function><type><name>void</name></type>
+<name>SetCommitTsLimit</name><parameter_list>(<parameter><decl><type><name>TransactionId</name></type> <name>oldestXact</name></decl></parameter>, <parameter><decl><type><name>TransactionId</name></type> <name>newestXact</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<comment type="block">/*
+	 * Be careful not to overwrite values that are either further into the
+	 * "future" or signal a disabled committs.
+	 */</comment>
+	<expr_stmt><expr><call><name>LWLockAcquire</name><argument_list>(<argument><expr><name>CommitTsLock</name></expr></argument>, <argument><expr><name>LW_EXCLUSIVE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><name><name>ShmemVariableCache</name><operator>-&gt;</operator><name>oldestCommitTsXid</name></name> <operator>!=</operator> <name>InvalidTransactionId</name></expr>)</condition>
+	<block>{<block_content>
+		<if_stmt><if>if <condition>(<expr><call><name>TransactionIdPrecedes</name><argument_list>(<argument><expr><name><name>ShmemVariableCache</name><operator>-&gt;</operator><name>oldestCommitTsXid</name></name></expr></argument>, <argument><expr><name>oldestXact</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><name><name>ShmemVariableCache</name><operator>-&gt;</operator><name>oldestCommitTsXid</name></name> <operator>=</operator> <name>oldestXact</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+		<if_stmt><if>if <condition>(<expr><call><name>TransactionIdPrecedes</name><argument_list>(<argument><expr><name>newestXact</name></expr></argument>, <argument><expr><name><name>ShmemVariableCache</name><operator>-&gt;</operator><name>newestCommitTsXid</name></name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><name><name>ShmemVariableCache</name><operator>-&gt;</operator><name>newestCommitTsXid</name></name> <operator>=</operator> <name>newestXact</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	</block_content>}</block></if>
+	<else>else
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>ShmemVariableCache</name><operator>-&gt;</operator><name>newestCommitTsXid</name></name> <operator>==</operator> <name>InvalidTransactionId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>ShmemVariableCache</name><operator>-&gt;</operator><name>oldestCommitTsXid</name></name> <operator>=</operator> <name>oldestXact</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>ShmemVariableCache</name><operator>-&gt;</operator><name>newestCommitTsXid</name></name> <operator>=</operator> <name>newestXact</name></expr>;</expr_stmt>
+	</block_content>}</block></else></if_stmt>
+	<expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><name>CommitTsLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Move forwards the oldest commitTS value that can be consulted
+ */</comment>
+<function><type><name>void</name></type>
+<name>AdvanceOldestCommitTsXid</name><parameter_list>(<parameter><decl><type><name>TransactionId</name></type> <name>oldestXact</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>LWLockAcquire</name><argument_list>(<argument><expr><name>CommitTsLock</name></expr></argument>, <argument><expr><name>LW_EXCLUSIVE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><name><name>ShmemVariableCache</name><operator>-&gt;</operator><name>oldestCommitTsXid</name></name> <operator>!=</operator> <name>InvalidTransactionId</name> <operator>&amp;&amp;</operator>
+		<call><name>TransactionIdPrecedes</name><argument_list>(<argument><expr><name><name>ShmemVariableCache</name><operator>-&gt;</operator><name>oldestCommitTsXid</name></name></expr></argument>, <argument><expr><name>oldestXact</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name><name>ShmemVariableCache</name><operator>-&gt;</operator><name>oldestCommitTsXid</name></name> <operator>=</operator> <name>oldestXact</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	<expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><name>CommitTsLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * Decide which of two commitTS page numbers is "older" for truncation
+ * purposes.
+ *
+ * We need to use comparison of TransactionIds here in order to do the right
+ * thing with wraparound XID arithmetic.  However, if we are asked about
+ * page number zero, we don't want to hand InvalidTransactionId to
+ * TransactionIdPrecedes: it'll get weird about permanent xact IDs.  So,
+ * offset both xids by FirstNormalTransactionId to avoid that.
+ */</comment>
+<function><type><specifier>static</specifier> <name>bool</name></type>
+<name>CommitTsPagePrecedes</name><parameter_list>(<parameter><decl><type><name>int</name></type> <name>page1</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>page2</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>TransactionId</name></type> <name>xid1</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>TransactionId</name></type> <name>xid2</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name>xid1</name> <operator>=</operator> <operator>(</operator><operator>(</operator><name>TransactionId</name><operator>)</operator> <name>page1</name><operator>)</operator> <operator>*</operator> <name>COMMIT_TS_XACTS_PER_PAGE</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name>xid1</name> <operator>+=</operator> <name>FirstNormalTransactionId</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name>xid2</name> <operator>=</operator> <operator>(</operator><operator>(</operator><name>TransactionId</name><operator>)</operator> <name>page2</name><operator>)</operator> <operator>*</operator> <name>COMMIT_TS_XACTS_PER_PAGE</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name>xid2</name> <operator>+=</operator> <name>FirstNormalTransactionId</name></expr>;</expr_stmt>
+
+	<return>return <expr><call><name>TransactionIdPrecedes</name><argument_list>(<argument><expr><name>xid1</name></expr></argument>, <argument><expr><name>xid2</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * Write a ZEROPAGE xlog record
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>WriteZeroPageXlogRec</name><parameter_list>(<parameter><decl><type><name>int</name></type> <name>pageno</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>XLogBeginInsert</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>XLogRegisterData</name><argument_list>(<argument><expr><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <operator>(</operator><operator>&amp;</operator><name>pageno</name><operator>)</operator></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>int</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><operator>(</operator><name>void</name><operator>)</operator> <call><name>XLogInsert</name><argument_list>(<argument><expr><name>RM_COMMIT_TS_ID</name></expr></argument>, <argument><expr><name>COMMIT_TS_ZEROPAGE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Write a TRUNCATE xlog record
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>WriteTruncateXlogRec</name><parameter_list>(<parameter><decl><type><name>int</name></type> <name>pageno</name></decl></parameter>, <parameter><decl><type><name>TransactionId</name></type> <name>oldestXid</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>xl_commit_ts_truncate</name></type> <name>xlrec</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name><name>xlrec</name><operator>.</operator><name>pageno</name></name> <operator>=</operator> <name>pageno</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>xlrec</name><operator>.</operator><name>oldestXid</name></name> <operator>=</operator> <name>oldestXid</name></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>XLogBeginInsert</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>XLogRegisterData</name><argument_list>(<argument><expr><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <operator>(</operator><operator>&amp;</operator><name>xlrec</name><operator>)</operator></expr></argument>, <argument><expr><name>SizeOfCommitTsTruncate</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><operator>(</operator><name>void</name><operator>)</operator> <call><name>XLogInsert</name><argument_list>(<argument><expr><name>RM_COMMIT_TS_ID</name></expr></argument>, <argument><expr><name>COMMIT_TS_TRUNCATE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Write a SETTS xlog record
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>WriteSetTimestampXlogRec</name><parameter_list>(<parameter><decl><type><name>TransactionId</name></type> <name>mainxid</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>nsubxids</name></decl></parameter>,
+						 <parameter><decl><type><name>TransactionId</name> <modifier>*</modifier></type><name>subxids</name></decl></parameter>, <parameter><decl><type><name>TimestampTz</name></type> <name>timestamp</name></decl></parameter>,
+						 <parameter><decl><type><name>RepOriginId</name></type> <name>nodeid</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>xl_commit_ts_set</name></type> <name>record</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name><name>record</name><operator>.</operator><name>timestamp</name></name> <operator>=</operator> <name>timestamp</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>record</name><operator>.</operator><name>nodeid</name></name> <operator>=</operator> <name>nodeid</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>record</name><operator>.</operator><name>mainxid</name></name> <operator>=</operator> <name>mainxid</name></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>XLogBeginInsert</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>XLogRegisterData</name><argument_list>(<argument><expr><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <operator>&amp;</operator><name>record</name></expr></argument>,
+					 <argument><expr><call><name>offsetof</name><argument_list>(<argument><expr><name>xl_commit_ts_set</name></expr></argument>, <argument><expr><name>mainxid</name></expr></argument>)</argument_list></call> <operator>+</operator>
+					 <sizeof>sizeof<argument_list>(<argument><expr><name>TransactionId</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>XLogRegisterData</name><argument_list>(<argument><expr><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <name>subxids</name></expr></argument>, <argument><expr><name>nsubxids</name> <operator>*</operator> <sizeof>sizeof<argument_list>(<argument><expr><name>TransactionId</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>XLogInsert</name><argument_list>(<argument><expr><name>RM_COMMIT_TS_ID</name></expr></argument>, <argument><expr><name>COMMIT_TS_SETTS</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * CommitTS resource manager's routines
+ */</comment>
+<function><type><name>void</name></type>
+<name>commit_ts_redo</name><parameter_list>(<parameter><decl><type><name>XLogReaderState</name> <modifier>*</modifier></type><name>record</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>uint8</name></type>		<name>info</name> <init>= <expr><call><name>XLogRecGetInfo</name><argument_list>(<argument><expr><name>record</name></expr></argument>)</argument_list></call> <operator>&amp;</operator> <operator>~</operator><name>XLR_INFO_MASK</name></expr></init></decl>;</decl_stmt>
+
+	<comment type="block">/* Backup blocks are not used in commit_ts records */</comment>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><operator>!</operator><call><name>XLogRecHasAnyBlockRefs</name><argument_list>(<argument><expr><name>record</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>info</name> <operator>==</operator> <name>COMMIT_TS_ZEROPAGE</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>int</name></type>			<name>pageno</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>int</name></type>			<name>slotno</name></decl>;</decl_stmt>
+
+		<expr_stmt><expr><call><name>memcpy</name><argument_list>(<argument><expr><operator>&amp;</operator><name>pageno</name></expr></argument>, <argument><expr><call><name>XLogRecGetData</name><argument_list>(<argument><expr><name>record</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>int</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><call><name>LWLockAcquire</name><argument_list>(<argument><expr><name>CommitTsControlLock</name></expr></argument>, <argument><expr><name>LW_EXCLUSIVE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><name>slotno</name> <operator>=</operator> <call><name>ZeroCommitTsPage</name><argument_list>(<argument><expr><name>pageno</name></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>SimpleLruWritePage</name><argument_list>(<argument><expr><name>CommitTsCtl</name></expr></argument>, <argument><expr><name>slotno</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><operator>!</operator><name><name>CommitTsCtl</name><operator>-&gt;</operator><name>shared</name><operator>-&gt;</operator><name>page_dirty</name><index>[<expr><name>slotno</name></expr>]</index></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><name>CommitTsControlLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<if type="elseif">else if <condition>(<expr><name>info</name> <operator>==</operator> <name>COMMIT_TS_TRUNCATE</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>xl_commit_ts_truncate</name> <modifier>*</modifier></type><name>trunc</name> <init>= <expr><operator>(</operator><name>xl_commit_ts_truncate</name> <operator>*</operator><operator>)</operator> <call><name>XLogRecGetData</name><argument_list>(<argument><expr><name>record</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+		<expr_stmt><expr><call><name>AdvanceOldestCommitTsXid</name><argument_list>(<argument><expr><name><name>trunc</name><operator>-&gt;</operator><name>oldestXid</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/*
+		 * During XLOG replay, latest_page_number isn't set up yet; insert a
+		 * suitable value to bypass the sanity test in SimpleLruTruncate.
+		 */</comment>
+		<expr_stmt><expr><name><name>CommitTsCtl</name><operator>-&gt;</operator><name>shared</name><operator>-&gt;</operator><name>latest_page_number</name></name> <operator>=</operator> <name><name>trunc</name><operator>-&gt;</operator><name>pageno</name></name></expr>;</expr_stmt>
+
+		<expr_stmt><expr><call><name>SimpleLruTruncate</name><argument_list>(<argument><expr><name>CommitTsCtl</name></expr></argument>, <argument><expr><name><name>trunc</name><operator>-&gt;</operator><name>pageno</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<if type="elseif">else if <condition>(<expr><name>info</name> <operator>==</operator> <name>COMMIT_TS_SETTS</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>xl_commit_ts_set</name> <modifier>*</modifier></type><name>setts</name> <init>= <expr><operator>(</operator><name>xl_commit_ts_set</name> <operator>*</operator><operator>)</operator> <call><name>XLogRecGetData</name><argument_list>(<argument><expr><name>record</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>int</name></type>			<name>nsubxids</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>TransactionId</name> <modifier>*</modifier></type><name>subxids</name></decl>;</decl_stmt>
+
+		<expr_stmt><expr><name>nsubxids</name> <operator>=</operator> <operator>(</operator><operator>(</operator><call><name>XLogRecGetDataLen</name><argument_list>(<argument><expr><name>record</name></expr></argument>)</argument_list></call> <operator>-</operator> <name>SizeOfCommitTsSet</name><operator>)</operator> <operator>/</operator>
+					<sizeof>sizeof<argument_list>(<argument><expr><name>TransactionId</name></expr></argument>)</argument_list></sizeof><operator>)</operator></expr>;</expr_stmt>
+		<if_stmt><if>if <condition>(<expr><name>nsubxids</name> <operator>&gt;</operator> <literal type="number">0</literal></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><name>subxids</name> <operator>=</operator> <call><name>palloc</name><argument_list>(<argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>TransactionId</name></expr></argument>)</argument_list></sizeof> <operator>*</operator> <name>nsubxids</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>memcpy</name><argument_list>(<argument><expr><name>subxids</name></expr></argument>,
+				   <argument><expr><call><name>XLogRecGetData</name><argument_list>(<argument><expr><name>record</name></expr></argument>)</argument_list></call> <operator>+</operator> <name>SizeOfCommitTsSet</name></expr></argument>,
+				   <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>TransactionId</name></expr></argument>)</argument_list></sizeof> <operator>*</operator> <name>nsubxids</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></if>
+		<else>else<block type="pseudo"><block_content>
+			<expr_stmt><expr><name>subxids</name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt></block_content></block></else></if_stmt>
+
+		<expr_stmt><expr><call><name>TransactionTreeSetCommitTsData</name><argument_list>(<argument><expr><name><name>setts</name><operator>-&gt;</operator><name>mainxid</name></name></expr></argument>, <argument><expr><name>nsubxids</name></expr></argument>, <argument><expr><name>subxids</name></expr></argument>,
+									   <argument><expr><name><name>setts</name><operator>-&gt;</operator><name>timestamp</name></name></expr></argument>, <argument><expr><name><name>setts</name><operator>-&gt;</operator><name>nodeid</name></name></expr></argument>, <argument><expr><name>true</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<if_stmt><if>if <condition>(<expr><name>subxids</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>pfree</name><argument_list>(<argument><expr><name>subxids</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	</block_content>}</block></if>
+	<else>else<block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>PANIC</name></expr></argument>, <argument><expr><literal type="string">"commit_ts_redo: unknown op code %u"</literal></expr></argument>, <argument><expr><name>info</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></else></if_stmt>
+</block_content>}</block></function>
+</unit>

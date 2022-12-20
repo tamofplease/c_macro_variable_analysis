@@ -1,0 +1,701 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<unit xmlns="http://www.srcML.org/srcML/src" xmlns:cpp="http://www.srcML.org/srcML/cpp" revision="1.0.0" language="C" filename="/cloned_projects/agensgraph/src/backend/access/spgist/spgtextproc.c"><comment type="block">/*-------------------------------------------------------------------------
+ *
+ * spgtextproc.c
+ *	  implementation of radix tree (compressed trie) over text
+ *
+ * In a text_ops SPGiST index, inner tuples can have a prefix which is the
+ * common prefix of all strings indexed under that tuple.  The node labels
+ * represent the next byte of the string(s) after the prefix.  Assuming we
+ * always use the longest possible prefix, we will get more than one node
+ * label unless the prefix length is restricted by SPGIST_MAX_PREFIX_LENGTH.
+ *
+ * To reconstruct the indexed string for any index entry, concatenate the
+ * inner-tuple prefixes and node labels starting at the root and working
+ * down to the leaf entry, then append the datum in the leaf entry.
+ * (While descending the tree, "level" is the number of bytes reconstructed
+ * so far.)
+ *
+ * However, there are two special cases for node labels: -1 indicates that
+ * there are no more bytes after the prefix-so-far, and -2 indicates that we
+ * had to split an existing allTheSame tuple (in such a case we have to create
+ * a node label that doesn't correspond to any string byte).  In either case,
+ * the node label does not contribute anything to the reconstructed string.
+ *
+ * Previously, we used a node label of zero for both special cases, but
+ * this was problematic because one can't tell whether a string ending at
+ * the current level can be pushed down into such a child node.  For
+ * backwards compatibility, we still support such node labels for reading;
+ * but no new entries will ever be pushed down into a zero-labeled child.
+ * No new entries ever get pushed into a -2-labeled child, either.
+ *
+ *
+ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1994, Regents of the University of California
+ *
+ * IDENTIFICATION
+ *			src/backend/access/spgist/spgtextproc.c
+ *
+ *-------------------------------------------------------------------------
+ */</comment>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"postgres.h"</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/spgist.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/pg_type.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"mb/pg_wchar.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/builtins.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/datum.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/pg_locale.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/varlena.h"</cpp:file></cpp:include>
+
+
+<comment type="block">/*
+ * In the worst case, an inner tuple in a text radix tree could have as many
+ * as 258 nodes (one for each possible byte value, plus the two special
+ * cases).  Each node can take 16 bytes on MAXALIGN=8 machines.  The inner
+ * tuple must fit on an index page of size BLCKSZ.  Rather than assuming we
+ * know the exact amount of overhead imposed by page headers, tuple headers,
+ * etc, we leave 100 bytes for that (the actual overhead should be no more
+ * than 56 bytes at this writing, so there is slop in this number).
+ * So we can safely create prefixes up to BLCKSZ - 258 * 16 - 100 bytes long.
+ * Unfortunately, because 258 * 16 is over 4K, there is no safe prefix length
+ * when BLCKSZ is less than 8K; it is always possible to get "SPGiST inner
+ * tuple size exceeds maximum" if there are too many distinct next-byte values
+ * at a given place in the tree.  Since use of nonstandard block sizes appears
+ * to be negligible in the field, we just live with that fact for now,
+ * choosing a max prefix size of 32 bytes when BLCKSZ is configured smaller
+ * than default.
+ */</comment>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>SPGIST_MAX_PREFIX_LENGTH</name></cpp:macro>	<cpp:value>Max((int) (BLCKSZ - 258 * 16 - 100), 32)</cpp:value></cpp:define>
+
+<comment type="block">/*
+ * Strategy for collation aware operator on text is equal to btree strategy
+ * plus value of 10.
+ *
+ * Current collation aware strategies and their corresponding btree strategies:
+ * 11 BTLessStrategyNumber
+ * 12 BTLessEqualStrategyNumber
+ * 14 BTGreaterEqualStrategyNumber
+ * 15 BTGreaterStrategyNumber
+ */</comment>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>SPG_STRATEGY_ADDITION</name></cpp:macro>	<cpp:value>(10)</cpp:value></cpp:define>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>SPG_IS_COLLATION_AWARE_STRATEGY</name><parameter_list>(<parameter><type><name>s</name></type></parameter>)</parameter_list></cpp:macro> <cpp:value>((s) &gt; SPG_STRATEGY_ADDITION \
+										 &amp;&amp; (s) != RTPrefixStrategyNumber)</cpp:value></cpp:define>
+
+<comment type="block">/* Struct for sorting values in picksplit */</comment>
+<typedef>typedef <type><struct>struct <name>spgNodePtr</name>
+<block>{
+	<decl_stmt><decl><type><name>Datum</name></type>		<name>d</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>i</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int16</name></type>		<name>c</name></decl>;</decl_stmt>
+}</block></struct></type> <name>spgNodePtr</name>;</typedef>
+
+
+<function><type><name>Datum</name></type>
+<name>spg_text_config</name><parameter_list>(<parameter><decl><type><name>PG_FUNCTION_ARGS</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<comment type="block">/* spgConfigIn *cfgin = (spgConfigIn *) PG_GETARG_POINTER(0); */</comment>
+	<decl_stmt><decl><type><name>spgConfigOut</name> <modifier>*</modifier></type><name>cfg</name> <init>= <expr><operator>(</operator><name>spgConfigOut</name> <operator>*</operator><operator>)</operator> <call><name>PG_GETARG_POINTER</name><argument_list>(<argument><expr><literal type="number">1</literal></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name><name>cfg</name><operator>-&gt;</operator><name>prefixType</name></name> <operator>=</operator> <name>TEXTOID</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>cfg</name><operator>-&gt;</operator><name>labelType</name></name> <operator>=</operator> <name>INT2OID</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>cfg</name><operator>-&gt;</operator><name>canReturnData</name></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>cfg</name><operator>-&gt;</operator><name>longValuesOK</name></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>	<comment type="block">/* suffixing will shorten long values */</comment>
+	<expr_stmt><expr><call><name>PG_RETURN_VOID</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Form a text datum from the given not-necessarily-null-terminated string,
+ * using short varlena header format if possible
+ */</comment>
+<function><type><specifier>static</specifier> <name>Datum</name></type>
+<name>formTextDatum</name><parameter_list>(<parameter><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>data</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>datalen</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>p</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name>p</name> <operator>=</operator> <operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <call><name>palloc</name><argument_list>(<argument><expr><name>datalen</name> <operator>+</operator> <name>VARHDRSZ</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>datalen</name> <operator>+</operator> <name>VARHDRSZ_SHORT</name> <operator>&lt;=</operator> <name>VARATT_SHORT_MAX</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>SET_VARSIZE_SHORT</name><argument_list>(<argument><expr><name>p</name></expr></argument>, <argument><expr><name>datalen</name> <operator>+</operator> <name>VARHDRSZ_SHORT</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<if_stmt><if>if <condition>(<expr><name>datalen</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>memcpy</name><argument_list>(<argument><expr><name>p</name> <operator>+</operator> <name>VARHDRSZ_SHORT</name></expr></argument>, <argument><expr><name>data</name></expr></argument>, <argument><expr><name>datalen</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	</block_content>}</block></if>
+	<else>else
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>SET_VARSIZE</name><argument_list>(<argument><expr><name>p</name></expr></argument>, <argument><expr><name>datalen</name> <operator>+</operator> <name>VARHDRSZ</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>memcpy</name><argument_list>(<argument><expr><name>p</name> <operator>+</operator> <name>VARHDRSZ</name></expr></argument>, <argument><expr><name>data</name></expr></argument>, <argument><expr><name>datalen</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></else></if_stmt>
+
+	<return>return <expr><call><name>PointerGetDatum</name><argument_list>(<argument><expr><name>p</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Find the length of the common prefix of a and b
+ */</comment>
+<function><type><specifier>static</specifier> <name>int</name></type>
+<name>commonPrefix</name><parameter_list>(<parameter><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>a</name></decl></parameter>, <parameter><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>b</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>lena</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>lenb</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>int</name></type>			<name>i</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+
+	<while>while <condition>(<expr><name>i</name> <operator>&lt;</operator> <name>lena</name> <operator>&amp;&amp;</operator> <name>i</name> <operator>&lt;</operator> <name>lenb</name> <operator>&amp;&amp;</operator> <operator>*</operator><name>a</name> <operator>==</operator> <operator>*</operator><name>b</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name>a</name><operator>++</operator></expr>;</expr_stmt>
+		<expr_stmt><expr><name>b</name><operator>++</operator></expr>;</expr_stmt>
+		<expr_stmt><expr><name>i</name><operator>++</operator></expr>;</expr_stmt>
+	</block_content>}</block></while>
+
+	<return>return <expr><name>i</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Binary search an array of int16 datums for a match to c
+ *
+ * On success, *i gets the match location; on failure, it gets where to insert
+ */</comment>
+<function><type><specifier>static</specifier> <name>bool</name></type>
+<name>searchChar</name><parameter_list>(<parameter><decl><type><name>Datum</name> <modifier>*</modifier></type><name>nodeLabels</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>nNodes</name></decl></parameter>, <parameter><decl><type><name>int16</name></type> <name>c</name></decl></parameter>, <parameter><decl><type><name>int</name> <modifier>*</modifier></type><name>i</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>int</name></type>			<name>StopLow</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>,
+				<decl><type ref="prev"/><name>StopHigh</name> <init>= <expr><name>nNodes</name></expr></init></decl>;</decl_stmt>
+
+	<while>while <condition>(<expr><name>StopLow</name> <operator>&lt;</operator> <name>StopHigh</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>int</name></type>			<name>StopMiddle</name> <init>= <expr><operator>(</operator><name>StopLow</name> <operator>+</operator> <name>StopHigh</name><operator>)</operator> <operator>&gt;&gt;</operator> <literal type="number">1</literal></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>int16</name></type>		<name>middle</name> <init>= <expr><call><name>DatumGetInt16</name><argument_list>(<argument><expr><name><name>nodeLabels</name><index>[<expr><name>StopMiddle</name></expr>]</index></name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name>c</name> <operator>&lt;</operator> <name>middle</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><name>StopHigh</name> <operator>=</operator> <name>StopMiddle</name></expr>;</expr_stmt></block_content></block></if>
+		<if type="elseif">else if <condition>(<expr><name>c</name> <operator>&gt;</operator> <name>middle</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><name>StopLow</name> <operator>=</operator> <name>StopMiddle</name> <operator>+</operator> <literal type="number">1</literal></expr>;</expr_stmt></block_content></block></if>
+		<else>else
+		<block>{<block_content>
+			<expr_stmt><expr><operator>*</operator><name>i</name> <operator>=</operator> <name>StopMiddle</name></expr>;</expr_stmt>
+			<return>return <expr><name>true</name></expr>;</return>
+		</block_content>}</block></else></if_stmt>
+	</block_content>}</block></while>
+
+	<expr_stmt><expr><operator>*</operator><name>i</name> <operator>=</operator> <name>StopHigh</name></expr>;</expr_stmt>
+	<return>return <expr><name>false</name></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><name>Datum</name></type>
+<name>spg_text_choose</name><parameter_list>(<parameter><decl><type><name>PG_FUNCTION_ARGS</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>spgChooseIn</name> <modifier>*</modifier></type><name>in</name> <init>= <expr><operator>(</operator><name>spgChooseIn</name> <operator>*</operator><operator>)</operator> <call><name>PG_GETARG_POINTER</name><argument_list>(<argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>spgChooseOut</name> <modifier>*</modifier></type><name>out</name> <init>= <expr><operator>(</operator><name>spgChooseOut</name> <operator>*</operator><operator>)</operator> <call><name>PG_GETARG_POINTER</name><argument_list>(<argument><expr><literal type="number">1</literal></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>text</name>	   <modifier>*</modifier></type><name>inText</name> <init>= <expr><call><name>DatumGetTextPP</name><argument_list>(<argument><expr><name><name>in</name><operator>-&gt;</operator><name>datum</name></name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>inStr</name> <init>= <expr><call><name>VARDATA_ANY</name><argument_list>(<argument><expr><name>inText</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>inSize</name> <init>= <expr><call><name>VARSIZE_ANY_EXHDR</name><argument_list>(<argument><expr><name>inText</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>prefixStr</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>prefixSize</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>commonLen</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int16</name></type>		<name>nodeChar</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>i</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+
+	<comment type="block">/* Check for prefix match, set nodeChar to first byte after prefix */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>in</name><operator>-&gt;</operator><name>hasPrefix</name></name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>text</name>	   <modifier>*</modifier></type><name>prefixText</name> <init>= <expr><call><name>DatumGetTextPP</name><argument_list>(<argument><expr><name><name>in</name><operator>-&gt;</operator><name>prefixDatum</name></name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+		<expr_stmt><expr><name>prefixStr</name> <operator>=</operator> <call><name>VARDATA_ANY</name><argument_list>(<argument><expr><name>prefixText</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name>prefixSize</name> <operator>=</operator> <call><name>VARSIZE_ANY_EXHDR</name><argument_list>(<argument><expr><name>prefixText</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><name>commonLen</name> <operator>=</operator> <call><name>commonPrefix</name><argument_list>(<argument><expr><name>inStr</name> <operator>+</operator> <name><name>in</name><operator>-&gt;</operator><name>level</name></name></expr></argument>,
+								 <argument><expr><name>prefixStr</name></expr></argument>,
+								 <argument><expr><name>inSize</name> <operator>-</operator> <name><name>in</name><operator>-&gt;</operator><name>level</name></name></expr></argument>,
+								 <argument><expr><name>prefixSize</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name>commonLen</name> <operator>==</operator> <name>prefixSize</name></expr>)</condition>
+		<block>{<block_content>
+			<if_stmt><if>if <condition>(<expr><name>inSize</name> <operator>-</operator> <name><name>in</name><operator>-&gt;</operator><name>level</name></name> <operator>&gt;</operator> <name>commonLen</name></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><name>nodeChar</name> <operator>=</operator> <operator>*</operator><operator>(</operator><name>unsigned</name> <name>char</name> <operator>*</operator><operator>)</operator> <operator>(</operator><name>inStr</name> <operator>+</operator> <name><name>in</name><operator>-&gt;</operator><name>level</name></name> <operator>+</operator> <name>commonLen</name><operator>)</operator></expr>;</expr_stmt></block_content></block></if>
+			<else>else<block type="pseudo"><block_content>
+				<expr_stmt><expr><name>nodeChar</name> <operator>=</operator> <operator>-</operator><literal type="number">1</literal></expr>;</expr_stmt></block_content></block></else></if_stmt>
+		</block_content>}</block></if>
+		<else>else
+		<block>{<block_content>
+			<comment type="block">/* Must split tuple because incoming value doesn't match prefix */</comment>
+			<expr_stmt><expr><name><name>out</name><operator>-&gt;</operator><name>resultType</name></name> <operator>=</operator> <name>spgSplitTuple</name></expr>;</expr_stmt>
+
+			<if_stmt><if>if <condition>(<expr><name>commonLen</name> <operator>==</operator> <literal type="number">0</literal></expr>)</condition>
+			<block>{<block_content>
+				<expr_stmt><expr><name><name>out</name><operator>-&gt;</operator><name>result</name><operator>.</operator><name>splitTuple</name><operator>.</operator><name>prefixHasPrefix</name></name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+			</block_content>}</block></if>
+			<else>else
+			<block>{<block_content>
+				<expr_stmt><expr><name><name>out</name><operator>-&gt;</operator><name>result</name><operator>.</operator><name>splitTuple</name><operator>.</operator><name>prefixHasPrefix</name></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+				<expr_stmt><expr><name><name>out</name><operator>-&gt;</operator><name>result</name><operator>.</operator><name>splitTuple</name><operator>.</operator><name>prefixPrefixDatum</name></name> <operator>=</operator>
+					<call><name>formTextDatum</name><argument_list>(<argument><expr><name>prefixStr</name></expr></argument>, <argument><expr><name>commonLen</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			</block_content>}</block></else></if_stmt>
+			<expr_stmt><expr><name><name>out</name><operator>-&gt;</operator><name>result</name><operator>.</operator><name>splitTuple</name><operator>.</operator><name>prefixNNodes</name></name> <operator>=</operator> <literal type="number">1</literal></expr>;</expr_stmt>
+			<expr_stmt><expr><name><name>out</name><operator>-&gt;</operator><name>result</name><operator>.</operator><name>splitTuple</name><operator>.</operator><name>prefixNodeLabels</name></name> <operator>=</operator>
+				<operator>(</operator><name>Datum</name> <operator>*</operator><operator>)</operator> <call><name>palloc</name><argument_list>(<argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>Datum</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><name><name>out</name><operator>-&gt;</operator><name>result</name><operator>.</operator><name>splitTuple</name><operator>.</operator><name>prefixNodeLabels</name><index>[<expr><literal type="number">0</literal></expr>]</index></name> <operator>=</operator>
+				<call><name>Int16GetDatum</name><argument_list>(<argument><expr><operator>*</operator><operator>(</operator><name>unsigned</name> <name>char</name> <operator>*</operator><operator>)</operator> <operator>(</operator><name>prefixStr</name> <operator>+</operator> <name>commonLen</name><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+			<expr_stmt><expr><name><name>out</name><operator>-&gt;</operator><name>result</name><operator>.</operator><name>splitTuple</name><operator>.</operator><name>childNodeN</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+
+			<if_stmt><if>if <condition>(<expr><name>prefixSize</name> <operator>-</operator> <name>commonLen</name> <operator>==</operator> <literal type="number">1</literal></expr>)</condition>
+			<block>{<block_content>
+				<expr_stmt><expr><name><name>out</name><operator>-&gt;</operator><name>result</name><operator>.</operator><name>splitTuple</name><operator>.</operator><name>postfixHasPrefix</name></name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+			</block_content>}</block></if>
+			<else>else
+			<block>{<block_content>
+				<expr_stmt><expr><name><name>out</name><operator>-&gt;</operator><name>result</name><operator>.</operator><name>splitTuple</name><operator>.</operator><name>postfixHasPrefix</name></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+				<expr_stmt><expr><name><name>out</name><operator>-&gt;</operator><name>result</name><operator>.</operator><name>splitTuple</name><operator>.</operator><name>postfixPrefixDatum</name></name> <operator>=</operator>
+					<call><name>formTextDatum</name><argument_list>(<argument><expr><name>prefixStr</name> <operator>+</operator> <name>commonLen</name> <operator>+</operator> <literal type="number">1</literal></expr></argument>,
+								  <argument><expr><name>prefixSize</name> <operator>-</operator> <name>commonLen</name> <operator>-</operator> <literal type="number">1</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			</block_content>}</block></else></if_stmt>
+
+			<expr_stmt><expr><call><name>PG_RETURN_VOID</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></else></if_stmt>
+	</block_content>}</block></if>
+	<if type="elseif">else if <condition>(<expr><name>inSize</name> <operator>&gt;</operator> <name><name>in</name><operator>-&gt;</operator><name>level</name></name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name>nodeChar</name> <operator>=</operator> <operator>*</operator><operator>(</operator><name>unsigned</name> <name>char</name> <operator>*</operator><operator>)</operator> <operator>(</operator><name>inStr</name> <operator>+</operator> <name><name>in</name><operator>-&gt;</operator><name>level</name></name><operator>)</operator></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<else>else
+	<block>{<block_content>
+		<expr_stmt><expr><name>nodeChar</name> <operator>=</operator> <operator>-</operator><literal type="number">1</literal></expr>;</expr_stmt>
+	</block_content>}</block></else></if_stmt>
+
+	<comment type="block">/* Look up nodeChar in the node label array */</comment>
+	<if_stmt><if>if <condition>(<expr><call><name>searchChar</name><argument_list>(<argument><expr><name><name>in</name><operator>-&gt;</operator><name>nodeLabels</name></name></expr></argument>, <argument><expr><name><name>in</name><operator>-&gt;</operator><name>nNodes</name></name></expr></argument>, <argument><expr><name>nodeChar</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>i</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/*
+		 * Descend to existing node.  (If in-&gt;allTheSame, the core code will
+		 * ignore our nodeN specification here, but that's OK.  We still have
+		 * to provide the correct levelAdd and restDatum values, and those are
+		 * the same regardless of which node gets chosen by core.)
+		 */</comment>
+		<decl_stmt><decl><type><name>int</name></type>			<name>levelAdd</name></decl>;</decl_stmt>
+
+		<expr_stmt><expr><name><name>out</name><operator>-&gt;</operator><name>resultType</name></name> <operator>=</operator> <name>spgMatchNode</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>out</name><operator>-&gt;</operator><name>result</name><operator>.</operator><name>matchNode</name><operator>.</operator><name>nodeN</name></name> <operator>=</operator> <name>i</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name>levelAdd</name> <operator>=</operator> <name>commonLen</name></expr>;</expr_stmt>
+		<if_stmt><if>if <condition>(<expr><name>nodeChar</name> <operator>&gt;=</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><name>levelAdd</name><operator>++</operator></expr>;</expr_stmt></block_content></block></if></if_stmt>
+		<expr_stmt><expr><name><name>out</name><operator>-&gt;</operator><name>result</name><operator>.</operator><name>matchNode</name><operator>.</operator><name>levelAdd</name></name> <operator>=</operator> <name>levelAdd</name></expr>;</expr_stmt>
+		<if_stmt><if>if <condition>(<expr><name>inSize</name> <operator>-</operator> <name><name>in</name><operator>-&gt;</operator><name>level</name></name> <operator>-</operator> <name>levelAdd</name> <operator>&gt;</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><name><name>out</name><operator>-&gt;</operator><name>result</name><operator>.</operator><name>matchNode</name><operator>.</operator><name>restDatum</name></name> <operator>=</operator>
+				<call><name>formTextDatum</name><argument_list>(<argument><expr><name>inStr</name> <operator>+</operator> <name><name>in</name><operator>-&gt;</operator><name>level</name></name> <operator>+</operator> <name>levelAdd</name></expr></argument>,
+							  <argument><expr><name>inSize</name> <operator>-</operator> <name><name>in</name><operator>-&gt;</operator><name>level</name></name> <operator>-</operator> <name>levelAdd</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if>
+		<else>else<block type="pseudo"><block_content>
+			<expr_stmt><expr><name><name>out</name><operator>-&gt;</operator><name>result</name><operator>.</operator><name>matchNode</name><operator>.</operator><name>restDatum</name></name> <operator>=</operator>
+				<call><name>formTextDatum</name><argument_list>(<argument><expr><name>NULL</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></else></if_stmt>
+	</block_content>}</block></if>
+	<if type="elseif">else if <condition>(<expr><name><name>in</name><operator>-&gt;</operator><name>allTheSame</name></name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/*
+		 * Can't use AddNode action, so split the tuple.  The upper tuple has
+		 * the same prefix as before and uses a dummy node label -2 for the
+		 * lower tuple.  The lower tuple has no prefix and the same node
+		 * labels as the original tuple.
+		 *
+		 * Note: it might seem tempting to shorten the upper tuple's prefix,
+		 * if it has one, then use its last byte as label for the lower tuple.
+		 * But that doesn't win since we know the incoming value matches the
+		 * whole prefix: we'd just end up splitting the lower tuple again.
+		 */</comment>
+		<expr_stmt><expr><name><name>out</name><operator>-&gt;</operator><name>resultType</name></name> <operator>=</operator> <name>spgSplitTuple</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>out</name><operator>-&gt;</operator><name>result</name><operator>.</operator><name>splitTuple</name><operator>.</operator><name>prefixHasPrefix</name></name> <operator>=</operator> <name><name>in</name><operator>-&gt;</operator><name>hasPrefix</name></name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>out</name><operator>-&gt;</operator><name>result</name><operator>.</operator><name>splitTuple</name><operator>.</operator><name>prefixPrefixDatum</name></name> <operator>=</operator> <name><name>in</name><operator>-&gt;</operator><name>prefixDatum</name></name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>out</name><operator>-&gt;</operator><name>result</name><operator>.</operator><name>splitTuple</name><operator>.</operator><name>prefixNNodes</name></name> <operator>=</operator> <literal type="number">1</literal></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>out</name><operator>-&gt;</operator><name>result</name><operator>.</operator><name>splitTuple</name><operator>.</operator><name>prefixNodeLabels</name></name> <operator>=</operator> <operator>(</operator><name>Datum</name> <operator>*</operator><operator>)</operator> <call><name>palloc</name><argument_list>(<argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>Datum</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>out</name><operator>-&gt;</operator><name>result</name><operator>.</operator><name>splitTuple</name><operator>.</operator><name>prefixNodeLabels</name><index>[<expr><literal type="number">0</literal></expr>]</index></name> <operator>=</operator> <call><name>Int16GetDatum</name><argument_list>(<argument><expr><operator>-</operator><literal type="number">2</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>out</name><operator>-&gt;</operator><name>result</name><operator>.</operator><name>splitTuple</name><operator>.</operator><name>childNodeN</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>out</name><operator>-&gt;</operator><name>result</name><operator>.</operator><name>splitTuple</name><operator>.</operator><name>postfixHasPrefix</name></name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<else>else
+	<block>{<block_content>
+		<comment type="block">/* Add a node for the not-previously-seen nodeChar value */</comment>
+		<expr_stmt><expr><name><name>out</name><operator>-&gt;</operator><name>resultType</name></name> <operator>=</operator> <name>spgAddNode</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>out</name><operator>-&gt;</operator><name>result</name><operator>.</operator><name>addNode</name><operator>.</operator><name>nodeLabel</name></name> <operator>=</operator> <call><name>Int16GetDatum</name><argument_list>(<argument><expr><name>nodeChar</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>out</name><operator>-&gt;</operator><name>result</name><operator>.</operator><name>addNode</name><operator>.</operator><name>nodeN</name></name> <operator>=</operator> <name>i</name></expr>;</expr_stmt>
+	</block_content>}</block></else></if_stmt>
+
+	<expr_stmt><expr><call><name>PG_RETURN_VOID</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/* qsort comparator to sort spgNodePtr structs by "c" */</comment>
+<function><type><specifier>static</specifier> <name>int</name></type>
+<name>cmpNodePtr</name><parameter_list>(<parameter><decl><type><specifier>const</specifier> <name>void</name> <modifier>*</modifier></type><name>a</name></decl></parameter>, <parameter><decl><type><specifier>const</specifier> <name>void</name> <modifier>*</modifier></type><name>b</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><specifier>const</specifier> <name>spgNodePtr</name> <modifier>*</modifier></type><name>aa</name> <init>= <expr><operator>(</operator><specifier>const</specifier> <name>spgNodePtr</name> <operator>*</operator><operator>)</operator> <name>a</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><specifier>const</specifier> <name>spgNodePtr</name> <modifier>*</modifier></type><name>bb</name> <init>= <expr><operator>(</operator><specifier>const</specifier> <name>spgNodePtr</name> <operator>*</operator><operator>)</operator> <name>b</name></expr></init></decl>;</decl_stmt>
+
+	<return>return <expr><name><name>aa</name><operator>-&gt;</operator><name>c</name></name> <operator>-</operator> <name><name>bb</name><operator>-&gt;</operator><name>c</name></name></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><name>Datum</name></type>
+<name>spg_text_picksplit</name><parameter_list>(<parameter><decl><type><name>PG_FUNCTION_ARGS</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>spgPickSplitIn</name> <modifier>*</modifier></type><name>in</name> <init>= <expr><operator>(</operator><name>spgPickSplitIn</name> <operator>*</operator><operator>)</operator> <call><name>PG_GETARG_POINTER</name><argument_list>(<argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>spgPickSplitOut</name> <modifier>*</modifier></type><name>out</name> <init>= <expr><operator>(</operator><name>spgPickSplitOut</name> <operator>*</operator><operator>)</operator> <call><name>PG_GETARG_POINTER</name><argument_list>(<argument><expr><literal type="number">1</literal></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>text</name>	   <modifier>*</modifier></type><name>text0</name> <init>= <expr><call><name>DatumGetTextPP</name><argument_list>(<argument><expr><name><name>in</name><operator>-&gt;</operator><name>datums</name><index>[<expr><literal type="number">0</literal></expr>]</index></name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>i</name></decl>,
+				<decl><type ref="prev"/><name>commonLen</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>spgNodePtr</name> <modifier>*</modifier></type><name>nodes</name></decl>;</decl_stmt>
+
+	<comment type="block">/* Identify longest common prefix, if any */</comment>
+	<expr_stmt><expr><name>commonLen</name> <operator>=</operator> <call><name>VARSIZE_ANY_EXHDR</name><argument_list>(<argument><expr><name>text0</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">1</literal></expr>;</init> <condition><expr><name><name>i</name> <argument_list type="generic">&lt; <argument><expr><name><name>in</name><operator>-&gt;</operator><name>nTuples</name></name> <operator>&amp;&amp;</operator> <name>commonLen</name></expr></argument> &gt;</argument_list></name> <literal type="number">0</literal></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>text</name>	   <modifier>*</modifier></type><name>texti</name> <init>= <expr><call><name>DatumGetTextPP</name><argument_list>(<argument><expr><name><name>in</name><operator>-&gt;</operator><name>datums</name><index>[<expr><name>i</name></expr>]</index></name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>int</name></type>			<name>tmp</name> <init>= <expr><call><name>commonPrefix</name><argument_list>(<argument><expr><call><name>VARDATA_ANY</name><argument_list>(<argument><expr><name>text0</name></expr></argument>)</argument_list></call></expr></argument>,
+									   <argument><expr><call><name>VARDATA_ANY</name><argument_list>(<argument><expr><name>texti</name></expr></argument>)</argument_list></call></expr></argument>,
+									   <argument><expr><call><name>VARSIZE_ANY_EXHDR</name><argument_list>(<argument><expr><name>text0</name></expr></argument>)</argument_list></call></expr></argument>,
+									   <argument><expr><call><name>VARSIZE_ANY_EXHDR</name><argument_list>(<argument><expr><name>texti</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name>tmp</name> <operator>&lt;</operator> <name>commonLen</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><name>commonLen</name> <operator>=</operator> <name>tmp</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	</block_content>}</block></for>
+
+	<comment type="block">/*
+	 * Limit the prefix length, if necessary, to ensure that the resulting
+	 * inner tuple will fit on a page.
+	 */</comment>
+	<expr_stmt><expr><name>commonLen</name> <operator>=</operator> <call><name>Min</name><argument_list>(<argument><expr><name>commonLen</name></expr></argument>, <argument><expr><name>SPGIST_MAX_PREFIX_LENGTH</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Set node prefix to be that string, if it's not empty */</comment>
+	<if_stmt><if>if <condition>(<expr><name>commonLen</name> <operator>==</operator> <literal type="number">0</literal></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name><name>out</name><operator>-&gt;</operator><name>hasPrefix</name></name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<else>else
+	<block>{<block_content>
+		<expr_stmt><expr><name><name>out</name><operator>-&gt;</operator><name>hasPrefix</name></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>out</name><operator>-&gt;</operator><name>prefixDatum</name></name> <operator>=</operator> <call><name>formTextDatum</name><argument_list>(<argument><expr><call><name>VARDATA_ANY</name><argument_list>(<argument><expr><name>text0</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>commonLen</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></else></if_stmt>
+
+	<comment type="block">/* Extract the node label (first non-common byte) from each value */</comment>
+	<expr_stmt><expr><name>nodes</name> <operator>=</operator> <operator>(</operator><name>spgNodePtr</name> <operator>*</operator><operator>)</operator> <call><name>palloc</name><argument_list>(<argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>spgNodePtr</name></expr></argument>)</argument_list></sizeof> <operator>*</operator> <name><name>in</name><operator>-&gt;</operator><name>nTuples</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name><name>in</name><operator>-&gt;</operator><name>nTuples</name></name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>text</name>	   <modifier>*</modifier></type><name>texti</name> <init>= <expr><call><name>DatumGetTextPP</name><argument_list>(<argument><expr><name><name>in</name><operator>-&gt;</operator><name>datums</name><index>[<expr><name>i</name></expr>]</index></name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name>commonLen</name> <operator>&lt;</operator> <call><name>VARSIZE_ANY_EXHDR</name><argument_list>(<argument><expr><name>texti</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><name><name>nodes</name><index>[<expr><name>i</name></expr>]</index></name><operator>.</operator><name>c</name> <operator>=</operator> <operator>*</operator><operator>(</operator><name>unsigned</name> <name>char</name> <operator>*</operator><operator>)</operator> <operator>(</operator><call><name>VARDATA_ANY</name><argument_list>(<argument><expr><name>texti</name></expr></argument>)</argument_list></call> <operator>+</operator> <name>commonLen</name><operator>)</operator></expr>;</expr_stmt></block_content></block></if>
+		<else>else<block type="pseudo"><block_content>
+			<expr_stmt><expr><name><name>nodes</name><index>[<expr><name>i</name></expr>]</index></name><operator>.</operator><name>c</name> <operator>=</operator> <operator>-</operator><literal type="number">1</literal></expr>;</expr_stmt></block_content></block></else></if_stmt>	<comment type="block">/* use -1 if string is all common */</comment>
+		<expr_stmt><expr><name><name>nodes</name><index>[<expr><name>i</name></expr>]</index></name><operator>.</operator><name>i</name> <operator>=</operator> <name>i</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>nodes</name><index>[<expr><name>i</name></expr>]</index></name><operator>.</operator><name>d</name> <operator>=</operator> <name><name>in</name><operator>-&gt;</operator><name>datums</name><index>[<expr><name>i</name></expr>]</index></name></expr>;</expr_stmt>
+	</block_content>}</block></for>
+
+	<comment type="block">/*
+	 * Sort by label values so that we can group the values into nodes.  This
+	 * also ensures that the nodes are ordered by label value, allowing the
+	 * use of binary search in searchChar.
+	 */</comment>
+	<expr_stmt><expr><call><name>qsort</name><argument_list>(<argument><expr><name>nodes</name></expr></argument>, <argument><expr><name><name>in</name><operator>-&gt;</operator><name>nTuples</name></name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><operator>*</operator><name>nodes</name></expr></argument>)</argument_list></sizeof></expr></argument>, <argument><expr><name>cmpNodePtr</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* And emit results */</comment>
+	<expr_stmt><expr><name><name>out</name><operator>-&gt;</operator><name>nNodes</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>out</name><operator>-&gt;</operator><name>nodeLabels</name></name> <operator>=</operator> <operator>(</operator><name>Datum</name> <operator>*</operator><operator>)</operator> <call><name>palloc</name><argument_list>(<argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>Datum</name></expr></argument>)</argument_list></sizeof> <operator>*</operator> <name><name>in</name><operator>-&gt;</operator><name>nTuples</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>out</name><operator>-&gt;</operator><name>mapTuplesToNodes</name></name> <operator>=</operator> <operator>(</operator><name>int</name> <operator>*</operator><operator>)</operator> <call><name>palloc</name><argument_list>(<argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>int</name></expr></argument>)</argument_list></sizeof> <operator>*</operator> <name><name>in</name><operator>-&gt;</operator><name>nTuples</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>out</name><operator>-&gt;</operator><name>leafTupleDatums</name></name> <operator>=</operator> <operator>(</operator><name>Datum</name> <operator>*</operator><operator>)</operator> <call><name>palloc</name><argument_list>(<argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>Datum</name></expr></argument>)</argument_list></sizeof> <operator>*</operator> <name><name>in</name><operator>-&gt;</operator><name>nTuples</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name><name>in</name><operator>-&gt;</operator><name>nTuples</name></name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>text</name>	   <modifier>*</modifier></type><name>texti</name> <init>= <expr><call><name>DatumGetTextPP</name><argument_list>(<argument><expr><name><name>nodes</name><index>[<expr><name>i</name></expr>]</index></name><operator>.</operator><name>d</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>Datum</name></type>		<name>leafD</name></decl>;</decl_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name>i</name> <operator>==</operator> <literal type="number">0</literal> <operator>||</operator> <name><name>nodes</name><index>[<expr><name>i</name></expr>]</index></name><operator>.</operator><name>c</name> <operator>!=</operator> <name><name>nodes</name><index>[<expr><name>i</name> <operator>-</operator> <literal type="number">1</literal></expr>]</index></name><operator>.</operator><name>c</name></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><name><name>out</name><operator>-&gt;</operator><name>nodeLabels</name><index>[<expr><name><name>out</name><operator>-&gt;</operator><name>nNodes</name></name></expr>]</index></name> <operator>=</operator> <call><name>Int16GetDatum</name><argument_list>(<argument><expr><name><name>nodes</name><index>[<expr><name>i</name></expr>]</index></name><operator>.</operator><name>c</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><name><name>out</name><operator>-&gt;</operator><name>nNodes</name></name><operator>++</operator></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name>commonLen</name> <operator>&lt;</operator> <call><name>VARSIZE_ANY_EXHDR</name><argument_list>(<argument><expr><name>texti</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><name>leafD</name> <operator>=</operator> <call><name>formTextDatum</name><argument_list>(<argument><expr><call><name>VARDATA_ANY</name><argument_list>(<argument><expr><name>texti</name></expr></argument>)</argument_list></call> <operator>+</operator> <name>commonLen</name> <operator>+</operator> <literal type="number">1</literal></expr></argument>,
+								  <argument><expr><call><name>VARSIZE_ANY_EXHDR</name><argument_list>(<argument><expr><name>texti</name></expr></argument>)</argument_list></call> <operator>-</operator> <name>commonLen</name> <operator>-</operator> <literal type="number">1</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if>
+		<else>else<block type="pseudo"><block_content>
+			<expr_stmt><expr><name>leafD</name> <operator>=</operator> <call><name>formTextDatum</name><argument_list>(<argument><expr><name>NULL</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></else></if_stmt>
+
+		<expr_stmt><expr><name><name>out</name><operator>-&gt;</operator><name>leafTupleDatums</name><index>[<expr><name><name>nodes</name><index>[<expr><name>i</name></expr>]</index></name><operator>.</operator><name>i</name></expr>]</index></name> <operator>=</operator> <name>leafD</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>out</name><operator>-&gt;</operator><name>mapTuplesToNodes</name><index>[<expr><name><name>nodes</name><index>[<expr><name>i</name></expr>]</index></name><operator>.</operator><name>i</name></expr>]</index></name> <operator>=</operator> <name><name>out</name><operator>-&gt;</operator><name>nNodes</name></name> <operator>-</operator> <literal type="number">1</literal></expr>;</expr_stmt>
+	</block_content>}</block></for>
+
+	<expr_stmt><expr><call><name>PG_RETURN_VOID</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<function><type><name>Datum</name></type>
+<name>spg_text_inner_consistent</name><parameter_list>(<parameter><decl><type><name>PG_FUNCTION_ARGS</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>spgInnerConsistentIn</name> <modifier>*</modifier></type><name>in</name> <init>= <expr><operator>(</operator><name>spgInnerConsistentIn</name> <operator>*</operator><operator>)</operator> <call><name>PG_GETARG_POINTER</name><argument_list>(<argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>spgInnerConsistentOut</name> <modifier>*</modifier></type><name>out</name> <init>= <expr><operator>(</operator><name>spgInnerConsistentOut</name> <operator>*</operator><operator>)</operator> <call><name>PG_GETARG_POINTER</name><argument_list>(<argument><expr><literal type="number">1</literal></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type>		<name>collate_is_c</name> <init>= <expr><call><name>lc_collate_is_c</name><argument_list>(<argument><expr><call><name>PG_GET_COLLATION</name><argument_list>()</argument_list></call></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>text</name>	   <modifier>*</modifier></type><name>reconstructedValue</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>text</name>	   <modifier>*</modifier></type><name>reconstrText</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>maxReconstrLen</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>text</name>	   <modifier>*</modifier></type><name>prefixText</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>prefixSize</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>i</name></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * Reconstruct values represented at this tuple, including parent data,
+	 * prefix of this tuple if any, and the node label if it's non-dummy.
+	 * in-&gt;level should be the length of the previously reconstructed value,
+	 * and the number of bytes added here is prefixSize or prefixSize + 1.
+	 *
+	 * Note: we assume that in-&gt;reconstructedValue isn't toasted and doesn't
+	 * have a short varlena header.  This is okay because it must have been
+	 * created by a previous invocation of this routine, and we always emit
+	 * long-format reconstructed values.
+	 */</comment>
+	<expr_stmt><expr><name>reconstructedValue</name> <operator>=</operator> <operator>(</operator><name>text</name> <operator>*</operator><operator>)</operator> <call><name>DatumGetPointer</name><argument_list>(<argument><expr><name><name>in</name><operator>-&gt;</operator><name>reconstructedValue</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><ternary><condition><expr><name>reconstructedValue</name> <operator>==</operator> <name>NULL</name></expr> ?</condition><then> <expr><name><name>in</name><operator>-&gt;</operator><name>level</name></name> <operator>==</operator> <literal type="number">0</literal></expr> </then><else>:
+		   <expr><call><name>VARSIZE_ANY_EXHDR</name><argument_list>(<argument><expr><name>reconstructedValue</name></expr></argument>)</argument_list></call> <operator>==</operator> <name><name>in</name><operator>-&gt;</operator><name>level</name></name></expr></else></ternary></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>maxReconstrLen</name> <operator>=</operator> <name><name>in</name><operator>-&gt;</operator><name>level</name></name> <operator>+</operator> <literal type="number">1</literal></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><name><name>in</name><operator>-&gt;</operator><name>hasPrefix</name></name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name>prefixText</name> <operator>=</operator> <call><name>DatumGetTextPP</name><argument_list>(<argument><expr><name><name>in</name><operator>-&gt;</operator><name>prefixDatum</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name>prefixSize</name> <operator>=</operator> <call><name>VARSIZE_ANY_EXHDR</name><argument_list>(<argument><expr><name>prefixText</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name>maxReconstrLen</name> <operator>+=</operator> <name>prefixSize</name></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<expr_stmt><expr><name>reconstrText</name> <operator>=</operator> <call><name>palloc</name><argument_list>(<argument><expr><name>VARHDRSZ</name> <operator>+</operator> <name>maxReconstrLen</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>SET_VARSIZE</name><argument_list>(<argument><expr><name>reconstrText</name></expr></argument>, <argument><expr><name>VARHDRSZ</name> <operator>+</operator> <name>maxReconstrLen</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name><name>in</name><operator>-&gt;</operator><name>level</name></name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>memcpy</name><argument_list>(<argument><expr><call><name>VARDATA</name><argument_list>(<argument><expr><name>reconstrText</name></expr></argument>)</argument_list></call></expr></argument>,
+			   <argument><expr><call><name>VARDATA</name><argument_list>(<argument><expr><name>reconstructedValue</name></expr></argument>)</argument_list></call></expr></argument>,
+			   <argument><expr><name><name>in</name><operator>-&gt;</operator><name>level</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	<if_stmt><if>if <condition>(<expr><name>prefixSize</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>memcpy</name><argument_list>(<argument><expr><operator>(</operator><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <call><name>VARDATA</name><argument_list>(<argument><expr><name>reconstrText</name></expr></argument>)</argument_list></call><operator>)</operator> <operator>+</operator> <name><name>in</name><operator>-&gt;</operator><name>level</name></name></expr></argument>,
+			   <argument><expr><call><name>VARDATA_ANY</name><argument_list>(<argument><expr><name>prefixText</name></expr></argument>)</argument_list></call></expr></argument>,
+			   <argument><expr><name>prefixSize</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	<comment type="block">/* last byte of reconstrText will be filled in below */</comment>
+
+	<comment type="block">/*
+	 * Scan the child nodes.  For each one, complete the reconstructed value
+	 * and see if it's consistent with the query.  If so, emit an entry into
+	 * the output arrays.
+	 */</comment>
+	<expr_stmt><expr><name><name>out</name><operator>-&gt;</operator><name>nodeNumbers</name></name> <operator>=</operator> <operator>(</operator><name>int</name> <operator>*</operator><operator>)</operator> <call><name>palloc</name><argument_list>(<argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>int</name></expr></argument>)</argument_list></sizeof> <operator>*</operator> <name><name>in</name><operator>-&gt;</operator><name>nNodes</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>out</name><operator>-&gt;</operator><name>levelAdds</name></name> <operator>=</operator> <operator>(</operator><name>int</name> <operator>*</operator><operator>)</operator> <call><name>palloc</name><argument_list>(<argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>int</name></expr></argument>)</argument_list></sizeof> <operator>*</operator> <name><name>in</name><operator>-&gt;</operator><name>nNodes</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>out</name><operator>-&gt;</operator><name>reconstructedValues</name></name> <operator>=</operator> <operator>(</operator><name>Datum</name> <operator>*</operator><operator>)</operator> <call><name>palloc</name><argument_list>(<argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>Datum</name></expr></argument>)</argument_list></sizeof> <operator>*</operator> <name><name>in</name><operator>-&gt;</operator><name>nNodes</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>out</name><operator>-&gt;</operator><name>nNodes</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+
+	<for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name><name>in</name><operator>-&gt;</operator><name>nNodes</name></name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>int16</name></type>		<name>nodeChar</name> <init>= <expr><call><name>DatumGetInt16</name><argument_list>(<argument><expr><name><name>in</name><operator>-&gt;</operator><name>nodeLabels</name><index>[<expr><name>i</name></expr>]</index></name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>int</name></type>			<name>thisLen</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>bool</name></type>		<name>res</name> <init>= <expr><name>true</name></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>int</name></type>			<name>j</name></decl>;</decl_stmt>
+
+		<comment type="block">/* If nodeChar is a dummy value, don't include it in data */</comment>
+		<if_stmt><if>if <condition>(<expr><name>nodeChar</name> <operator>&lt;=</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><name>thisLen</name> <operator>=</operator> <name>maxReconstrLen</name> <operator>-</operator> <literal type="number">1</literal></expr>;</expr_stmt></block_content></block></if>
+		<else>else
+		<block>{<block_content>
+			<expr_stmt><expr><operator>(</operator><operator>(</operator><name>unsigned</name> <name>char</name> <operator>*</operator><operator>)</operator> <call><name>VARDATA</name><argument_list>(<argument><expr><name>reconstrText</name></expr></argument>)</argument_list></call><operator>)</operator><index>[<expr><name>maxReconstrLen</name> <operator>-</operator> <literal type="number">1</literal></expr>]</index> <operator>=</operator> <name>nodeChar</name></expr>;</expr_stmt>
+			<expr_stmt><expr><name>thisLen</name> <operator>=</operator> <name>maxReconstrLen</name></expr>;</expr_stmt>
+		</block_content>}</block></else></if_stmt>
+
+		<for>for <control>(<init><expr><name>j</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>j</name> <operator>&lt;</operator> <name><name>in</name><operator>-&gt;</operator><name>nkeys</name></name></expr>;</condition> <incr><expr><name>j</name><operator>++</operator></expr></incr>)</control>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>StrategyNumber</name></type> <name>strategy</name> <init>= <expr><name><name>in</name><operator>-&gt;</operator><name>scankeys</name><index>[<expr><name>j</name></expr>]</index></name><operator>.</operator><name>sk_strategy</name></expr></init></decl>;</decl_stmt>
+			<decl_stmt><decl><type><name>text</name>	   <modifier>*</modifier></type><name>inText</name></decl>;</decl_stmt>
+			<decl_stmt><decl><type><name>int</name></type>			<name>inSize</name></decl>;</decl_stmt>
+			<decl_stmt><decl><type><name>int</name></type>			<name>r</name></decl>;</decl_stmt>
+
+			<comment type="block">/*
+			 * If it's a collation-aware operator, but the collation is C, we
+			 * can treat it as non-collation-aware.  With non-C collation we
+			 * need to traverse whole tree :-( so there's no point in making
+			 * any check here.  (Note also that our reconstructed value may
+			 * well end with a partial multibyte character, so that applying
+			 * any encoding-sensitive test to it would be risky anyhow.)
+			 */</comment>
+			<if_stmt><if>if <condition>(<expr><call><name>SPG_IS_COLLATION_AWARE_STRATEGY</name><argument_list>(<argument><expr><name>strategy</name></expr></argument>)</argument_list></call></expr>)</condition>
+			<block>{<block_content>
+				<if_stmt><if>if <condition>(<expr><name>collate_is_c</name></expr>)</condition><block type="pseudo"><block_content>
+					<expr_stmt><expr><name>strategy</name> <operator>-=</operator> <name>SPG_STRATEGY_ADDITION</name></expr>;</expr_stmt></block_content></block></if>
+				<else>else<block type="pseudo"><block_content>
+					<continue>continue;</continue></block_content></block></else></if_stmt>
+			</block_content>}</block></if></if_stmt>
+
+			<expr_stmt><expr><name>inText</name> <operator>=</operator> <call><name>DatumGetTextPP</name><argument_list>(<argument><expr><name><name>in</name><operator>-&gt;</operator><name>scankeys</name><index>[<expr><name>j</name></expr>]</index></name><operator>.</operator><name>sk_argument</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><name>inSize</name> <operator>=</operator> <call><name>VARSIZE_ANY_EXHDR</name><argument_list>(<argument><expr><name>inText</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+			<expr_stmt><expr><name>r</name> <operator>=</operator> <call><name>memcmp</name><argument_list>(<argument><expr><call><name>VARDATA</name><argument_list>(<argument><expr><name>reconstrText</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><call><name>VARDATA_ANY</name><argument_list>(<argument><expr><name>inText</name></expr></argument>)</argument_list></call></expr></argument>,
+					   <argument><expr><call><name>Min</name><argument_list>(<argument><expr><name>inSize</name></expr></argument>, <argument><expr><name>thisLen</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+			<switch>switch <condition>(<expr><name>strategy</name></expr>)</condition>
+			<block>{<block_content>
+				<case>case <expr><name>BTLessStrategyNumber</name></expr>:</case>
+				<case>case <expr><name>BTLessEqualStrategyNumber</name></expr>:</case>
+					<if_stmt><if>if <condition>(<expr><name>r</name> <operator>&gt;</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+						<expr_stmt><expr><name>res</name> <operator>=</operator> <name>false</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+					<break>break;</break>
+				<case>case <expr><name>BTEqualStrategyNumber</name></expr>:</case>
+					<if_stmt><if>if <condition>(<expr><name>r</name> <operator>!=</operator> <literal type="number">0</literal> <operator>||</operator> <name>inSize</name> <operator>&lt;</operator> <name>thisLen</name></expr>)</condition><block type="pseudo"><block_content>
+						<expr_stmt><expr><name>res</name> <operator>=</operator> <name>false</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+					<break>break;</break>
+				<case>case <expr><name>BTGreaterEqualStrategyNumber</name></expr>:</case>
+				<case>case <expr><name>BTGreaterStrategyNumber</name></expr>:</case>
+					<if_stmt><if>if <condition>(<expr><name>r</name> <operator>&lt;</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+						<expr_stmt><expr><name>res</name> <operator>=</operator> <name>false</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+					<break>break;</break>
+				<case>case <expr><name>RTPrefixStrategyNumber</name></expr>:</case>
+					<if_stmt><if>if <condition>(<expr><name>r</name> <operator>!=</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+						<expr_stmt><expr><name>res</name> <operator>=</operator> <name>false</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+					<break>break;</break>
+				<default>default:</default>
+					<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"unrecognized strategy number: %d"</literal></expr></argument>,
+						 <argument><expr><name><name>in</name><operator>-&gt;</operator><name>scankeys</name><index>[<expr><name>j</name></expr>]</index></name><operator>.</operator><name>sk_strategy</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+					<break>break;</break>
+			</block_content>}</block></switch>
+
+			<if_stmt><if>if <condition>(<expr><operator>!</operator><name>res</name></expr>)</condition><block type="pseudo"><block_content>
+				<break>break;</break></block_content></block></if></if_stmt>			<comment type="block">/* no need to consider remaining conditions */</comment>
+		</block_content>}</block></for>
+
+		<if_stmt><if>if <condition>(<expr><name>res</name></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><name><name>out</name><operator>-&gt;</operator><name>nodeNumbers</name><index>[<expr><name><name>out</name><operator>-&gt;</operator><name>nNodes</name></name></expr>]</index></name> <operator>=</operator> <name>i</name></expr>;</expr_stmt>
+			<expr_stmt><expr><name><name>out</name><operator>-&gt;</operator><name>levelAdds</name><index>[<expr><name><name>out</name><operator>-&gt;</operator><name>nNodes</name></name></expr>]</index></name> <operator>=</operator> <name>thisLen</name> <operator>-</operator> <name><name>in</name><operator>-&gt;</operator><name>level</name></name></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>SET_VARSIZE</name><argument_list>(<argument><expr><name>reconstrText</name></expr></argument>, <argument><expr><name>VARHDRSZ</name> <operator>+</operator> <name>thisLen</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><name><name>out</name><operator>-&gt;</operator><name>reconstructedValues</name><index>[<expr><name><name>out</name><operator>-&gt;</operator><name>nNodes</name></name></expr>]</index></name> <operator>=</operator>
+				<call><name>datumCopy</name><argument_list>(<argument><expr><call><name>PointerGetDatum</name><argument_list>(<argument><expr><name>reconstrText</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>false</name></expr></argument>, <argument><expr><operator>-</operator><literal type="number">1</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><name><name>out</name><operator>-&gt;</operator><name>nNodes</name></name><operator>++</operator></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+	</block_content>}</block></for>
+
+	<expr_stmt><expr><call><name>PG_RETURN_VOID</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<function><type><name>Datum</name></type>
+<name>spg_text_leaf_consistent</name><parameter_list>(<parameter><decl><type><name>PG_FUNCTION_ARGS</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>spgLeafConsistentIn</name> <modifier>*</modifier></type><name>in</name> <init>= <expr><operator>(</operator><name>spgLeafConsistentIn</name> <operator>*</operator><operator>)</operator> <call><name>PG_GETARG_POINTER</name><argument_list>(<argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>spgLeafConsistentOut</name> <modifier>*</modifier></type><name>out</name> <init>= <expr><operator>(</operator><name>spgLeafConsistentOut</name> <operator>*</operator><operator>)</operator> <call><name>PG_GETARG_POINTER</name><argument_list>(<argument><expr><literal type="number">1</literal></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>level</name> <init>= <expr><name><name>in</name><operator>-&gt;</operator><name>level</name></name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>text</name>	   <modifier>*</modifier></type><name>leafValue</name></decl>,
+			   <decl><type ref="prev"><modifier>*</modifier></type><name>reconstrValue</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>fullValue</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>fullLen</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type>		<name>res</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>j</name></decl>;</decl_stmt>
+
+	<comment type="block">/* all tests are exact */</comment>
+	<expr_stmt><expr><name><name>out</name><operator>-&gt;</operator><name>recheck</name></name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>leafValue</name> <operator>=</operator> <call><name>DatumGetTextPP</name><argument_list>(<argument><expr><name><name>in</name><operator>-&gt;</operator><name>leafDatum</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* As above, in-&gt;reconstructedValue isn't toasted or short. */</comment>
+	<if_stmt><if>if <condition>(<expr><call><name>DatumGetPointer</name><argument_list>(<argument><expr><name><name>in</name><operator>-&gt;</operator><name>reconstructedValue</name></name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name>reconstrValue</name> <operator>=</operator> <operator>(</operator><name>text</name> <operator>*</operator><operator>)</operator> <call><name>DatumGetPointer</name><argument_list>(<argument><expr><name><name>in</name><operator>-&gt;</operator><name>reconstructedValue</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><ternary><condition><expr><name>reconstrValue</name> <operator>==</operator> <name>NULL</name></expr> ?</condition><then> <expr><name>level</name> <operator>==</operator> <literal type="number">0</literal></expr> </then><else>:
+		   <expr><call><name>VARSIZE_ANY_EXHDR</name><argument_list>(<argument><expr><name>reconstrValue</name></expr></argument>)</argument_list></call> <operator>==</operator> <name>level</name></expr></else></ternary></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Reconstruct the full string represented by this leaf tuple */</comment>
+	<expr_stmt><expr><name>fullLen</name> <operator>=</operator> <name>level</name> <operator>+</operator> <call><name>VARSIZE_ANY_EXHDR</name><argument_list>(<argument><expr><name>leafValue</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><call><name>VARSIZE_ANY_EXHDR</name><argument_list>(<argument><expr><name>leafValue</name></expr></argument>)</argument_list></call> <operator>==</operator> <literal type="number">0</literal> <operator>&amp;&amp;</operator> <name>level</name> <operator>&gt;</operator> <literal type="number">0</literal></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name>fullValue</name> <operator>=</operator> <call><name>VARDATA</name><argument_list>(<argument><expr><name>reconstrValue</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>out</name><operator>-&gt;</operator><name>leafValue</name></name> <operator>=</operator> <call><name>PointerGetDatum</name><argument_list>(<argument><expr><name>reconstrValue</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<else>else
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>text</name>	   <modifier>*</modifier></type><name>fullText</name> <init>= <expr><call><name>palloc</name><argument_list>(<argument><expr><name>VARHDRSZ</name> <operator>+</operator> <name>fullLen</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+		<expr_stmt><expr><call><name>SET_VARSIZE</name><argument_list>(<argument><expr><name>fullText</name></expr></argument>, <argument><expr><name>VARHDRSZ</name> <operator>+</operator> <name>fullLen</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name>fullValue</name> <operator>=</operator> <call><name>VARDATA</name><argument_list>(<argument><expr><name>fullText</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<if_stmt><if>if <condition>(<expr><name>level</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>memcpy</name><argument_list>(<argument><expr><name>fullValue</name></expr></argument>, <argument><expr><call><name>VARDATA</name><argument_list>(<argument><expr><name>reconstrValue</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>level</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+		<if_stmt><if>if <condition>(<expr><call><name>VARSIZE_ANY_EXHDR</name><argument_list>(<argument><expr><name>leafValue</name></expr></argument>)</argument_list></call> <operator>&gt;</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>memcpy</name><argument_list>(<argument><expr><name>fullValue</name> <operator>+</operator> <name>level</name></expr></argument>, <argument><expr><call><name>VARDATA_ANY</name><argument_list>(<argument><expr><name>leafValue</name></expr></argument>)</argument_list></call></expr></argument>,
+				   <argument><expr><call><name>VARSIZE_ANY_EXHDR</name><argument_list>(<argument><expr><name>leafValue</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+		<expr_stmt><expr><name><name>out</name><operator>-&gt;</operator><name>leafValue</name></name> <operator>=</operator> <call><name>PointerGetDatum</name><argument_list>(<argument><expr><name>fullText</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></else></if_stmt>
+
+	<comment type="block">/* Perform the required comparison(s) */</comment>
+	<expr_stmt><expr><name>res</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+	<for>for <control>(<init><expr><name>j</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>j</name> <operator>&lt;</operator> <name><name>in</name><operator>-&gt;</operator><name>nkeys</name></name></expr>;</condition> <incr><expr><name>j</name><operator>++</operator></expr></incr>)</control>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>StrategyNumber</name></type> <name>strategy</name> <init>= <expr><name><name>in</name><operator>-&gt;</operator><name>scankeys</name><index>[<expr><name>j</name></expr>]</index></name><operator>.</operator><name>sk_strategy</name></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>text</name>	   <modifier>*</modifier></type><name>query</name> <init>= <expr><call><name>DatumGetTextPP</name><argument_list>(<argument><expr><name><name>in</name><operator>-&gt;</operator><name>scankeys</name><index>[<expr><name>j</name></expr>]</index></name><operator>.</operator><name>sk_argument</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>int</name></type>			<name>queryLen</name> <init>= <expr><call><name>VARSIZE_ANY_EXHDR</name><argument_list>(<argument><expr><name>query</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>int</name></type>			<name>r</name></decl>;</decl_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name>strategy</name> <operator>==</operator> <name>RTPrefixStrategyNumber</name></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/*
+			 * if level &gt;= length of query then reconstrValue must begin with
+			 * query (prefix) string, so we don't need to check it again.
+			 */</comment>
+			<expr_stmt><expr><name>res</name> <operator>=</operator> <operator>(</operator><name>level</name> <operator>&gt;=</operator> <name>queryLen</name><operator>)</operator> <operator>||</operator>
+				<call><name>DatumGetBool</name><argument_list>(<argument><expr><call><name>DirectFunctionCall2Coll</name><argument_list>(<argument><expr><name>text_starts_with</name></expr></argument>,
+													 <argument><expr><call><name>PG_GET_COLLATION</name><argument_list>()</argument_list></call></expr></argument>,
+													 <argument><expr><name><name>out</name><operator>-&gt;</operator><name>leafValue</name></name></expr></argument>,
+													 <argument><expr><call><name>PointerGetDatum</name><argument_list>(<argument><expr><name>query</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+			<if_stmt><if>if <condition>(<expr><operator>!</operator><name>res</name></expr>)</condition><block type="pseudo"><block_content>			<comment type="block">/* no need to consider remaining conditions */</comment>
+				<break>break;</break></block_content></block></if></if_stmt>
+
+			<continue>continue;</continue>
+		</block_content>}</block></if></if_stmt>
+
+		<if_stmt><if>if <condition>(<expr><call><name>SPG_IS_COLLATION_AWARE_STRATEGY</name><argument_list>(<argument><expr><name>strategy</name></expr></argument>)</argument_list></call></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/* Collation-aware comparison */</comment>
+			<expr_stmt><expr><name>strategy</name> <operator>-=</operator> <name>SPG_STRATEGY_ADDITION</name></expr>;</expr_stmt>
+
+			<comment type="block">/* If asserts enabled, verify encoding of reconstructed string */</comment>
+			<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>pg_verifymbstr</name><argument_list>(<argument><expr><name>fullValue</name></expr></argument>, <argument><expr><name>fullLen</name></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+			<expr_stmt><expr><name>r</name> <operator>=</operator> <call><name>varstr_cmp</name><argument_list>(<argument><expr><name>fullValue</name></expr></argument>, <argument><expr><name>fullLen</name></expr></argument>,
+						   <argument><expr><call><name>VARDATA_ANY</name><argument_list>(<argument><expr><name>query</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>queryLen</name></expr></argument>,
+						   <argument><expr><call><name>PG_GET_COLLATION</name><argument_list>()</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></if>
+		<else>else
+		<block>{<block_content>
+			<comment type="block">/* Non-collation-aware comparison */</comment>
+			<expr_stmt><expr><name>r</name> <operator>=</operator> <call><name>memcmp</name><argument_list>(<argument><expr><name>fullValue</name></expr></argument>, <argument><expr><call><name>VARDATA_ANY</name><argument_list>(<argument><expr><name>query</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><call><name>Min</name><argument_list>(<argument><expr><name>queryLen</name></expr></argument>, <argument><expr><name>fullLen</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+			<if_stmt><if>if <condition>(<expr><name>r</name> <operator>==</operator> <literal type="number">0</literal></expr>)</condition>
+			<block>{<block_content>
+				<if_stmt><if>if <condition>(<expr><name>queryLen</name> <operator>&gt;</operator> <name>fullLen</name></expr>)</condition><block type="pseudo"><block_content>
+					<expr_stmt><expr><name>r</name> <operator>=</operator> <operator>-</operator><literal type="number">1</literal></expr>;</expr_stmt></block_content></block></if>
+				<if type="elseif">else if <condition>(<expr><name>queryLen</name> <operator>&lt;</operator> <name>fullLen</name></expr>)</condition><block type="pseudo"><block_content>
+					<expr_stmt><expr><name>r</name> <operator>=</operator> <literal type="number">1</literal></expr>;</expr_stmt></block_content></block></if></if_stmt>
+			</block_content>}</block></if></if_stmt>
+		</block_content>}</block></else></if_stmt>
+
+		<switch>switch <condition>(<expr><name>strategy</name></expr>)</condition>
+		<block>{<block_content>
+			<case>case <expr><name>BTLessStrategyNumber</name></expr>:</case>
+				<expr_stmt><expr><name>res</name> <operator>=</operator> <operator>(</operator><name>r</name> <operator>&lt;</operator> <literal type="number">0</literal><operator>)</operator></expr>;</expr_stmt>
+				<break>break;</break>
+			<case>case <expr><name>BTLessEqualStrategyNumber</name></expr>:</case>
+				<expr_stmt><expr><name>res</name> <operator>=</operator> <operator>(</operator><name>r</name> <operator>&lt;=</operator> <literal type="number">0</literal><operator>)</operator></expr>;</expr_stmt>
+				<break>break;</break>
+			<case>case <expr><name>BTEqualStrategyNumber</name></expr>:</case>
+				<expr_stmt><expr><name>res</name> <operator>=</operator> <operator>(</operator><name>r</name> <operator>==</operator> <literal type="number">0</literal><operator>)</operator></expr>;</expr_stmt>
+				<break>break;</break>
+			<case>case <expr><name>BTGreaterEqualStrategyNumber</name></expr>:</case>
+				<expr_stmt><expr><name>res</name> <operator>=</operator> <operator>(</operator><name>r</name> <operator>&gt;=</operator> <literal type="number">0</literal><operator>)</operator></expr>;</expr_stmt>
+				<break>break;</break>
+			<case>case <expr><name>BTGreaterStrategyNumber</name></expr>:</case>
+				<expr_stmt><expr><name>res</name> <operator>=</operator> <operator>(</operator><name>r</name> <operator>&gt;</operator> <literal type="number">0</literal><operator>)</operator></expr>;</expr_stmt>
+				<break>break;</break>
+			<default>default:</default>
+				<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"unrecognized strategy number: %d"</literal></expr></argument>,
+					 <argument><expr><name><name>in</name><operator>-&gt;</operator><name>scankeys</name><index>[<expr><name>j</name></expr>]</index></name><operator>.</operator><name>sk_strategy</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<expr_stmt><expr><name>res</name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+				<break>break;</break>
+		</block_content>}</block></switch>
+
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><name>res</name></expr>)</condition><block type="pseudo"><block_content>
+			<break>break;</break></block_content></block></if></if_stmt>				<comment type="block">/* no need to consider remaining conditions */</comment>
+	</block_content>}</block></for>
+
+	<expr_stmt><expr><call><name>PG_RETURN_BOOL</name><argument_list>(<argument><expr><name>res</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+</unit>

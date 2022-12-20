@@ -1,0 +1,557 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<unit xmlns="http://www.srcML.org/srcML/src" xmlns:cpp="http://www.srcML.org/srcML/cpp" revision="1.0.0" language="C" filename="/cloned_projects/citus/src/backend/distributed/transaction/transaction_recovery.c"><comment type="block">/*-------------------------------------------------------------------------
+ *
+ * transaction_recovery.c
+ *
+ * Routines for recovering two-phase commits started by this node if a
+ * failure occurs between prepare and commit/abort.
+ *
+ * Copyright (c) Citus Data, Inc.
+ *
+ * $Id$
+ *
+ *-------------------------------------------------------------------------
+ */</comment>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"postgres.h"</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/pg_version_constants.h"</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"miscadmin.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"libpq-fe.h"</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;sys/stat.h&gt;</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;unistd.h&gt;</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/genam.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/heapam.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/htup_details.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/relscan.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/xact.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/indexing.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/backend_data.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/connection_management.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/listutils.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/metadata_cache.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/pg_dist_transaction.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/remote_commands.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/resource_lock.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/transaction_recovery.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/worker_manager.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/version_compat.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"lib/stringinfo.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/lmgr.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/lock.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/builtins.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/fmgroids.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/memutils.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/rel.h"</cpp:file></cpp:include>
+
+
+<comment type="block">/* exports for SQL callable functions */</comment>
+<expr_stmt><expr><call><name>PG_FUNCTION_INFO_V1</name><argument_list>(<argument><expr><name>recover_prepared_transactions</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+
+<comment type="block">/* Local functions forward declarations */</comment>
+<function_decl><type><specifier>static</specifier> <name>int</name></type> <name>RecoverWorkerTransactions</name><parameter_list>(<parameter><decl><type><name>WorkerNode</name> <modifier>*</modifier></type><name>workerNode</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>List</name> <modifier>*</modifier></type> <name>PendingWorkerTransactionList</name><parameter_list>(<parameter><decl><type><name>MultiConnection</name> <modifier>*</modifier></type><name>connection</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>bool</name></type> <name>IsTransactionInProgress</name><parameter_list>(<parameter><decl><type><name>HTAB</name> <modifier>*</modifier></type><name>activeTransactionNumberSet</name></decl></parameter>,
+									<parameter><decl><type><name>char</name> <modifier>*</modifier></type><name>preparedTransactionName</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>bool</name></type> <name>RecoverPreparedTransactionOnWorker</name><parameter_list>(<parameter><decl><type><name>MultiConnection</name> <modifier>*</modifier></type><name>connection</name></decl></parameter>,
+											   <parameter><decl><type><name>char</name> <modifier>*</modifier></type><name>transactionName</name></decl></parameter>, <parameter><decl><type><name>bool</name></type> <name>shouldCommit</name></decl></parameter>)</parameter_list>;</function_decl>
+
+
+<comment type="block">/*
+ * recover_prepared_transactions recovers any pending prepared
+ * transactions started by this node on other nodes.
+ */</comment>
+<function><type><name>Datum</name></type>
+<name>recover_prepared_transactions</name><parameter_list>(<parameter><decl><type><name>PG_FUNCTION_ARGS</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>CheckCitusVersion</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<decl_stmt><decl><type><name>int</name></type> <name>recoveredTransactionCount</name> <init>= <expr><call><name>RecoverTwoPhaseCommits</name><argument_list>()</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>PG_RETURN_INT32</name><argument_list>(<argument><expr><name>recoveredTransactionCount</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * LogTransactionRecord registers the fact that a transaction has been
+ * prepared on a worker. The presence of this record indicates that the
+ * prepared transaction should be committed.
+ */</comment>
+<function><type><name>void</name></type>
+<name>LogTransactionRecord</name><parameter_list>(<parameter><decl><type><name>int32</name></type> <name>groupId</name></decl></parameter>, <parameter><decl><type><name>char</name> <modifier>*</modifier></type><name>transactionName</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>Datum</name></type> <name><name>values</name><index>[<expr><name>Natts_pg_dist_transaction</name></expr>]</index></name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type> <name><name>isNulls</name><index>[<expr><name>Natts_pg_dist_transaction</name></expr>]</index></name></decl>;</decl_stmt>
+
+	<comment type="block">/* form new transaction tuple */</comment>
+	<expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><name>values</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>values</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><name>isNulls</name></expr></argument>, <argument><expr><name>false</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>isNulls</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name><name>values</name><index>[<expr><name>Anum_pg_dist_transaction_groupid</name> <operator>-</operator> <literal type="number">1</literal></expr>]</index></name> <operator>=</operator> <call><name>Int32GetDatum</name><argument_list>(<argument><expr><name>groupId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>values</name><index>[<expr><name>Anum_pg_dist_transaction_gid</name> <operator>-</operator> <literal type="number">1</literal></expr>]</index></name> <operator>=</operator> <call><name>CStringGetTextDatum</name><argument_list>(<argument><expr><name>transactionName</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* open transaction relation and insert new tuple */</comment>
+	<decl_stmt><decl><type><name>Relation</name></type> <name>pgDistTransaction</name> <init>= <expr><call><name>table_open</name><argument_list>(<argument><expr><call><name>DistTransactionRelationId</name><argument_list>()</argument_list></call></expr></argument>,
+											<argument><expr><name>RowExclusiveLock</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<decl_stmt><decl><type><name>TupleDesc</name></type> <name>tupleDescriptor</name> <init>= <expr><call><name>RelationGetDescr</name><argument_list>(<argument><expr><name>pgDistTransaction</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>HeapTuple</name></type> <name>heapTuple</name> <init>= <expr><call><name>heap_form_tuple</name><argument_list>(<argument><expr><name>tupleDescriptor</name></expr></argument>, <argument><expr><name>values</name></expr></argument>, <argument><expr><name>isNulls</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>CatalogTupleInsert</name><argument_list>(<argument><expr><name>pgDistTransaction</name></expr></argument>, <argument><expr><name>heapTuple</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>CommandCounterIncrement</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* close relation and invalidate previous cache entry */</comment>
+	<expr_stmt><expr><call><name>table_close</name><argument_list>(<argument><expr><name>pgDistTransaction</name></expr></argument>, <argument><expr><name>NoLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * RecoverTwoPhaseCommits recovers any pending prepared
+ * transactions started by this node on other nodes.
+ */</comment>
+<function><type><name>int</name></type>
+<name>RecoverTwoPhaseCommits</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>int</name></type> <name>recoveredTransactionCount</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+
+	<comment type="block">/* take advisory lock first to avoid running concurrently */</comment>
+	<expr_stmt><expr><call><name>LockTransactionRecovery</name><argument_list>(<argument><expr><name>ShareUpdateExclusiveLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<decl_stmt><decl><type><name>List</name> <modifier>*</modifier></type><name>workerList</name> <init>= <expr><call><name>ActivePrimaryNodeList</name><argument_list>(<argument><expr><name>NoLock</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>WorkerNode</name> <modifier>*</modifier></type><name>workerNode</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+	<macro><name>foreach_ptr</name><argument_list>(<argument>workerNode</argument>, <argument>workerList</argument>)</argument_list></macro>
+	<block>{<block_content>
+		<expr_stmt><expr><name>recoveredTransactionCount</name> <operator>+=</operator> <call><name>RecoverWorkerTransactions</name><argument_list>(<argument><expr><name>workerNode</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block>
+
+	<return>return <expr><name>recoveredTransactionCount</name></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * RecoverWorkerTransactions recovers any pending prepared transactions
+ * started by this node on the specified worker.
+ */</comment>
+<function><type><specifier>static</specifier> <name>int</name></type>
+<name>RecoverWorkerTransactions</name><parameter_list>(<parameter><decl><type><name>WorkerNode</name> <modifier>*</modifier></type><name>workerNode</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>int</name></type> <name>recoveredTransactionCount</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+
+	<decl_stmt><decl><type><name>int32</name></type> <name>groupId</name> <init>= <expr><name><name>workerNode</name><operator>-&gt;</operator><name>groupId</name></name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>char</name> <modifier>*</modifier></type><name>nodeName</name> <init>= <expr><name><name>workerNode</name><operator>-&gt;</operator><name>workerName</name></name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type> <name>nodePort</name> <init>= <expr><name><name>workerNode</name><operator>-&gt;</operator><name>workerPort</name></name></expr></init></decl>;</decl_stmt>
+
+
+	<decl_stmt><decl><type><name>ScanKeyData</name></type> <name><name>scanKey</name><index>[<expr><literal type="number">1</literal></expr>]</index></name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type> <name>scanKeyCount</name> <init>= <expr><literal type="number">1</literal></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type> <name>indexOK</name> <init>= <expr><name>true</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>HeapTuple</name></type> <name>heapTuple</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+
+	<decl_stmt><decl><type><name>HASH_SEQ_STATUS</name></type> <name>status</name></decl>;</decl_stmt>
+
+	<decl_stmt><decl><type><name>bool</name></type> <name>recoveryFailed</name> <init>= <expr><name>false</name></expr></init></decl>;</decl_stmt>
+
+	<decl_stmt><decl><type><name>int</name></type> <name>connectionFlags</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>MultiConnection</name> <modifier>*</modifier></type><name>connection</name> <init>= <expr><call><name>GetNodeConnection</name><argument_list>(<argument><expr><name>connectionFlags</name></expr></argument>, <argument><expr><name>nodeName</name></expr></argument>, <argument><expr><name>nodePort</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<if_stmt><if>if <condition>(<expr><name><name>connection</name><operator>-&gt;</operator><name>pgConn</name></name> <operator>==</operator> <name>NULL</name> <operator>||</operator> <call><name>PQstatus</name><argument_list>(<argument><expr><name><name>connection</name><operator>-&gt;</operator><name>pgConn</name></name></expr></argument>)</argument_list></call> <operator>!=</operator> <name>CONNECTION_OK</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>WARNING</name></expr></argument>, <argument><expr><operator>(</operator><call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"transaction recovery cannot connect to %s:%d"</literal></expr></argument>,
+								 <argument><expr><name>nodeName</name></expr></argument>, <argument><expr><name>nodePort</name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<return>return <expr><literal type="number">0</literal></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<decl_stmt><decl><type><name>MemoryContext</name></type> <name>localContext</name> <init>= <expr><call><name>AllocSetContextCreateInternal</name><argument_list>(<argument><expr><name>CurrentMemoryContext</name></expr></argument>,
+															   <argument><expr><literal type="string">"RecoverWorkerTransactions"</literal></expr></argument>,
+															   <argument><expr><name>ALLOCSET_DEFAULT_MINSIZE</name></expr></argument>,
+															   <argument><expr><name>ALLOCSET_DEFAULT_INITSIZE</name></expr></argument>,
+															   <argument><expr><name>ALLOCSET_DEFAULT_MAXSIZE</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<decl_stmt><decl><type><name>MemoryContext</name></type> <name>oldContext</name> <init>= <expr><call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>localContext</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<decl_stmt><decl><type><name>Relation</name></type> <name>pgDistTransaction</name> <init>= <expr><call><name>table_open</name><argument_list>(<argument><expr><call><name>DistTransactionRelationId</name><argument_list>()</argument_list></call></expr></argument>,
+											<argument><expr><name>RowExclusiveLock</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>TupleDesc</name></type> <name>tupleDescriptor</name> <init>= <expr><call><name>RelationGetDescr</name><argument_list>(<argument><expr><name>pgDistTransaction</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * We're going to check the list of prepared transactions on the worker,
+	 * but some of those prepared transactions might belong to ongoing
+	 * distributed transactions.
+	 *
+	 * We could avoid this by temporarily blocking new prepared transactions
+	 * from being created by taking an ExclusiveLock on pg_dist_transaction.
+	 * However, this hurts write performance, so instead we avoid blocking
+	 * by consulting the list of active distributed transactions, and follow
+	 * a carefully chosen order to avoid race conditions:
+	 *
+	 * 1) P = prepared transactions on worker
+	 * 2) A = active distributed transactions
+	 * 3) T = pg_dist_transaction snapshot
+	 * 4) Q = prepared transactions on worker
+	 *
+	 * By observing A after P, we get a conclusive answer to which distributed
+	 * transactions we observed in P are still in progress. It is safe to recover
+	 * the transactions in P - A based on the presence or absence of a record
+	 * in T.
+	 *
+	 * We also remove records in T if there is no prepared transaction, which
+	 * we assume means the transaction committed. However, a transaction could
+	 * have left prepared transactions and committed between steps 1 and 2.
+	 * In that case, we would incorrectly remove the records, while the
+	 * prepared transaction is still in place.
+	 *
+	 * We therefore observe the set of prepared transactions one more time in
+	 * step 4. The aforementioned transactions would show up in Q, but not in
+	 * P. We can skip those transactions and recover them later.
+	 */</comment>
+
+	<comment type="block">/* find stale prepared transactions on the remote node */</comment>
+	<decl_stmt><decl><type><name>List</name> <modifier>*</modifier></type><name>pendingTransactionList</name> <init>= <expr><call><name>PendingWorkerTransactionList</name><argument_list>(<argument><expr><name>connection</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>HTAB</name> <modifier>*</modifier></type><name>pendingTransactionSet</name> <init>= <expr><call><name>ListToHashSet</name><argument_list>(<argument><expr><name>pendingTransactionList</name></expr></argument>, <argument><expr><name>NAMEDATALEN</name></expr></argument>,
+												<argument><expr><name>true</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<comment type="block">/* find in-progress distributed transactions */</comment>
+	<decl_stmt><decl><type><name>List</name> <modifier>*</modifier></type><name>activeTransactionNumberList</name> <init>= <expr><call><name>ActiveDistributedTransactionNumbers</name><argument_list>()</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>HTAB</name> <modifier>*</modifier></type><name>activeTransactionNumberSet</name> <init>= <expr><call><name>ListToHashSet</name><argument_list>(<argument><expr><name>activeTransactionNumberList</name></expr></argument>,
+													 <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>uint64</name></expr></argument>)</argument_list></sizeof></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<comment type="block">/* scan through all recovery records of the current worker */</comment>
+	<expr_stmt><expr><call><name>ScanKeyInit</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>scanKey</name><index>[<expr><literal type="number">0</literal></expr>]</index></name></expr></argument>, <argument><expr><name>Anum_pg_dist_transaction_groupid</name></expr></argument>,
+				<argument><expr><name>BTEqualStrategyNumber</name></expr></argument>, <argument><expr><name>F_INT4EQ</name></expr></argument>, <argument><expr><call><name>Int32GetDatum</name><argument_list>(<argument><expr><name>groupId</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* get a snapshot of pg_dist_transaction */</comment>
+	<decl_stmt><decl><type><name>SysScanDesc</name></type> <name>scanDescriptor</name> <init>= <expr><call><name>systable_beginscan</name><argument_list>(<argument><expr><name>pgDistTransaction</name></expr></argument>,
+													<argument><expr><call><name>DistTransactionGroupIndexId</name><argument_list>()</argument_list></call></expr></argument>,
+													<argument><expr><name>indexOK</name></expr></argument>,
+													<argument><expr><name>NULL</name></expr></argument>, <argument><expr><name>scanKeyCount</name></expr></argument>, <argument><expr><name>scanKey</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<comment type="block">/* find stale prepared transactions on the remote node */</comment>
+	<decl_stmt><decl><type><name>List</name> <modifier>*</modifier></type><name>recheckTransactionList</name> <init>= <expr><call><name>PendingWorkerTransactionList</name><argument_list>(<argument><expr><name>connection</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>HTAB</name> <modifier>*</modifier></type><name>recheckTransactionSet</name> <init>= <expr><call><name>ListToHashSet</name><argument_list>(<argument><expr><name>recheckTransactionList</name></expr></argument>, <argument><expr><name>NAMEDATALEN</name></expr></argument>,
+												<argument><expr><name>true</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<while>while <condition>(<expr><call><name>HeapTupleIsValid</name><argument_list>(<argument><expr><name>heapTuple</name> <operator>=</operator> <call><name>systable_getnext</name><argument_list>(<argument><expr><name>scanDescriptor</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>bool</name></type> <name>isNull</name> <init>= <expr><name>false</name></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>bool</name></type> <name>foundPreparedTransactionBeforeCommit</name> <init>= <expr><name>false</name></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>bool</name></type> <name>foundPreparedTransactionAfterCommit</name> <init>= <expr><name>false</name></expr></init></decl>;</decl_stmt>
+
+		<decl_stmt><decl><type><name>Datum</name></type> <name>transactionNameDatum</name> <init>= <expr><call><name>heap_getattr</name><argument_list>(<argument><expr><name>heapTuple</name></expr></argument>,
+												  <argument><expr><name>Anum_pg_dist_transaction_gid</name></expr></argument>,
+												  <argument><expr><name>tupleDescriptor</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>isNull</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>char</name> <modifier>*</modifier></type><name>transactionName</name> <init>= <expr><call><name>TextDatumGetCString</name><argument_list>(<argument><expr><name>transactionNameDatum</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+		<decl_stmt><decl><type><name>bool</name></type> <name>isTransactionInProgress</name> <init>= <expr><call><name>IsTransactionInProgress</name><argument_list>(<argument><expr><name>activeTransactionNumberSet</name></expr></argument>,
+															   <argument><expr><name>transactionName</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+		<if_stmt><if>if <condition>(<expr><name>isTransactionInProgress</name></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/*
+			 * Do not touch in progress transactions as we might mistakenly
+			 * commit a transaction that is actually in the process of
+			 * aborting or vice-versa.
+			 */</comment>
+			<continue>continue;</continue>
+		</block_content>}</block></if></if_stmt>
+
+		<comment type="block">/*
+		 * Remove the transaction from the pending list such that only transactions
+		 * that need to be aborted remain at the end.
+		 */</comment>
+		<expr_stmt><expr><call><name>hash_search</name><argument_list>(<argument><expr><name>pendingTransactionSet</name></expr></argument>, <argument><expr><name>transactionName</name></expr></argument>, <argument><expr><name>HASH_REMOVE</name></expr></argument>,
+					<argument><expr><operator>&amp;</operator><name>foundPreparedTransactionBeforeCommit</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><call><name>hash_search</name><argument_list>(<argument><expr><name>recheckTransactionSet</name></expr></argument>, <argument><expr><name>transactionName</name></expr></argument>, <argument><expr><name>HASH_FIND</name></expr></argument>,
+					<argument><expr><operator>&amp;</operator><name>foundPreparedTransactionAfterCommit</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name>foundPreparedTransactionBeforeCommit</name> <operator>&amp;&amp;</operator> <name>foundPreparedTransactionAfterCommit</name></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/*
+			 * The transaction was committed, but the prepared transaction still exists
+			 * on the worker. Try committing it.
+			 *
+			 * We double check that the recovery record exists both before and after
+			 * checking ActiveDistributedTransactionNumbers(), since we may have
+			 * observed a prepared transaction that was committed immediately after.
+			 */</comment>
+			<decl_stmt><decl><type><name>bool</name></type> <name>shouldCommit</name> <init>= <expr><name>true</name></expr></init></decl>;</decl_stmt>
+			<decl_stmt><decl><type><name>bool</name></type> <name>commitSucceeded</name> <init>= <expr><call><name>RecoverPreparedTransactionOnWorker</name><argument_list>(<argument><expr><name>connection</name></expr></argument>,
+																	  <argument><expr><name>transactionName</name></expr></argument>,
+																	  <argument><expr><name>shouldCommit</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+			<if_stmt><if>if <condition>(<expr><operator>!</operator><name>commitSucceeded</name></expr>)</condition>
+			<block>{<block_content>
+				<comment type="block">/*
+				 * Failed to commit on the current worker. Stop without throwing
+				 * an error to allow recover_prepared_transactions to continue with
+				 * other workers.
+				 */</comment>
+				<expr_stmt><expr><name>recoveryFailed</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+				<break>break;</break>
+			</block_content>}</block></if></if_stmt>
+
+			<expr_stmt><expr><name>recoveredTransactionCount</name><operator>++</operator></expr>;</expr_stmt>
+
+			<comment type="block">/*
+			 * We successfully committed the prepared transaction, safe to delete
+			 * the recovery record.
+			 */</comment>
+		</block_content>}</block></if>
+		<if type="elseif">else if <condition>(<expr><name>foundPreparedTransactionAfterCommit</name></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/*
+			 * We found a committed pg_dist_transaction record that initially did
+			 * not have a prepared transaction, but did when we checked again.
+			 *
+			 * If a transaction started and committed just after we observed the
+			 * set of prepared transactions, and just before we called
+			 * ActiveDistributedTransactionNumbers, then we would see a recovery
+			 * record without a prepared transaction in pendingTransactionSet,
+			 * but there may be prepared transactions that failed to commit.
+			 * We should not delete the records for those prepared transactions,
+			 * since we would otherwise roll back them on the next call to
+			 * recover_prepared_transactions.
+			 *
+			 * In addition, if the transaction started after the call to
+			 * ActiveDistributedTransactionNumbers and finished just before our
+			 * pg_dist_transaction snapshot, then it may still be in the process
+			 * of committing the prepared transactions in the post-commit callback
+			 * and we should not touch the prepared transactions.
+			 *
+			 * To handle these cases, we just leave the records and prepared
+			 * transactions for the next call to recover_prepared_transactions
+			 * and skip them here.
+			 */</comment>
+
+			<continue>continue;</continue>
+		</block_content>}</block></if>
+		<else>else
+		<block>{<block_content>
+			<comment type="block">/*
+			 * We found a recovery record without any prepared transaction. It
+			 * must have already been committed, so it's safe to delete the
+			 * recovery record.
+			 *
+			 * Transactions that started after we observed pendingTransactionSet,
+			 * but successfully committed their prepared transactions before
+			 * ActiveDistributedTransactionNumbers are indistinguishable from
+			 * transactions that committed at an earlier time, in which case it's
+			 * safe delete the recovery record as well.
+			 */</comment>
+		</block_content>}</block></else></if_stmt>
+
+		<expr_stmt><expr><call><name>simple_heap_delete</name><argument_list>(<argument><expr><name>pgDistTransaction</name></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>heapTuple</name><operator>-&gt;</operator><name>t_self</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></while>
+
+	<expr_stmt><expr><call><name>systable_endscan</name><argument_list>(<argument><expr><name>scanDescriptor</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>table_close</name><argument_list>(<argument><expr><name>pgDistTransaction</name></expr></argument>, <argument><expr><name>NoLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><name>recoveryFailed</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>char</name> <modifier>*</modifier></type><name>pendingTransactionName</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>bool</name></type> <name>abortSucceeded</name> <init>= <expr><name>true</name></expr></init></decl>;</decl_stmt>
+
+		<comment type="block">/*
+		 * All remaining prepared transactions that are not part of an in-progress
+		 * distributed transaction should be aborted since we did not find a recovery
+		 * record, which implies the disributed transaction aborted.
+		 */</comment>
+		<expr_stmt><expr><call><name>hash_seq_init</name><argument_list>(<argument><expr><operator>&amp;</operator><name>status</name></expr></argument>, <argument><expr><name>pendingTransactionSet</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<while>while <condition>(<expr><operator>(</operator><name>pendingTransactionName</name> <operator>=</operator> <call><name>hash_seq_search</name><argument_list>(<argument><expr><operator>&amp;</operator><name>status</name></expr></argument>)</argument_list></call><operator>)</operator> <operator>!=</operator> <name>NULL</name></expr>)</condition>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>bool</name></type> <name>isTransactionInProgress</name> <init>= <expr><call><name>IsTransactionInProgress</name><argument_list>(
+				<argument><expr><name>activeTransactionNumberSet</name></expr></argument>,
+				<argument><expr><name>pendingTransactionName</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+			<if_stmt><if>if <condition>(<expr><name>isTransactionInProgress</name></expr>)</condition>
+			<block>{<block_content>
+				<continue>continue;</continue>
+			</block_content>}</block></if></if_stmt>
+
+			<decl_stmt><decl><type><name>bool</name></type> <name>shouldCommit</name> <init>= <expr><name>false</name></expr></init></decl>;</decl_stmt>
+			<expr_stmt><expr><name>abortSucceeded</name> <operator>=</operator> <call><name>RecoverPreparedTransactionOnWorker</name><argument_list>(<argument><expr><name>connection</name></expr></argument>,
+																<argument><expr><name>pendingTransactionName</name></expr></argument>,
+																<argument><expr><name>shouldCommit</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<if_stmt><if>if <condition>(<expr><operator>!</operator><name>abortSucceeded</name></expr>)</condition>
+			<block>{<block_content>
+				<expr_stmt><expr><call><name>hash_seq_term</name><argument_list>(<argument><expr><operator>&amp;</operator><name>status</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<break>break;</break>
+			</block_content>}</block></if></if_stmt>
+
+			<expr_stmt><expr><name>recoveredTransactionCount</name><operator>++</operator></expr>;</expr_stmt>
+		</block_content>}</block></while>
+	</block_content>}</block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>oldContext</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>MemoryContextDelete</name><argument_list>(<argument><expr><name>localContext</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<return>return <expr><name>recoveredTransactionCount</name></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * PendingWorkerTransactionList returns a list of pending prepared
+ * transactions on a remote node that were started by this node.
+ */</comment>
+<function><type><specifier>static</specifier> <name>List</name> <modifier>*</modifier></type>
+<name>PendingWorkerTransactionList</name><parameter_list>(<parameter><decl><type><name>MultiConnection</name> <modifier>*</modifier></type><name>connection</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>StringInfo</name></type> <name>command</name> <init>= <expr><call><name>makeStringInfo</name><argument_list>()</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type> <name>raiseInterrupts</name> <init>= <expr><name>true</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>List</name> <modifier>*</modifier></type><name>transactionNames</name> <init>= <expr><name>NIL</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int32</name></type> <name>coordinatorId</name> <init>= <expr><call><name>GetLocalGroupId</name><argument_list>()</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>appendStringInfo</name><argument_list>(<argument><expr><name>command</name></expr></argument>, <argument><expr><literal type="string">"SELECT gid FROM pg_prepared_xacts "</literal>
+							  <literal type="string">"WHERE gid LIKE 'citus\\_%d\\_%%'"</literal></expr></argument>,
+					 <argument><expr><name>coordinatorId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<decl_stmt><decl><type><name>int</name></type> <name>querySent</name> <init>= <expr><call><name>SendRemoteCommand</name><argument_list>(<argument><expr><name>connection</name></expr></argument>, <argument><expr><name><name>command</name><operator>-&gt;</operator><name>data</name></name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<if_stmt><if>if <condition>(<expr><name>querySent</name> <operator>==</operator> <literal type="number">0</literal></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>ReportConnectionError</name><argument_list>(<argument><expr><name>connection</name></expr></argument>, <argument><expr><name>ERROR</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<decl_stmt><decl><type><name>PGresult</name> <modifier>*</modifier></type><name>result</name> <init>= <expr><call><name>GetRemoteCommandResult</name><argument_list>(<argument><expr><name>connection</name></expr></argument>, <argument><expr><name>raiseInterrupts</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>IsResponseOK</name><argument_list>(<argument><expr><name>result</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>ReportResultError</name><argument_list>(<argument><expr><name>connection</name></expr></argument>, <argument><expr><name>result</name></expr></argument>, <argument><expr><name>ERROR</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<decl_stmt><decl><type><name>int</name></type> <name>rowCount</name> <init>= <expr><call><name>PQntuples</name><argument_list>(<argument><expr><name>result</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<for>for <control>(<init><decl><type><name>int</name></type> <name>rowIndex</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</init> <condition><expr><name>rowIndex</name> <operator>&lt;</operator> <name>rowCount</name></expr>;</condition> <incr><expr><name>rowIndex</name><operator>++</operator></expr></incr>)</control>
+	<block>{<block_content>
+		<decl_stmt><decl><type><specifier>const</specifier> <name>int</name></type> <name>columnIndex</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>char</name> <modifier>*</modifier></type><name>transactionName</name> <init>= <expr><call><name>PQgetvalue</name><argument_list>(<argument><expr><name>result</name></expr></argument>, <argument><expr><name>rowIndex</name></expr></argument>, <argument><expr><name>columnIndex</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+		<expr_stmt><expr><name>transactionNames</name> <operator>=</operator> <call><name>lappend</name><argument_list>(<argument><expr><name>transactionNames</name></expr></argument>, <argument><expr><call><name>pstrdup</name><argument_list>(<argument><expr><name>transactionName</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></for>
+
+	<expr_stmt><expr><call><name>PQclear</name><argument_list>(<argument><expr><name>result</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>ForgetResults</name><argument_list>(<argument><expr><name>connection</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<return>return <expr><name>transactionNames</name></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * IsTransactionInProgress returns whether the distributed transaction to which
+ * preparedTransactionName belongs is still in progress, or false if the
+ * transaction name cannot be parsed. This can happen when the user manually
+ * inserts into pg_dist_transaction.
+ */</comment>
+<function><type><specifier>static</specifier> <name>bool</name></type>
+<name>IsTransactionInProgress</name><parameter_list>(<parameter><decl><type><name>HTAB</name> <modifier>*</modifier></type><name>activeTransactionNumberSet</name></decl></parameter>, <parameter><decl><type><name>char</name> <modifier>*</modifier></type><name>preparedTransactionName</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>int32</name></type> <name>groupId</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type> <name>procId</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>uint32</name></type> <name>connectionNumber</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>uint64</name></type> <name>transactionNumber</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type> <name>isTransactionInProgress</name> <init>= <expr><name>false</name></expr></init></decl>;</decl_stmt>
+
+	<decl_stmt><decl><type><name>bool</name></type> <name>isValidName</name> <init>= <expr><call><name>ParsePreparedTransactionName</name><argument_list>(<argument><expr><name>preparedTransactionName</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>groupId</name></expr></argument>,
+													<argument><expr><operator>&amp;</operator><name>procId</name></expr></argument>,
+													<argument><expr><operator>&amp;</operator><name>transactionNumber</name></expr></argument>,
+													<argument><expr><operator>&amp;</operator><name>connectionNumber</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<if_stmt><if>if <condition>(<expr><name>isValidName</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>hash_search</name><argument_list>(<argument><expr><name>activeTransactionNumberSet</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>transactionNumber</name></expr></argument>, <argument><expr><name>HASH_FIND</name></expr></argument>,
+					<argument><expr><operator>&amp;</operator><name>isTransactionInProgress</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<return>return <expr><name>isTransactionInProgress</name></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * RecoverPreparedTransactionOnWorker recovers a single prepared transaction over
+ * the given connection. If shouldCommit is true we send
+ */</comment>
+<function><type><specifier>static</specifier> <name>bool</name></type>
+<name>RecoverPreparedTransactionOnWorker</name><parameter_list>(<parameter><decl><type><name>MultiConnection</name> <modifier>*</modifier></type><name>connection</name></decl></parameter>, <parameter><decl><type><name>char</name> <modifier>*</modifier></type><name>transactionName</name></decl></parameter>,
+								   <parameter><decl><type><name>bool</name></type> <name>shouldCommit</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>StringInfo</name></type> <name>command</name> <init>= <expr><call><name>makeStringInfo</name><argument_list>()</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>PGresult</name> <modifier>*</modifier></type><name>result</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type> <name>raiseInterrupts</name> <init>= <expr><name>false</name></expr></init></decl>;</decl_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>shouldCommit</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* should have committed this prepared transaction */</comment>
+		<expr_stmt><expr><call><name>appendStringInfo</name><argument_list>(<argument><expr><name>command</name></expr></argument>, <argument><expr><literal type="string">"COMMIT PREPARED %s"</literal></expr></argument>,
+						 <argument><expr><call><name>quote_literal_cstr</name><argument_list>(<argument><expr><name>transactionName</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<else>else
+	<block>{<block_content>
+		<comment type="block">/* should have aborted this prepared transaction */</comment>
+		<expr_stmt><expr><call><name>appendStringInfo</name><argument_list>(<argument><expr><name>command</name></expr></argument>, <argument><expr><literal type="string">"ROLLBACK PREPARED %s"</literal></expr></argument>,
+						 <argument><expr><call><name>quote_literal_cstr</name><argument_list>(<argument><expr><name>transactionName</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></else></if_stmt>
+
+	<decl_stmt><decl><type><name>int</name></type> <name>executeCommand</name> <init>= <expr><call><name>ExecuteOptionalRemoteCommand</name><argument_list>(<argument><expr><name>connection</name></expr></argument>, <argument><expr><name><name>command</name><operator>-&gt;</operator><name>data</name></name></expr></argument>, <argument><expr><operator>&amp;</operator><name>result</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<if_stmt><if>if <condition>(<expr><name>executeCommand</name> <operator>==</operator> <name>QUERY_SEND_FAILED</name></expr>)</condition>
+	<block>{<block_content>
+		<return>return <expr><name>false</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+	<if_stmt><if>if <condition>(<expr><name>executeCommand</name> <operator>==</operator> <name>RESPONSE_NOT_OKAY</name></expr>)</condition>
+	<block>{<block_content>
+		<return>return <expr><name>false</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>PQclear</name><argument_list>(<argument><expr><name>result</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>ClearResults</name><argument_list>(<argument><expr><name>connection</name></expr></argument>, <argument><expr><name>raiseInterrupts</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>LOG</name></expr></argument>, <argument><expr><operator>(</operator><call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"recovered a prepared transaction on %s:%d"</literal></expr></argument>,
+						 <argument><expr><name><name>connection</name><operator>-&gt;</operator><name>hostname</name></name></expr></argument>, <argument><expr><name><name>connection</name><operator>-&gt;</operator><name>port</name></name></expr></argument>)</argument_list></call><operator>,</operator>
+				  <call><name>errcontext</name><argument_list>(<argument><expr><literal type="string">"%s"</literal></expr></argument>, <argument><expr><name><name>command</name><operator>-&gt;</operator><name>data</name></name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<return>return <expr><name>true</name></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * DeleteWorkerTransactions deletes the entries on pg_dist_transaction for a given
+ * worker node. It's implemented to be called at master_remove_node.
+ */</comment>
+<function><type><name>void</name></type>
+<name>DeleteWorkerTransactions</name><parameter_list>(<parameter><decl><type><name>WorkerNode</name> <modifier>*</modifier></type><name>workerNode</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<if_stmt><if>if <condition>(<expr><name>workerNode</name> <operator>==</operator> <name>NULL</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/*
+		 * We don't expect this, but let's be defensive since crashing is much worse
+		 * than leaving pg_dist_transction entries.
+		 */</comment>
+		<return>return;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<decl_stmt><decl><type><name>bool</name></type> <name>indexOK</name> <init>= <expr><name>true</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type> <name>scanKeyCount</name> <init>= <expr><literal type="number">1</literal></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>ScanKeyData</name></type> <name><name>scanKey</name><index>[<expr><literal type="number">1</literal></expr>]</index></name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int32</name></type> <name>groupId</name> <init>= <expr><name><name>workerNode</name><operator>-&gt;</operator><name>groupId</name></name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>HeapTuple</name></type> <name>heapTuple</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+
+	<decl_stmt><decl><type><name>Relation</name></type> <name>pgDistTransaction</name> <init>= <expr><call><name>table_open</name><argument_list>(<argument><expr><call><name>DistTransactionRelationId</name><argument_list>()</argument_list></call></expr></argument>,
+											<argument><expr><name>RowExclusiveLock</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>ScanKeyInit</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>scanKey</name><index>[<expr><literal type="number">0</literal></expr>]</index></name></expr></argument>, <argument><expr><name>Anum_pg_dist_transaction_groupid</name></expr></argument>,
+				<argument><expr><name>BTEqualStrategyNumber</name></expr></argument>, <argument><expr><name>F_INT4EQ</name></expr></argument>, <argument><expr><call><name>Int32GetDatum</name><argument_list>(<argument><expr><name>groupId</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<decl_stmt><decl><type><name>SysScanDesc</name></type> <name>scanDescriptor</name> <init>= <expr><call><name>systable_beginscan</name><argument_list>(<argument><expr><name>pgDistTransaction</name></expr></argument>,
+													<argument><expr><call><name>DistTransactionGroupIndexId</name><argument_list>()</argument_list></call></expr></argument>,
+													<argument><expr><name>indexOK</name></expr></argument>,
+													<argument><expr><name>NULL</name></expr></argument>, <argument><expr><name>scanKeyCount</name></expr></argument>, <argument><expr><name>scanKey</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<while>while <condition>(<expr><call><name>HeapTupleIsValid</name><argument_list>(<argument><expr><name>heapTuple</name> <operator>=</operator> <call><name>systable_getnext</name><argument_list>(<argument><expr><name>scanDescriptor</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>simple_heap_delete</name><argument_list>(<argument><expr><name>pgDistTransaction</name></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>heapTuple</name><operator>-&gt;</operator><name>t_self</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></while>
+
+	<expr_stmt><expr><call><name>CommandCounterIncrement</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>systable_endscan</name><argument_list>(<argument><expr><name>scanDescriptor</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>table_close</name><argument_list>(<argument><expr><name>pgDistTransaction</name></expr></argument>, <argument><expr><name>NoLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+</unit>

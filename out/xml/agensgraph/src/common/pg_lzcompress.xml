@@ -1,0 +1,874 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<unit xmlns="http://www.srcML.org/srcML/src" xmlns:cpp="http://www.srcML.org/srcML/cpp" revision="1.0.0" language="C" filename="/cloned_projects/agensgraph/src/common/pg_lzcompress.c"><comment type="block">/* ----------
+ * pg_lzcompress.c -
+ *
+ *		This is an implementation of LZ compression for PostgreSQL.
+ *		It uses a simple history table and generates 2-3 byte tags
+ *		capable of backward copy information for 3-273 bytes with
+ *		a max offset of 4095.
+ *
+ *		Entry routines:
+ *
+ *			int32
+ *			pglz_compress(const char *source, int32 slen, char *dest,
+ *						  const PGLZ_Strategy *strategy);
+ *
+ *				source is the input data to be compressed.
+ *
+ *				slen is the length of the input data.
+ *
+ *				dest is the output area for the compressed result.
+ *					It must be at least as big as PGLZ_MAX_OUTPUT(slen).
+ *
+ *				strategy is a pointer to some information controlling
+ *					the compression algorithm. If NULL, the compiled
+ *					in default strategy is used.
+ *
+ *				The return value is the number of bytes written in the
+ *				buffer dest, or -1 if compression fails; in the latter
+ *				case the contents of dest are undefined.
+ *
+ *			int32
+ *			pglz_decompress(const char *source, int32 slen, char *dest,
+ *							int32 rawsize, bool check_complete)
+ *
+ *				source is the compressed input.
+ *
+ *				slen is the length of the compressed input.
+ *
+ *				dest is the area where the uncompressed data will be
+ *					written to. It is the callers responsibility to
+ *					provide enough space.
+ *
+ *					The data is written to buff exactly as it was handed
+ *					to pglz_compress(). No terminating zero byte is added.
+ *
+ *				rawsize is the length of the uncompressed data.
+ *
+ *				check_complete is a flag to let us know if -1 should be
+ *					returned in cases where we don't reach the end of the
+ *					source or dest buffers, or not.  This should be false
+ *					if the caller is asking for only a partial result and
+ *					true otherwise.
+ *
+ *				The return value is the number of bytes written in the
+ *				buffer dest, or -1 if decompression fails.
+ *
+ *		The decompression algorithm and internal data format:
+ *
+ *			It is made with the compressed data itself.
+ *
+ *			The data representation is easiest explained by describing
+ *			the process of decompression.
+ *
+ *			If compressed_size == rawsize, then the data
+ *			is stored uncompressed as plain bytes. Thus, the decompressor
+ *			simply copies rawsize bytes to the destination.
+ *
+ *			Otherwise the first byte tells what to do the next 8 times.
+ *			We call this the control byte.
+ *
+ *			An unset bit in the control byte means, that one uncompressed
+ *			byte follows, which is copied from input to output.
+ *
+ *			A set bit in the control byte means, that a tag of 2-3 bytes
+ *			follows. A tag contains information to copy some bytes, that
+ *			are already in the output buffer, to the current location in
+ *			the output. Let's call the three tag bytes T1, T2 and T3. The
+ *			position of the data to copy is coded as an offset from the
+ *			actual output position.
+ *
+ *			The offset is in the upper nibble of T1 and in T2.
+ *			The length is in the lower nibble of T1.
+ *
+ *			So the 16 bits of a 2 byte tag are coded as
+ *
+ *				7---T1--0  7---T2--0
+ *				OOOO LLLL  OOOO OOOO
+ *
+ *			This limits the offset to 1-4095 (12 bits) and the length
+ *			to 3-18 (4 bits) because 3 is always added to it. To emit
+ *			a tag of 2 bytes with a length of 2 only saves one control
+ *			bit. But we lose one byte in the possible length of a tag.
+ *
+ *			In the actual implementation, the 2 byte tag's length is
+ *			limited to 3-17, because the value 0xF in the length nibble
+ *			has special meaning. It means, that the next following
+ *			byte (T3) has to be added to the length value of 18. That
+ *			makes total limits of 1-4095 for offset and 3-273 for length.
+ *
+ *			Now that we have successfully decoded a tag. We simply copy
+ *			the output that occurred &lt;offset&gt; bytes back to the current
+ *			output location in the specified &lt;length&gt;. Thus, a
+ *			sequence of 200 spaces (think about bpchar fields) could be
+ *			coded in 4 bytes. One literal space and a three byte tag to
+ *			copy 199 bytes with a -1 offset. Whow - that's a compression
+ *			rate of 98%! Well, the implementation needs to save the
+ *			original data size too, so we need another 4 bytes for it
+ *			and end up with a total compression rate of 96%, what's still
+ *			worth a Whow.
+ *
+ *		The compression algorithm
+ *
+ *			The following uses numbers used in the default strategy.
+ *
+ *			The compressor works best for attributes of a size between
+ *			1K and 1M. For smaller items there's not that much chance of
+ *			redundancy in the character sequence (except for large areas
+ *			of identical bytes like trailing spaces) and for bigger ones
+ *			our 4K maximum look-back distance is too small.
+ *
+ *			The compressor creates a table for lists of positions.
+ *			For each input position (except the last 3), a hash key is
+ *			built from the 4 next input bytes and the position remembered
+ *			in the appropriate list. Thus, the table points to linked
+ *			lists of likely to be at least in the first 4 characters
+ *			matching strings. This is done on the fly while the input
+ *			is compressed into the output area.  Table entries are only
+ *			kept for the last 4096 input positions, since we cannot use
+ *			back-pointers larger than that anyway.  The size of the hash
+ *			table is chosen based on the size of the input - a larger table
+ *			has a larger startup cost, as it needs to be initialized to
+ *			zero, but reduces the number of hash collisions on long inputs.
+ *
+ *			For each byte in the input, its hash key (built from this
+ *			byte and the next 3) is used to find the appropriate list
+ *			in the table. The lists remember the positions of all bytes
+ *			that had the same hash key in the past in increasing backward
+ *			offset order. Now for all entries in the used lists, the
+ *			match length is computed by comparing the characters from the
+ *			entries position with the characters from the actual input
+ *			position.
+ *
+ *			The compressor starts with a so called "good_match" of 128.
+ *			It is a "prefer speed against compression ratio" optimizer.
+ *			So if the first entry looked at already has 128 or more
+ *			matching characters, the lookup stops and that position is
+ *			used for the next tag in the output.
+ *
+ *			For each subsequent entry in the history list, the "good_match"
+ *			is lowered by 10%. So the compressor will be more happy with
+ *			short matches the farer it has to go back in the history.
+ *			Another "speed against ratio" preference characteristic of
+ *			the algorithm.
+ *
+ *			Thus there are 3 stop conditions for the lookup of matches:
+ *
+ *				- a match &gt;= good_match is found
+ *				- there are no more history entries to look at
+ *				- the next history entry is already too far back
+ *				  to be coded into a tag.
+ *
+ *			Finally the match algorithm checks that at least a match
+ *			of 3 or more bytes has been found, because that is the smallest
+ *			amount of copy information to code into a tag. If so, a tag
+ *			is omitted and all the input bytes covered by that are just
+ *			scanned for the history add's, otherwise a literal character
+ *			is omitted and only his history entry added.
+ *
+ *		Acknowledgments:
+ *
+ *			Many thanks to Adisak Pochanayon, who's article about SLZ
+ *			inspired me to write the PostgreSQL compression this way.
+ *
+ *			Jan Wieck
+ *
+ * Copyright (c) 1999-2020, PostgreSQL Global Development Group
+ *
+ * src/common/pg_lzcompress.c
+ * ----------
+ */</comment>
+<cpp:ifndef>#<cpp:directive>ifndef</cpp:directive> <name>FRONTEND</name></cpp:ifndef>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"postgres.h"</cpp:file></cpp:include>
+<cpp:else>#<cpp:directive>else</cpp:directive></cpp:else>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"postgres_fe.h"</cpp:file></cpp:include>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;limits.h&gt;</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"common/pg_lzcompress.h"</cpp:file></cpp:include>
+
+
+<comment type="block">/* ----------
+ * Local definitions
+ * ----------
+ */</comment>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>PGLZ_MAX_HISTORY_LISTS</name></cpp:macro>	<cpp:value>8192</cpp:value></cpp:define>	<comment type="block">/* must be power of 2 */</comment>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>PGLZ_HISTORY_SIZE</name></cpp:macro>		<cpp:value>4096</cpp:value></cpp:define>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>PGLZ_MAX_MATCH</name></cpp:macro>			<cpp:value>273</cpp:value></cpp:define>
+
+
+<comment type="block">/* ----------
+ * PGLZ_HistEntry -
+ *
+ *		Linked list for the backward history lookup
+ *
+ * All the entries sharing a hash key are linked in a doubly linked list.
+ * This makes it easy to remove an entry when it's time to recycle it
+ * (because it's more than 4K positions old).
+ * ----------
+ */</comment>
+<typedef>typedef <type><struct>struct <name>PGLZ_HistEntry</name>
+<block>{
+	<decl_stmt><decl><type><name><name>struct</name> <name>PGLZ_HistEntry</name></name> <modifier>*</modifier></type><name>next</name></decl>;</decl_stmt>	<comment type="block">/* links for my hash key's list */</comment>
+	<decl_stmt><decl><type><name><name>struct</name> <name>PGLZ_HistEntry</name></name> <modifier>*</modifier></type><name>prev</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>hindex</name></decl>;</decl_stmt>			<comment type="block">/* my current hash key */</comment>
+	<decl_stmt><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>pos</name></decl>;</decl_stmt>			<comment type="block">/* my input position */</comment>
+}</block></struct></type> <name>PGLZ_HistEntry</name>;</typedef>
+
+
+<comment type="block">/* ----------
+ * The provided standard strategies
+ * ----------
+ */</comment>
+<decl_stmt><decl><type><specifier>static</specifier> <specifier>const</specifier> <name>PGLZ_Strategy</name></type> <name>strategy_default_data</name> <init>= <expr><block>{
+	<expr><literal type="number">32</literal></expr>,							<comment type="block">/* Data chunks less than 32 bytes are not
+								 * compressed */</comment>
+	<expr><name>INT_MAX</name></expr>,					<comment type="block">/* No upper limit on what we'll try to
+								 * compress */</comment>
+	<expr><literal type="number">25</literal></expr>,							<comment type="block">/* Require 25% compression rate, or not worth
+								 * it */</comment>
+	<expr><literal type="number">1024</literal></expr>,						<comment type="block">/* Give up if no compression in the first 1KB */</comment>
+	<expr><literal type="number">128</literal></expr>,						<comment type="block">/* Stop history lookup if a match of 128 bytes
+								 * is found */</comment>
+	<expr><literal type="number">10</literal></expr>							<comment type="block">/* Lower good match size by 10% at every loop
+								 * iteration */</comment>
+}</block></expr></init></decl>;</decl_stmt>
+<decl_stmt><decl><type><specifier>const</specifier> <name>PGLZ_Strategy</name> <modifier>*</modifier><specifier>const</specifier></type> <name>PGLZ_strategy_default</name> <init>= <expr><operator>&amp;</operator><name>strategy_default_data</name></expr></init></decl>;</decl_stmt>
+
+
+<decl_stmt><decl><type><specifier>static</specifier> <specifier>const</specifier> <name>PGLZ_Strategy</name></type> <name>strategy_always_data</name> <init>= <expr><block>{
+	<expr><literal type="number">0</literal></expr>,							<comment type="block">/* Chunks of any size are compressed */</comment>
+	<expr><name>INT_MAX</name></expr>,
+	<expr><literal type="number">0</literal></expr>,							<comment type="block">/* It's enough to save one single byte */</comment>
+	<expr><name>INT_MAX</name></expr>,					<comment type="block">/* Never give up early */</comment>
+	<expr><literal type="number">128</literal></expr>,						<comment type="block">/* Stop history lookup if a match of 128 bytes
+								 * is found */</comment>
+	<expr><literal type="number">6</literal></expr>							<comment type="block">/* Look harder for a good match */</comment>
+}</block></expr></init></decl>;</decl_stmt>
+<decl_stmt><decl><type><specifier>const</specifier> <name>PGLZ_Strategy</name> <modifier>*</modifier><specifier>const</specifier></type> <name>PGLZ_strategy_always</name> <init>= <expr><operator>&amp;</operator><name>strategy_always_data</name></expr></init></decl>;</decl_stmt>
+
+
+<comment type="block">/* ----------
+ * Statically allocated work arrays for history
+ * ----------
+ */</comment>
+<decl_stmt><decl><type><specifier>static</specifier> <name>int16</name></type> <name><name>hist_start</name><index>[<expr><name>PGLZ_MAX_HISTORY_LISTS</name></expr>]</index></name></decl>;</decl_stmt>
+<decl_stmt><decl><type><specifier>static</specifier> <name>PGLZ_HistEntry</name></type> <name><name>hist_entries</name><index>[<expr><name>PGLZ_HISTORY_SIZE</name> <operator>+</operator> <literal type="number">1</literal></expr>]</index></name></decl>;</decl_stmt>
+
+<comment type="block">/*
+ * Element 0 in hist_entries is unused, and means 'invalid'. Likewise,
+ * INVALID_ENTRY_PTR in next/prev pointers mean 'invalid'.
+ */</comment>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>INVALID_ENTRY</name></cpp:macro>			<cpp:value>0</cpp:value></cpp:define>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>INVALID_ENTRY_PTR</name></cpp:macro>		<cpp:value>(&amp;hist_entries[INVALID_ENTRY])</cpp:value></cpp:define>
+
+<comment type="block">/* ----------
+ * pglz_hist_idx -
+ *
+ *		Computes the history table slot for the lookup by the next 4
+ *		characters in the input.
+ *
+ * NB: because we use the next 4 characters, we are not guaranteed to
+ * find 3-character matches; they very possibly will be in the wrong
+ * hash list.  This seems an acceptable tradeoff for spreading out the
+ * hash keys more.
+ * ----------
+ */</comment>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>pglz_hist_idx</name><parameter_list>(<parameter><type><name>_s</name></type></parameter>,<parameter><type><name>_e</name></type></parameter>, <parameter><type><name>_mask</name></type></parameter>)</parameter_list></cpp:macro> <cpp:value>(										\
+			((((_e) - (_s)) &lt; 4) ? (int) (_s)[0] :							\
+			 (((_s)[0] &lt;&lt; 6) ^ ((_s)[1] &lt;&lt; 4) ^								\
+			  ((_s)[2] &lt;&lt; 2) ^ (_s)[3])) &amp; (_mask)				\
+		)</cpp:value></cpp:define>
+
+
+<comment type="block">/* ----------
+ * pglz_hist_add -
+ *
+ *		Adds a new entry to the history table.
+ *
+ * If _recycle is true, then we are recycling a previously used entry,
+ * and must first delink it from its old hashcode's linked list.
+ *
+ * NOTE: beware of multiple evaluations of macro's arguments, and note that
+ * _hn and _recycle are modified in the macro.
+ * ----------
+ */</comment>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>pglz_hist_add</name><parameter_list>(<parameter><type><name>_hs</name></type></parameter>,<parameter><type><name>_he</name></type></parameter>,<parameter><type><name>_hn</name></type></parameter>,<parameter><type><name>_recycle</name></type></parameter>,<parameter><type><name>_s</name></type></parameter>,<parameter><type><name>_e</name></type></parameter>, <parameter><type><name>_mask</name></type></parameter>)</parameter_list></cpp:macro>	\
+<cpp:value>do {									\
+			int __hindex = pglz_hist_idx((_s),(_e), (_mask));				\
+			int16 *__myhsp = &amp;(_hs)[__hindex];								\
+			PGLZ_HistEntry *__myhe = &amp;(_he)[_hn];							\
+			if (_recycle) {													\
+				if (__myhe-&gt;prev == NULL)									\
+					(_hs)[__myhe-&gt;hindex] = __myhe-&gt;next - (_he);			\
+				else														\
+					__myhe-&gt;prev-&gt;next = __myhe-&gt;next;						\
+				if (__myhe-&gt;next != NULL)									\
+					__myhe-&gt;next-&gt;prev = __myhe-&gt;prev;						\
+			}																\
+			__myhe-&gt;next = &amp;(_he)[*__myhsp];								\
+			__myhe-&gt;prev = NULL;											\
+			__myhe-&gt;hindex = __hindex;										\
+			__myhe-&gt;pos  = (_s);											\
+			<comment type="block">/* If there was an existing entry in this hash slot, link */</comment>	\
+			<comment type="block">/* this new entry to it. However, the 0th entry in the */</comment>		\
+			<comment type="block">/* entries table is unused, so we can freely scribble on it. */</comment> \
+			<comment type="block">/* So don't bother checking if the slot was used - we'll */</comment>		\
+			<comment type="block">/* scribble on the unused entry if it was not, but that's */</comment>	\
+			<comment type="block">/* harmless. Avoiding the branch in this critical path */</comment>		\
+			<comment type="block">/* speeds this up a little bit. */</comment>								\
+			<comment type="block">/* if (*__myhsp != INVALID_ENTRY) */</comment>							\
+				(_he)[(*__myhsp)].prev = __myhe;							\
+			*__myhsp = _hn;													\
+			if (++(_hn) &gt;= PGLZ_HISTORY_SIZE + 1) {							\
+				(_hn) = 1;													\
+				(_recycle) = true;											\
+			}																\
+} while (0)</cpp:value></cpp:define>
+
+
+<comment type="block">/* ----------
+ * pglz_out_ctrl -
+ *
+ *		Outputs the last and allocates a new control byte if needed.
+ * ----------
+ */</comment>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>pglz_out_ctrl</name><parameter_list>(<parameter><type><name>__ctrlp</name></type></parameter>,<parameter><type><name>__ctrlb</name></type></parameter>,<parameter><type><name>__ctrl</name></type></parameter>,<parameter><type><name>__buf</name></type></parameter>)</parameter_list></cpp:macro> \
+<cpp:value>do { \
+	if ((__ctrl &amp; 0xff) == 0)												\
+	{																		\
+		*(__ctrlp) = __ctrlb;												\
+		__ctrlp = (__buf)++;												\
+		__ctrlb = 0;														\
+		__ctrl = 1;															\
+	}																		\
+} while (0)</cpp:value></cpp:define>
+
+
+<comment type="block">/* ----------
+ * pglz_out_literal -
+ *
+ *		Outputs a literal byte to the destination buffer including the
+ *		appropriate control bit.
+ * ----------
+ */</comment>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>pglz_out_literal</name><parameter_list>(<parameter><type><name>_ctrlp</name></type></parameter>,<parameter><type><name>_ctrlb</name></type></parameter>,<parameter><type><name>_ctrl</name></type></parameter>,<parameter><type><name>_buf</name></type></parameter>,<parameter><type><name>_byte</name></type></parameter>)</parameter_list></cpp:macro> \
+<cpp:value>do { \
+	pglz_out_ctrl(_ctrlp,_ctrlb,_ctrl,_buf);								\
+	*(_buf)++ = (unsigned char)(_byte);										\
+	_ctrl &lt;&lt;= 1;															\
+} while (0)</cpp:value></cpp:define>
+
+
+<comment type="block">/* ----------
+ * pglz_out_tag -
+ *
+ *		Outputs a backward reference tag of 2-4 bytes (depending on
+ *		offset and length) to the destination buffer including the
+ *		appropriate control bit.
+ * ----------
+ */</comment>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>pglz_out_tag</name><parameter_list>(<parameter><type><name>_ctrlp</name></type></parameter>,<parameter><type><name>_ctrlb</name></type></parameter>,<parameter><type><name>_ctrl</name></type></parameter>,<parameter><type><name>_buf</name></type></parameter>,<parameter><type><name>_len</name></type></parameter>,<parameter><type><name>_off</name></type></parameter>)</parameter_list></cpp:macro> \
+<cpp:value>do { \
+	pglz_out_ctrl(_ctrlp,_ctrlb,_ctrl,_buf);								\
+	_ctrlb |= _ctrl;														\
+	_ctrl &lt;&lt;= 1;															\
+	if (_len &gt; 17)															\
+	{																		\
+		(_buf)[0] = (unsigned char)((((_off) &amp; 0xf00) &gt;&gt; 4) | 0x0f);		\
+		(_buf)[1] = (unsigned char)(((_off) &amp; 0xff));						\
+		(_buf)[2] = (unsigned char)((_len) - 18);							\
+		(_buf) += 3;														\
+	} else {																\
+		(_buf)[0] = (unsigned char)((((_off) &amp; 0xf00) &gt;&gt; 4) | ((_len) - 3)); \
+		(_buf)[1] = (unsigned char)((_off) &amp; 0xff);							\
+		(_buf) += 2;														\
+	}																		\
+} while (0)</cpp:value></cpp:define>
+
+
+<comment type="block">/* ----------
+ * pglz_find_match -
+ *
+ *		Lookup the history table if the actual input stream matches
+ *		another sequence of characters, starting somewhere earlier
+ *		in the input buffer.
+ * ----------
+ */</comment>
+<function><type><specifier>static</specifier> <specifier>inline</specifier> <name>int</name></type>
+<name>pglz_find_match</name><parameter_list>(<parameter><decl><type><name>int16</name> <modifier>*</modifier></type><name>hstart</name></decl></parameter>, <parameter><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>input</name></decl></parameter>, <parameter><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>end</name></decl></parameter>,
+				<parameter><decl><type><name>int</name> <modifier>*</modifier></type><name>lenp</name></decl></parameter>, <parameter><decl><type><name>int</name> <modifier>*</modifier></type><name>offp</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>good_match</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>good_drop</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>mask</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>PGLZ_HistEntry</name> <modifier>*</modifier></type><name>hent</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int16</name></type>		<name>hentno</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int32</name></type>		<name>len</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int32</name></type>		<name>off</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * Traverse the linked history list until a good enough match is found.
+	 */</comment>
+	<expr_stmt><expr><name>hentno</name> <operator>=</operator> <name><name>hstart</name><index>[<expr><call><name>pglz_hist_idx</name><argument_list>(<argument><expr><name>input</name></expr></argument>, <argument><expr><name>end</name></expr></argument>, <argument><expr><name>mask</name></expr></argument>)</argument_list></call></expr>]</index></name></expr>;</expr_stmt>
+	<expr_stmt><expr><name>hent</name> <operator>=</operator> <operator>&amp;</operator><name><name>hist_entries</name><index>[<expr><name>hentno</name></expr>]</index></name></expr>;</expr_stmt>
+	<while>while <condition>(<expr><name>hent</name> <operator>!=</operator> <name>INVALID_ENTRY_PTR</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>ip</name> <init>= <expr><name>input</name></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>hp</name> <init>= <expr><name><name>hent</name><operator>-&gt;</operator><name>pos</name></name></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>int32</name></type>		<name>thisoff</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>int32</name></type>		<name>thislen</name></decl>;</decl_stmt>
+
+		<comment type="block">/*
+		 * Stop if the offset does not fit into our tag anymore.
+		 */</comment>
+		<expr_stmt><expr><name>thisoff</name> <operator>=</operator> <name>ip</name> <operator>-</operator> <name>hp</name></expr>;</expr_stmt>
+		<if_stmt><if>if <condition>(<expr><name>thisoff</name> <operator>&gt;=</operator> <literal type="number">0x0fff</literal></expr>)</condition><block type="pseudo"><block_content>
+			<break>break;</break></block_content></block></if></if_stmt>
+
+		<comment type="block">/*
+		 * Determine length of match. A better match must be larger than the
+		 * best so far. And if we already have a match of 16 or more bytes,
+		 * it's worth the call overhead to use memcmp() to check if this match
+		 * is equal for the same size. After that we must fallback to
+		 * character by character comparison to know the exact position where
+		 * the diff occurred.
+		 */</comment>
+		<expr_stmt><expr><name>thislen</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+		<if_stmt><if>if <condition>(<expr><name>len</name> <operator>&gt;=</operator> <literal type="number">16</literal></expr>)</condition>
+		<block>{<block_content>
+			<if_stmt><if>if <condition>(<expr><call><name>memcmp</name><argument_list>(<argument><expr><name>ip</name></expr></argument>, <argument><expr><name>hp</name></expr></argument>, <argument><expr><name>len</name></expr></argument>)</argument_list></call> <operator>==</operator> <literal type="number">0</literal></expr>)</condition>
+			<block>{<block_content>
+				<expr_stmt><expr><name>thislen</name> <operator>=</operator> <name>len</name></expr>;</expr_stmt>
+				<expr_stmt><expr><name>ip</name> <operator>+=</operator> <name>len</name></expr>;</expr_stmt>
+				<expr_stmt><expr><name>hp</name> <operator>+=</operator> <name>len</name></expr>;</expr_stmt>
+				<while>while <condition>(<expr><name>ip</name> <operator>&lt;</operator> <name>end</name> <operator>&amp;&amp;</operator> <operator>*</operator><name>ip</name> <operator>==</operator> <operator>*</operator><name>hp</name> <operator>&amp;&amp;</operator> <name>thislen</name> <operator>&lt;</operator> <name>PGLZ_MAX_MATCH</name></expr>)</condition>
+				<block>{<block_content>
+					<expr_stmt><expr><name>thislen</name><operator>++</operator></expr>;</expr_stmt>
+					<expr_stmt><expr><name>ip</name><operator>++</operator></expr>;</expr_stmt>
+					<expr_stmt><expr><name>hp</name><operator>++</operator></expr>;</expr_stmt>
+				</block_content>}</block></while>
+			</block_content>}</block></if></if_stmt>
+		</block_content>}</block></if>
+		<else>else
+		<block>{<block_content>
+			<while>while <condition>(<expr><name>ip</name> <operator>&lt;</operator> <name>end</name> <operator>&amp;&amp;</operator> <operator>*</operator><name>ip</name> <operator>==</operator> <operator>*</operator><name>hp</name> <operator>&amp;&amp;</operator> <name>thislen</name> <operator>&lt;</operator> <name>PGLZ_MAX_MATCH</name></expr>)</condition>
+			<block>{<block_content>
+				<expr_stmt><expr><name>thislen</name><operator>++</operator></expr>;</expr_stmt>
+				<expr_stmt><expr><name>ip</name><operator>++</operator></expr>;</expr_stmt>
+				<expr_stmt><expr><name>hp</name><operator>++</operator></expr>;</expr_stmt>
+			</block_content>}</block></while>
+		</block_content>}</block></else></if_stmt>
+
+		<comment type="block">/*
+		 * Remember this match as the best (if it is)
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><name>thislen</name> <operator>&gt;</operator> <name>len</name></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><name>len</name> <operator>=</operator> <name>thislen</name></expr>;</expr_stmt>
+			<expr_stmt><expr><name>off</name> <operator>=</operator> <name>thisoff</name></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+
+		<comment type="block">/*
+		 * Advance to the next history entry
+		 */</comment>
+		<expr_stmt><expr><name>hent</name> <operator>=</operator> <name><name>hent</name><operator>-&gt;</operator><name>next</name></name></expr>;</expr_stmt>
+
+		<comment type="block">/*
+		 * Be happy with lesser good matches the more entries we visited. But
+		 * no point in doing calculation if we're at end of list.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><name>hent</name> <operator>!=</operator> <name>INVALID_ENTRY_PTR</name></expr>)</condition>
+		<block>{<block_content>
+			<if_stmt><if>if <condition>(<expr><name>len</name> <operator>&gt;=</operator> <name>good_match</name></expr>)</condition><block type="pseudo"><block_content>
+				<break>break;</break></block_content></block></if></if_stmt>
+			<expr_stmt><expr><name>good_match</name> <operator>-=</operator> <operator>(</operator><name>good_match</name> <operator>*</operator> <name>good_drop</name><operator>)</operator> <operator>/</operator> <literal type="number">100</literal></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+	</block_content>}</block></while>
+
+	<comment type="block">/*
+	 * Return match information only if it results at least in one byte
+	 * reduction.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name>len</name> <operator>&gt;</operator> <literal type="number">2</literal></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><operator>*</operator><name>lenp</name> <operator>=</operator> <name>len</name></expr>;</expr_stmt>
+		<expr_stmt><expr><operator>*</operator><name>offp</name> <operator>=</operator> <name>off</name></expr>;</expr_stmt>
+		<return>return <expr><literal type="number">1</literal></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<return>return <expr><literal type="number">0</literal></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/* ----------
+ * pglz_compress -
+ *
+ *		Compresses source into dest using strategy. Returns the number of
+ *		bytes written in buffer dest, or -1 if compression fails.
+ * ----------
+ */</comment>
+<function><type><name>int32</name></type>
+<name>pglz_compress</name><parameter_list>(<parameter><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>source</name></decl></parameter>, <parameter><decl><type><name>int32</name></type> <name>slen</name></decl></parameter>, <parameter><decl><type><name>char</name> <modifier>*</modifier></type><name>dest</name></decl></parameter>,
+			  <parameter><decl><type><specifier>const</specifier> <name>PGLZ_Strategy</name> <modifier>*</modifier></type><name>strategy</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>unsigned</name> <name>char</name> <modifier>*</modifier></type><name>bp</name> <init>= <expr><operator>(</operator><name>unsigned</name> <name>char</name> <operator>*</operator><operator>)</operator> <name>dest</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>unsigned</name> <name>char</name> <modifier>*</modifier></type><name>bstart</name> <init>= <expr><name>bp</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>hist_next</name> <init>= <expr><literal type="number">1</literal></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type>		<name>hist_recycle</name> <init>= <expr><name>false</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>dp</name> <init>= <expr><name>source</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>dend</name> <init>= <expr><name>source</name> <operator>+</operator> <name>slen</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>unsigned</name> <name>char</name></type> <name>ctrl_dummy</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>unsigned</name> <name>char</name> <modifier>*</modifier></type><name>ctrlp</name> <init>= <expr><operator>&amp;</operator><name>ctrl_dummy</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>unsigned</name> <name>char</name></type> <name>ctrlb</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>unsigned</name> <name>char</name></type> <name>ctrl</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type>		<name>found_match</name> <init>= <expr><name>false</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int32</name></type>		<name>match_len</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int32</name></type>		<name>match_off</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int32</name></type>		<name>good_match</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int32</name></type>		<name>good_drop</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int32</name></type>		<name>result_size</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int32</name></type>		<name>result_max</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int32</name></type>		<name>need_rate</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>hashsz</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>mask</name></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * Our fallback strategy is the default.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name>strategy</name> <operator>==</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name>strategy</name> <operator>=</operator> <name>PGLZ_strategy_default</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<comment type="block">/*
+	 * If the strategy forbids compression (at all or if source chunk size out
+	 * of range), fail.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>strategy</name><operator>-&gt;</operator><name>match_size_good</name></name> <operator>&lt;=</operator> <literal type="number">0</literal> <operator>||</operator>
+		<name><name>slen</name> <argument_list type="generic">&lt; <argument><expr><name><name>strategy</name><operator>-&gt;</operator><name>min_input_size</name></name> <operator>||</operator>
+		<name>slen</name></expr></argument> &gt;</argument_list></name> <name><name>strategy</name><operator>-&gt;</operator><name>max_input_size</name></name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><operator>-</operator><literal type="number">1</literal></expr>;</return></block_content></block></if></if_stmt>
+
+	<comment type="block">/*
+	 * Limit the match parameters to the supported range.
+	 */</comment>
+	<expr_stmt><expr><name>good_match</name> <operator>=</operator> <name><name>strategy</name><operator>-&gt;</operator><name>match_size_good</name></name></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><name>good_match</name> <operator>&gt;</operator> <name>PGLZ_MAX_MATCH</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name>good_match</name> <operator>=</operator> <name>PGLZ_MAX_MATCH</name></expr>;</expr_stmt></block_content></block></if>
+	<if type="elseif">else if <condition>(<expr><name>good_match</name> <operator>&lt;</operator> <literal type="number">17</literal></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name>good_match</name> <operator>=</operator> <literal type="number">17</literal></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><name>good_drop</name> <operator>=</operator> <name><name>strategy</name><operator>-&gt;</operator><name>match_size_drop</name></name></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><name>good_drop</name> <operator>&lt;</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name>good_drop</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt></block_content></block></if>
+	<if type="elseif">else if <condition>(<expr><name>good_drop</name> <operator>&gt;</operator> <literal type="number">100</literal></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name>good_drop</name> <operator>=</operator> <literal type="number">100</literal></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><name>need_rate</name> <operator>=</operator> <name><name>strategy</name><operator>-&gt;</operator><name>min_comp_rate</name></name></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><name>need_rate</name> <operator>&lt;</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name>need_rate</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt></block_content></block></if>
+	<if type="elseif">else if <condition>(<expr><name>need_rate</name> <operator>&gt;</operator> <literal type="number">99</literal></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name>need_rate</name> <operator>=</operator> <literal type="number">99</literal></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<comment type="block">/*
+	 * Compute the maximum result size allowed by the strategy, namely the
+	 * input size minus the minimum wanted compression rate.  This had better
+	 * be &lt;= slen, else we might overrun the provided output buffer.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name>slen</name> <operator>&gt;</operator> <operator>(</operator><name>INT_MAX</name> <operator>/</operator> <literal type="number">100</literal><operator>)</operator></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* Approximate to avoid overflow */</comment>
+		<expr_stmt><expr><name>result_max</name> <operator>=</operator> <operator>(</operator><name>slen</name> <operator>/</operator> <literal type="number">100</literal><operator>)</operator> <operator>*</operator> <operator>(</operator><literal type="number">100</literal> <operator>-</operator> <name>need_rate</name><operator>)</operator></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<else>else<block type="pseudo"><block_content>
+		<expr_stmt><expr><name>result_max</name> <operator>=</operator> <operator>(</operator><name>slen</name> <operator>*</operator> <operator>(</operator><literal type="number">100</literal> <operator>-</operator> <name>need_rate</name><operator>)</operator><operator>)</operator> <operator>/</operator> <literal type="number">100</literal></expr>;</expr_stmt></block_content></block></else></if_stmt>
+
+	<comment type="block">/*
+	 * Experiments suggest that these hash sizes work pretty well. A large
+	 * hash table minimizes collision, but has a higher startup cost. For a
+	 * small input, the startup cost dominates. The table size must be a power
+	 * of two.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name>slen</name> <operator>&lt;</operator> <literal type="number">128</literal></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name>hashsz</name> <operator>=</operator> <literal type="number">512</literal></expr>;</expr_stmt></block_content></block></if>
+	<if type="elseif">else if <condition>(<expr><name>slen</name> <operator>&lt;</operator> <literal type="number">256</literal></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name>hashsz</name> <operator>=</operator> <literal type="number">1024</literal></expr>;</expr_stmt></block_content></block></if>
+	<if type="elseif">else if <condition>(<expr><name>slen</name> <operator>&lt;</operator> <literal type="number">512</literal></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name>hashsz</name> <operator>=</operator> <literal type="number">2048</literal></expr>;</expr_stmt></block_content></block></if>
+	<if type="elseif">else if <condition>(<expr><name>slen</name> <operator>&lt;</operator> <literal type="number">1024</literal></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name>hashsz</name> <operator>=</operator> <literal type="number">4096</literal></expr>;</expr_stmt></block_content></block></if>
+	<else>else<block type="pseudo"><block_content>
+		<expr_stmt><expr><name>hashsz</name> <operator>=</operator> <literal type="number">8192</literal></expr>;</expr_stmt></block_content></block></else></if_stmt>
+	<expr_stmt><expr><name>mask</name> <operator>=</operator> <name>hashsz</name> <operator>-</operator> <literal type="number">1</literal></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Initialize the history lists to empty.  We do not need to zero the
+	 * hist_entries[] array; its entries are initialized as they are used.
+	 */</comment>
+	<expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><name>hist_start</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><name>hashsz</name> <operator>*</operator> <sizeof>sizeof<argument_list>(<argument><expr><name>int16</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Compress the source directly into the output buffer.
+	 */</comment>
+	<while>while <condition>(<expr><name>dp</name> <operator>&lt;</operator> <name>dend</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/*
+		 * If we already exceeded the maximum result size, fail.
+		 *
+		 * We check once per loop; since the loop body could emit as many as 4
+		 * bytes (a control byte and 3-byte tag), PGLZ_MAX_OUTPUT() had better
+		 * allow 4 slop bytes.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><name>bp</name> <operator>-</operator> <name>bstart</name> <operator>&gt;=</operator> <name>result_max</name></expr>)</condition><block type="pseudo"><block_content>
+			<return>return <expr><operator>-</operator><literal type="number">1</literal></expr>;</return></block_content></block></if></if_stmt>
+
+		<comment type="block">/*
+		 * If we've emitted more than first_success_by bytes without finding
+		 * anything compressible at all, fail.  This lets us fall out
+		 * reasonably quickly when looking at incompressible input (such as
+		 * pre-compressed data).
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><name>found_match</name> <operator>&amp;&amp;</operator> <name>bp</name> <operator>-</operator> <name>bstart</name> <operator>&gt;=</operator> <name><name>strategy</name><operator>-&gt;</operator><name>first_success_by</name></name></expr>)</condition><block type="pseudo"><block_content>
+			<return>return <expr><operator>-</operator><literal type="number">1</literal></expr>;</return></block_content></block></if></if_stmt>
+
+		<comment type="block">/*
+		 * Try to find a match in the history
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><call><name>pglz_find_match</name><argument_list>(<argument><expr><name>hist_start</name></expr></argument>, <argument><expr><name>dp</name></expr></argument>, <argument><expr><name>dend</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>match_len</name></expr></argument>,
+							<argument><expr><operator>&amp;</operator><name>match_off</name></expr></argument>, <argument><expr><name>good_match</name></expr></argument>, <argument><expr><name>good_drop</name></expr></argument>, <argument><expr><name>mask</name></expr></argument>)</argument_list></call></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/*
+			 * Create the tag and add history entries for all matched
+			 * characters.
+			 */</comment>
+			<expr_stmt><expr><call><name>pglz_out_tag</name><argument_list>(<argument><expr><name>ctrlp</name></expr></argument>, <argument><expr><name>ctrlb</name></expr></argument>, <argument><expr><name>ctrl</name></expr></argument>, <argument><expr><name>bp</name></expr></argument>, <argument><expr><name>match_len</name></expr></argument>, <argument><expr><name>match_off</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<while>while <condition>(<expr><name>match_len</name><operator>--</operator></expr>)</condition>
+			<block>{<block_content>
+				<expr_stmt><expr><call><name>pglz_hist_add</name><argument_list>(<argument><expr><name>hist_start</name></expr></argument>, <argument><expr><name>hist_entries</name></expr></argument>,
+							  <argument><expr><name>hist_next</name></expr></argument>, <argument><expr><name>hist_recycle</name></expr></argument>,
+							  <argument><expr><name>dp</name></expr></argument>, <argument><expr><name>dend</name></expr></argument>, <argument><expr><name>mask</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<expr_stmt><expr><name>dp</name><operator>++</operator></expr>;</expr_stmt>			<comment type="block">/* Do not do this ++ in the line above! */</comment>
+				<comment type="block">/* The macro would do it four times - Jan.  */</comment>
+			</block_content>}</block></while>
+			<expr_stmt><expr><name>found_match</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+		</block_content>}</block></if>
+		<else>else
+		<block>{<block_content>
+			<comment type="block">/*
+			 * No match found. Copy one literal byte.
+			 */</comment>
+			<expr_stmt><expr><call><name>pglz_out_literal</name><argument_list>(<argument><expr><name>ctrlp</name></expr></argument>, <argument><expr><name>ctrlb</name></expr></argument>, <argument><expr><name>ctrl</name></expr></argument>, <argument><expr><name>bp</name></expr></argument>, <argument><expr><operator>*</operator><name>dp</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>pglz_hist_add</name><argument_list>(<argument><expr><name>hist_start</name></expr></argument>, <argument><expr><name>hist_entries</name></expr></argument>,
+						  <argument><expr><name>hist_next</name></expr></argument>, <argument><expr><name>hist_recycle</name></expr></argument>,
+						  <argument><expr><name>dp</name></expr></argument>, <argument><expr><name>dend</name></expr></argument>, <argument><expr><name>mask</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><name>dp</name><operator>++</operator></expr>;</expr_stmt>				<comment type="block">/* Do not do this ++ in the line above! */</comment>
+			<comment type="block">/* The macro would do it four times - Jan.  */</comment>
+		</block_content>}</block></else></if_stmt>
+	</block_content>}</block></while>
+
+	<comment type="block">/*
+	 * Write out the last control byte and check that we haven't overrun the
+	 * output size allowed by the strategy.
+	 */</comment>
+	<expr_stmt><expr><operator>*</operator><name>ctrlp</name> <operator>=</operator> <name>ctrlb</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name>result_size</name> <operator>=</operator> <name>bp</name> <operator>-</operator> <name>bstart</name></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><name>result_size</name> <operator>&gt;=</operator> <name>result_max</name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><operator>-</operator><literal type="number">1</literal></expr>;</return></block_content></block></if></if_stmt>
+
+	<comment type="block">/* success */</comment>
+	<return>return <expr><name>result_size</name></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/* ----------
+ * pglz_decompress -
+ *
+ *		Decompresses source into dest. Returns the number of bytes
+ *		decompressed into the destination buffer, or -1 if the
+ *		compressed data is corrupted.
+ *
+ *		If check_complete is true, the data is considered corrupted
+ *		if we don't exactly fill the destination buffer.  Callers that
+ *		are extracting a slice typically can't apply this check.
+ * ----------
+ */</comment>
+<function><type><name>int32</name></type>
+<name>pglz_decompress</name><parameter_list>(<parameter><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>source</name></decl></parameter>, <parameter><decl><type><name>int32</name></type> <name>slen</name></decl></parameter>, <parameter><decl><type><name>char</name> <modifier>*</modifier></type><name>dest</name></decl></parameter>,
+				<parameter><decl><type><name>int32</name></type> <name>rawsize</name></decl></parameter>, <parameter><decl><type><name>bool</name></type> <name>check_complete</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><specifier>const</specifier> <name>unsigned</name> <name>char</name> <modifier>*</modifier></type><name>sp</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><specifier>const</specifier> <name>unsigned</name> <name>char</name> <modifier>*</modifier></type><name>srcend</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>unsigned</name> <name>char</name> <modifier>*</modifier></type><name>dp</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>unsigned</name> <name>char</name> <modifier>*</modifier></type><name>destend</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name>sp</name> <operator>=</operator> <operator>(</operator><specifier>const</specifier> <name>unsigned</name> <name>char</name> <operator>*</operator><operator>)</operator> <name>source</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name>srcend</name> <operator>=</operator> <operator>(</operator><operator>(</operator><specifier>const</specifier> <name>unsigned</name> <name>char</name> <operator>*</operator><operator>)</operator> <name>source</name><operator>)</operator> <operator>+</operator> <name>slen</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name>dp</name> <operator>=</operator> <operator>(</operator><name>unsigned</name> <name>char</name> <operator>*</operator><operator>)</operator> <name>dest</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name>destend</name> <operator>=</operator> <name>dp</name> <operator>+</operator> <name>rawsize</name></expr>;</expr_stmt>
+
+	<while>while <condition>(<expr><name>sp</name> <operator>&lt;</operator> <name>srcend</name> <operator>&amp;&amp;</operator> <name>dp</name> <operator>&lt;</operator> <name>destend</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/*
+		 * Read one control byte and process the next 8 items (or as many as
+		 * remain in the compressed input).
+		 */</comment>
+		<decl_stmt><decl><type><name>unsigned</name> <name>char</name></type> <name>ctrl</name> <init>= <expr><operator>*</operator><name>sp</name><operator>++</operator></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>int</name></type>			<name>ctrlc</name></decl>;</decl_stmt>
+
+		<for>for <control>(<init><expr><name>ctrlc</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>ctrlc</name> <operator>&lt;</operator> <literal type="number">8</literal> <operator>&amp;&amp;</operator> <name>sp</name> <operator>&lt;</operator> <name>srcend</name> <operator>&amp;&amp;</operator> <name>dp</name> <operator>&lt;</operator> <name>destend</name></expr>;</condition> <incr><expr><name>ctrlc</name><operator>++</operator></expr></incr>)</control>
+		<block>{<block_content>
+			<if_stmt><if>if <condition>(<expr><name>ctrl</name> <operator>&amp;</operator> <literal type="number">1</literal></expr>)</condition>
+			<block>{<block_content>
+				<comment type="block">/*
+				 * Set control bit means we must read a match tag. The match
+				 * is coded with two bytes. First byte uses lower nibble to
+				 * code length - 3. Higher nibble contains upper 4 bits of the
+				 * offset. The next following byte contains the lower 8 bits
+				 * of the offset. If the length is coded as 18, another
+				 * extension tag byte tells how much longer the match really
+				 * was (0-255).
+				 */</comment>
+				<decl_stmt><decl><type><name>int32</name></type>		<name>len</name></decl>;</decl_stmt>
+				<decl_stmt><decl><type><name>int32</name></type>		<name>off</name></decl>;</decl_stmt>
+
+				<expr_stmt><expr><name>len</name> <operator>=</operator> <operator>(</operator><name><name>sp</name><index>[<expr><literal type="number">0</literal></expr>]</index></name> <operator>&amp;</operator> <literal type="number">0x0f</literal><operator>)</operator> <operator>+</operator> <literal type="number">3</literal></expr>;</expr_stmt>
+				<expr_stmt><expr><name>off</name> <operator>=</operator> <operator>(</operator><operator>(</operator><name><name>sp</name><index>[<expr><literal type="number">0</literal></expr>]</index></name> <operator>&amp;</operator> <literal type="number">0xf0</literal><operator>)</operator> <operator>&lt;&lt;</operator> <literal type="number">4</literal><operator>)</operator> <operator>|</operator> <name><name>sp</name><index>[<expr><literal type="number">1</literal></expr>]</index></name></expr>;</expr_stmt>
+				<expr_stmt><expr><name>sp</name> <operator>+=</operator> <literal type="number">2</literal></expr>;</expr_stmt>
+				<if_stmt><if>if <condition>(<expr><name>len</name> <operator>==</operator> <literal type="number">18</literal></expr>)</condition><block type="pseudo"><block_content>
+					<expr_stmt><expr><name>len</name> <operator>+=</operator> <operator>*</operator><name>sp</name><operator>++</operator></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+				<comment type="block">/*
+				 * Check for corrupt data: if we fell off the end of the
+				 * source, or if we obtained off = 0, we have problems.  (We
+				 * must check this, else we risk an infinite loop below in the
+				 * face of corrupt data.)
+				 */</comment>
+				<if_stmt><if>if <condition>(<expr><call><name>unlikely</name><argument_list>(<argument><expr><name>sp</name> <operator>&gt;</operator> <name>srcend</name> <operator>||</operator> <name>off</name> <operator>==</operator> <literal type="number">0</literal></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+					<return>return <expr><operator>-</operator><literal type="number">1</literal></expr>;</return></block_content></block></if></if_stmt>
+
+				<comment type="block">/*
+				 * Don't emit more data than requested.
+				 */</comment>
+				<expr_stmt><expr><name>len</name> <operator>=</operator> <call><name>Min</name><argument_list>(<argument><expr><name>len</name></expr></argument>, <argument><expr><name>destend</name> <operator>-</operator> <name>dp</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+				<comment type="block">/*
+				 * Now we copy the bytes specified by the tag from OUTPUT to
+				 * OUTPUT (copy len bytes from dp - off to dp).  The copied
+				 * areas could overlap, so to avoid undefined behavior in
+				 * memcpy(), be careful to copy only non-overlapping regions.
+				 *
+				 * Note that we cannot use memmove() instead, since while its
+				 * behavior is well-defined, it's also not what we want.
+				 */</comment>
+				<while>while <condition>(<expr><name>off</name> <operator>&lt;</operator> <name>len</name></expr>)</condition>
+				<block>{<block_content>
+					<comment type="block">/*
+					 * We can safely copy "off" bytes since that clearly
+					 * results in non-overlapping source and destination.
+					 */</comment>
+					<expr_stmt><expr><call><name>memcpy</name><argument_list>(<argument><expr><name>dp</name></expr></argument>, <argument><expr><name>dp</name> <operator>-</operator> <name>off</name></expr></argument>, <argument><expr><name>off</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+					<expr_stmt><expr><name>len</name> <operator>-=</operator> <name>off</name></expr>;</expr_stmt>
+					<expr_stmt><expr><name>dp</name> <operator>+=</operator> <name>off</name></expr>;</expr_stmt>
+
+					<comment type="block">/*----------
+					 * This bit is less obvious: we can double "off" after
+					 * each such step.  Consider this raw input:
+					 *		112341234123412341234
+					 * This will be encoded as 5 literal bytes "11234" and
+					 * then a match tag with length 16 and offset 4.  After
+					 * memcpy'ing the first 4 bytes, we will have emitted
+					 *		112341234
+					 * so we can double "off" to 8, then after the next step
+					 * we have emitted
+					 *		11234123412341234
+					 * Then we can double "off" again, after which it is more
+					 * than the remaining "len" so we fall out of this loop
+					 * and finish with a non-overlapping copy of the
+					 * remainder.  In general, a match tag with off &lt; len
+					 * implies that the decoded data has a repeat length of
+					 * "off".  We can handle 1, 2, 4, etc repetitions of the
+					 * repeated string per memcpy until we get to a situation
+					 * where the final copy step is non-overlapping.
+					 *
+					 * (Another way to understand this is that we are keeping
+					 * the copy source point dp - off the same throughout.)
+					 *----------
+					 */</comment>
+					<expr_stmt><expr><name>off</name> <operator>+=</operator> <name>off</name></expr>;</expr_stmt>
+				</block_content>}</block></while>
+				<expr_stmt><expr><call><name>memcpy</name><argument_list>(<argument><expr><name>dp</name></expr></argument>, <argument><expr><name>dp</name> <operator>-</operator> <name>off</name></expr></argument>, <argument><expr><name>len</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<expr_stmt><expr><name>dp</name> <operator>+=</operator> <name>len</name></expr>;</expr_stmt>
+			</block_content>}</block></if>
+			<else>else
+			<block>{<block_content>
+				<comment type="block">/*
+				 * An unset control bit means LITERAL BYTE. So we just copy
+				 * one from INPUT to OUTPUT.
+				 */</comment>
+				<expr_stmt><expr><operator>*</operator><name>dp</name><operator>++</operator> <operator>=</operator> <operator>*</operator><name>sp</name><operator>++</operator></expr>;</expr_stmt>
+			</block_content>}</block></else></if_stmt>
+
+			<comment type="block">/*
+			 * Advance the control bit
+			 */</comment>
+			<expr_stmt><expr><name>ctrl</name> <operator>&gt;&gt;=</operator> <literal type="number">1</literal></expr>;</expr_stmt>
+		</block_content>}</block></for>
+	</block_content>}</block></while>
+
+	<comment type="block">/*
+	 * If requested, check we decompressed the right amount.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name>check_complete</name> <operator>&amp;&amp;</operator> <operator>(</operator><name>dp</name> <operator>!=</operator> <name>destend</name> <operator>||</operator> <name>sp</name> <operator>!=</operator> <name>srcend</name><operator>)</operator></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><operator>-</operator><literal type="number">1</literal></expr>;</return></block_content></block></if></if_stmt>
+
+	<comment type="block">/*
+	 * That's it.
+	 */</comment>
+	<return>return <expr><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <name>dp</name> <operator>-</operator> <name>dest</name></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/* ----------
+ * pglz_max_compressed_size -
+ *
+ *		Calculate the maximum compressed size for a given amount of raw data.
+ *		Return the maximum size, or total compressed size if maximum size is
+ *		larger than total compressed size.
+ *
+ * We can't use PGLZ_MAX_OUTPUT for this purpose, because that's used to size
+ * the compression buffer (and abort the compression). It does not really say
+ * what's the maximum compressed size for an input of a given length, and it
+ * may happen that while the whole value is compressible (and thus fits into
+ * PGLZ_MAX_OUTPUT nicely), the prefix is not compressible at all.
+ * ----------
+ */</comment>
+<function><type><name>int32</name></type>
+<name>pglz_maximum_compressed_size</name><parameter_list>(<parameter><decl><type><name>int32</name></type> <name>rawsize</name></decl></parameter>, <parameter><decl><type><name>int32</name></type> <name>total_compressed_size</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>int64</name></type>		<name>compressed_size</name></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * pglz uses one control bit per byte, so if the entire desired prefix is
+	 * represented as literal bytes, we'll need (rawsize * 9) bits.  We care
+	 * about bytes though, so be sure to round up not down.
+	 *
+	 * Use int64 here to prevent overflow during calculation.
+	 */</comment>
+	<expr_stmt><expr><name>compressed_size</name> <operator>=</operator> <operator>(</operator><operator>(</operator><name>int64</name><operator>)</operator> <name>rawsize</name> <operator>*</operator> <literal type="number">9</literal> <operator>+</operator> <literal type="number">7</literal><operator>)</operator> <operator>/</operator> <literal type="number">8</literal></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * The above fails to account for a corner case: we could have compressed
+	 * data that starts with N-1 or N-2 literal bytes and then has a match tag
+	 * of 2 or 3 bytes.  It's therefore possible that we need to fetch 1 or 2
+	 * more bytes in order to have the whole match tag.  (Match tags earlier
+	 * in the compressed data don't cause a problem, since they should
+	 * represent more decompressed bytes than they occupy themselves.)
+	 */</comment>
+	<expr_stmt><expr><name>compressed_size</name> <operator>+=</operator> <literal type="number">2</literal></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Maximum compressed size can't be larger than total compressed size.
+	 * (This also ensures that our result fits in int32.)
+	 */</comment>
+	<expr_stmt><expr><name>compressed_size</name> <operator>=</operator> <call><name>Min</name><argument_list>(<argument><expr><name>compressed_size</name></expr></argument>, <argument><expr><name>total_compressed_size</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<return>return <expr><operator>(</operator><name>int32</name><operator>)</operator> <name>compressed_size</name></expr>;</return>
+</block_content>}</block></function>
+</unit>

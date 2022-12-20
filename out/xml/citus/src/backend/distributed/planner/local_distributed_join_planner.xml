@@ -1,0 +1,575 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<unit xmlns="http://www.srcML.org/srcML/src" xmlns:cpp="http://www.srcML.org/srcML/cpp" revision="1.0.0" language="C" filename="/cloned_projects/citus/src/backend/distributed/planner/local_distributed_join_planner.c"><comment type="block">/*-------------------------------------------------------------------------
+ *
+ * local_distributed_join_planner.c
+ *
+ * This file contains functions to convert convert local-distributed
+ * tables to subqueries so that they can be planned by the router planner.
+ *
+ *
+ * The current algorithm checks if there is any table in the `jointree` that
+ * should be converted, if so it creates conversion candidates.
+ * With conversion candidates, it will convert either a distributed table or a local table to a
+ * subquery until it is plannable by router planner. It will choose a distributed table if we
+ * expect it to return few rows, such as a constant equality filter on a unique column.
+ *
+ * ```sql
+ * -- assuming dist.a is a unique column, this will convert distributed table
+ * SELECT * FROM dist join local ON(a) where dist.a = 5;
+ * ```
+ *
+ * If the uniqueness is defined on multiple columns such as `dist.a, dist.b`
+ * then distributed table will only be chosen if there is a constant equality in all of the columns such as:
+ *
+ * ```sql
+ * SELECT * FROM dist join local ON(a) where dist.a = 5 AND dist.b =10; -- this will choose distributed table
+ * SELECT * FROM dist join local ON(a) where dist.a = 5 AND dist.b &gt;10; -- this won't since no equality on dist.b
+ * SELECT * FROM dist join local ON(a) where dist.a = 5; -- this won't since no equality on dist.b
+ * ```
+ *
+ * The algorithm will also not favor distributed tables if there exists a
+ * distributed table which is expected to return many rows, because in that
+ * case we will already plan local tables hence there is no point in converting some distributed tables.
+ *
+ * ```sql
+ * -- here only the local table will be chosen
+ * SELECT * FROM dist_without_unique JOIN dist_with_unique USING(a) join local USING (a);
+ * ```
+ *
+ * this also makes the algorithm consistent.
+ *
+ * The algorithm can understand `OR` and `AND` expressions in the filters.
+ *
+ * There is a GUC called `local_table_join_policy` consisting of 4 modes:
+ * `none`: don't do any conversion
+ * `prefer-local`: prefer converting local tables if there is
+ * `prefer-distributed`: prefer converting distributed tables if there is
+ * `auto`: use the above mechanism to decide (constant equality on unique column)
+ *
+ * `auto` mode is the default.
+ *
+ * While converting to a subquery, we use a trick to avoid unnecessary network bandwidth,
+ * if there are columns that are not required in a table that will be converted to a subquery, We do:
+ *
+ * ```sql
+ * SELECT t.a, NULL, NULL (SELECT a FROM table) t
+ * ```
+ *
+ * instead of
+ *
+ * ```sql
+ * SELECT a, NULL, NULL FROM table
+ * ```
+ *
+ * There are NULLs in the query because we currently don't have an easy way to update the Vars
+ * that reference the non-required ones and we don't want to break the postgres query.
+ *
+ *
+ * Copyright (c) Citus Data, Inc.
+ *
+ *-------------------------------------------------------------------------
+ */</comment>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"postgres.h"</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/pg_version_constants.h"</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"funcapi.h"</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/pg_type.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/pg_class.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/pg_index.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/citus_nodes.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/citus_ruleutils.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/commands.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/commands/multi_copy.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/distributed_planner.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/errormessage.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/local_distributed_join_planner.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/listutils.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/log_utils.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/metadata_cache.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/multi_logical_planner.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/multi_logical_optimizer.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/multi_router_planner.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/multi_physical_planner.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/multi_server_executor.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/multi_router_planner.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/coordinator_protocol.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/query_colocation_checker.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/query_pushdown_planning.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/recursive_planning.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/relation_restriction_equivalence.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/log_utils.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/shard_pruning.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/version_compat.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"lib/stringinfo.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"optimizer/clauses.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"optimizer/optimizer.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"optimizer/planner.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"optimizer/prep.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"parser/parsetree.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"nodes/makefuncs.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"nodes/nodeFuncs.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"nodes/nodes.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"nodes/nodeFuncs.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"nodes/pg_list.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"nodes/primnodes.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"nodes/pathnodes.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/builtins.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/guc.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/lsyscache.h"</cpp:file></cpp:include>
+
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>INVALID_RTE_IDENTITY</name></cpp:macro> <cpp:value>-1</cpp:value></cpp:define>
+
+<comment type="block">/*
+ * Managed via a GUC
+ */</comment>
+<decl_stmt><decl><type><name>int</name></type> <name>LocalTableJoinPolicy</name> <init>= <expr><name>LOCAL_JOIN_POLICY_AUTO</name></expr></init></decl>;</decl_stmt>
+
+<comment type="block">/*
+ * RangeTableEntryDetails contains some information about
+ * a range table entry so that we don't need to calculate
+ * them over and over.
+ */</comment>
+<typedef>typedef <type><struct>struct <name>RangeTableEntryDetails</name>
+<block>{
+	<decl_stmt><decl><type><name>RangeTblEntry</name> <modifier>*</modifier></type><name>rangeTableEntry</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>List</name> <modifier>*</modifier></type><name>requiredAttributeNumbers</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type> <name>hasConstantFilterOnUniqueColumn</name></decl>;</decl_stmt>
+}</block></struct></type> <name>RangeTableEntryDetails</name>;</typedef>
+
+<comment type="block">/*
+ * ConversionCandidates contains candidates that could
+ * be converted to a subquery. This is used as a convenience to
+ * first generate all the candidates and then choose which ones to convert.
+ */</comment>
+<typedef>typedef <type><struct>struct <name>ConversionCandidates</name>
+<block>{
+	<decl_stmt><decl><type><name>List</name> <modifier>*</modifier></type><name>distributedTableList</name></decl>;</decl_stmt> <comment type="block">/* reference or distributed table */</comment>
+	<decl_stmt><decl><type><name>List</name> <modifier>*</modifier></type><name>localTableList</name></decl>;</decl_stmt> <comment type="block">/* local or citus local table */</comment>
+}</block></struct></type><name>ConversionCandidates</name>;</typedef>
+
+
+<comment type="block">/*
+ * IndexColumns contains the column numbers for an index.
+ * For example if there is an index on (a, b) then it will contain
+ * their column numbers (1,2).
+ */</comment>
+<typedef>typedef <type><struct>struct <name>IndexColumns</name>
+<block>{
+	<decl_stmt><decl><type><name>List</name> <modifier>*</modifier></type><name>indexColumnNos</name></decl>;</decl_stmt>
+}</block></struct></type><name>IndexColumns</name>;</typedef>
+
+<comment type="block">/*
+ * ConversionChoice represents which conversion group
+ * to convert to a subquery. Currently we either convert all
+ * local tables, or distributed tables.
+ */</comment>
+<typedef>typedef <type><enum>enum <name>ConversionChoice</name>
+<block>{
+	<decl><name>CONVERT_LOCAL_TABLES</name> <init>= <expr><literal type="number">1</literal></expr></init></decl>,
+	<decl><name>CONVERT_DISTRIBUTED_TABLES</name> <init>= <expr><literal type="number">2</literal></expr></init></decl>
+}</block></enum></type><name>ConversionChoice</name>;</typedef>
+
+<function_decl><type><specifier>static</specifier> <name>bool</name></type> <name>HasConstantFilterOnUniqueColumn</name><parameter_list>(<parameter><decl><type><name>RangeTblEntry</name> <modifier>*</modifier></type><name>rangeTableEntry</name></decl></parameter>,
+											<parameter><decl><type><name>RelationRestriction</name> <modifier>*</modifier></type><name>relationRestriction</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>ConversionCandidates</name> <modifier>*</modifier></type> <name>CreateConversionCandidates</name><parameter_list>(<parameter><decl><type><name>PlannerRestrictionContext</name> <modifier>*</modifier></type>
+														 <name>plannerRestrictionContext</name></decl></parameter>,
+														 <parameter><decl><type><name>List</name> <modifier>*</modifier></type><name>rangeTableList</name></decl></parameter>,
+														 <parameter><decl><type><name>int</name></type> <name>resultRTEIdentity</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>AppendUniqueIndexColumnsToList</name><parameter_list>(<parameter><decl><type><name>Form_pg_index</name></type> <name>indexForm</name></decl></parameter>, <parameter><decl><type><name>List</name> <modifier>*</modifier><modifier>*</modifier></type><name>uniqueIndexes</name></decl></parameter>,
+										   <parameter><decl><type><name>int</name></type> <name>flags</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>ConversionChoice</name></type> <name>GetConversionChoice</name><parameter_list>(<parameter><decl><type><name>ConversionCandidates</name> <modifier>*</modifier></type>
+											<name>conversionCandidates</name></decl></parameter>,
+											<parameter><decl><type><name>PlannerRestrictionContext</name> <modifier>*</modifier></type>
+											<name>plannerRestrictionContext</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>bool</name></type> <name>AllRangeTableEntriesHaveUniqueIndex</name><parameter_list>(<parameter><decl><type><name>List</name> <modifier>*</modifier></type><name>rangeTableEntryDetailsList</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>bool</name></type> <name>FirstIsSuperSetOfSecond</name><parameter_list>(<parameter><decl><type><name>List</name> <modifier>*</modifier></type><name>firstIntList</name></decl></parameter>, <parameter><decl><type><name>List</name> <modifier>*</modifier></type><name>secondIntList</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>ConvertRTEsToSubquery</name><parameter_list>(<parameter><decl><type><name>List</name> <modifier>*</modifier></type><name>rangeTableEntryDetailsList</name></decl></parameter>,
+								  <parameter><decl><type><name>RecursivePlanningContext</name> <modifier>*</modifier></type><name>context</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>int</name></type> <name>ResultRTEIdentity</name><parameter_list>(<parameter><decl><type><name>Query</name> <modifier>*</modifier></type><name>query</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>List</name> <modifier>*</modifier></type> <name>RTEListToConvert</name><parameter_list>(<parameter><decl><type><name>ConversionCandidates</name> <modifier>*</modifier></type><name>conversionCandidates</name></decl></parameter>,
+							   <parameter><decl><type><name>ConversionChoice</name></type> <name>conversionChoice</name></decl></parameter>)</parameter_list>;</function_decl>
+
+
+<comment type="block">/*
+ * RecursivelyPlanLocalTableJoins gets a query and the planner
+ * restrictions. As long as the query is not plannable by router planner,
+ * it converts either a local or distributed table to a subquery.
+ */</comment>
+<function><type><name>void</name></type>
+<name>RecursivelyPlanLocalTableJoins</name><parameter_list>(<parameter><decl><type><name>Query</name> <modifier>*</modifier></type><name>query</name></decl></parameter>,
+							   <parameter><decl><type><name>RecursivePlanningContext</name> <modifier>*</modifier></type><name>context</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>PlannerRestrictionContext</name> <modifier>*</modifier></type><name>plannerRestrictionContext</name> <init>=
+		<expr><call><name>GetPlannerRestrictionContext</name><argument_list>(<argument><expr><name>context</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<decl_stmt><decl><type><name>List</name> <modifier>*</modifier></type><name>rangeTableList</name> <init>= <expr><name><name>query</name><operator>-&gt;</operator><name>rtable</name></name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type> <name>resultRTEIdentity</name> <init>= <expr><call><name>ResultRTEIdentity</name><argument_list>(<argument><expr><name>query</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>ConversionCandidates</name> <modifier>*</modifier></type><name>conversionCandidates</name> <init>=
+		<expr><call><name>CreateConversionCandidates</name><argument_list>(<argument><expr><name>plannerRestrictionContext</name></expr></argument>,
+								   <argument><expr><name>rangeTableList</name></expr></argument>, <argument><expr><name>resultRTEIdentity</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<decl_stmt><decl><type><name>ConversionChoice</name></type> <name>conversionChoise</name> <init>=
+		<expr><call><name>GetConversionChoice</name><argument_list>(<argument><expr><name>conversionCandidates</name></expr></argument>, <argument><expr><name>plannerRestrictionContext</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+
+	<decl_stmt><decl><type><name>List</name> <modifier>*</modifier></type><name>rteListToConvert</name> <init>= <expr><call><name>RTEListToConvert</name><argument_list>(<argument><expr><name>conversionCandidates</name></expr></argument>, <argument><expr><name>conversionChoise</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<expr_stmt><expr><call><name>ConvertRTEsToSubquery</name><argument_list>(<argument><expr><name>rteListToConvert</name></expr></argument>, <argument><expr><name>context</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * ResultRTEIdentity returns the result RTE's identity if it exists,
+ * otherwise it returns INVALID_RTE_INDENTITY
+ */</comment>
+<function><type><specifier>static</specifier> <name>int</name></type>
+<name>ResultRTEIdentity</name><parameter_list>(<parameter><decl><type><name>Query</name> <modifier>*</modifier></type><name>query</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>int</name></type> <name>resultRTEIdentity</name> <init>= <expr><name>INVALID_RTE_IDENTITY</name></expr></init></decl>;</decl_stmt>
+	<if_stmt><if>if <condition>(<expr><call><name>IsModifyCommand</name><argument_list>(<argument><expr><name>query</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>RangeTblEntry</name> <modifier>*</modifier></type><name>resultRTE</name> <init>= <expr><call><name>ExtractResultRelationRTEOrError</name><argument_list>(<argument><expr><name>query</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+		<expr_stmt><expr><name>resultRTEIdentity</name> <operator>=</operator> <call><name>GetRTEIdentity</name><argument_list>(<argument><expr><name>resultRTE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+	<return>return <expr><name>resultRTEIdentity</name></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * RTEListToConvert to converts returns a list of RTEs that should
+ * be converted to a subquery.
+ */</comment>
+<function><type><specifier>static</specifier> <name>List</name> <modifier>*</modifier></type>
+<name>RTEListToConvert</name><parameter_list>(<parameter><decl><type><name>ConversionCandidates</name> <modifier>*</modifier></type><name>conversionCandidates</name></decl></parameter>, <parameter><decl><type><name>ConversionChoice</name></type>
+				 <name>conversionChoice</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>List</name> <modifier>*</modifier></type><name>rtesToConvert</name> <init>= <expr><name>NIL</name></expr></init></decl>;</decl_stmt>
+	<if_stmt><if>if <condition>(<expr><name>conversionChoice</name> <operator>==</operator> <name>CONVERT_LOCAL_TABLES</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name>rtesToConvert</name> <operator>=</operator> <call><name>list_concat</name><argument_list>(<argument><expr><name>rtesToConvert</name></expr></argument>, <argument><expr><name><name>conversionCandidates</name><operator>-&gt;</operator><name>localTableList</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<else>else
+	<block>{<block_content>
+		<expr_stmt><expr><name>rtesToConvert</name> <operator>=</operator> <call><name>list_concat</name><argument_list>(<argument><expr><name>rtesToConvert</name></expr></argument>,
+									<argument><expr><name><name>conversionCandidates</name><operator>-&gt;</operator><name>distributedTableList</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></else></if_stmt>
+	<return>return <expr><name>rtesToConvert</name></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * GetConversionChoice returns the conversion choice considering the local table
+ * join policy.
+ */</comment>
+<function><type><specifier>static</specifier> <name>ConversionChoice</name></type>
+<name>GetConversionChoice</name><parameter_list>(<parameter><decl><type><name>ConversionCandidates</name> <modifier>*</modifier></type><name>conversionCandidates</name></decl></parameter>,
+					<parameter><decl><type><name>PlannerRestrictionContext</name> <modifier>*</modifier></type><name>plannerRestrictionContext</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>RangeTableEntryDetails</name> <modifier>*</modifier></type><name>localRTECandidate</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>RangeTableEntryDetails</name> <modifier>*</modifier></type><name>distributedRTECandidate</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+
+	<if_stmt><if>if <condition>(<expr><call><name>list_length</name><argument_list>(<argument><expr><name><name>conversionCandidates</name><operator>-&gt;</operator><name>localTableList</name></name></expr></argument>)</argument_list></call> <operator>&gt;</operator> <literal type="number">0</literal></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name>localRTECandidate</name> <operator>=</operator> <call><name>linitial</name><argument_list>(<argument><expr><name><name>conversionCandidates</name><operator>-&gt;</operator><name>localTableList</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+	<if_stmt><if>if <condition>(<expr><call><name>list_length</name><argument_list>(<argument><expr><name><name>conversionCandidates</name><operator>-&gt;</operator><name>distributedTableList</name></name></expr></argument>)</argument_list></call> <operator>&gt;</operator> <literal type="number">0</literal></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name>distributedRTECandidate</name> <operator>=</operator> <call><name>linitial</name><argument_list>(<argument><expr><name><name>conversionCandidates</name><operator>-&gt;</operator><name>distributedTableList</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>LocalTableJoinPolicy</name> <operator>==</operator> <name>LOCAL_JOIN_POLICY_PREFER_LOCAL</name></expr>)</condition>
+	<block>{<block_content>
+		<return>return <expr><ternary><condition><expr><name>localRTECandidate</name></expr> ?</condition><then> <expr><name>CONVERT_LOCAL_TABLES</name></expr> </then><else>: <expr><name>CONVERT_DISTRIBUTED_TABLES</name></expr></else></ternary></expr>;</return>
+	</block_content>}</block></if>
+	<if type="elseif">else if <condition>(<expr><name>LocalTableJoinPolicy</name> <operator>==</operator> <name>LOCAL_JOIN_POLICY_PREFER_DISTRIBUTED</name></expr>)</condition>
+	<block>{<block_content>
+		<return>return <expr><ternary><condition><expr><name>distributedRTECandidate</name></expr> ?</condition><then> <expr><name>CONVERT_DISTRIBUTED_TABLES</name></expr> </then><else>:
+			   <expr><name>CONVERT_LOCAL_TABLES</name></expr></else></ternary></expr>;</return>
+	</block_content>}</block></if>
+	<else>else
+	<block>{<block_content>
+		<comment type="block">/*
+		 * We want to convert distributed tables only if all the distributed tables
+		 * have a constant filter on a unique index, otherwise we would be redundantly
+		 * converting a distributed table as we will convert all the other local tables.
+		 */</comment>
+		<decl_stmt><decl><type><name>bool</name></type> <name>allRangeTableEntriesHaveUniqueIndex</name> <init>= <expr><call><name>AllRangeTableEntriesHaveUniqueIndex</name><argument_list>(
+			<argument><expr><name><name>conversionCandidates</name><operator>-&gt;</operator><name>distributedTableList</name></name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name>allRangeTableEntriesHaveUniqueIndex</name></expr>)</condition>
+		<block>{<block_content>
+			<return>return <expr><ternary><condition><expr><name>distributedRTECandidate</name></expr> ?</condition><then> <expr><name>CONVERT_DISTRIBUTED_TABLES</name></expr> </then><else>:
+				   <expr><name>CONVERT_LOCAL_TABLES</name></expr></else></ternary></expr>;</return>
+		</block_content>}</block></if>
+		<else>else
+		<block>{<block_content>
+			<return>return <expr><ternary><condition><expr><name>localRTECandidate</name></expr> ?</condition><then> <expr><name>CONVERT_LOCAL_TABLES</name></expr> </then><else>: <expr><name>CONVERT_DISTRIBUTED_TABLES</name></expr></else></ternary></expr>;</return>
+		</block_content>}</block></else></if_stmt>
+	</block_content>}</block></else></if_stmt>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * ConvertRTEsToSubquery converts all the given range table entries
+ * to a subquery.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>ConvertRTEsToSubquery</name><parameter_list>(<parameter><decl><type><name>List</name> <modifier>*</modifier></type><name>rangeTableEntryDetailsList</name></decl></parameter>, <parameter><decl><type><name>RecursivePlanningContext</name> <modifier>*</modifier></type><name>context</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>RangeTableEntryDetails</name> <modifier>*</modifier></type><name>rangeTableEntryDetails</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+	<macro><name>foreach_ptr</name><argument_list>(<argument>rangeTableEntryDetails</argument>, <argument>rangeTableEntryDetailsList</argument>)</argument_list></macro>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>RangeTblEntry</name> <modifier>*</modifier></type><name>rangeTableEntry</name> <init>= <expr><name><name>rangeTableEntryDetails</name><operator>-&gt;</operator><name>rangeTableEntry</name></name></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>List</name> <modifier>*</modifier></type><name>requiredAttributeNumbers</name> <init>= <expr><name><name>rangeTableEntryDetails</name><operator>-&gt;</operator><name>requiredAttributeNumbers</name></name></expr></init></decl>;</decl_stmt>
+		<expr_stmt><expr><call><name>ReplaceRTERelationWithRteSubquery</name><argument_list>(<argument><expr><name>rangeTableEntry</name></expr></argument>,
+										  <argument><expr><name>requiredAttributeNumbers</name></expr></argument>, <argument><expr><name>context</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * AllRangeTableEntriesHaveUniqueIndex returns true if all of the RTE's in the given
+ * list have a unique index.
+ */</comment>
+<function><type><specifier>static</specifier> <name>bool</name></type>
+<name>AllRangeTableEntriesHaveUniqueIndex</name><parameter_list>(<parameter><decl><type><name>List</name> <modifier>*</modifier></type><name>rangeTableEntryDetailsList</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>RangeTableEntryDetails</name> <modifier>*</modifier></type><name>rangeTableEntryDetails</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+	<macro><name>foreach_ptr</name><argument_list>(<argument>rangeTableEntryDetails</argument>, <argument>rangeTableEntryDetailsList</argument>)</argument_list></macro>
+	<block>{<block_content>
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><name><name>rangeTableEntryDetails</name><operator>-&gt;</operator><name>hasConstantFilterOnUniqueColumn</name></name></expr>)</condition>
+		<block>{<block_content>
+			<return>return <expr><name>false</name></expr>;</return>
+		</block_content>}</block></if></if_stmt>
+	</block_content>}</block>
+	<return>return <expr><name>true</name></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * ShouldConvertLocalTableJoinsToSubqueries returns true if we should
+ * convert local-dist table joins to subqueries.
+ */</comment>
+<function><type><name>bool</name></type>
+<name>ShouldConvertLocalTableJoinsToSubqueries</name><parameter_list>(<parameter><decl><type><name>List</name> <modifier>*</modifier></type><name>rangeTableList</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<if_stmt><if>if <condition>(<expr><name>LocalTableJoinPolicy</name> <operator>==</operator> <name>LOCAL_JOIN_POLICY_NEVER</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* user doesn't want Citus to enable local table joins */</comment>
+		<return>return <expr><name>false</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>ContainsLocalTableDistributedTableJoin</name><argument_list>(<argument><expr><name>rangeTableList</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<return>return <expr><name>false</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+	<return>return <expr><name>true</name></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * HasConstantFilterOnUniqueColumn returns true if the given rangeTableEntry has a constant
+ * filter on a unique column.
+ */</comment>
+<function><type><specifier>static</specifier> <name>bool</name></type>
+<name>HasConstantFilterOnUniqueColumn</name><parameter_list>(<parameter><decl><type><name>RangeTblEntry</name> <modifier>*</modifier></type><name>rangeTableEntry</name></decl></parameter>,
+								<parameter><decl><type><name>RelationRestriction</name> <modifier>*</modifier></type><name>relationRestriction</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<if_stmt><if>if <condition>(<expr><name>rangeTableEntry</name> <operator>==</operator> <name>NULL</name> <operator>||</operator> <name>relationRestriction</name> <operator>==</operator> <name>NULL</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/*
+		 * Postgres might not pass relationRestriction info with hooks if
+		 * the table doesn't contribute to the result, and in that case
+		 * relationRestriction will be NULL. Ideally it doesn't make sense
+		 * to recursively plan such tables but for the time being we don't
+		 * add any special logic for these tables as it might introduce bugs.
+		 */</comment>
+		<return>return <expr><name>false</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<decl_stmt><decl><type><name>bool</name></type> <name>joinOnFalse</name> <init>= <expr><call><name>JoinConditionIsOnFalse</name><argument_list>(<argument><expr><name><name>relationRestriction</name><operator>-&gt;</operator><name>relOptInfo</name><operator>-&gt;</operator><name>joininfo</name></name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<if_stmt><if>if <condition>(<expr><name>joinOnFalse</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* If there is a WHERE FALSE, we consider it as a constant filter. */</comment>
+		<return>return <expr><name>true</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<decl_stmt><decl><type><name>List</name> <modifier>*</modifier></type><name>baseRestrictionList</name> <init>= <expr><name><name>relationRestriction</name><operator>-&gt;</operator><name>relOptInfo</name><operator>-&gt;</operator><name>baserestrictinfo</name></name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>List</name> <modifier>*</modifier></type><name>restrictClauseList</name> <init>= <expr><call><name>get_all_actual_clauses</name><argument_list>(<argument><expr><name>baseRestrictionList</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<decl_stmt><decl><type><name>List</name> <modifier>*</modifier></type><name>rteEqualityColumnsNos</name> <init>=
+		<expr><call><name>FetchEqualityAttrNumsForRTE</name><argument_list>(<argument><expr><operator>(</operator><name>Node</name> <operator>*</operator><operator>)</operator> <name>restrictClauseList</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<decl_stmt><decl><type><name>List</name> <modifier>*</modifier></type><name>uniqueIndexColumnsList</name> <init>= <expr><call><name>ExecuteFunctionOnEachTableIndex</name><argument_list>(<argument><expr><name><name>rangeTableEntry</name><operator>-&gt;</operator><name>relid</name></name></expr></argument>,
+																   <argument><expr><name>AppendUniqueIndexColumnsToList</name></expr></argument>,
+																   <argument><expr><name>INCLUDE_INDEX_ALL_STATEMENTS</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>IndexColumns</name> <modifier>*</modifier></type><name>indexColumns</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+	<macro><name>foreach_ptr</name><argument_list>(<argument>indexColumns</argument>, <argument>uniqueIndexColumnsList</argument>)</argument_list></macro>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>List</name> <modifier>*</modifier></type><name>uniqueIndexColumnNos</name> <init>= <expr><name><name>indexColumns</name><operator>-&gt;</operator><name>indexColumnNos</name></name></expr></init></decl>;</decl_stmt>
+		<if_stmt><if>if <condition>(<expr><call><name>FirstIsSuperSetOfSecond</name><argument_list>(<argument><expr><name>rteEqualityColumnsNos</name></expr></argument>,
+									<argument><expr><name>uniqueIndexColumnNos</name></expr></argument>)</argument_list></call></expr>)</condition>
+		<block>{<block_content>
+			<return>return <expr><name>true</name></expr>;</return>
+		</block_content>}</block></if></if_stmt>
+	</block_content>}</block>
+	<return>return <expr><name>false</name></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * FirstIsSuperSetOfSecond returns true if the first int List
+ * contains every element of the second int List.
+ */</comment>
+<function><type><specifier>static</specifier> <name>bool</name></type>
+<name>FirstIsSuperSetOfSecond</name><parameter_list>(<parameter><decl><type><name>List</name> <modifier>*</modifier></type><name>firstIntList</name></decl></parameter>, <parameter><decl><type><name>List</name> <modifier>*</modifier></type><name>secondIntList</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>int</name></type> <name>curInt</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+	<macro><name>foreach_int</name><argument_list>(<argument>curInt</argument>, <argument>secondIntList</argument>)</argument_list></macro>
+	<block>{<block_content>
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>list_member_int</name><argument_list>(<argument><expr><name>firstIntList</name></expr></argument>, <argument><expr><name>curInt</name></expr></argument>)</argument_list></call></expr>)</condition>
+		<block>{<block_content>
+			<return>return <expr><name>false</name></expr>;</return>
+		</block_content>}</block></if></if_stmt>
+	</block_content>}</block>
+	<return>return <expr><name>true</name></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * AppendUniqueIndexColumnsToList adds the given index's column numbers if it is a
+ * unique index.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>AppendUniqueIndexColumnsToList</name><parameter_list>(<parameter><decl><type><name>Form_pg_index</name></type> <name>indexForm</name></decl></parameter>, <parameter><decl><type><name>List</name> <modifier>*</modifier><modifier>*</modifier></type><name>uniqueIndexGroups</name></decl></parameter>,
+							   <parameter><decl><type><name>int</name></type> <name>flags</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<if_stmt><if>if <condition>(<expr><name><name>indexForm</name><operator>-&gt;</operator><name>indisunique</name></name> <operator>||</operator> <name><name>indexForm</name><operator>-&gt;</operator><name>indisprimary</name></name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>IndexColumns</name> <modifier>*</modifier></type><name>indexColumns</name> <init>= <expr><call><name>palloc0</name><argument_list>(<argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>IndexColumns</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>List</name> <modifier>*</modifier></type><name>uniqueIndexes</name> <init>= <expr><name>NIL</name></expr></init></decl>;</decl_stmt>
+		<for>for <control>(<init><decl><type><name>int</name></type> <name>i</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name><name>indexForm</name><operator>-&gt;</operator><name>indkey</name><operator>.</operator><name>dim1</name></name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control>
+		<block>{<block_content>
+			<expr_stmt><expr><name>uniqueIndexes</name> <operator>=</operator> <call><name>list_append_unique_int</name><argument_list>(<argument><expr><name>uniqueIndexes</name></expr></argument>,
+												   <argument><expr><name><name>indexForm</name><operator>-&gt;</operator><name>indkey</name><operator>.</operator><name>values</name><index>[<expr><name>i</name></expr>]</index></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></for>
+		<if_stmt><if>if <condition>(<expr><call><name>list_length</name><argument_list>(<argument><expr><name>uniqueIndexes</name></expr></argument>)</argument_list></call> <operator>==</operator> <literal type="number">0</literal></expr>)</condition>
+		<block>{<block_content>
+			<return>return;</return>
+		</block_content>}</block></if></if_stmt>
+		<expr_stmt><expr><name><name>indexColumns</name><operator>-&gt;</operator><name>indexColumnNos</name></name> <operator>=</operator> <name>uniqueIndexes</name></expr>;</expr_stmt>
+		<expr_stmt><expr><operator>*</operator><name>uniqueIndexGroups</name> <operator>=</operator> <call><name>lappend</name><argument_list>(<argument><expr><operator>*</operator><name>uniqueIndexGroups</name></expr></argument>, <argument><expr><name>indexColumns</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * RequiredAttrNumbersForRelation returns the required attribute numbers for
+ * the input RTE relation in order for the planning to succeed.
+ *
+ * The function could be optimized by not adding the columns that only appear
+ * WHERE clause as a filter (e.g., not a join clause).
+ */</comment>
+<function><type><name>List</name> <modifier>*</modifier></type>
+<name>RequiredAttrNumbersForRelation</name><parameter_list>(<parameter><decl><type><name>RangeTblEntry</name> <modifier>*</modifier></type><name>rangeTableEntry</name></decl></parameter>,
+							   <parameter><decl><type><name>PlannerRestrictionContext</name> <modifier>*</modifier></type><name>plannerRestrictionContext</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>RelationRestriction</name> <modifier>*</modifier></type><name>relationRestriction</name> <init>=
+		<expr><call><name>RelationRestrictionForRelation</name><argument_list>(<argument><expr><name>rangeTableEntry</name></expr></argument>, <argument><expr><name>plannerRestrictionContext</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>relationRestriction</name> <operator>==</operator> <name>NULL</name></expr>)</condition>
+	<block>{<block_content>
+		<return>return <expr><name>NIL</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<decl_stmt><decl><type><name>PlannerInfo</name> <modifier>*</modifier></type><name>plannerInfo</name> <init>= <expr><name><name>relationRestriction</name><operator>-&gt;</operator><name>plannerInfo</name></name></expr></init></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * Here we used the query from plannerInfo because it has the optimizations
+	 * so that it doesn't have unnecessary columns. The original query doesn't have
+	 * some of these optimizations hence if we use it here, we don't get the
+	 * 'required' attributes.
+	 */</comment>
+	<decl_stmt><decl><type><name>Query</name> <modifier>*</modifier></type><name>queryToProcess</name> <init>= <expr><name><name>plannerInfo</name><operator>-&gt;</operator><name>parse</name></name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type> <name>rteIndex</name> <init>= <expr><name><name>relationRestriction</name><operator>-&gt;</operator><name>index</name></name></expr></init></decl>;</decl_stmt>
+
+	<decl_stmt><decl><type><name>List</name> <modifier>*</modifier></type><name>allVarsInQuery</name> <init>= <expr><call><name>pull_vars_of_level</name><argument_list>(<argument><expr><operator>(</operator><name>Node</name> <operator>*</operator><operator>)</operator> <name>queryToProcess</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<decl_stmt><decl><type><name>List</name> <modifier>*</modifier></type><name>requiredAttrNumbers</name> <init>= <expr><name>NIL</name></expr></init></decl>;</decl_stmt>
+
+	<decl_stmt><decl><type><name>Var</name> <modifier>*</modifier></type><name>var</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+	<macro><name>foreach_ptr</name><argument_list>(<argument>var</argument>, <argument>allVarsInQuery</argument>)</argument_list></macro>
+	<block>{<block_content>
+		<if_stmt><if>if <condition>(<expr><name><name>var</name><operator>-&gt;</operator><name>varno</name></name> <operator>==</operator> <name>rteIndex</name></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><name>requiredAttrNumbers</name> <operator>=</operator> <call><name>list_append_unique_int</name><argument_list>(<argument><expr><name>requiredAttrNumbers</name></expr></argument>,
+														 <argument><expr><name><name>var</name><operator>-&gt;</operator><name>varattno</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+	</block_content>}</block>
+
+	<return>return <expr><name>requiredAttrNumbers</name></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * CreateConversionCandidates creates the conversion candidates that might
+ * be converted to a subquery so that citus planners can work.
+ */</comment>
+<function><type><specifier>static</specifier> <name>ConversionCandidates</name> <modifier>*</modifier></type>
+<name>CreateConversionCandidates</name><parameter_list>(<parameter><decl><type><name>PlannerRestrictionContext</name> <modifier>*</modifier></type><name>plannerRestrictionContext</name></decl></parameter>,
+						   <parameter><decl><type><name>List</name> <modifier>*</modifier></type><name>rangeTableList</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>resultRTEIdentity</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>ConversionCandidates</name> <modifier>*</modifier></type><name>conversionCandidates</name> <init>=
+		<expr><call><name>palloc0</name><argument_list>(<argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>ConversionCandidates</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+
+	<decl_stmt><decl><type><name>RangeTblEntry</name> <modifier>*</modifier></type><name>rangeTableEntry</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+	<macro><name>foreach_ptr</name><argument_list>(<argument>rangeTableEntry</argument>, <argument>rangeTableList</argument>)</argument_list></macro>
+	<block>{<block_content>
+		<comment type="block">/* we're only interested in tables */</comment>
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>IsRecursivelyPlannableRelation</name><argument_list>(<argument><expr><name>rangeTableEntry</name></expr></argument>)</argument_list></call></expr>)</condition>
+		<block>{<block_content>
+			<continue>continue;</continue>
+		</block_content>}</block></if></if_stmt>
+
+		<decl_stmt><decl><type><name>int</name></type> <name>rteIdentity</name> <init>= <expr><call><name>GetRTEIdentity</name><argument_list>(<argument><expr><name>rangeTableEntry</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+		<comment type="block">/* result relation cannot converted to a subquery */</comment>
+		<if_stmt><if>if <condition>(<expr><name>resultRTEIdentity</name> <operator>==</operator> <name>rteIdentity</name></expr>)</condition>
+		<block>{<block_content>
+			<continue>continue;</continue>
+		</block_content>}</block></if></if_stmt>
+
+		<decl_stmt><decl><type><name>RelationRestriction</name> <modifier>*</modifier></type><name>relationRestriction</name> <init>=
+			<expr><call><name>RelationRestrictionForRelation</name><argument_list>(<argument><expr><name>rangeTableEntry</name></expr></argument>, <argument><expr><name>plannerRestrictionContext</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+		<decl_stmt><decl><type><name>RangeTableEntryDetails</name> <modifier>*</modifier></type><name>rangeTableEntryDetails</name> <init>=
+			<expr><call><name>palloc0</name><argument_list>(<argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>RangeTableEntryDetails</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+		<expr_stmt><expr><name><name>rangeTableEntryDetails</name><operator>-&gt;</operator><name>rangeTableEntry</name></name> <operator>=</operator> <name>rangeTableEntry</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>rangeTableEntryDetails</name><operator>-&gt;</operator><name>requiredAttributeNumbers</name></name> <operator>=</operator>
+			<call><name>RequiredAttrNumbersForRelation</name><argument_list>(<argument><expr><name>rangeTableEntry</name></expr></argument>, <argument><expr><name>plannerRestrictionContext</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>rangeTableEntryDetails</name><operator>-&gt;</operator><name>hasConstantFilterOnUniqueColumn</name></name> <operator>=</operator>
+			<call><name>HasConstantFilterOnUniqueColumn</name><argument_list>(<argument><expr><name>rangeTableEntry</name></expr></argument>, <argument><expr><name>relationRestriction</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<decl_stmt><decl><type><name>bool</name></type> <name>referenceOrDistributedTable</name> <init>=
+			<expr><call><name>IsCitusTableType</name><argument_list>(<argument><expr><name><name>rangeTableEntry</name><operator>-&gt;</operator><name>relid</name></name></expr></argument>, <argument><expr><name>REFERENCE_TABLE</name></expr></argument>)</argument_list></call> <operator>||</operator>
+			<call><name>IsCitusTableType</name><argument_list>(<argument><expr><name><name>rangeTableEntry</name><operator>-&gt;</operator><name>relid</name></name></expr></argument>, <argument><expr><name>DISTRIBUTED_TABLE</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+		<if_stmt><if>if <condition>(<expr><name>referenceOrDistributedTable</name></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><name><name>conversionCandidates</name><operator>-&gt;</operator><name>distributedTableList</name></name> <operator>=</operator>
+				<call><name>lappend</name><argument_list>(<argument><expr><name><name>conversionCandidates</name><operator>-&gt;</operator><name>distributedTableList</name></name></expr></argument>,
+						<argument><expr><name>rangeTableEntryDetails</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></if>
+		<else>else
+		<block>{<block_content>
+			<expr_stmt><expr><name><name>conversionCandidates</name><operator>-&gt;</operator><name>localTableList</name></name> <operator>=</operator>
+				<call><name>lappend</name><argument_list>(<argument><expr><name><name>conversionCandidates</name><operator>-&gt;</operator><name>localTableList</name></name></expr></argument>,
+						<argument><expr><name>rangeTableEntryDetails</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></else></if_stmt>
+	</block_content>}</block>
+	<return>return <expr><name>conversionCandidates</name></expr>;</return>
+</block_content>}</block></function>
+</unit>

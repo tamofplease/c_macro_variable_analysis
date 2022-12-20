@@ -1,0 +1,379 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<unit xmlns="http://www.srcML.org/srcML/src" xmlns:cpp="http://www.srcML.org/srcML/cpp" revision="1.0.0" language="C" filename="/cloned_projects/agensgraph/src/backend/storage/lmgr/s_lock.c"><comment type="block">/*-------------------------------------------------------------------------
+ *
+ * s_lock.c
+ *	   Hardware-dependent implementation of spinlocks.
+ *
+ * When waiting for a contended spinlock we loop tightly for awhile, then
+ * delay using pg_usleep() and try again.  Preferably, "awhile" should be a
+ * small multiple of the maximum time we expect a spinlock to be held.  100
+ * iterations seems about right as an initial guess.  However, on a
+ * uniprocessor the loop is a waste of cycles, while in a multi-CPU scenario
+ * it's usually better to spin a bit longer than to call the kernel, so we try
+ * to adapt the spin loop count depending on whether we seem to be in a
+ * uniprocessor or multiprocessor.
+ *
+ * Note: you might think MIN_SPINS_PER_DELAY should be just 1, but you'd
+ * be wrong; there are platforms where that can result in a "stuck
+ * spinlock" failure.  This has been seen particularly on Alphas; it seems
+ * that the first TAS after returning from kernel space will always fail
+ * on that hardware.
+ *
+ * Once we do decide to block, we use randomly increasing pg_usleep()
+ * delays. The first delay is 1 msec, then the delay randomly increases to
+ * about one second, after which we reset to 1 msec and start again.  The
+ * idea here is that in the presence of heavy contention we need to
+ * increase the delay, else the spinlock holder may never get to run and
+ * release the lock.  (Consider situation where spinlock holder has been
+ * nice'd down in priority by the scheduler --- it will not get scheduled
+ * until all would-be acquirers are sleeping, so if we always use a 1-msec
+ * sleep, there is a real possibility of starvation.)  But we can't just
+ * clamp the delay to an upper bound, else it would take a long time to
+ * make a reasonable number of tries.
+ *
+ * We time out and declare error after NUM_DELAYS delays (thus, exactly
+ * that many tries).  With the given settings, this will usually take 2 or
+ * so minutes.  It seems better to fix the total number of tries (and thus
+ * the probability of unintended failure) than to fix the total time
+ * spent.
+ *
+ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1994, Regents of the University of California
+ *
+ *
+ * IDENTIFICATION
+ *	  src/backend/storage/lmgr/s_lock.c
+ *
+ *-------------------------------------------------------------------------
+ */</comment>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"postgres.h"</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;time.h&gt;</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;unistd.h&gt;</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"port/atomics.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/s_lock.h"</cpp:file></cpp:include>
+
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>MIN_SPINS_PER_DELAY</name></cpp:macro> <cpp:value>10</cpp:value></cpp:define>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>MAX_SPINS_PER_DELAY</name></cpp:macro> <cpp:value>1000</cpp:value></cpp:define>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>NUM_DELAYS</name></cpp:macro>			<cpp:value>1000</cpp:value></cpp:define>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>MIN_DELAY_USEC</name></cpp:macro>		<cpp:value>1000L</cpp:value></cpp:define>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>MAX_DELAY_USEC</name></cpp:macro>		<cpp:value>1000000L</cpp:value></cpp:define>
+
+
+<decl_stmt><decl><type><name>slock_t</name></type>		<name>dummy_spinlock</name></decl>;</decl_stmt>
+
+<decl_stmt><decl><type><specifier>static</specifier> <name>int</name></type>	<name>spins_per_delay</name> <init>= <expr><name>DEFAULT_SPINS_PER_DELAY</name></expr></init></decl>;</decl_stmt>
+
+
+<comment type="block">/*
+ * s_lock_stuck() - complain about a stuck spinlock
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>s_lock_stuck</name><parameter_list>(<parameter><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>file</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>line</name></decl></parameter>, <parameter><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>func</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><name>func</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name>func</name> <operator>=</operator> <literal type="string">"(unknown)"</literal></expr>;</expr_stmt></block_content></block></if></if_stmt>
+<cpp:if>#<cpp:directive>if</cpp:directive> <expr><call><name>defined</name><argument_list>(<argument><expr><name>S_LOCK_TEST</name></expr></argument>)</argument_list></call></expr></cpp:if>
+	<expr_stmt><expr><call><name>fprintf</name><argument_list>(<argument><expr><name>stderr</name></expr></argument>,
+			<argument><expr><literal type="string">"\nStuck spinlock detected at %s, %s:%d.\n"</literal></expr></argument>,
+			<argument><expr><name>func</name></expr></argument>, <argument><expr><name>file</name></expr></argument>, <argument><expr><name>line</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>exit</name><argument_list>(<argument><expr><literal type="number">1</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+<cpp:else>#<cpp:directive>else</cpp:directive></cpp:else>
+	<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>PANIC</name></expr></argument>, <argument><expr><literal type="string">"stuck spinlock detected at %s, %s:%d"</literal></expr></argument>,
+		 <argument><expr><name>func</name></expr></argument>, <argument><expr><name>file</name></expr></argument>, <argument><expr><name>line</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * s_lock(lock) - platform-independent portion of waiting for a spinlock.
+ */</comment>
+<function><type><name>int</name></type>
+<name>s_lock</name><parameter_list>(<parameter><decl><type><specifier>volatile</specifier> <name>slock_t</name> <modifier>*</modifier></type><name>lock</name></decl></parameter>, <parameter><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>file</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>line</name></decl></parameter>, <parameter><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>func</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>SpinDelayStatus</name></type> <name>delayStatus</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>init_spin_delay</name><argument_list>(<argument><expr><operator>&amp;</operator><name>delayStatus</name></expr></argument>, <argument><expr><name>file</name></expr></argument>, <argument><expr><name>line</name></expr></argument>, <argument><expr><name>func</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<while>while <condition>(<expr><call><name>TAS_SPIN</name><argument_list>(<argument><expr><name>lock</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>perform_spin_delay</name><argument_list>(<argument><expr><operator>&amp;</operator><name>delayStatus</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></while>
+
+	<expr_stmt><expr><call><name>finish_spin_delay</name><argument_list>(<argument><expr><operator>&amp;</operator><name>delayStatus</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<return>return <expr><name><name>delayStatus</name><operator>.</operator><name>delays</name></name></expr>;</return>
+</block_content>}</block></function>
+
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>USE_DEFAULT_S_UNLOCK</name></cpp:ifdef>
+<function><type><name>void</name></type>
+<name>s_unlock</name><parameter_list>(<parameter><decl><type><specifier>volatile</specifier> <name>slock_t</name> <modifier>*</modifier></type><name>lock</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>TAS_ACTIVE_WORD</name></cpp:ifdef>
+	<comment type="block">/* HP's PA-RISC */</comment>
+	<expr_stmt><expr><operator>*</operator><call><name>TAS_ACTIVE_WORD</name><argument_list>(<argument><expr><name>lock</name></expr></argument>)</argument_list></call> <operator>=</operator> <operator>-</operator><literal type="number">1</literal></expr>;</expr_stmt>
+<cpp:else>#<cpp:directive>else</cpp:directive></cpp:else>
+	<expr_stmt><expr><operator>*</operator><name>lock</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+</block_content>}</block></function>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+<comment type="block">/*
+ * Wait while spinning on a contended spinlock.
+ */</comment>
+<function><type><name>void</name></type>
+<name>perform_spin_delay</name><parameter_list>(<parameter><decl><type><name>SpinDelayStatus</name> <modifier>*</modifier></type><name>status</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<comment type="block">/* CPU-specific delay each time through the loop */</comment>
+	<expr_stmt><expr><call><name>SPIN_DELAY</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Block the process every spins_per_delay tries */</comment>
+	<if_stmt><if>if <condition>(<expr><operator>++</operator><operator>(</operator><name><name>status</name><operator>-&gt;</operator><name>spins</name></name><operator>)</operator> <operator>&gt;=</operator> <name>spins_per_delay</name></expr>)</condition>
+	<block>{<block_content>
+		<if_stmt><if>if <condition>(<expr><operator>++</operator><operator>(</operator><name><name>status</name><operator>-&gt;</operator><name>delays</name></name><operator>)</operator> <operator>&gt;</operator> <name>NUM_DELAYS</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>s_lock_stuck</name><argument_list>(<argument><expr><name><name>status</name><operator>-&gt;</operator><name>file</name></name></expr></argument>, <argument><expr><name><name>status</name><operator>-&gt;</operator><name>line</name></name></expr></argument>, <argument><expr><name><name>status</name><operator>-&gt;</operator><name>func</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name><name>status</name><operator>-&gt;</operator><name>cur_delay</name></name> <operator>==</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content> <comment type="block">/* first time to delay? */</comment>
+			<expr_stmt><expr><name><name>status</name><operator>-&gt;</operator><name>cur_delay</name></name> <operator>=</operator> <name>MIN_DELAY_USEC</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+		<expr_stmt><expr><call><name>pg_usleep</name><argument_list>(<argument><expr><name><name>status</name><operator>-&gt;</operator><name>cur_delay</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+<cpp:if>#<cpp:directive>if</cpp:directive> <expr><call><name>defined</name><argument_list>(<argument><expr><name>S_LOCK_TEST</name></expr></argument>)</argument_list></call></expr></cpp:if>
+		<expr_stmt><expr><call><name>fprintf</name><argument_list>(<argument><expr><name>stdout</name></expr></argument>, <argument><expr><literal type="string">"*"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>fflush</name><argument_list>(<argument><expr><name>stdout</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+		<comment type="block">/* increase delay by a random fraction between 1X and 2X */</comment>
+		<expr_stmt><expr><name><name>status</name><operator>-&gt;</operator><name>cur_delay</name></name> <operator>+=</operator> <operator>(</operator><name>int</name><operator>)</operator> <operator>(</operator><name><name>status</name><operator>-&gt;</operator><name>cur_delay</name></name> <operator>*</operator>
+									<operator>(</operator><operator>(</operator><name>double</name><operator>)</operator> <call><name>random</name><argument_list>()</argument_list></call> <operator>/</operator> <operator>(</operator><name>double</name><operator>)</operator> <name>MAX_RANDOM_VALUE</name><operator>)</operator> <operator>+</operator> <literal type="number">0.5</literal><operator>)</operator></expr>;</expr_stmt>
+		<comment type="block">/* wrap back to minimum delay when max is exceeded */</comment>
+		<if_stmt><if>if <condition>(<expr><name><name>status</name><operator>-&gt;</operator><name>cur_delay</name></name> <operator>&gt;</operator> <name>MAX_DELAY_USEC</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><name><name>status</name><operator>-&gt;</operator><name>cur_delay</name></name> <operator>=</operator> <name>MIN_DELAY_USEC</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+		<expr_stmt><expr><name><name>status</name><operator>-&gt;</operator><name>spins</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * After acquiring a spinlock, update estimates about how long to loop.
+ *
+ * If we were able to acquire the lock without delaying, it's a good
+ * indication we are in a multiprocessor.  If we had to delay, it's a sign
+ * (but not a sure thing) that we are in a uniprocessor. Hence, we
+ * decrement spins_per_delay slowly when we had to delay, and increase it
+ * rapidly when we didn't.  It's expected that spins_per_delay will
+ * converge to the minimum value on a uniprocessor and to the maximum
+ * value on a multiprocessor.
+ *
+ * Note: spins_per_delay is local within our current process. We want to
+ * average these observations across multiple backends, since it's
+ * relatively rare for this function to even get entered, and so a single
+ * backend might not live long enough to converge on a good value.  That
+ * is handled by the two routines below.
+ */</comment>
+<function><type><name>void</name></type>
+<name>finish_spin_delay</name><parameter_list>(<parameter><decl><type><name>SpinDelayStatus</name> <modifier>*</modifier></type><name>status</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<if_stmt><if>if <condition>(<expr><name><name>status</name><operator>-&gt;</operator><name>cur_delay</name></name> <operator>==</operator> <literal type="number">0</literal></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* we never had to delay */</comment>
+		<if_stmt><if>if <condition>(<expr><name>spins_per_delay</name> <operator>&lt;</operator> <name>MAX_SPINS_PER_DELAY</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><name>spins_per_delay</name> <operator>=</operator> <call><name>Min</name><argument_list>(<argument><expr><name>spins_per_delay</name> <operator>+</operator> <literal type="number">100</literal></expr></argument>, <argument><expr><name>MAX_SPINS_PER_DELAY</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	</block_content>}</block></if>
+	<else>else
+	<block>{<block_content>
+		<if_stmt><if>if <condition>(<expr><name>spins_per_delay</name> <operator>&gt;</operator> <name>MIN_SPINS_PER_DELAY</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><name>spins_per_delay</name> <operator>=</operator> <call><name>Max</name><argument_list>(<argument><expr><name>spins_per_delay</name> <operator>-</operator> <literal type="number">1</literal></expr></argument>, <argument><expr><name>MIN_SPINS_PER_DELAY</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	</block_content>}</block></else></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Set local copy of spins_per_delay during backend startup.
+ *
+ * NB: this has to be pretty fast as it is called while holding a spinlock
+ */</comment>
+<function><type><name>void</name></type>
+<name>set_spins_per_delay</name><parameter_list>(<parameter><decl><type><name>int</name></type> <name>shared_spins_per_delay</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><name>spins_per_delay</name> <operator>=</operator> <name>shared_spins_per_delay</name></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Update shared estimate of spins_per_delay during backend exit.
+ *
+ * NB: this has to be pretty fast as it is called while holding a spinlock
+ */</comment>
+<function><type><name>int</name></type>
+<name>update_spins_per_delay</name><parameter_list>(<parameter><decl><type><name>int</name></type> <name>shared_spins_per_delay</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<comment type="block">/*
+	 * We use an exponential moving average with a relatively slow adaption
+	 * rate, so that noise in any one backend's result won't affect the shared
+	 * value too much.  As long as both inputs are within the allowed range,
+	 * the result must be too, so we need not worry about clamping the result.
+	 *
+	 * We deliberately truncate rather than rounding; this is so that single
+	 * adjustments inside a backend can affect the shared estimate (see the
+	 * asymmetric adjustment rules above).
+	 */</comment>
+	<return>return <expr><operator>(</operator><name>shared_spins_per_delay</name> <operator>*</operator> <literal type="number">15</literal> <operator>+</operator> <name>spins_per_delay</name><operator>)</operator> <operator>/</operator> <literal type="number">16</literal></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * Various TAS implementations that cannot live in s_lock.h as no inline
+ * definition exists (yet).
+ * In the future, get rid of tas.[cso] and fold it into this file.
+ *
+ * If you change something here, you will likely need to modify s_lock.h too,
+ * because the definitions for these are split between this file and s_lock.h.
+ */</comment>
+
+
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>HAVE_SPINLOCKS</name></cpp:ifdef>			<comment type="block">/* skip spinlocks if requested */</comment>
+
+
+<cpp:if>#<cpp:directive>if</cpp:directive> <expr><call><name>defined</name><argument_list>(<argument><expr><name>__GNUC__</name></expr></argument>)</argument_list></call></expr></cpp:if>
+
+<comment type="block">/*
+ * All the gcc flavors that are not inlined
+ */</comment>
+
+
+<comment type="block">/*
+ * Note: all the if-tests here probably ought to be testing gcc version
+ * rather than platform, but I don't have adequate info to know what to
+ * write.  Ideally we'd flush all this in favor of the inline version.
+ */</comment>
+<cpp:if>#<cpp:directive>if</cpp:directive> <expr><call><name>defined</name><argument_list>(<argument><expr><name>__m68k__</name></expr></argument>)</argument_list></call> <operator>&amp;&amp;</operator> <operator>!</operator><call><name>defined</name><argument_list>(<argument><expr><name>__linux__</name></expr></argument>)</argument_list></call></expr></cpp:if>
+<comment type="block">/* really means: extern int tas(slock_t* **lock); */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>tas_dummy</name><parameter_list>()</parameter_list>
+<block>{<block_content>
+	<asm>__asm__ <specifier>__volatile__</specifier>(
+<cpp:if>#<cpp:directive>if</cpp:directive> <expr><operator>(</operator><call><name>defined</name><argument_list>(<argument><expr><name>__NetBSD__</name></expr></argument>)</argument_list></call> <operator>||</operator> <call><name>defined</name><argument_list>(<argument><expr><name>__OpenBSD__</name></expr></argument>)</argument_list></call><operator>)</operator> <operator>&amp;&amp;</operator> <call><name>defined</name><argument_list>(<argument><expr><name>__ELF__</name></expr></argument>)</argument_list></call></expr></cpp:if>
+<comment type="block">/* no underscore for label and % for registers */</comment>
+						 "\
+.global		tas 				\n\
+tas:							\n\
+			movel	%sp@(0x4),%a0	\n\
+			tas 	%a0@		\n\
+			beq 	_success	\n\
+			moveq	#-128,%d0	\n\
+			rts 				\n\
+_success:						\n\
+			moveq	#0,%d0		\n\
+			rts 				\n"
+<cpp:else>#<cpp:directive>else</cpp:directive></cpp:else>
+						 "\
+.global		_tas				\n\
+_tas:							\n\
+			movel	sp@(0x4),a0	\n\
+			tas 	a0@			\n\
+			beq 	_success	\n\
+			moveq 	#-128,d0	\n\
+			rts					\n\
+_success:						\n\
+			moveq 	#0,d0		\n\
+			rts					\n"
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>							<comment type="block">/* (__NetBSD__ || __OpenBSD__) &amp;&amp; __ELF__ */</comment>
+		);</asm>
+</block_content>}</block></function>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>							<comment type="block">/* __m68k__ &amp;&amp; !__linux__ */</comment>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>							<comment type="block">/* not __GNUC__ */</comment>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>							<comment type="block">/* HAVE_SPINLOCKS */</comment>
+
+
+
+<comment type="block" format="doxygen">/*****************************************************************************/</comment>
+<cpp:if>#<cpp:directive>if</cpp:directive> <expr><call><name>defined</name><argument_list>(<argument><expr><name>S_LOCK_TEST</name></expr></argument>)</argument_list></call></expr></cpp:if>
+
+<comment type="block">/*
+ * test program for verifying a port's spinlock support.
+ */</comment>
+
+<struct>struct <name>test_lock_struct</name>
+<block>{
+	<decl_stmt><decl><type><name>char</name></type>		<name>pad1</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>slock_t</name></type>		<name>lock</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>char</name></type>		<name>pad2</name></decl>;</decl_stmt>
+}</block>;</struct>
+
+<decl_stmt><decl><type><specifier>volatile</specifier> <name><name>struct</name> <name>test_lock_struct</name></name></type> <name>test_lock</name></decl>;</decl_stmt>
+
+<function><type><name>int</name></type>
+<name>main</name><parameter_list>()</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>srandom</name><argument_list>(<argument><expr><operator>(</operator><name>unsigned</name> <name>int</name><operator>)</operator> <call><name>time</name><argument_list>(<argument><expr><name>NULL</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name><name>test_lock</name><operator>.</operator><name>pad1</name></name> <operator>=</operator> <name><name>test_lock</name><operator>.</operator><name>pad2</name></name> <operator>=</operator> <literal type="number">0x44</literal></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>S_INIT_LOCK</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>test_lock</name><operator>.</operator><name>lock</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name><name>test_lock</name><operator>.</operator><name>pad1</name></name> <operator>!=</operator> <literal type="number">0x44</literal> <operator>||</operator> <name><name>test_lock</name><operator>.</operator><name>pad2</name></name> <operator>!=</operator> <literal type="number">0x44</literal></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>printf</name><argument_list>(<argument><expr><literal type="string">"S_LOCK_TEST: failed, declared datatype is wrong size\n"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<return>return <expr><literal type="number">1</literal></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>S_LOCK_FREE</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>test_lock</name><operator>.</operator><name>lock</name></name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>printf</name><argument_list>(<argument><expr><literal type="string">"S_LOCK_TEST: failed, lock not initialized\n"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<return>return <expr><literal type="number">1</literal></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>S_LOCK</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>test_lock</name><operator>.</operator><name>lock</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name><name>test_lock</name><operator>.</operator><name>pad1</name></name> <operator>!=</operator> <literal type="number">0x44</literal> <operator>||</operator> <name><name>test_lock</name><operator>.</operator><name>pad2</name></name> <operator>!=</operator> <literal type="number">0x44</literal></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>printf</name><argument_list>(<argument><expr><literal type="string">"S_LOCK_TEST: failed, declared datatype is wrong size\n"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<return>return <expr><literal type="number">1</literal></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><call><name>S_LOCK_FREE</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>test_lock</name><operator>.</operator><name>lock</name></name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>printf</name><argument_list>(<argument><expr><literal type="string">"S_LOCK_TEST: failed, lock not locked\n"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<return>return <expr><literal type="number">1</literal></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>S_UNLOCK</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>test_lock</name><operator>.</operator><name>lock</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name><name>test_lock</name><operator>.</operator><name>pad1</name></name> <operator>!=</operator> <literal type="number">0x44</literal> <operator>||</operator> <name><name>test_lock</name><operator>.</operator><name>pad2</name></name> <operator>!=</operator> <literal type="number">0x44</literal></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>printf</name><argument_list>(<argument><expr><literal type="string">"S_LOCK_TEST: failed, declared datatype is wrong size\n"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<return>return <expr><literal type="number">1</literal></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>S_LOCK_FREE</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>test_lock</name><operator>.</operator><name>lock</name></name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>printf</name><argument_list>(<argument><expr><literal type="string">"S_LOCK_TEST: failed, lock not unlocked\n"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<return>return <expr><literal type="number">1</literal></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>S_LOCK</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>test_lock</name><operator>.</operator><name>lock</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name><name>test_lock</name><operator>.</operator><name>pad1</name></name> <operator>!=</operator> <literal type="number">0x44</literal> <operator>||</operator> <name><name>test_lock</name><operator>.</operator><name>pad2</name></name> <operator>!=</operator> <literal type="number">0x44</literal></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>printf</name><argument_list>(<argument><expr><literal type="string">"S_LOCK_TEST: failed, declared datatype is wrong size\n"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<return>return <expr><literal type="number">1</literal></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><call><name>S_LOCK_FREE</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>test_lock</name><operator>.</operator><name>lock</name></name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>printf</name><argument_list>(<argument><expr><literal type="string">"S_LOCK_TEST: failed, lock not re-locked\n"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<return>return <expr><literal type="number">1</literal></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>printf</name><argument_list>(<argument><expr><literal type="string">"S_LOCK_TEST: this will print %d stars and then\n"</literal></expr></argument>, <argument><expr><name>NUM_DELAYS</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>printf</name><argument_list>(<argument><expr><literal type="string">"             exit with a 'stuck spinlock' message\n"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>printf</name><argument_list>(<argument><expr><literal type="string">"             if S_LOCK() and TAS() are working.\n"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>fflush</name><argument_list>(<argument><expr><name>stdout</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>s_lock</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>test_lock</name><operator>.</operator><name>lock</name></name></expr></argument>, <argument><expr><name>__FILE__</name></expr></argument>, <argument><expr><name>__LINE__</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>printf</name><argument_list>(<argument><expr><literal type="string">"S_LOCK_TEST: failed, lock not locked\n"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<return>return <expr><literal type="number">1</literal></expr>;</return>
+</block_content>}</block></function>
+
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>							<comment type="block">/* S_LOCK_TEST */</comment>
+</unit>

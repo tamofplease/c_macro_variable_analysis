@@ -1,0 +1,1412 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<unit xmlns="http://www.srcML.org/srcML/src" xmlns:cpp="http://www.srcML.org/srcML/cpp" revision="1.0.0" language="C" filename="/cloned_projects/yugabyte-db/src/postgres/src/backend/utils/adt/jsonb_gin.c"><comment type="block">/*-------------------------------------------------------------------------
+ *
+ * jsonb_gin.c
+ *	 GIN support functions for jsonb
+ *
+ * Copyright (c) 2014-2018, PostgreSQL Global Development Group
+ *
+ * We provide two opclasses for jsonb indexing: jsonb_ops and jsonb_path_ops.
+ * For their description see json.sgml and comments in jsonb.h.
+ *
+ * The operators support, among the others, "jsonb @? jsonpath" and
+ * "jsonb @@ jsonpath".  Expressions containing these operators are easily
+ * expressed through each other.
+ *
+ *	jb @? 'path' &lt;=&gt; jb @@ 'EXISTS(path)'
+ *	jb @@ 'expr' &lt;=&gt; jb @? '$ ? (expr)'
+ *
+ * Thus, we're going to consider only @@ operator, while regarding @? operator
+ * the same is true for jb @@ 'EXISTS(path)'.
+ *
+ * Result of jsonpath query extraction is a tree, which leaf nodes are index
+ * entries and non-leaf nodes are AND/OR logical expressions.  Basically we
+ * extract following statements out of jsonpath:
+ *
+ *	1) "accessors_chain = const",
+ *	2) "EXISTS(accessors_chain)".
+ *
+ * Accessors chain may consist of .key, [*] and [index] accessors.  jsonb_ops
+ * additionally supports .* and .**.
+ *
+ * For now, both jsonb_ops and jsonb_path_ops supports only statements of
+ * the 1st find.  jsonb_ops might also support statements of the 2nd kind,
+ * but given we have no statistics keys extracted from accessors chain
+ * are likely non-selective.  Therefore, we choose to not confuse optimizer
+ * and skip statements of the 2nd kind altogether.  In future versions that
+ * might be changed.
+ *
+ * In jsonb_ops statement of the 1st kind is split into expression of AND'ed
+ * keys and const.  Sometimes const might be interpreted as both value or key
+ * in jsonb_ops.  Then statement of 1st kind is decomposed into the expression
+ * below.
+ *
+ *	key1 AND key2 AND ... AND keyN AND (const_as_value OR const_as_key)
+ *
+ * jsonb_path_ops transforms each statement of the 1st kind into single hash
+ * entry below.
+ *
+ *	HASH(key1, key2, ... , keyN, const)
+ *
+ * Despite statements of the 2nd kind are not supported by both jsonb_ops and
+ * jsonb_path_ops, EXISTS(path) expressions might be still supported,
+ * when statements of 1st kind could be extracted out of their filters.
+ *
+ * IDENTIFICATION
+ *	  src/backend/utils/adt/jsonb_gin.c
+ *
+ *-------------------------------------------------------------------------
+ */</comment>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"postgres.h"</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/gin.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/hash.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/stratnum.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/pg_collation.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/pg_type.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"miscadmin.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/builtins.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/jsonb.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/jsonpath.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/varlena.h"</cpp:file></cpp:include>
+
+<typedef>typedef <type><struct>struct <name>PathHashStack</name>
+<block>{
+	<decl_stmt><decl><type><name>uint32</name></type>		<name>hash</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name><name>struct</name> <name>PathHashStack</name></name> <modifier>*</modifier></type><name>parent</name></decl>;</decl_stmt>
+}</block></struct></type> <name>PathHashStack</name>;</typedef>
+
+<comment type="block">/* Buffer for GIN entries */</comment>
+<typedef>typedef <type><struct>struct <name>GinEntries</name>
+<block>{
+	<decl_stmt><decl><type><name>Datum</name>	   <modifier>*</modifier></type><name>buf</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>count</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>allocated</name></decl>;</decl_stmt>
+}</block></struct></type> <name>GinEntries</name>;</typedef>
+
+<typedef>typedef <type><enum>enum <name>JsonPathGinNodeType</name>
+<block>{
+	<decl><name>JSP_GIN_OR</name></decl>,
+	<decl><name>JSP_GIN_AND</name></decl>,
+	<decl><name>JSP_GIN_ENTRY</name></decl>
+}</block></enum></type> <name>JsonPathGinNodeType</name>;</typedef>
+
+<typedef>typedef <type><name><name>struct</name> <name>JsonPathGinNode</name></name></type> <name>JsonPathGinNode</name>;</typedef>
+
+<comment type="block">/* Node in jsonpath expression tree */</comment>
+<struct>struct <name>JsonPathGinNode</name>
+<block>{
+	<decl_stmt><decl><type><name>JsonPathGinNodeType</name></type> <name>type</name></decl>;</decl_stmt>
+	<union>union
+	<block>{
+		<decl_stmt><decl><type><name>int</name></type>			<name>nargs</name></decl>;</decl_stmt>		<comment type="block">/* valid for OR and AND nodes */</comment>
+		<decl_stmt><decl><type><name>int</name></type>			<name>entryIndex</name></decl>;</decl_stmt> <comment type="block">/* index in GinEntries array, valid for ENTRY
+								 * nodes after entries output */</comment>
+		<decl_stmt><decl><type><name>Datum</name></type>		<name>entryDatum</name></decl>;</decl_stmt> <comment type="block">/* path hash or key name/scalar, valid for
+								 * ENTRY nodes before entries output */</comment>
+	}</block>			<decl><name>val</name></decl>;</union>
+	<decl_stmt><decl><type><name>JsonPathGinNode</name> <modifier>*</modifier></type><name><name>args</name><index>[<expr><name>FLEXIBLE_ARRAY_MEMBER</name></expr>]</index></name></decl>;</decl_stmt>	<comment type="block">/* valid for OR and AND
+													 * nodes */</comment>
+}</block>;</struct>
+
+<comment type="block">/*
+ * jsonb_ops entry extracted from jsonpath item.  Corresponding path item
+ * may be: '.key', '.*', '.**', '[index]' or '[*]'.
+ * Entry type is stored in 'type' field.
+ */</comment>
+<typedef>typedef <type><struct>struct <name>JsonPathGinPathItem</name>
+<block>{
+	<decl_stmt><decl><type><name><name>struct</name> <name>JsonPathGinPathItem</name></name> <modifier>*</modifier></type><name>parent</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Datum</name></type>		<name>keyName</name></decl>;</decl_stmt>		<comment type="block">/* key name (for '.key' path item) or NULL */</comment>
+	<decl_stmt><decl><type><name>JsonPathItemType</name></type> <name>type</name></decl>;</decl_stmt>		<comment type="block">/* type of jsonpath item */</comment>
+}</block></struct></type> <name>JsonPathGinPathItem</name>;</typedef>
+
+<comment type="block">/* GIN representation of the extracted json path */</comment>
+<typedef>typedef <type><union>union <name>JsonPathGinPath</name>
+<block>{
+	<decl_stmt><decl><type><name>JsonPathGinPathItem</name> <modifier>*</modifier></type><name>items</name></decl>;</decl_stmt> <comment type="block">/* list of path items (jsonb_ops) */</comment>
+	<decl_stmt><decl><type><name>uint32</name></type>		<name>hash</name></decl>;</decl_stmt>			<comment type="block">/* hash of the path (jsonb_path_ops) */</comment>
+}</block></union></type> <name>JsonPathGinPath</name>;</typedef>
+
+<typedef>typedef <type><name><name>struct</name> <name>JsonPathGinContext</name></name></type> <name>JsonPathGinContext</name>;</typedef>
+
+<comment type="block">/* Callback, which stores information about path item into JsonPathGinPath */</comment>
+<typedef>typedef <function_decl><type><name>bool</name></type> (<modifier>*</modifier><name>JsonPathGinAddPathItemFunc</name>) <parameter_list>(<parameter><decl><type><name>JsonPathGinPath</name> <modifier>*</modifier></type><name>path</name></decl></parameter>,
+											<parameter><decl><type><name>JsonPathItem</name> <modifier>*</modifier></type><name>jsp</name></decl></parameter>)</parameter_list>;</function_decl></typedef>
+
+<comment type="block">/*
+ * Callback, which extracts set of nodes from statement of 1st kind
+ * (scalar != NULL) or statement of 2nd kind (scalar == NULL).
+ */</comment>
+<typedef>typedef <function_decl><type><name>List</name> <modifier>*</modifier></type>(<modifier>*</modifier><name>JsonPathGinExtractNodesFunc</name>) <parameter_list>(<parameter><decl><type><name>JsonPathGinContext</name> <modifier>*</modifier></type><name>cxt</name></decl></parameter>,
+											  <parameter><decl><type><name>JsonPathGinPath</name></type> <name>path</name></decl></parameter>,
+											  <parameter><decl><type><name>JsonbValue</name> <modifier>*</modifier></type><name>scalar</name></decl></parameter>,
+											  <parameter><decl><type><name>List</name> <modifier>*</modifier></type><name>nodes</name></decl></parameter>)</parameter_list>;</function_decl></typedef>
+
+<comment type="block">/* Context for jsonpath entries extraction */</comment>
+<struct>struct <name>JsonPathGinContext</name>
+<block>{
+	<decl_stmt><decl><type><name>JsonPathGinAddPathItemFunc</name></type> <name>add_path_item</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>JsonPathGinExtractNodesFunc</name></type> <name>extract_nodes</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type>		<name>lax</name></decl>;</decl_stmt>
+}</block>;</struct>
+
+<function_decl><type><specifier>static</specifier> <name>Datum</name></type> <name>make_text_key</name><parameter_list>(<parameter><decl><type><name>char</name></type> <name>flag</name></decl></parameter>, <parameter><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>str</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>len</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>Datum</name></type> <name>make_scalar_key</name><parameter_list>(<parameter><decl><type><specifier>const</specifier> <name>JsonbValue</name> <modifier>*</modifier></type><name>scalarVal</name></decl></parameter>, <parameter><decl><type><name>bool</name></type> <name>is_key</name></decl></parameter>)</parameter_list>;</function_decl>
+
+<function_decl><type><specifier>static</specifier> <name>JsonPathGinNode</name> <modifier>*</modifier></type><name>extract_jsp_bool_expr</name><parameter_list>(<parameter><decl><type><name>JsonPathGinContext</name> <modifier>*</modifier></type><name>cxt</name></decl></parameter>,
+					  <parameter><decl><type><name>JsonPathGinPath</name></type> <name>path</name></decl></parameter>, <parameter><decl><type><name>JsonPathItem</name> <modifier>*</modifier></type><name>jsp</name></decl></parameter>, <parameter><decl><type><name>bool</name></type> <name>not</name></decl></parameter>)</parameter_list>;</function_decl>
+
+
+<comment type="block">/* Initialize GinEntries struct */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>init_gin_entries</name><parameter_list>(<parameter><decl><type><name>GinEntries</name> <modifier>*</modifier></type><name>entries</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>preallocated</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><name><name>entries</name><operator>-&gt;</operator><name>allocated</name></name> <operator>=</operator> <name>preallocated</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>entries</name><operator>-&gt;</operator><name>buf</name></name> <operator>=</operator> <ternary><condition><expr><name>preallocated</name></expr> ?</condition><then> <expr><call><name>palloc</name><argument_list>(<argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>Datum</name></expr></argument>)</argument_list></sizeof> <operator>*</operator> <name>preallocated</name></expr></argument>)</argument_list></call></expr> </then><else>: <expr><name>NULL</name></expr></else></ternary></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>entries</name><operator>-&gt;</operator><name>count</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/* Add new entry to GinEntries */</comment>
+<function><type><specifier>static</specifier> <name>int</name></type>
+<name>add_gin_entry</name><parameter_list>(<parameter><decl><type><name>GinEntries</name> <modifier>*</modifier></type><name>entries</name></decl></parameter>, <parameter><decl><type><name>Datum</name></type> <name>entry</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>int</name></type>			<name>id</name> <init>= <expr><name><name>entries</name><operator>-&gt;</operator><name>count</name></name></expr></init></decl>;</decl_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name><name>entries</name><operator>-&gt;</operator><name>count</name></name> <operator>&gt;=</operator> <name><name>entries</name><operator>-&gt;</operator><name>allocated</name></name></expr>)</condition>
+	<block>{<block_content>
+		<if_stmt><if>if <condition>(<expr><name><name>entries</name><operator>-&gt;</operator><name>allocated</name></name></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><name><name>entries</name><operator>-&gt;</operator><name>allocated</name></name> <operator>*=</operator> <literal type="number">2</literal></expr>;</expr_stmt>
+			<expr_stmt><expr><name><name>entries</name><operator>-&gt;</operator><name>buf</name></name> <operator>=</operator> <call><name>repalloc</name><argument_list>(<argument><expr><name><name>entries</name><operator>-&gt;</operator><name>buf</name></name></expr></argument>,
+									<argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>Datum</name></expr></argument>)</argument_list></sizeof> <operator>*</operator> <name><name>entries</name><operator>-&gt;</operator><name>allocated</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></if>
+		<else>else
+		<block>{<block_content>
+			<expr_stmt><expr><name><name>entries</name><operator>-&gt;</operator><name>allocated</name></name> <operator>=</operator> <literal type="number">8</literal></expr>;</expr_stmt>
+			<expr_stmt><expr><name><name>entries</name><operator>-&gt;</operator><name>buf</name></name> <operator>=</operator> <call><name>palloc</name><argument_list>(<argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>Datum</name></expr></argument>)</argument_list></sizeof> <operator>*</operator> <name><name>entries</name><operator>-&gt;</operator><name>allocated</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></else></if_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<expr_stmt><expr><name><name>entries</name><operator>-&gt;</operator><name>buf</name><index>[<expr><name><name>entries</name><operator>-&gt;</operator><name>count</name></name><operator>++</operator></expr>]</index></name> <operator>=</operator> <name>entry</name></expr>;</expr_stmt>
+
+	<return>return <expr><name>id</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ *
+ * jsonb_ops GIN opclass support functions
+ *
+ */</comment>
+
+<function><type><name>Datum</name></type>
+<name>gin_compare_jsonb</name><parameter_list>(<parameter><decl><type><name>PG_FUNCTION_ARGS</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>text</name>	   <modifier>*</modifier></type><name>arg1</name> <init>= <expr><call><name>PG_GETARG_TEXT_PP</name><argument_list>(<argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>text</name>	   <modifier>*</modifier></type><name>arg2</name> <init>= <expr><call><name>PG_GETARG_TEXT_PP</name><argument_list>(<argument><expr><literal type="number">1</literal></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int32</name></type>		<name>result</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>a1p</name></decl>,
+			   <decl><type ref="prev"><modifier>*</modifier></type><name>a2p</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>len1</name></decl>,
+				<decl><type ref="prev"/><name>len2</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name>a1p</name> <operator>=</operator> <call><name>VARDATA_ANY</name><argument_list>(<argument><expr><name>arg1</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>a2p</name> <operator>=</operator> <call><name>VARDATA_ANY</name><argument_list>(<argument><expr><name>arg2</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>len1</name> <operator>=</operator> <call><name>VARSIZE_ANY_EXHDR</name><argument_list>(<argument><expr><name>arg1</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>len2</name> <operator>=</operator> <call><name>VARSIZE_ANY_EXHDR</name><argument_list>(<argument><expr><name>arg2</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Compare text as bttextcmp does, but always using C collation */</comment>
+	<expr_stmt><expr><name>result</name> <operator>=</operator> <call><name>varstr_cmp</name><argument_list>(<argument><expr><name>a1p</name></expr></argument>, <argument><expr><name>len1</name></expr></argument>, <argument><expr><name>a2p</name></expr></argument>, <argument><expr><name>len2</name></expr></argument>, <argument><expr><name>C_COLLATION_OID</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>PG_FREE_IF_COPY</name><argument_list>(<argument><expr><name>arg1</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>PG_FREE_IF_COPY</name><argument_list>(<argument><expr><name>arg2</name></expr></argument>, <argument><expr><literal type="number">1</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>PG_RETURN_INT32</name><argument_list>(<argument><expr><name>result</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<function><type><name>Datum</name></type>
+<name>gin_extract_jsonb</name><parameter_list>(<parameter><decl><type><name>PG_FUNCTION_ARGS</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>Jsonb</name>	   <modifier>*</modifier></type><name>jb</name> <init>= <expr><operator>(</operator><name>Jsonb</name> <operator>*</operator><operator>)</operator> <call><name>PG_GETARG_JSONB_P</name><argument_list>(<argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int32</name>	   <modifier>*</modifier></type><name>nentries</name> <init>= <expr><operator>(</operator><name>int32</name> <operator>*</operator><operator>)</operator> <call><name>PG_GETARG_POINTER</name><argument_list>(<argument><expr><literal type="number">1</literal></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>total</name> <init>= <expr><call><name>JB_ROOT_COUNT</name><argument_list>(<argument><expr><name>jb</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>JsonbIterator</name> <modifier>*</modifier></type><name>it</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>JsonbValue</name></type>	<name>v</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>JsonbIteratorToken</name></type> <name>r</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>GinEntries</name></type>	<name>entries</name></decl>;</decl_stmt>
+
+	<comment type="block">/* If the root level is empty, we certainly have no keys */</comment>
+	<if_stmt><if>if <condition>(<expr><name>total</name> <operator>==</operator> <literal type="number">0</literal></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><operator>*</operator><name>nentries</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>PG_RETURN_POINTER</name><argument_list>(<argument><expr><name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/* Otherwise, use 2 * root count as initial estimate of result size */</comment>
+	<expr_stmt><expr><call><name>init_gin_entries</name><argument_list>(<argument><expr><operator>&amp;</operator><name>entries</name></expr></argument>, <argument><expr><literal type="number">2</literal> <operator>*</operator> <name>total</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>it</name> <operator>=</operator> <call><name>JsonbIteratorInit</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>jb</name><operator>-&gt;</operator><name>root</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<while>while <condition>(<expr><operator>(</operator><name>r</name> <operator>=</operator> <call><name>JsonbIteratorNext</name><argument_list>(<argument><expr><operator>&amp;</operator><name>it</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>v</name></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call><operator>)</operator> <operator>!=</operator> <name>WJB_DONE</name></expr>)</condition>
+	<block>{<block_content>
+		<switch>switch <condition>(<expr><name>r</name></expr>)</condition>
+		<block>{<block_content>
+			<case>case <expr><name>WJB_KEY</name></expr>:</case>
+				<expr_stmt><expr><call><name>add_gin_entry</name><argument_list>(<argument><expr><operator>&amp;</operator><name>entries</name></expr></argument>, <argument><expr><call><name>make_scalar_key</name><argument_list>(<argument><expr><operator>&amp;</operator><name>v</name></expr></argument>, <argument><expr><name>true</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<break>break;</break>
+			<case>case <expr><name>WJB_ELEM</name></expr>:</case>
+				<comment type="block">/* Pretend string array elements are keys, see jsonb.h */</comment>
+				<expr_stmt><expr><call><name>add_gin_entry</name><argument_list>(<argument><expr><operator>&amp;</operator><name>entries</name></expr></argument>, <argument><expr><call><name>make_scalar_key</name><argument_list>(<argument><expr><operator>&amp;</operator><name>v</name></expr></argument>, <argument><expr><name><name>v</name><operator>.</operator><name>type</name></name> <operator>==</operator> <name>jbvString</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<break>break;</break>
+			<case>case <expr><name>WJB_VALUE</name></expr>:</case>
+				<expr_stmt><expr><call><name>add_gin_entry</name><argument_list>(<argument><expr><operator>&amp;</operator><name>entries</name></expr></argument>, <argument><expr><call><name>make_scalar_key</name><argument_list>(<argument><expr><operator>&amp;</operator><name>v</name></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<break>break;</break>
+			<default>default:</default>
+				<comment type="block">/* we can ignore structural items */</comment>
+				<break>break;</break>
+		</block_content>}</block></switch>
+	</block_content>}</block></while>
+
+	<expr_stmt><expr><operator>*</operator><name>nentries</name> <operator>=</operator> <name><name>entries</name><operator>.</operator><name>count</name></name></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>PG_RETURN_POINTER</name><argument_list>(<argument><expr><name><name>entries</name><operator>.</operator><name>buf</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/* Append JsonPathGinPathItem to JsonPathGinPath (jsonb_ops) */</comment>
+<function><type><specifier>static</specifier> <name>bool</name></type>
+<name>jsonb_ops__add_path_item</name><parameter_list>(<parameter><decl><type><name>JsonPathGinPath</name> <modifier>*</modifier></type><name>path</name></decl></parameter>, <parameter><decl><type><name>JsonPathItem</name> <modifier>*</modifier></type><name>jsp</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>JsonPathGinPathItem</name> <modifier>*</modifier></type><name>pentry</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Datum</name></type>		<name>keyName</name></decl>;</decl_stmt>
+
+	<switch>switch <condition>(<expr><name><name>jsp</name><operator>-&gt;</operator><name>type</name></name></expr>)</condition>
+	<block>{<block_content>
+		<case>case <expr><name>jpiRoot</name></expr>:</case>
+			<expr_stmt><expr><name><name>path</name><operator>-&gt;</operator><name>items</name></name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt> <comment type="block">/* reset path */</comment>
+			<return>return <expr><name>true</name></expr>;</return>
+
+		<case>case <expr><name>jpiKey</name></expr>:</case>
+			<block>{<block_content>
+				<decl_stmt><decl><type><name>int</name></type>			<name>len</name></decl>;</decl_stmt>
+				<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>key</name> <init>= <expr><call><name>jspGetString</name><argument_list>(<argument><expr><name>jsp</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>len</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+				<expr_stmt><expr><name>keyName</name> <operator>=</operator> <call><name>make_text_key</name><argument_list>(<argument><expr><name>JGINFLAG_KEY</name></expr></argument>, <argument><expr><name>key</name></expr></argument>, <argument><expr><name>len</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<break>break;</break>
+			</block_content>}</block>
+
+		<case>case <expr><name>jpiAny</name></expr>:</case>
+		<case>case <expr><name>jpiAnyKey</name></expr>:</case>
+		<case>case <expr><name>jpiAnyArray</name></expr>:</case>
+		<case>case <expr><name>jpiIndexArray</name></expr>:</case>
+			<expr_stmt><expr><name>keyName</name> <operator>=</operator> <call><name>PointerGetDatum</name><argument_list>(<argument><expr><name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<break>break;</break>
+
+		<default>default:</default>
+			<comment type="block">/* other path items like item methods are not supported */</comment>
+			<return>return <expr><name>false</name></expr>;</return>
+	</block_content>}</block></switch>
+
+	<expr_stmt><expr><name>pentry</name> <operator>=</operator> <call><name>palloc</name><argument_list>(<argument><expr><sizeof>sizeof<argument_list>(<argument><expr><operator>*</operator><name>pentry</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name><name>pentry</name><operator>-&gt;</operator><name>type</name></name> <operator>=</operator> <name><name>jsp</name><operator>-&gt;</operator><name>type</name></name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>pentry</name><operator>-&gt;</operator><name>keyName</name></name> <operator>=</operator> <name>keyName</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>pentry</name><operator>-&gt;</operator><name>parent</name></name> <operator>=</operator> <name><name>path</name><operator>-&gt;</operator><name>items</name></name></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name><name>path</name><operator>-&gt;</operator><name>items</name></name> <operator>=</operator> <name>pentry</name></expr>;</expr_stmt>
+
+	<return>return <expr><name>true</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/* Combine existing path hash with next key hash (jsonb_path_ops) */</comment>
+<function><type><specifier>static</specifier> <name>bool</name></type>
+<name>jsonb_path_ops__add_path_item</name><parameter_list>(<parameter><decl><type><name>JsonPathGinPath</name> <modifier>*</modifier></type><name>path</name></decl></parameter>, <parameter><decl><type><name>JsonPathItem</name> <modifier>*</modifier></type><name>jsp</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<switch>switch <condition>(<expr><name><name>jsp</name><operator>-&gt;</operator><name>type</name></name></expr>)</condition>
+	<block>{<block_content>
+		<case>case <expr><name>jpiRoot</name></expr>:</case>
+			<expr_stmt><expr><name><name>path</name><operator>-&gt;</operator><name>hash</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>		<comment type="block">/* reset path hash */</comment>
+			<return>return <expr><name>true</name></expr>;</return>
+
+		<case>case <expr><name>jpiKey</name></expr>:</case>
+			<block>{<block_content>
+				<decl_stmt><decl><type><name>JsonbValue</name></type>	<name>jbv</name></decl>;</decl_stmt>
+
+				<expr_stmt><expr><name><name>jbv</name><operator>.</operator><name>type</name></name> <operator>=</operator> <name>jbvString</name></expr>;</expr_stmt>
+				<expr_stmt><expr><name><name>jbv</name><operator>.</operator><name>val</name><operator>.</operator><name>string</name><operator>.</operator><name>val</name></name> <operator>=</operator> <call><name>jspGetString</name><argument_list>(<argument><expr><name>jsp</name></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>jbv</name><operator>.</operator><name>val</name><operator>.</operator><name>string</name><operator>.</operator><name>len</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+				<expr_stmt><expr><call><name>JsonbHashScalarValue</name><argument_list>(<argument><expr><operator>&amp;</operator><name>jbv</name></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>path</name><operator>-&gt;</operator><name>hash</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<return>return <expr><name>true</name></expr>;</return>
+			</block_content>}</block>
+
+		<case>case <expr><name>jpiIndexArray</name></expr>:</case>
+		<case>case <expr><name>jpiAnyArray</name></expr>:</case>
+			<return>return <expr><name>true</name></expr>;</return>		<comment type="block">/* path hash is unchanged */</comment>
+
+		<default>default:</default>
+			<comment type="block">/* other items (wildcard paths, item methods) are not supported */</comment>
+			<return>return <expr><name>false</name></expr>;</return>
+	</block_content>}</block></switch>
+</block_content>}</block></function>
+
+<function><type><specifier>static</specifier> <name>JsonPathGinNode</name> <modifier>*</modifier></type>
+<name>make_jsp_entry_node</name><parameter_list>(<parameter><decl><type><name>Datum</name></type> <name>entry</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>JsonPathGinNode</name> <modifier>*</modifier></type><name>node</name> <init>= <expr><call><name>palloc</name><argument_list>(<argument><expr><call><name>offsetof</name><argument_list>(<argument><expr><name>JsonPathGinNode</name></expr></argument>, <argument><expr><name>args</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name><name>node</name><operator>-&gt;</operator><name>type</name></name> <operator>=</operator> <name>JSP_GIN_ENTRY</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>node</name><operator>-&gt;</operator><name>val</name><operator>.</operator><name>entryDatum</name></name> <operator>=</operator> <name>entry</name></expr>;</expr_stmt>
+
+	<return>return <expr><name>node</name></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><specifier>static</specifier> <name>JsonPathGinNode</name> <modifier>*</modifier></type>
+<name>make_jsp_entry_node_scalar</name><parameter_list>(<parameter><decl><type><name>JsonbValue</name> <modifier>*</modifier></type><name>scalar</name></decl></parameter>, <parameter><decl><type><name>bool</name></type> <name>iskey</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<return>return <expr><call><name>make_jsp_entry_node</name><argument_list>(<argument><expr><call><name>make_scalar_key</name><argument_list>(<argument><expr><name>scalar</name></expr></argument>, <argument><expr><name>iskey</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><specifier>static</specifier> <name>JsonPathGinNode</name> <modifier>*</modifier></type>
+<name>make_jsp_expr_node</name><parameter_list>(<parameter><decl><type><name>JsonPathGinNodeType</name></type> <name>type</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>nargs</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>JsonPathGinNode</name> <modifier>*</modifier></type><name>node</name> <init>= <expr><call><name>palloc</name><argument_list>(<argument><expr><call><name>offsetof</name><argument_list>(<argument><expr><name>JsonPathGinNode</name></expr></argument>, <argument><expr><name>args</name></expr></argument>)</argument_list></call> <operator>+</operator>
+								   <sizeof>sizeof<argument_list>(<argument><expr><name><name>node</name><operator>-&gt;</operator><name>args</name><index>[<expr><literal type="number">0</literal></expr>]</index></name></expr></argument>)</argument_list></sizeof> <operator>*</operator> <name>nargs</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name><name>node</name><operator>-&gt;</operator><name>type</name></name> <operator>=</operator> <name>type</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>node</name><operator>-&gt;</operator><name>val</name><operator>.</operator><name>nargs</name></name> <operator>=</operator> <name>nargs</name></expr>;</expr_stmt>
+
+	<return>return <expr><name>node</name></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><specifier>static</specifier> <name>JsonPathGinNode</name> <modifier>*</modifier></type>
+<name>make_jsp_expr_node_args</name><parameter_list>(<parameter><decl><type><name>JsonPathGinNodeType</name></type> <name>type</name></decl></parameter>, <parameter><decl><type><name>List</name> <modifier>*</modifier></type><name>args</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>JsonPathGinNode</name> <modifier>*</modifier></type><name>node</name> <init>= <expr><call><name>make_jsp_expr_node</name><argument_list>(<argument><expr><name>type</name></expr></argument>, <argument><expr><call><name>list_length</name><argument_list>(<argument><expr><name>args</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>ListCell</name>   <modifier>*</modifier></type><name>lc</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>i</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+
+	<macro><name>foreach</name><argument_list>(<argument>lc</argument>, <argument>args</argument>)</argument_list></macro>
+		<expr_stmt><expr><name><name>node</name><operator>-&gt;</operator><name>args</name><index>[<expr><name>i</name><operator>++</operator></expr>]</index></name> <operator>=</operator> <call><name>lfirst</name><argument_list>(<argument><expr><name>lc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<return>return <expr><name>node</name></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><specifier>static</specifier> <name>JsonPathGinNode</name> <modifier>*</modifier></type>
+<name>make_jsp_expr_node_binary</name><parameter_list>(<parameter><decl><type><name>JsonPathGinNodeType</name></type> <name>type</name></decl></parameter>,
+						  <parameter><decl><type><name>JsonPathGinNode</name> <modifier>*</modifier></type><name>arg1</name></decl></parameter>, <parameter><decl><type><name>JsonPathGinNode</name> <modifier>*</modifier></type><name>arg2</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>JsonPathGinNode</name> <modifier>*</modifier></type><name>node</name> <init>= <expr><call><name>make_jsp_expr_node</name><argument_list>(<argument><expr><name>type</name></expr></argument>, <argument><expr><literal type="number">2</literal></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name><name>node</name><operator>-&gt;</operator><name>args</name><index>[<expr><literal type="number">0</literal></expr>]</index></name> <operator>=</operator> <name>arg1</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>node</name><operator>-&gt;</operator><name>args</name><index>[<expr><literal type="number">1</literal></expr>]</index></name> <operator>=</operator> <name>arg2</name></expr>;</expr_stmt>
+
+	<return>return <expr><name>node</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/* Append a list of nodes from the jsonpath (jsonb_ops). */</comment>
+<function><type><specifier>static</specifier> <name>List</name> <modifier>*</modifier></type>
+<name>jsonb_ops__extract_nodes</name><parameter_list>(<parameter><decl><type><name>JsonPathGinContext</name> <modifier>*</modifier></type><name>cxt</name></decl></parameter>, <parameter><decl><type><name>JsonPathGinPath</name></type> <name>path</name></decl></parameter>,
+						 <parameter><decl><type><name>JsonbValue</name> <modifier>*</modifier></type><name>scalar</name></decl></parameter>, <parameter><decl><type><name>List</name> <modifier>*</modifier></type><name>nodes</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>JsonPathGinPathItem</name> <modifier>*</modifier></type><name>pentry</name></decl>;</decl_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>scalar</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>JsonPathGinNode</name> <modifier>*</modifier></type><name>node</name></decl>;</decl_stmt>
+
+		<comment type="block">/*
+		 * Append path entry nodes only if scalar is provided.  See header
+		 * comment for details.
+		 */</comment>
+		<for>for <control>(<init><expr><name>pentry</name> <operator>=</operator> <name><name>path</name><operator>.</operator><name>items</name></name></expr>;</init> <condition><expr><name>pentry</name></expr>;</condition> <incr><expr><name>pentry</name> <operator>=</operator> <name><name>pentry</name><operator>-&gt;</operator><name>parent</name></name></expr></incr>)</control>
+		<block>{<block_content>
+			<if_stmt><if>if <condition>(<expr><name><name>pentry</name><operator>-&gt;</operator><name>type</name></name> <operator>==</operator> <name>jpiKey</name></expr>)</condition><block type="pseudo"><block_content> <comment type="block">/* only keys are indexed */</comment>
+				<expr_stmt><expr><name>nodes</name> <operator>=</operator> <call><name>lappend</name><argument_list>(<argument><expr><name>nodes</name></expr></argument>, <argument><expr><call><name>make_jsp_entry_node</name><argument_list>(<argument><expr><name><name>pentry</name><operator>-&gt;</operator><name>keyName</name></name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+		</block_content>}</block></for>
+
+		<comment type="block">/* Append scalar node for equality queries. */</comment>
+		<if_stmt><if>if <condition>(<expr><name><name>scalar</name><operator>-&gt;</operator><name>type</name></name> <operator>==</operator> <name>jbvString</name></expr>)</condition>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>JsonPathGinPathItem</name> <modifier>*</modifier></type><name>last</name> <init>= <expr><name><name>path</name><operator>.</operator><name>items</name></name></expr></init></decl>;</decl_stmt>
+			<decl_stmt><decl><type><name>GinTernaryValue</name></type> <name>key_entry</name></decl>;</decl_stmt>
+
+			<comment type="block">/*
+			 * Assuming that jsonb_ops interprets string array elements as
+			 * keys, we may extract key or non-key entry or even both.  In the
+			 * latter case we create OR-node.  It is possible in lax mode
+			 * where arrays are automatically unwrapped, or in strict mode for
+			 * jpiAny items.
+			 */</comment>
+
+			<if_stmt><if>if <condition>(<expr><name><name>cxt</name><operator>-&gt;</operator><name>lax</name></name></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><name>key_entry</name> <operator>=</operator> <name>GIN_MAYBE</name></expr>;</expr_stmt></block_content></block></if>
+			<if type="elseif">else if <condition>(<expr><operator>!</operator><name>last</name></expr>)</condition><block type="pseudo"><block_content>		<comment type="block">/* root ($) */</comment>
+				<expr_stmt><expr><name>key_entry</name> <operator>=</operator> <name>GIN_FALSE</name></expr>;</expr_stmt></block_content></block></if>
+			<if type="elseif">else if <condition>(<expr><name><name>last</name><operator>-&gt;</operator><name>type</name></name> <operator>==</operator> <name>jpiAnyArray</name> <operator>||</operator> <name><name>last</name><operator>-&gt;</operator><name>type</name></name> <operator>==</operator> <name>jpiIndexArray</name></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><name>key_entry</name> <operator>=</operator> <name>GIN_TRUE</name></expr>;</expr_stmt></block_content></block></if>
+			<if type="elseif">else if <condition>(<expr><name><name>last</name><operator>-&gt;</operator><name>type</name></name> <operator>==</operator> <name>jpiAny</name></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><name>key_entry</name> <operator>=</operator> <name>GIN_MAYBE</name></expr>;</expr_stmt></block_content></block></if>
+			<else>else<block type="pseudo"><block_content>
+				<expr_stmt><expr><name>key_entry</name> <operator>=</operator> <name>GIN_FALSE</name></expr>;</expr_stmt></block_content></block></else></if_stmt>
+
+			<if_stmt><if>if <condition>(<expr><name>key_entry</name> <operator>==</operator> <name>GIN_MAYBE</name></expr>)</condition>
+			<block>{<block_content>
+				<decl_stmt><decl><type><name>JsonPathGinNode</name> <modifier>*</modifier></type><name>n1</name> <init>= <expr><call><name>make_jsp_entry_node_scalar</name><argument_list>(<argument><expr><name>scalar</name></expr></argument>, <argument><expr><name>true</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+				<decl_stmt><decl><type><name>JsonPathGinNode</name> <modifier>*</modifier></type><name>n2</name> <init>= <expr><call><name>make_jsp_entry_node_scalar</name><argument_list>(<argument><expr><name>scalar</name></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+				<expr_stmt><expr><name>node</name> <operator>=</operator> <call><name>make_jsp_expr_node_binary</name><argument_list>(<argument><expr><name>JSP_GIN_OR</name></expr></argument>, <argument><expr><name>n1</name></expr></argument>, <argument><expr><name>n2</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			</block_content>}</block></if>
+			<else>else
+			<block>{<block_content>
+				<expr_stmt><expr><name>node</name> <operator>=</operator> <call><name>make_jsp_entry_node_scalar</name><argument_list>(<argument><expr><name>scalar</name></expr></argument>,
+												  <argument><expr><name>key_entry</name> <operator>==</operator> <name>GIN_TRUE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			</block_content>}</block></else></if_stmt>
+		</block_content>}</block></if>
+		<else>else
+		<block>{<block_content>
+			<expr_stmt><expr><name>node</name> <operator>=</operator> <call><name>make_jsp_entry_node_scalar</name><argument_list>(<argument><expr><name>scalar</name></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></else></if_stmt>
+
+		<expr_stmt><expr><name>nodes</name> <operator>=</operator> <call><name>lappend</name><argument_list>(<argument><expr><name>nodes</name></expr></argument>, <argument><expr><name>node</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<return>return <expr><name>nodes</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/* Append a list of nodes from the jsonpath (jsonb_path_ops). */</comment>
+<function><type><specifier>static</specifier> <name>List</name> <modifier>*</modifier></type>
+<name>jsonb_path_ops__extract_nodes</name><parameter_list>(<parameter><decl><type><name>JsonPathGinContext</name> <modifier>*</modifier></type><name>cxt</name></decl></parameter>, <parameter><decl><type><name>JsonPathGinPath</name></type> <name>path</name></decl></parameter>,
+							  <parameter><decl><type><name>JsonbValue</name> <modifier>*</modifier></type><name>scalar</name></decl></parameter>, <parameter><decl><type><name>List</name> <modifier>*</modifier></type><name>nodes</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<if_stmt><if>if <condition>(<expr><name>scalar</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* append path hash node for equality queries */</comment>
+		<decl_stmt><decl><type><name>uint32</name></type>		<name>hash</name> <init>= <expr><name><name>path</name><operator>.</operator><name>hash</name></name></expr></init></decl>;</decl_stmt>
+
+		<expr_stmt><expr><call><name>JsonbHashScalarValue</name><argument_list>(<argument><expr><name>scalar</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>hash</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<return>return <expr><call><name>lappend</name><argument_list>(<argument><expr><name>nodes</name></expr></argument>,
+					   <argument><expr><call><name>make_jsp_entry_node</name><argument_list>(<argument><expr><call><name>UInt32GetDatum</name><argument_list>(<argument><expr><name>hash</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</return>
+	</block_content>}</block></if>
+	<else>else
+	<block>{<block_content>
+		<comment type="block">/* jsonb_path_ops doesn't support EXISTS queries =&gt; nothing to append */</comment>
+		<return>return <expr><name>nodes</name></expr>;</return>
+	</block_content>}</block></else></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Extract a list of expression nodes that need to be AND-ed by the caller.
+ * Extracted expression is 'path == scalar' if 'scalar' is non-NULL, and
+ * 'EXISTS(path)' otherwise.
+ */</comment>
+<function><type><specifier>static</specifier> <name>List</name> <modifier>*</modifier></type>
+<name>extract_jsp_path_expr_nodes</name><parameter_list>(<parameter><decl><type><name>JsonPathGinContext</name> <modifier>*</modifier></type><name>cxt</name></decl></parameter>, <parameter><decl><type><name>JsonPathGinPath</name></type> <name>path</name></decl></parameter>,
+							<parameter><decl><type><name>JsonPathItem</name> <modifier>*</modifier></type><name>jsp</name></decl></parameter>, <parameter><decl><type><name>JsonbValue</name> <modifier>*</modifier></type><name>scalar</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>JsonPathItem</name></type> <name>next</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>List</name>	   <modifier>*</modifier></type><name>nodes</name> <init>= <expr><name>NIL</name></expr></init></decl>;</decl_stmt>
+
+	<for>for <control>(<init>;</init><condition>;</condition><incr/>)</control>
+	<block>{<block_content>
+		<switch>switch <condition>(<expr><name><name>jsp</name><operator>-&gt;</operator><name>type</name></name></expr>)</condition>
+		<block>{<block_content>
+			<case>case <expr><name>jpiCurrent</name></expr>:</case>
+				<break>break;</break>
+
+			<case>case <expr><name>jpiFilter</name></expr>:</case>
+				<block>{<block_content>
+					<decl_stmt><decl><type><name>JsonPathItem</name></type> <name>arg</name></decl>;</decl_stmt>
+					<decl_stmt><decl><type><name>JsonPathGinNode</name> <modifier>*</modifier></type><name>filter</name></decl>;</decl_stmt>
+
+					<expr_stmt><expr><call><name>jspGetArg</name><argument_list>(<argument><expr><name>jsp</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>arg</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+					<expr_stmt><expr><name>filter</name> <operator>=</operator> <call><name>extract_jsp_bool_expr</name><argument_list>(<argument><expr><name>cxt</name></expr></argument>, <argument><expr><name>path</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>arg</name></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+					<if_stmt><if>if <condition>(<expr><name>filter</name></expr>)</condition><block type="pseudo"><block_content>
+						<expr_stmt><expr><name>nodes</name> <operator>=</operator> <call><name>lappend</name><argument_list>(<argument><expr><name>nodes</name></expr></argument>, <argument><expr><name>filter</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+					<break>break;</break>
+				</block_content>}</block>
+
+			<default>default:</default>
+				<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name><name>cxt</name><operator>-&gt;</operator><name>add_path_item</name></name><argument_list>(<argument><expr><operator>&amp;</operator><name>path</name></expr></argument>, <argument><expr><name>jsp</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+
+					<comment type="block">/*
+					 * Path is not supported by the index opclass, return only
+					 * the extracted filter nodes.
+					 */</comment>
+					<return>return <expr><name>nodes</name></expr>;</return></block_content></block></if></if_stmt>
+				<break>break;</break>
+		</block_content>}</block></switch>
+
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>jspGetNext</name><argument_list>(<argument><expr><name>jsp</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>next</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<break>break;</break></block_content></block></if></if_stmt>
+
+		<expr_stmt><expr><name>jsp</name> <operator>=</operator> <operator>&amp;</operator><name>next</name></expr>;</expr_stmt>
+	</block_content>}</block></for>
+
+	<comment type="block">/*
+	 * Append nodes from the path expression itself to the already extracted
+	 * list of filter nodes.
+	 */</comment>
+	<return>return <expr><call><name><name>cxt</name><operator>-&gt;</operator><name>extract_nodes</name></name><argument_list>(<argument><expr><name>cxt</name></expr></argument>, <argument><expr><name>path</name></expr></argument>, <argument><expr><name>scalar</name></expr></argument>, <argument><expr><name>nodes</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Extract an expression node from one of following jsonpath path expressions:
+ *   EXISTS(jsp)    (when 'scalar' is NULL)
+ *   jsp == scalar  (when 'scalar' is not NULL).
+ *
+ * The current path (@) is passed in 'path'.
+ */</comment>
+<function><type><specifier>static</specifier> <name>JsonPathGinNode</name> <modifier>*</modifier></type>
+<name>extract_jsp_path_expr</name><parameter_list>(<parameter><decl><type><name>JsonPathGinContext</name> <modifier>*</modifier></type><name>cxt</name></decl></parameter>, <parameter><decl><type><name>JsonPathGinPath</name></type> <name>path</name></decl></parameter>,
+					  <parameter><decl><type><name>JsonPathItem</name> <modifier>*</modifier></type><name>jsp</name></decl></parameter>, <parameter><decl><type><name>JsonbValue</name> <modifier>*</modifier></type><name>scalar</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<comment type="block">/* extract a list of nodes to be AND-ed */</comment>
+	<decl_stmt><decl><type><name>List</name>	   <modifier>*</modifier></type><name>nodes</name> <init>= <expr><call><name>extract_jsp_path_expr_nodes</name><argument_list>(<argument><expr><name>cxt</name></expr></argument>, <argument><expr><name>path</name></expr></argument>, <argument><expr><name>jsp</name></expr></argument>, <argument><expr><name>scalar</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<if_stmt><if>if <condition>(<expr><call><name>list_length</name><argument_list>(<argument><expr><name>nodes</name></expr></argument>)</argument_list></call> <operator>&lt;=</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+		<comment type="block">/* no nodes were extracted =&gt; full scan is needed for this path */</comment>
+		<return>return <expr><name>NULL</name></expr>;</return></block_content></block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><call><name>list_length</name><argument_list>(<argument><expr><name>nodes</name></expr></argument>)</argument_list></call> <operator>==</operator> <literal type="number">1</literal></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><call><name>linitial</name><argument_list>(<argument><expr><name>nodes</name></expr></argument>)</argument_list></call></expr>;</return></block_content></block></if></if_stmt> <comment type="block">/* avoid extra AND-node */</comment>
+
+	<comment type="block">/* construct AND-node for path with filters */</comment>
+	<return>return <expr><call><name>make_jsp_expr_node_args</name><argument_list>(<argument><expr><name>JSP_GIN_AND</name></expr></argument>, <argument><expr><name>nodes</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/* Recursively extract nodes from the boolean jsonpath expression. */</comment>
+<function><type><specifier>static</specifier> <name>JsonPathGinNode</name> <modifier>*</modifier></type>
+<name>extract_jsp_bool_expr</name><parameter_list>(<parameter><decl><type><name>JsonPathGinContext</name> <modifier>*</modifier></type><name>cxt</name></decl></parameter>, <parameter><decl><type><name>JsonPathGinPath</name></type> <name>path</name></decl></parameter>,
+					  <parameter><decl><type><name>JsonPathItem</name> <modifier>*</modifier></type><name>jsp</name></decl></parameter>, <parameter><decl><type><name>bool</name></type> <name>not</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>check_stack_depth</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+	<switch>switch <condition>(<expr><name><name>jsp</name><operator>-&gt;</operator><name>type</name></name></expr>)</condition>
+	<block>{<block_content>
+		<case>case <expr><name>jpiAnd</name></expr>:</case>			<comment type="block">/* expr &amp;&amp; expr */</comment>
+		<case>case <expr><name>jpiOr</name></expr>:</case>				<comment type="block">/* expr || expr */</comment>
+			<block>{<block_content>
+				<decl_stmt><decl><type><name>JsonPathItem</name></type> <name>arg</name></decl>;</decl_stmt>
+				<decl_stmt><decl><type><name>JsonPathGinNode</name> <modifier>*</modifier></type><name>larg</name></decl>;</decl_stmt>
+				<decl_stmt><decl><type><name>JsonPathGinNode</name> <modifier>*</modifier></type><name>rarg</name></decl>;</decl_stmt>
+				<decl_stmt><decl><type><name>JsonPathGinNodeType</name></type> <name>type</name></decl>;</decl_stmt>
+
+				<expr_stmt><expr><call><name>jspGetLeftArg</name><argument_list>(<argument><expr><name>jsp</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>arg</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<expr_stmt><expr><name>larg</name> <operator>=</operator> <call><name>extract_jsp_bool_expr</name><argument_list>(<argument><expr><name>cxt</name></expr></argument>, <argument><expr><name>path</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>arg</name></expr></argument>, <argument><expr><name>not</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+				<expr_stmt><expr><call><name>jspGetRightArg</name><argument_list>(<argument><expr><name>jsp</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>arg</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<expr_stmt><expr><name>rarg</name> <operator>=</operator> <call><name>extract_jsp_bool_expr</name><argument_list>(<argument><expr><name>cxt</name></expr></argument>, <argument><expr><name>path</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>arg</name></expr></argument>, <argument><expr><name>not</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+				<if_stmt><if>if <condition>(<expr><operator>!</operator><name>larg</name> <operator>||</operator> <operator>!</operator><name>rarg</name></expr>)</condition>
+				<block>{<block_content>
+					<if_stmt><if>if <condition>(<expr><name><name>jsp</name><operator>-&gt;</operator><name>type</name></name> <operator>==</operator> <name>jpiOr</name></expr>)</condition><block type="pseudo"><block_content>
+						<return>return <expr><name>NULL</name></expr>;</return></block_content></block></if></if_stmt>
+
+					<return>return <expr><ternary><condition><expr><name>larg</name></expr> ?</condition><then> <expr><name>larg</name></expr> </then><else>: <expr><name>rarg</name></expr></else></ternary></expr>;</return>
+				</block_content>}</block></if></if_stmt>
+
+				<expr_stmt><expr><name>type</name> <operator>=</operator> <ternary><condition><expr><name>not</name> <operator>^</operator> <operator>(</operator><name><name>jsp</name><operator>-&gt;</operator><name>type</name></name> <operator>==</operator> <name>jpiAnd</name><operator>)</operator></expr> ?</condition><then> <expr><name>JSP_GIN_AND</name></expr> </then><else>: <expr><name>JSP_GIN_OR</name></expr></else></ternary></expr>;</expr_stmt>
+
+				<return>return <expr><call><name>make_jsp_expr_node_binary</name><argument_list>(<argument><expr><name>type</name></expr></argument>, <argument><expr><name>larg</name></expr></argument>, <argument><expr><name>rarg</name></expr></argument>)</argument_list></call></expr>;</return>
+			</block_content>}</block>
+
+		<case>case <expr><name>jpiNot</name></expr>:</case>			<comment type="block">/* !expr  */</comment>
+			<block>{<block_content>
+				<decl_stmt><decl><type><name>JsonPathItem</name></type> <name>arg</name></decl>;</decl_stmt>
+
+				<expr_stmt><expr><call><name>jspGetArg</name><argument_list>(<argument><expr><name>jsp</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>arg</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+				<comment type="block">/* extract child expression inverting 'not' flag */</comment>
+				<return>return <expr><call><name>extract_jsp_bool_expr</name><argument_list>(<argument><expr><name>cxt</name></expr></argument>, <argument><expr><name>path</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>arg</name></expr></argument>, <argument><expr><operator>!</operator><name>not</name></expr></argument>)</argument_list></call></expr>;</return>
+			</block_content>}</block>
+
+		<case>case <expr><name>jpiExists</name></expr>:</case>			<comment type="block">/* EXISTS(path) */</comment>
+			<block>{<block_content>
+				<decl_stmt><decl><type><name>JsonPathItem</name></type> <name>arg</name></decl>;</decl_stmt>
+
+				<if_stmt><if>if <condition>(<expr><name>not</name></expr>)</condition><block type="pseudo"><block_content>
+					<return>return <expr><name>NULL</name></expr>;</return></block_content></block></if></if_stmt>	<comment type="block">/* NOT EXISTS is not supported */</comment>
+
+				<expr_stmt><expr><call><name>jspGetArg</name><argument_list>(<argument><expr><name>jsp</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>arg</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+				<return>return <expr><call><name>extract_jsp_path_expr</name><argument_list>(<argument><expr><name>cxt</name></expr></argument>, <argument><expr><name>path</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>arg</name></expr></argument>, <argument><expr><name>NULL</name></expr></argument>)</argument_list></call></expr>;</return>
+			</block_content>}</block>
+
+		<case>case <expr><name>jpiNotEqual</name></expr>:</case>
+
+			<comment type="block">/*
+			 * 'not' == true case is not supported here because '!(path !=
+			 * scalar)' is not equivalent to 'path == scalar' in the general
+			 * case because of sequence comparison semantics: 'path == scalar'
+			 * === 'EXISTS (path, @ == scalar)', '!(path != scalar)' ===
+			 * 'FOR_ALL(path, @ == scalar)'. So, we should translate '!(path
+			 * != scalar)' into GIN query 'path == scalar || EMPTY(path)', but
+			 * 'EMPTY(path)' queries are not supported by the both jsonb
+			 * opclasses.  However in strict mode we could omit 'EMPTY(path)'
+			 * part if the path can return exactly one item (it does not
+			 * contain wildcard accessors or item methods like .keyvalue()
+			 * etc.).
+			 */</comment>
+			<return>return <expr><name>NULL</name></expr>;</return>
+
+		<case>case <expr><name>jpiEqual</name></expr>:</case>			<comment type="block">/* path == scalar */</comment>
+			<block>{<block_content>
+				<decl_stmt><decl><type><name>JsonPathItem</name></type> <name>left_item</name></decl>;</decl_stmt>
+				<decl_stmt><decl><type><name>JsonPathItem</name></type> <name>right_item</name></decl>;</decl_stmt>
+				<decl_stmt><decl><type><name>JsonPathItem</name> <modifier>*</modifier></type><name>path_item</name></decl>;</decl_stmt>
+				<decl_stmt><decl><type><name>JsonPathItem</name> <modifier>*</modifier></type><name>scalar_item</name></decl>;</decl_stmt>
+				<decl_stmt><decl><type><name>JsonbValue</name></type>	<name>scalar</name></decl>;</decl_stmt>
+
+				<if_stmt><if>if <condition>(<expr><name>not</name></expr>)</condition><block type="pseudo"><block_content>
+					<return>return <expr><name>NULL</name></expr>;</return></block_content></block></if></if_stmt>
+
+				<expr_stmt><expr><call><name>jspGetLeftArg</name><argument_list>(<argument><expr><name>jsp</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>left_item</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<expr_stmt><expr><call><name>jspGetRightArg</name><argument_list>(<argument><expr><name>jsp</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>right_item</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+				<if_stmt><if>if <condition>(<expr><call><name>jspIsScalar</name><argument_list>(<argument><expr><name><name>left_item</name><operator>.</operator><name>type</name></name></expr></argument>)</argument_list></call></expr>)</condition>
+				<block>{<block_content>
+					<expr_stmt><expr><name>scalar_item</name> <operator>=</operator> <operator>&amp;</operator><name>left_item</name></expr>;</expr_stmt>
+					<expr_stmt><expr><name>path_item</name> <operator>=</operator> <operator>&amp;</operator><name>right_item</name></expr>;</expr_stmt>
+				</block_content>}</block></if>
+				<if type="elseif">else if <condition>(<expr><call><name>jspIsScalar</name><argument_list>(<argument><expr><name><name>right_item</name><operator>.</operator><name>type</name></name></expr></argument>)</argument_list></call></expr>)</condition>
+				<block>{<block_content>
+					<expr_stmt><expr><name>scalar_item</name> <operator>=</operator> <operator>&amp;</operator><name>right_item</name></expr>;</expr_stmt>
+					<expr_stmt><expr><name>path_item</name> <operator>=</operator> <operator>&amp;</operator><name>left_item</name></expr>;</expr_stmt>
+				</block_content>}</block></if>
+				<else>else<block type="pseudo"><block_content>
+					<return>return <expr><name>NULL</name></expr>;</return></block_content></block></else></if_stmt>	<comment type="block">/* at least one operand should be a scalar */</comment>
+
+				<switch>switch <condition>(<expr><name><name>scalar_item</name><operator>-&gt;</operator><name>type</name></name></expr>)</condition>
+				<block>{<block_content>
+					<case>case <expr><name>jpiNull</name></expr>:</case>
+						<expr_stmt><expr><name><name>scalar</name><operator>.</operator><name>type</name></name> <operator>=</operator> <name>jbvNull</name></expr>;</expr_stmt>
+						<break>break;</break>
+					<case>case <expr><name>jpiBool</name></expr>:</case>
+						<expr_stmt><expr><name><name>scalar</name><operator>.</operator><name>type</name></name> <operator>=</operator> <name>jbvBool</name></expr>;</expr_stmt>
+						<expr_stmt><expr><name><name>scalar</name><operator>.</operator><name>val</name><operator>.</operator><name>boolean</name></name> <operator>=</operator> <operator>!</operator><operator>!</operator><operator>*</operator><name><name>scalar_item</name><operator>-&gt;</operator><name>content</name><operator>.</operator><name>value</name><operator>.</operator><name>data</name></name></expr>;</expr_stmt>
+						<break>break;</break>
+					<case>case <expr><name>jpiNumeric</name></expr>:</case>
+						<expr_stmt><expr><name><name>scalar</name><operator>.</operator><name>type</name></name> <operator>=</operator> <name>jbvNumeric</name></expr>;</expr_stmt>
+						<expr_stmt><expr><name><name>scalar</name><operator>.</operator><name>val</name><operator>.</operator><name>numeric</name></name> <operator>=</operator>
+							<operator>(</operator><name>Numeric</name><operator>)</operator> <name><name>scalar_item</name><operator>-&gt;</operator><name>content</name><operator>.</operator><name>value</name><operator>.</operator><name>data</name></name></expr>;</expr_stmt>
+						<break>break;</break>
+					<case>case <expr><name>jpiString</name></expr>:</case>
+						<expr_stmt><expr><name><name>scalar</name><operator>.</operator><name>type</name></name> <operator>=</operator> <name>jbvString</name></expr>;</expr_stmt>
+						<expr_stmt><expr><name><name>scalar</name><operator>.</operator><name>val</name><operator>.</operator><name>string</name><operator>.</operator><name>val</name></name> <operator>=</operator> <name><name>scalar_item</name><operator>-&gt;</operator><name>content</name><operator>.</operator><name>value</name><operator>.</operator><name>data</name></name></expr>;</expr_stmt>
+						<expr_stmt><expr><name><name>scalar</name><operator>.</operator><name>val</name><operator>.</operator><name>string</name><operator>.</operator><name>len</name></name> <operator>=</operator>
+							<name><name>scalar_item</name><operator>-&gt;</operator><name>content</name><operator>.</operator><name>value</name><operator>.</operator><name>datalen</name></name></expr>;</expr_stmt>
+						<break>break;</break>
+					<default>default:</default>
+						<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"invalid scalar jsonpath item type: %d"</literal></expr></argument>,
+							 <argument><expr><name><name>scalar_item</name><operator>-&gt;</operator><name>type</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+						<return>return <expr><name>NULL</name></expr>;</return>
+				</block_content>}</block></switch>
+
+				<return>return <expr><call><name>extract_jsp_path_expr</name><argument_list>(<argument><expr><name>cxt</name></expr></argument>, <argument><expr><name>path</name></expr></argument>, <argument><expr><name>path_item</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>scalar</name></expr></argument>)</argument_list></call></expr>;</return>
+			</block_content>}</block>
+
+		<default>default:</default>
+			<return>return <expr><name>NULL</name></expr>;</return>		<comment type="block">/* not a boolean expression */</comment>
+	</block_content>}</block></switch>
+</block_content>}</block></function>
+
+<comment type="block">/* Recursively emit all GIN entries found in the node tree */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>emit_jsp_gin_entries</name><parameter_list>(<parameter><decl><type><name>JsonPathGinNode</name> <modifier>*</modifier></type><name>node</name></decl></parameter>, <parameter><decl><type><name>GinEntries</name> <modifier>*</modifier></type><name>entries</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>check_stack_depth</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+	<switch>switch <condition>(<expr><name><name>node</name><operator>-&gt;</operator><name>type</name></name></expr>)</condition>
+	<block>{<block_content>
+		<case>case <expr><name>JSP_GIN_ENTRY</name></expr>:</case>
+			<comment type="block">/* replace datum with its index in the array */</comment>
+			<expr_stmt><expr><name><name>node</name><operator>-&gt;</operator><name>val</name><operator>.</operator><name>entryIndex</name></name> <operator>=</operator> <call><name>add_gin_entry</name><argument_list>(<argument><expr><name>entries</name></expr></argument>, <argument><expr><name><name>node</name><operator>-&gt;</operator><name>val</name><operator>.</operator><name>entryDatum</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<break>break;</break>
+
+		<case>case <expr><name>JSP_GIN_OR</name></expr>:</case>
+		<case>case <expr><name>JSP_GIN_AND</name></expr>:</case>
+			<block>{<block_content>
+				<decl_stmt><decl><type><name>int</name></type>			<name>i</name></decl>;</decl_stmt>
+
+				<for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name><name>node</name><operator>-&gt;</operator><name>val</name><operator>.</operator><name>nargs</name></name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control><block type="pseudo"><block_content>
+					<expr_stmt><expr><call><name>emit_jsp_gin_entries</name><argument_list>(<argument><expr><name><name>node</name><operator>-&gt;</operator><name>args</name><index>[<expr><name>i</name></expr>]</index></name></expr></argument>, <argument><expr><name>entries</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></for>
+
+				<break>break;</break>
+			</block_content>}</block>
+	</block_content>}</block></switch>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Recursively extract GIN entries from jsonpath query.
+ * Root expression node is put into (*extra_data)[0].
+ */</comment>
+<function><type><specifier>static</specifier> <name>Datum</name> <modifier>*</modifier></type>
+<name>extract_jsp_query</name><parameter_list>(<parameter><decl><type><name>JsonPath</name> <modifier>*</modifier></type><name>jp</name></decl></parameter>, <parameter><decl><type><name>StrategyNumber</name></type> <name>strat</name></decl></parameter>, <parameter><decl><type><name>bool</name></type> <name>pathOps</name></decl></parameter>,
+				  <parameter><decl><type><name>int32</name> <modifier>*</modifier></type><name>nentries</name></decl></parameter>, <parameter><decl><type><name>Pointer</name> <modifier>*</modifier><modifier>*</modifier></type><name>extra_data</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>JsonPathGinContext</name></type> <name>cxt</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>JsonPathItem</name></type> <name>root</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>JsonPathGinNode</name> <modifier>*</modifier></type><name>node</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>JsonPathGinPath</name></type> <name>path</name> <init>= <expr><block>{<expr><literal type="number">0</literal></expr>}</block></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>GinEntries</name></type>	<name>entries</name> <init>= <expr><block>{<expr><literal type="number">0</literal></expr>}</block></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name><name>cxt</name><operator>.</operator><name>lax</name></name> <operator>=</operator> <operator>(</operator><name><name>jp</name><operator>-&gt;</operator><name>header</name></name> <operator>&amp;</operator> <name>JSONPATH_LAX</name><operator>)</operator> <operator>!=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>pathOps</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name><name>cxt</name><operator>.</operator><name>add_path_item</name></name> <operator>=</operator> <name>jsonb_path_ops__add_path_item</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>cxt</name><operator>.</operator><name>extract_nodes</name></name> <operator>=</operator> <name>jsonb_path_ops__extract_nodes</name></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<else>else
+	<block>{<block_content>
+		<expr_stmt><expr><name><name>cxt</name><operator>.</operator><name>add_path_item</name></name> <operator>=</operator> <name>jsonb_ops__add_path_item</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>cxt</name><operator>.</operator><name>extract_nodes</name></name> <operator>=</operator> <name>jsonb_ops__extract_nodes</name></expr>;</expr_stmt>
+	</block_content>}</block></else></if_stmt>
+
+	<expr_stmt><expr><call><name>jspInit</name><argument_list>(<argument><expr><operator>&amp;</operator><name>root</name></expr></argument>, <argument><expr><name>jp</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>node</name> <operator>=</operator> <ternary><condition><expr><name>strat</name> <operator>==</operator> <name>JsonbJsonpathExistsStrategyNumber</name></expr>
+		?</condition><then> <expr><call><name>extract_jsp_path_expr</name><argument_list>(<argument><expr><operator>&amp;</operator><name>cxt</name></expr></argument>, <argument><expr><name>path</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>root</name></expr></argument>, <argument><expr><name>NULL</name></expr></argument>)</argument_list></call></expr>
+		</then><else>: <expr><call><name>extract_jsp_bool_expr</name><argument_list>(<argument><expr><operator>&amp;</operator><name>cxt</name></expr></argument>, <argument><expr><name>path</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>root</name></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr></else></ternary></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><name>node</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><operator>*</operator><name>nentries</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+		<return>return <expr><name>NULL</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>emit_jsp_gin_entries</name><argument_list>(<argument><expr><name>node</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>entries</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><operator>*</operator><name>nentries</name> <operator>=</operator> <name><name>entries</name><operator>.</operator><name>count</name></name></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><operator>*</operator><name>nentries</name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>NULL</name></expr>;</return></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><operator>*</operator><name>extra_data</name> <operator>=</operator> <call><name>palloc0</name><argument_list>(<argument><expr><sizeof>sizeof<argument_list>(<argument><expr><operator>*</operator><operator>*</operator><name>extra_data</name></expr></argument>)</argument_list></sizeof> <operator>*</operator> <name><name>entries</name><operator>.</operator><name>count</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><operator>*</operator><operator>*</operator><name>extra_data</name> <operator>=</operator> <operator>(</operator><name>Pointer</name><operator>)</operator> <name>node</name></expr>;</expr_stmt>
+
+	<return>return <expr><name><name>entries</name><operator>.</operator><name>buf</name></name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Recursively execute jsonpath expression.
+ * 'check' is a bool[] or a GinTernaryValue[] depending on 'ternary' flag.
+ */</comment>
+<function><type><specifier>static</specifier> <name>GinTernaryValue</name></type>
+<name>execute_jsp_gin_node</name><parameter_list>(<parameter><decl><type><name>JsonPathGinNode</name> <modifier>*</modifier></type><name>node</name></decl></parameter>, <parameter><decl><type><name>void</name> <modifier>*</modifier></type><name>check</name></decl></parameter>, <parameter><decl><type><name>bool</name></type> <name>ternary</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>GinTernaryValue</name></type> <name>res</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>GinTernaryValue</name></type> <name>v</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>i</name></decl>;</decl_stmt>
+
+	<switch>switch <condition>(<expr><name><name>node</name><operator>-&gt;</operator><name>type</name></name></expr>)</condition>
+	<block>{<block_content>
+		<case>case <expr><name>JSP_GIN_AND</name></expr>:</case>
+			<expr_stmt><expr><name>res</name> <operator>=</operator> <name>GIN_TRUE</name></expr>;</expr_stmt>
+			<for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name><name>node</name><operator>-&gt;</operator><name>val</name><operator>.</operator><name>nargs</name></name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control>
+			<block>{<block_content>
+				<expr_stmt><expr><name>v</name> <operator>=</operator> <call><name>execute_jsp_gin_node</name><argument_list>(<argument><expr><name><name>node</name><operator>-&gt;</operator><name>args</name><index>[<expr><name>i</name></expr>]</index></name></expr></argument>, <argument><expr><name>check</name></expr></argument>, <argument><expr><name>ternary</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<if_stmt><if>if <condition>(<expr><name>v</name> <operator>==</operator> <name>GIN_FALSE</name></expr>)</condition><block type="pseudo"><block_content>
+					<return>return <expr><name>GIN_FALSE</name></expr>;</return></block_content></block></if>
+				<if type="elseif">else if <condition>(<expr><name>v</name> <operator>==</operator> <name>GIN_MAYBE</name></expr>)</condition><block type="pseudo"><block_content>
+					<expr_stmt><expr><name>res</name> <operator>=</operator> <name>GIN_MAYBE</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+			</block_content>}</block></for>
+			<return>return <expr><name>res</name></expr>;</return>
+
+		<case>case <expr><name>JSP_GIN_OR</name></expr>:</case>
+			<expr_stmt><expr><name>res</name> <operator>=</operator> <name>GIN_FALSE</name></expr>;</expr_stmt>
+			<for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name><name>node</name><operator>-&gt;</operator><name>val</name><operator>.</operator><name>nargs</name></name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control>
+			<block>{<block_content>
+				<expr_stmt><expr><name>v</name> <operator>=</operator> <call><name>execute_jsp_gin_node</name><argument_list>(<argument><expr><name><name>node</name><operator>-&gt;</operator><name>args</name><index>[<expr><name>i</name></expr>]</index></name></expr></argument>, <argument><expr><name>check</name></expr></argument>, <argument><expr><name>ternary</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<if_stmt><if>if <condition>(<expr><name>v</name> <operator>==</operator> <name>GIN_TRUE</name></expr>)</condition><block type="pseudo"><block_content>
+					<return>return <expr><name>GIN_TRUE</name></expr>;</return></block_content></block></if>
+				<if type="elseif">else if <condition>(<expr><name>v</name> <operator>==</operator> <name>GIN_MAYBE</name></expr>)</condition><block type="pseudo"><block_content>
+					<expr_stmt><expr><name>res</name> <operator>=</operator> <name>GIN_MAYBE</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+			</block_content>}</block></for>
+			<return>return <expr><name>res</name></expr>;</return>
+
+		<case>case <expr><name>JSP_GIN_ENTRY</name></expr>:</case>
+			<block>{<block_content>
+				<decl_stmt><decl><type><name>int</name></type>			<name>index</name> <init>= <expr><name><name>node</name><operator>-&gt;</operator><name>val</name><operator>.</operator><name>entryIndex</name></name></expr></init></decl>;</decl_stmt>
+
+				<if_stmt><if>if <condition>(<expr><name>ternary</name></expr>)</condition><block type="pseudo"><block_content>
+					<return>return <expr><operator>(</operator><operator>(</operator><name>GinTernaryValue</name> <operator>*</operator><operator>)</operator> <name>check</name><operator>)</operator><index>[<expr><name>index</name></expr>]</index></expr>;</return></block_content></block></if>
+				<else>else<block type="pseudo"><block_content>
+					<return>return <expr><ternary><condition><expr><operator>(</operator><operator>(</operator><name>bool</name> <operator>*</operator><operator>)</operator> <name>check</name><operator>)</operator><index>[<expr><name>index</name></expr>]</index></expr> ?</condition><then> <expr><name>GIN_TRUE</name></expr> </then><else>: <expr><name>GIN_FALSE</name></expr></else></ternary></expr>;</return></block_content></block></else></if_stmt>
+			</block_content>}</block>
+
+		<default>default:</default>
+			<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"invalid jsonpath gin node type: %d"</literal></expr></argument>, <argument><expr><name><name>node</name><operator>-&gt;</operator><name>type</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<return>return <expr><name>GIN_FALSE</name></expr>;</return>	<comment type="block">/* keep compiler quiet */</comment>
+	</block_content>}</block></switch>
+</block_content>}</block></function>
+
+<function><type><name>Datum</name></type>
+<name>gin_extract_jsonb_query</name><parameter_list>(<parameter><decl><type><name>PG_FUNCTION_ARGS</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>int32</name>	   <modifier>*</modifier></type><name>nentries</name> <init>= <expr><operator>(</operator><name>int32</name> <operator>*</operator><operator>)</operator> <call><name>PG_GETARG_POINTER</name><argument_list>(<argument><expr><literal type="number">1</literal></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>StrategyNumber</name></type> <name>strategy</name> <init>= <expr><call><name>PG_GETARG_UINT16</name><argument_list>(<argument><expr><literal type="number">2</literal></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int32</name>	   <modifier>*</modifier></type><name>searchMode</name> <init>= <expr><operator>(</operator><name>int32</name> <operator>*</operator><operator>)</operator> <call><name>PG_GETARG_POINTER</name><argument_list>(<argument><expr><literal type="number">6</literal></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Datum</name>	   <modifier>*</modifier></type><name>entries</name></decl>;</decl_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>strategy</name> <operator>==</operator> <name>JsonbContainsStrategyNumber</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* Query is a jsonb, so just apply gin_extract_jsonb... */</comment>
+		<expr_stmt><expr><name>entries</name> <operator>=</operator> <operator>(</operator><name>Datum</name> <operator>*</operator><operator>)</operator>
+			<call><name>DatumGetPointer</name><argument_list>(<argument><expr><call><name>DirectFunctionCall2</name><argument_list>(<argument><expr><name>gin_extract_jsonb</name></expr></argument>,
+												<argument><expr><call><name>PG_GETARG_DATUM</name><argument_list>(<argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr></argument>,
+												<argument><expr><call><name>PointerGetDatum</name><argument_list>(<argument><expr><name>nentries</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<comment type="block">/* ...although "contains {}" requires a full index scan */</comment>
+		<if_stmt><if>if <condition>(<expr><operator>*</operator><name>nentries</name> <operator>==</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><operator>*</operator><name>searchMode</name> <operator>=</operator> <name>GIN_SEARCH_MODE_ALL</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	</block_content>}</block></if>
+	<if type="elseif">else if <condition>(<expr><name>strategy</name> <operator>==</operator> <name>JsonbExistsStrategyNumber</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* Query is a text string, which we treat as a key */</comment>
+		<decl_stmt><decl><type><name>text</name>	   <modifier>*</modifier></type><name>query</name> <init>= <expr><call><name>PG_GETARG_TEXT_PP</name><argument_list>(<argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+		<expr_stmt><expr><operator>*</operator><name>nentries</name> <operator>=</operator> <literal type="number">1</literal></expr>;</expr_stmt>
+		<expr_stmt><expr><name>entries</name> <operator>=</operator> <operator>(</operator><name>Datum</name> <operator>*</operator><operator>)</operator> <call><name>palloc</name><argument_list>(<argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>Datum</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>entries</name><index>[<expr><literal type="number">0</literal></expr>]</index></name> <operator>=</operator> <call><name>make_text_key</name><argument_list>(<argument><expr><name>JGINFLAG_KEY</name></expr></argument>,
+								   <argument><expr><call><name>VARDATA_ANY</name><argument_list>(<argument><expr><name>query</name></expr></argument>)</argument_list></call></expr></argument>,
+								   <argument><expr><call><name>VARSIZE_ANY_EXHDR</name><argument_list>(<argument><expr><name>query</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<if type="elseif">else if <condition>(<expr><name>strategy</name> <operator>==</operator> <name>JsonbExistsAnyStrategyNumber</name> <operator>||</operator>
+			 <name>strategy</name> <operator>==</operator> <name>JsonbExistsAllStrategyNumber</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* Query is a text array; each element is treated as a key */</comment>
+		<decl_stmt><decl><type><name>ArrayType</name>  <modifier>*</modifier></type><name>query</name> <init>= <expr><call><name>PG_GETARG_ARRAYTYPE_P</name><argument_list>(<argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>Datum</name>	   <modifier>*</modifier></type><name>key_datums</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>bool</name>	   <modifier>*</modifier></type><name>key_nulls</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>int</name></type>			<name>key_count</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>int</name></type>			<name>i</name></decl>,
+					<decl><type ref="prev"/><name>j</name></decl>;</decl_stmt>
+
+		<expr_stmt><expr><call><name>deconstruct_array</name><argument_list>(<argument><expr><name>query</name></expr></argument>,
+						  <argument><expr><name>TEXTOID</name></expr></argument>, <argument><expr><operator>-</operator><literal type="number">1</literal></expr></argument>, <argument><expr><name>false</name></expr></argument>, <argument><expr><literal type="char">'i'</literal></expr></argument>,
+						  <argument><expr><operator>&amp;</operator><name>key_datums</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>key_nulls</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>key_count</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><name>entries</name> <operator>=</operator> <operator>(</operator><name>Datum</name> <operator>*</operator><operator>)</operator> <call><name>palloc</name><argument_list>(<argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>Datum</name></expr></argument>)</argument_list></sizeof> <operator>*</operator> <name>key_count</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr><operator>,</operator> <expr><name>j</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name>key_count</name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control>
+		<block>{<block_content>
+			<comment type="block">/* Nulls in the array are ignored */</comment>
+			<if_stmt><if>if <condition>(<expr><name><name>key_nulls</name><index>[<expr><name>i</name></expr>]</index></name></expr>)</condition><block type="pseudo"><block_content>
+				<continue>continue;</continue></block_content></block></if></if_stmt>
+			<expr_stmt><expr><name><name>entries</name><index>[<expr><name>j</name><operator>++</operator></expr>]</index></name> <operator>=</operator> <call><name>make_text_key</name><argument_list>(<argument><expr><name>JGINFLAG_KEY</name></expr></argument>,
+										 <argument><expr><call><name>VARDATA</name><argument_list>(<argument><expr><name><name>key_datums</name><index>[<expr><name>i</name></expr>]</index></name></expr></argument>)</argument_list></call></expr></argument>,
+										 <argument><expr><call><name>VARSIZE</name><argument_list>(<argument><expr><name><name>key_datums</name><index>[<expr><name>i</name></expr>]</index></name></expr></argument>)</argument_list></call> <operator>-</operator> <name>VARHDRSZ</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></for>
+
+		<expr_stmt><expr><operator>*</operator><name>nentries</name> <operator>=</operator> <name>j</name></expr>;</expr_stmt>
+		<comment type="block">/* ExistsAll with no keys should match everything */</comment>
+		<if_stmt><if>if <condition>(<expr><name>j</name> <operator>==</operator> <literal type="number">0</literal> <operator>&amp;&amp;</operator> <name>strategy</name> <operator>==</operator> <name>JsonbExistsAllStrategyNumber</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><operator>*</operator><name>searchMode</name> <operator>=</operator> <name>GIN_SEARCH_MODE_ALL</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	</block_content>}</block></if>
+	<if type="elseif">else if <condition>(<expr><name>strategy</name> <operator>==</operator> <name>JsonbJsonpathPredicateStrategyNumber</name> <operator>||</operator>
+			 <name>strategy</name> <operator>==</operator> <name>JsonbJsonpathExistsStrategyNumber</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>JsonPath</name>   <modifier>*</modifier></type><name>jp</name> <init>= <expr><call><name>PG_GETARG_JSONPATH_P</name><argument_list>(<argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>Pointer</name>   <modifier>*</modifier><modifier>*</modifier></type><name>extra_data</name> <init>= <expr><operator>(</operator><name>Pointer</name> <operator>*</operator><operator>*</operator><operator>)</operator> <call><name>PG_GETARG_POINTER</name><argument_list>(<argument><expr><literal type="number">4</literal></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+		<expr_stmt><expr><name>entries</name> <operator>=</operator> <call><name>extract_jsp_query</name><argument_list>(<argument><expr><name>jp</name></expr></argument>, <argument><expr><name>strategy</name></expr></argument>, <argument><expr><name>false</name></expr></argument>, <argument><expr><name>nentries</name></expr></argument>, <argument><expr><name>extra_data</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><name>entries</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><operator>*</operator><name>searchMode</name> <operator>=</operator> <name>GIN_SEARCH_MODE_ALL</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	</block_content>}</block></if>
+	<else>else
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"unrecognized strategy number: %d"</literal></expr></argument>, <argument><expr><name>strategy</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name>entries</name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>			<comment type="block">/* keep compiler quiet */</comment>
+	</block_content>}</block></else></if_stmt>
+
+	<expr_stmt><expr><call><name>PG_RETURN_POINTER</name><argument_list>(<argument><expr><name>entries</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<function><type><name>Datum</name></type>
+<name>gin_consistent_jsonb</name><parameter_list>(<parameter><decl><type><name>PG_FUNCTION_ARGS</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>bool</name>	   <modifier>*</modifier></type><name>check</name> <init>= <expr><operator>(</operator><name>bool</name> <operator>*</operator><operator>)</operator> <call><name>PG_GETARG_POINTER</name><argument_list>(<argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>StrategyNumber</name></type> <name>strategy</name> <init>= <expr><call><name>PG_GETARG_UINT16</name><argument_list>(<argument><expr><literal type="number">1</literal></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<comment type="block">/* Jsonb	   *query = PG_GETARG_JSONB_P(2); */</comment>
+	<decl_stmt><decl><type><name>int32</name></type>		<name>nkeys</name> <init>= <expr><call><name>PG_GETARG_INT32</name><argument_list>(<argument><expr><literal type="number">3</literal></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<decl_stmt><decl><type><name>Pointer</name>    <modifier>*</modifier></type><name>extra_data</name> <init>= <expr><operator>(</operator><name>Pointer</name> <operator>*</operator><operator>)</operator> <call><name>PG_GETARG_POINTER</name><argument_list>(<argument><expr><literal type="number">4</literal></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name>	   <modifier>*</modifier></type><name>recheck</name> <init>= <expr><operator>(</operator><name>bool</name> <operator>*</operator><operator>)</operator> <call><name>PG_GETARG_POINTER</name><argument_list>(<argument><expr><literal type="number">5</literal></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type>		<name>res</name> <init>= <expr><name>true</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int32</name></type>		<name>i</name></decl>;</decl_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>strategy</name> <operator>==</operator> <name>JsonbContainsStrategyNumber</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/*
+		 * We must always recheck, since we can't tell from the index whether
+		 * the positions of the matched items match the structure of the query
+		 * object.  (Even if we could, we'd also have to worry about hashed
+		 * keys and the index's failure to distinguish keys from string array
+		 * elements.)  However, the tuple certainly doesn't match unless it
+		 * contains all the query keys.
+		 */</comment>
+		<expr_stmt><expr><operator>*</operator><name>recheck</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+		<for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name>nkeys</name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control>
+		<block>{<block_content>
+			<if_stmt><if>if <condition>(<expr><operator>!</operator><name><name>check</name><index>[<expr><name>i</name></expr>]</index></name></expr>)</condition>
+			<block>{<block_content>
+				<expr_stmt><expr><name>res</name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+				<break>break;</break>
+			</block_content>}</block></if></if_stmt>
+		</block_content>}</block></for>
+	</block_content>}</block></if>
+	<if type="elseif">else if <condition>(<expr><name>strategy</name> <operator>==</operator> <name>JsonbExistsStrategyNumber</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/*
+		 * Although the key is certainly present in the index, we must recheck
+		 * because (1) the key might be hashed, and (2) the index match might
+		 * be for a key that's not at top level of the JSON object.  For (1),
+		 * we could look at the query key to see if it's hashed and not
+		 * recheck if not, but the index lacks enough info to tell about (2).
+		 */</comment>
+		<expr_stmt><expr><operator>*</operator><name>recheck</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name>res</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<if type="elseif">else if <condition>(<expr><name>strategy</name> <operator>==</operator> <name>JsonbExistsAnyStrategyNumber</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* As for plain exists, we must recheck */</comment>
+		<expr_stmt><expr><operator>*</operator><name>recheck</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name>res</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<if type="elseif">else if <condition>(<expr><name>strategy</name> <operator>==</operator> <name>JsonbExistsAllStrategyNumber</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* As for plain exists, we must recheck */</comment>
+		<expr_stmt><expr><operator>*</operator><name>recheck</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+		<comment type="block">/* ... but unless all the keys are present, we can say "false" */</comment>
+		<for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name>nkeys</name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control>
+		<block>{<block_content>
+			<if_stmt><if>if <condition>(<expr><operator>!</operator><name><name>check</name><index>[<expr><name>i</name></expr>]</index></name></expr>)</condition>
+			<block>{<block_content>
+				<expr_stmt><expr><name>res</name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+				<break>break;</break>
+			</block_content>}</block></if></if_stmt>
+		</block_content>}</block></for>
+	</block_content>}</block></if>
+	<if type="elseif">else if <condition>(<expr><name>strategy</name> <operator>==</operator> <name>JsonbJsonpathPredicateStrategyNumber</name> <operator>||</operator>
+			 <name>strategy</name> <operator>==</operator> <name>JsonbJsonpathExistsStrategyNumber</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><operator>*</operator><name>recheck</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name>nkeys</name> <operator>&gt;</operator> <literal type="number">0</literal></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>extra_data</name> <operator>&amp;&amp;</operator> <name><name>extra_data</name><index>[<expr><literal type="number">0</literal></expr>]</index></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><name>res</name> <operator>=</operator> <call><name>execute_jsp_gin_node</name><argument_list>(<argument><expr><operator>(</operator><name>JsonPathGinNode</name> <operator>*</operator><operator>)</operator> <name><name>extra_data</name><index>[<expr><literal type="number">0</literal></expr>]</index></name></expr></argument>, <argument><expr><name>check</name></expr></argument>,
+									   <argument><expr><name>false</name></expr></argument>)</argument_list></call> <operator>!=</operator> <name>GIN_FALSE</name></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+	</block_content>}</block></if>
+	<else>else<block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"unrecognized strategy number: %d"</literal></expr></argument>, <argument><expr><name>strategy</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></else></if_stmt>
+
+	<expr_stmt><expr><call><name>PG_RETURN_BOOL</name><argument_list>(<argument><expr><name>res</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<function><type><name>Datum</name></type>
+<name>gin_triconsistent_jsonb</name><parameter_list>(<parameter><decl><type><name>PG_FUNCTION_ARGS</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>GinTernaryValue</name> <modifier>*</modifier></type><name>check</name> <init>= <expr><operator>(</operator><name>GinTernaryValue</name> <operator>*</operator><operator>)</operator> <call><name>PG_GETARG_POINTER</name><argument_list>(<argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>StrategyNumber</name></type> <name>strategy</name> <init>= <expr><call><name>PG_GETARG_UINT16</name><argument_list>(<argument><expr><literal type="number">1</literal></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<comment type="block">/* Jsonb	   *query = PG_GETARG_JSONB_P(2); */</comment>
+	<decl_stmt><decl><type><name>int32</name></type>		<name>nkeys</name> <init>= <expr><call><name>PG_GETARG_INT32</name><argument_list>(<argument><expr><literal type="number">3</literal></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Pointer</name>    <modifier>*</modifier></type><name>extra_data</name> <init>= <expr><operator>(</operator><name>Pointer</name> <operator>*</operator><operator>)</operator> <call><name>PG_GETARG_POINTER</name><argument_list>(<argument><expr><literal type="number">4</literal></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>GinTernaryValue</name></type> <name>res</name> <init>= <expr><name>GIN_MAYBE</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int32</name></type>		<name>i</name></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * Note that we never return GIN_TRUE, only GIN_MAYBE or GIN_FALSE; this
+	 * corresponds to always forcing recheck in the regular consistent
+	 * function, for the reasons listed there.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name>strategy</name> <operator>==</operator> <name>JsonbContainsStrategyNumber</name> <operator>||</operator>
+		<name>strategy</name> <operator>==</operator> <name>JsonbExistsAllStrategyNumber</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* All extracted keys must be present */</comment>
+		<for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name>nkeys</name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control>
+		<block>{<block_content>
+			<if_stmt><if>if <condition>(<expr><name><name>check</name><index>[<expr><name>i</name></expr>]</index></name> <operator>==</operator> <name>GIN_FALSE</name></expr>)</condition>
+			<block>{<block_content>
+				<expr_stmt><expr><name>res</name> <operator>=</operator> <name>GIN_FALSE</name></expr>;</expr_stmt>
+				<break>break;</break>
+			</block_content>}</block></if></if_stmt>
+		</block_content>}</block></for>
+	</block_content>}</block></if>
+	<if type="elseif">else if <condition>(<expr><name>strategy</name> <operator>==</operator> <name>JsonbExistsStrategyNumber</name> <operator>||</operator>
+			 <name>strategy</name> <operator>==</operator> <name>JsonbExistsAnyStrategyNumber</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* At least one extracted key must be present */</comment>
+		<expr_stmt><expr><name>res</name> <operator>=</operator> <name>GIN_FALSE</name></expr>;</expr_stmt>
+		<for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name>nkeys</name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control>
+		<block>{<block_content>
+			<if_stmt><if>if <condition>(<expr><name><name>check</name><index>[<expr><name>i</name></expr>]</index></name> <operator>==</operator> <name>GIN_TRUE</name> <operator>||</operator>
+				<name><name>check</name><index>[<expr><name>i</name></expr>]</index></name> <operator>==</operator> <name>GIN_MAYBE</name></expr>)</condition>
+			<block>{<block_content>
+				<expr_stmt><expr><name>res</name> <operator>=</operator> <name>GIN_MAYBE</name></expr>;</expr_stmt>
+				<break>break;</break>
+			</block_content>}</block></if></if_stmt>
+		</block_content>}</block></for>
+	</block_content>}</block></if>
+	<if type="elseif">else if <condition>(<expr><name>strategy</name> <operator>==</operator> <name>JsonbJsonpathPredicateStrategyNumber</name> <operator>||</operator>
+			 <name>strategy</name> <operator>==</operator> <name>JsonbJsonpathExistsStrategyNumber</name></expr>)</condition>
+	<block>{<block_content>
+		<if_stmt><if>if <condition>(<expr><name>nkeys</name> <operator>&gt;</operator> <literal type="number">0</literal></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>extra_data</name> <operator>&amp;&amp;</operator> <name><name>extra_data</name><index>[<expr><literal type="number">0</literal></expr>]</index></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><name>res</name> <operator>=</operator> <call><name>execute_jsp_gin_node</name><argument_list>(<argument><expr><operator>(</operator><name>JsonPathGinNode</name> <operator>*</operator><operator>)</operator> <name><name>extra_data</name><index>[<expr><literal type="number">0</literal></expr>]</index></name></expr></argument>, <argument><expr><name>check</name></expr></argument>,
+									   <argument><expr><name>true</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+			<comment type="block">/* Should always recheck the result */</comment>
+			<if_stmt><if>if <condition>(<expr><name>res</name> <operator>==</operator> <name>GIN_TRUE</name></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><name>res</name> <operator>=</operator> <name>GIN_MAYBE</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+		</block_content>}</block></if></if_stmt>
+	</block_content>}</block></if>
+	<else>else<block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"unrecognized strategy number: %d"</literal></expr></argument>, <argument><expr><name>strategy</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></else></if_stmt>
+
+	<expr_stmt><expr><call><name>PG_RETURN_GIN_TERNARY_VALUE</name><argument_list>(<argument><expr><name>res</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ *
+ * jsonb_path_ops GIN opclass support functions
+ *
+ * In a jsonb_path_ops index, the GIN keys are uint32 hashes, one per JSON
+ * value; but the JSON key(s) leading to each value are also included in its
+ * hash computation.  This means we can only support containment queries,
+ * but the index can distinguish, for example, {"foo": 42} from {"bar": 42}
+ * since different hashes will be generated.
+ *
+ */</comment>
+
+<function><type><name>Datum</name></type>
+<name>gin_extract_jsonb_path</name><parameter_list>(<parameter><decl><type><name>PG_FUNCTION_ARGS</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>Jsonb</name>	   <modifier>*</modifier></type><name>jb</name> <init>= <expr><call><name>PG_GETARG_JSONB_P</name><argument_list>(<argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int32</name>	   <modifier>*</modifier></type><name>nentries</name> <init>= <expr><operator>(</operator><name>int32</name> <operator>*</operator><operator>)</operator> <call><name>PG_GETARG_POINTER</name><argument_list>(<argument><expr><literal type="number">1</literal></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>total</name> <init>= <expr><call><name>JB_ROOT_COUNT</name><argument_list>(<argument><expr><name>jb</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>JsonbIterator</name> <modifier>*</modifier></type><name>it</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>JsonbValue</name></type>	<name>v</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>JsonbIteratorToken</name></type> <name>r</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>PathHashStack</name></type> <name>tail</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>PathHashStack</name> <modifier>*</modifier></type><name>stack</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>GinEntries</name></type>	<name>entries</name></decl>;</decl_stmt>
+
+	<comment type="block">/* If the root level is empty, we certainly have no keys */</comment>
+	<if_stmt><if>if <condition>(<expr><name>total</name> <operator>==</operator> <literal type="number">0</literal></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><operator>*</operator><name>nentries</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>PG_RETURN_POINTER</name><argument_list>(<argument><expr><name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/* Otherwise, use 2 * root count as initial estimate of result size */</comment>
+	<expr_stmt><expr><call><name>init_gin_entries</name><argument_list>(<argument><expr><operator>&amp;</operator><name>entries</name></expr></argument>, <argument><expr><literal type="number">2</literal> <operator>*</operator> <name>total</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* We keep a stack of partial hashes corresponding to parent key levels */</comment>
+	<expr_stmt><expr><name><name>tail</name><operator>.</operator><name>parent</name></name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>tail</name><operator>.</operator><name>hash</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+	<expr_stmt><expr><name>stack</name> <operator>=</operator> <operator>&amp;</operator><name>tail</name></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>it</name> <operator>=</operator> <call><name>JsonbIteratorInit</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>jb</name><operator>-&gt;</operator><name>root</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<while>while <condition>(<expr><operator>(</operator><name>r</name> <operator>=</operator> <call><name>JsonbIteratorNext</name><argument_list>(<argument><expr><operator>&amp;</operator><name>it</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>v</name></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call><operator>)</operator> <operator>!=</operator> <name>WJB_DONE</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>PathHashStack</name> <modifier>*</modifier></type><name>parent</name></decl>;</decl_stmt>
+
+		<switch>switch <condition>(<expr><name>r</name></expr>)</condition>
+		<block>{<block_content>
+			<case>case <expr><name>WJB_BEGIN_ARRAY</name></expr>:</case>
+			<case>case <expr><name>WJB_BEGIN_OBJECT</name></expr>:</case>
+				<comment type="block">/* Push a stack level for this object */</comment>
+				<expr_stmt><expr><name>parent</name> <operator>=</operator> <name>stack</name></expr>;</expr_stmt>
+				<expr_stmt><expr><name>stack</name> <operator>=</operator> <operator>(</operator><name>PathHashStack</name> <operator>*</operator><operator>)</operator> <call><name>palloc</name><argument_list>(<argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>PathHashStack</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+				<comment type="block">/*
+				 * We pass forward hashes from outer nesting levels so that
+				 * the hashes for nested values will include outer keys as
+				 * well as their own keys.
+				 *
+				 * Nesting an array within another array will not alter
+				 * innermost scalar element hash values, but that seems
+				 * inconsequential.
+				 */</comment>
+				<expr_stmt><expr><name><name>stack</name><operator>-&gt;</operator><name>hash</name></name> <operator>=</operator> <name><name>parent</name><operator>-&gt;</operator><name>hash</name></name></expr>;</expr_stmt>
+				<expr_stmt><expr><name><name>stack</name><operator>-&gt;</operator><name>parent</name></name> <operator>=</operator> <name>parent</name></expr>;</expr_stmt>
+				<break>break;</break>
+			<case>case <expr><name>WJB_KEY</name></expr>:</case>
+				<comment type="block">/* mix this key into the current outer hash */</comment>
+				<expr_stmt><expr><call><name>JsonbHashScalarValue</name><argument_list>(<argument><expr><operator>&amp;</operator><name>v</name></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>stack</name><operator>-&gt;</operator><name>hash</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<comment type="block">/* hash is now ready to incorporate the value */</comment>
+				<break>break;</break>
+			<case>case <expr><name>WJB_ELEM</name></expr>:</case>
+			<case>case <expr><name>WJB_VALUE</name></expr>:</case>
+				<comment type="block">/* mix the element or value's hash into the prepared hash */</comment>
+				<expr_stmt><expr><call><name>JsonbHashScalarValue</name><argument_list>(<argument><expr><operator>&amp;</operator><name>v</name></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>stack</name><operator>-&gt;</operator><name>hash</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<comment type="block">/* and emit an index entry */</comment>
+				<expr_stmt><expr><call><name>add_gin_entry</name><argument_list>(<argument><expr><operator>&amp;</operator><name>entries</name></expr></argument>, <argument><expr><call><name>UInt32GetDatum</name><argument_list>(<argument><expr><name><name>stack</name><operator>-&gt;</operator><name>hash</name></name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<comment type="block">/* reset hash for next key, value, or sub-object */</comment>
+				<expr_stmt><expr><name><name>stack</name><operator>-&gt;</operator><name>hash</name></name> <operator>=</operator> <name><name>stack</name><operator>-&gt;</operator><name>parent</name><operator>-&gt;</operator><name>hash</name></name></expr>;</expr_stmt>
+				<break>break;</break>
+			<case>case <expr><name>WJB_END_ARRAY</name></expr>:</case>
+			<case>case <expr><name>WJB_END_OBJECT</name></expr>:</case>
+				<comment type="block">/* Pop the stack */</comment>
+				<expr_stmt><expr><name>parent</name> <operator>=</operator> <name><name>stack</name><operator>-&gt;</operator><name>parent</name></name></expr>;</expr_stmt>
+				<expr_stmt><expr><call><name>pfree</name><argument_list>(<argument><expr><name>stack</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<expr_stmt><expr><name>stack</name> <operator>=</operator> <name>parent</name></expr>;</expr_stmt>
+				<comment type="block">/* reset hash for next key, value, or sub-object */</comment>
+				<if_stmt><if>if <condition>(<expr><name><name>stack</name><operator>-&gt;</operator><name>parent</name></name></expr>)</condition><block type="pseudo"><block_content>
+					<expr_stmt><expr><name><name>stack</name><operator>-&gt;</operator><name>hash</name></name> <operator>=</operator> <name><name>stack</name><operator>-&gt;</operator><name>parent</name><operator>-&gt;</operator><name>hash</name></name></expr>;</expr_stmt></block_content></block></if>
+				<else>else<block type="pseudo"><block_content>
+					<expr_stmt><expr><name><name>stack</name><operator>-&gt;</operator><name>hash</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt></block_content></block></else></if_stmt>
+				<break>break;</break>
+			<default>default:</default>
+				<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"invalid JsonbIteratorNext rc: %d"</literal></expr></argument>, <argument><expr><operator>(</operator><name>int</name><operator>)</operator> <name>r</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></switch>
+	</block_content>}</block></while>
+
+	<expr_stmt><expr><operator>*</operator><name>nentries</name> <operator>=</operator> <name><name>entries</name><operator>.</operator><name>count</name></name></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>PG_RETURN_POINTER</name><argument_list>(<argument><expr><name><name>entries</name><operator>.</operator><name>buf</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<function><type><name>Datum</name></type>
+<name>gin_extract_jsonb_query_path</name><parameter_list>(<parameter><decl><type><name>PG_FUNCTION_ARGS</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>int32</name>	   <modifier>*</modifier></type><name>nentries</name> <init>= <expr><operator>(</operator><name>int32</name> <operator>*</operator><operator>)</operator> <call><name>PG_GETARG_POINTER</name><argument_list>(<argument><expr><literal type="number">1</literal></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>StrategyNumber</name></type> <name>strategy</name> <init>= <expr><call><name>PG_GETARG_UINT16</name><argument_list>(<argument><expr><literal type="number">2</literal></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int32</name>	   <modifier>*</modifier></type><name>searchMode</name> <init>= <expr><operator>(</operator><name>int32</name> <operator>*</operator><operator>)</operator> <call><name>PG_GETARG_POINTER</name><argument_list>(<argument><expr><literal type="number">6</literal></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Datum</name>	   <modifier>*</modifier></type><name>entries</name></decl>;</decl_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>strategy</name> <operator>==</operator> <name>JsonbContainsStrategyNumber</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* Query is a jsonb, so just apply gin_extract_jsonb_path ... */</comment>
+		<expr_stmt><expr><name>entries</name> <operator>=</operator> <operator>(</operator><name>Datum</name> <operator>*</operator><operator>)</operator>
+			<call><name>DatumGetPointer</name><argument_list>(<argument><expr><call><name>DirectFunctionCall2</name><argument_list>(<argument><expr><name>gin_extract_jsonb_path</name></expr></argument>,
+												<argument><expr><call><name>PG_GETARG_DATUM</name><argument_list>(<argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr></argument>,
+												<argument><expr><call><name>PointerGetDatum</name><argument_list>(<argument><expr><name>nentries</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/* ... although "contains {}" requires a full index scan */</comment>
+		<if_stmt><if>if <condition>(<expr><operator>*</operator><name>nentries</name> <operator>==</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><operator>*</operator><name>searchMode</name> <operator>=</operator> <name>GIN_SEARCH_MODE_ALL</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	</block_content>}</block></if>
+	<if type="elseif">else if <condition>(<expr><name>strategy</name> <operator>==</operator> <name>JsonbJsonpathPredicateStrategyNumber</name> <operator>||</operator>
+			 <name>strategy</name> <operator>==</operator> <name>JsonbJsonpathExistsStrategyNumber</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>JsonPath</name>   <modifier>*</modifier></type><name>jp</name> <init>= <expr><call><name>PG_GETARG_JSONPATH_P</name><argument_list>(<argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>Pointer</name>   <modifier>*</modifier><modifier>*</modifier></type><name>extra_data</name> <init>= <expr><operator>(</operator><name>Pointer</name> <operator>*</operator><operator>*</operator><operator>)</operator> <call><name>PG_GETARG_POINTER</name><argument_list>(<argument><expr><literal type="number">4</literal></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+		<expr_stmt><expr><name>entries</name> <operator>=</operator> <call><name>extract_jsp_query</name><argument_list>(<argument><expr><name>jp</name></expr></argument>, <argument><expr><name>strategy</name></expr></argument>, <argument><expr><name>true</name></expr></argument>, <argument><expr><name>nentries</name></expr></argument>, <argument><expr><name>extra_data</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><name>entries</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><operator>*</operator><name>searchMode</name> <operator>=</operator> <name>GIN_SEARCH_MODE_ALL</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	</block_content>}</block></if>
+	<else>else
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"unrecognized strategy number: %d"</literal></expr></argument>, <argument><expr><name>strategy</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name>entries</name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+	</block_content>}</block></else></if_stmt>
+
+	<expr_stmt><expr><call><name>PG_RETURN_POINTER</name><argument_list>(<argument><expr><name>entries</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<function><type><name>Datum</name></type>
+<name>gin_consistent_jsonb_path</name><parameter_list>(<parameter><decl><type><name>PG_FUNCTION_ARGS</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>bool</name>	   <modifier>*</modifier></type><name>check</name> <init>= <expr><operator>(</operator><name>bool</name> <operator>*</operator><operator>)</operator> <call><name>PG_GETARG_POINTER</name><argument_list>(<argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>StrategyNumber</name></type> <name>strategy</name> <init>= <expr><call><name>PG_GETARG_UINT16</name><argument_list>(<argument><expr><literal type="number">1</literal></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<comment type="block">/* Jsonb	   *query = PG_GETARG_JSONB_P(2); */</comment>
+	<decl_stmt><decl><type><name>int32</name></type>		<name>nkeys</name> <init>= <expr><call><name>PG_GETARG_INT32</name><argument_list>(<argument><expr><literal type="number">3</literal></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Pointer</name>    <modifier>*</modifier></type><name>extra_data</name> <init>= <expr><operator>(</operator><name>Pointer</name> <operator>*</operator><operator>)</operator> <call><name>PG_GETARG_POINTER</name><argument_list>(<argument><expr><literal type="number">4</literal></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name>	   <modifier>*</modifier></type><name>recheck</name> <init>= <expr><operator>(</operator><name>bool</name> <operator>*</operator><operator>)</operator> <call><name>PG_GETARG_POINTER</name><argument_list>(<argument><expr><literal type="number">5</literal></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type>		<name>res</name> <init>= <expr><name>true</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int32</name></type>		<name>i</name></decl>;</decl_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>strategy</name> <operator>==</operator> <name>JsonbContainsStrategyNumber</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/*
+		 * jsonb_path_ops is necessarily lossy, not only because of hash
+		 * collisions but also because it doesn't preserve complete
+		 * information about the structure of the JSON object.  Besides, there
+		 * are some special rules around the containment of raw scalars in
+		 * arrays that are not handled here.  So we must always recheck a
+		 * match.  However, if not all of the keys are present, the tuple
+		 * certainly doesn't match.
+		 */</comment>
+		<expr_stmt><expr><operator>*</operator><name>recheck</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+		<for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name>nkeys</name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control>
+		<block>{<block_content>
+			<if_stmt><if>if <condition>(<expr><operator>!</operator><name><name>check</name><index>[<expr><name>i</name></expr>]</index></name></expr>)</condition>
+			<block>{<block_content>
+				<expr_stmt><expr><name>res</name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+				<break>break;</break>
+			</block_content>}</block></if></if_stmt>
+		</block_content>}</block></for>
+	</block_content>}</block></if>
+	<if type="elseif">else if <condition>(<expr><name>strategy</name> <operator>==</operator> <name>JsonbJsonpathPredicateStrategyNumber</name> <operator>||</operator>
+			 <name>strategy</name> <operator>==</operator> <name>JsonbJsonpathExistsStrategyNumber</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><operator>*</operator><name>recheck</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name>nkeys</name> <operator>&gt;</operator> <literal type="number">0</literal></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>extra_data</name> <operator>&amp;&amp;</operator> <name><name>extra_data</name><index>[<expr><literal type="number">0</literal></expr>]</index></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><name>res</name> <operator>=</operator> <call><name>execute_jsp_gin_node</name><argument_list>(<argument><expr><operator>(</operator><name>JsonPathGinNode</name> <operator>*</operator><operator>)</operator> <name><name>extra_data</name><index>[<expr><literal type="number">0</literal></expr>]</index></name></expr></argument>, <argument><expr><name>check</name></expr></argument>,
+									   <argument><expr><name>false</name></expr></argument>)</argument_list></call> <operator>!=</operator> <name>GIN_FALSE</name></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+	</block_content>}</block></if>
+	<else>else<block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"unrecognized strategy number: %d"</literal></expr></argument>, <argument><expr><name>strategy</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></else></if_stmt>
+
+	<expr_stmt><expr><call><name>PG_RETURN_BOOL</name><argument_list>(<argument><expr><name>res</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<function><type><name>Datum</name></type>
+<name>gin_triconsistent_jsonb_path</name><parameter_list>(<parameter><decl><type><name>PG_FUNCTION_ARGS</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>GinTernaryValue</name> <modifier>*</modifier></type><name>check</name> <init>= <expr><operator>(</operator><name>GinTernaryValue</name> <operator>*</operator><operator>)</operator> <call><name>PG_GETARG_POINTER</name><argument_list>(<argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>StrategyNumber</name></type> <name>strategy</name> <init>= <expr><call><name>PG_GETARG_UINT16</name><argument_list>(<argument><expr><literal type="number">1</literal></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<comment type="block">/* Jsonb	   *query = PG_GETARG_JSONB_P(2); */</comment>
+	<decl_stmt><decl><type><name>int32</name></type>		<name>nkeys</name> <init>= <expr><call><name>PG_GETARG_INT32</name><argument_list>(<argument><expr><literal type="number">3</literal></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Pointer</name>    <modifier>*</modifier></type><name>extra_data</name> <init>= <expr><operator>(</operator><name>Pointer</name> <operator>*</operator><operator>)</operator> <call><name>PG_GETARG_POINTER</name><argument_list>(<argument><expr><literal type="number">4</literal></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>GinTernaryValue</name></type> <name>res</name> <init>= <expr><name>GIN_MAYBE</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int32</name></type>		<name>i</name></decl>;</decl_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>strategy</name> <operator>==</operator> <name>JsonbContainsStrategyNumber</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/*
+		 * Note that we never return GIN_TRUE, only GIN_MAYBE or GIN_FALSE;
+		 * this corresponds to always forcing recheck in the regular
+		 * consistent function, for the reasons listed there.
+		 */</comment>
+		<for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name>nkeys</name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control>
+		<block>{<block_content>
+			<if_stmt><if>if <condition>(<expr><name><name>check</name><index>[<expr><name>i</name></expr>]</index></name> <operator>==</operator> <name>GIN_FALSE</name></expr>)</condition>
+			<block>{<block_content>
+				<expr_stmt><expr><name>res</name> <operator>=</operator> <name>GIN_FALSE</name></expr>;</expr_stmt>
+				<break>break;</break>
+			</block_content>}</block></if></if_stmt>
+		</block_content>}</block></for>
+	</block_content>}</block></if>
+	<if type="elseif">else if <condition>(<expr><name>strategy</name> <operator>==</operator> <name>JsonbJsonpathPredicateStrategyNumber</name> <operator>||</operator>
+			 <name>strategy</name> <operator>==</operator> <name>JsonbJsonpathExistsStrategyNumber</name></expr>)</condition>
+	<block>{<block_content>
+		<if_stmt><if>if <condition>(<expr><name>nkeys</name> <operator>&gt;</operator> <literal type="number">0</literal></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>extra_data</name> <operator>&amp;&amp;</operator> <name><name>extra_data</name><index>[<expr><literal type="number">0</literal></expr>]</index></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><name>res</name> <operator>=</operator> <call><name>execute_jsp_gin_node</name><argument_list>(<argument><expr><operator>(</operator><name>JsonPathGinNode</name> <operator>*</operator><operator>)</operator> <name><name>extra_data</name><index>[<expr><literal type="number">0</literal></expr>]</index></name></expr></argument>, <argument><expr><name>check</name></expr></argument>,
+									   <argument><expr><name>true</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+			<comment type="block">/* Should always recheck the result */</comment>
+			<if_stmt><if>if <condition>(<expr><name>res</name> <operator>==</operator> <name>GIN_TRUE</name></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><name>res</name> <operator>=</operator> <name>GIN_MAYBE</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+		</block_content>}</block></if></if_stmt>
+	</block_content>}</block></if>
+	<else>else<block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"unrecognized strategy number: %d"</literal></expr></argument>, <argument><expr><name>strategy</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></else></if_stmt>
+
+	<expr_stmt><expr><call><name>PG_RETURN_GIN_TERNARY_VALUE</name><argument_list>(<argument><expr><name>res</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Construct a jsonb_ops GIN key from a flag byte and a textual representation
+ * (which need not be null-terminated).  This function is responsible
+ * for hashing overlength text representations; it will add the
+ * JGINFLAG_HASHED bit to the flag value if it does that.
+ */</comment>
+<function><type><specifier>static</specifier> <name>Datum</name></type>
+<name>make_text_key</name><parameter_list>(<parameter><decl><type><name>char</name></type> <name>flag</name></decl></parameter>, <parameter><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>str</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>len</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>text</name>	   <modifier>*</modifier></type><name>item</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>char</name></type>		<name><name>hashbuf</name><index>[<expr><literal type="number">10</literal></expr>]</index></name></decl>;</decl_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>len</name> <operator>&gt;</operator> <name>JGIN_MAXLENGTH</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>uint32</name></type>		<name>hashval</name></decl>;</decl_stmt>
+
+		<expr_stmt><expr><name>hashval</name> <operator>=</operator> <call><name>DatumGetUInt32</name><argument_list>(<argument><expr><call><name>hash_any</name><argument_list>(<argument><expr><operator>(</operator><specifier>const</specifier> <name>unsigned</name> <name>char</name> <operator>*</operator><operator>)</operator> <name>str</name></expr></argument>, <argument><expr><name>len</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>snprintf</name><argument_list>(<argument><expr><name>hashbuf</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>hashbuf</name></expr></argument>)</argument_list></sizeof></expr></argument>, <argument><expr><literal type="string">"%08x"</literal></expr></argument>, <argument><expr><name>hashval</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name>str</name> <operator>=</operator> <name>hashbuf</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name>len</name> <operator>=</operator> <literal type="number">8</literal></expr>;</expr_stmt>
+		<expr_stmt><expr><name>flag</name> <operator>|=</operator> <name>JGINFLAG_HASHED</name></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/*
+	 * Now build the text Datum.  For simplicity we build a 4-byte-header
+	 * varlena text Datum here, but we expect it will get converted to short
+	 * header format when stored in the index.
+	 */</comment>
+	<expr_stmt><expr><name>item</name> <operator>=</operator> <operator>(</operator><name>text</name> <operator>*</operator><operator>)</operator> <call><name>palloc</name><argument_list>(<argument><expr><name>VARHDRSZ</name> <operator>+</operator> <name>len</name> <operator>+</operator> <literal type="number">1</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>SET_VARSIZE</name><argument_list>(<argument><expr><name>item</name></expr></argument>, <argument><expr><name>VARHDRSZ</name> <operator>+</operator> <name>len</name> <operator>+</operator> <literal type="number">1</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><operator>*</operator><call><name>VARDATA</name><argument_list>(<argument><expr><name>item</name></expr></argument>)</argument_list></call> <operator>=</operator> <name>flag</name></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>memcpy</name><argument_list>(<argument><expr><call><name>VARDATA</name><argument_list>(<argument><expr><name>item</name></expr></argument>)</argument_list></call> <operator>+</operator> <literal type="number">1</literal></expr></argument>, <argument><expr><name>str</name></expr></argument>, <argument><expr><name>len</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<return>return <expr><call><name>PointerGetDatum</name><argument_list>(<argument><expr><name>item</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Create a textual representation of a JsonbValue that will serve as a GIN
+ * key in a jsonb_ops index.  is_key is true if the JsonbValue is a key,
+ * or if it is a string array element (since we pretend those are keys,
+ * see jsonb.h).
+ */</comment>
+<function><type><specifier>static</specifier> <name>Datum</name></type>
+<name>make_scalar_key</name><parameter_list>(<parameter><decl><type><specifier>const</specifier> <name>JsonbValue</name> <modifier>*</modifier></type><name>scalarVal</name></decl></parameter>, <parameter><decl><type><name>bool</name></type> <name>is_key</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>Datum</name></type>		<name>item</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>cstr</name></decl>;</decl_stmt>
+
+	<switch>switch <condition>(<expr><name><name>scalarVal</name><operator>-&gt;</operator><name>type</name></name></expr>)</condition>
+	<block>{<block_content>
+		<case>case <expr><name>jbvNull</name></expr>:</case>
+			<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><operator>!</operator><name>is_key</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><name>item</name> <operator>=</operator> <call><name>make_text_key</name><argument_list>(<argument><expr><name>JGINFLAG_NULL</name></expr></argument>, <argument><expr><literal type="string">""</literal></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<break>break;</break>
+		<case>case <expr><name>jbvBool</name></expr>:</case>
+			<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><operator>!</operator><name>is_key</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><name>item</name> <operator>=</operator> <call><name>make_text_key</name><argument_list>(<argument><expr><name>JGINFLAG_BOOL</name></expr></argument>,
+								 <argument><expr><ternary><condition><expr><name><name>scalarVal</name><operator>-&gt;</operator><name>val</name><operator>.</operator><name>boolean</name></name></expr> ?</condition><then> <expr><literal type="string">"t"</literal></expr> </then><else>: <expr><literal type="string">"f"</literal></expr></else></ternary></expr></argument>, <argument><expr><literal type="number">1</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<break>break;</break>
+		<case>case <expr><name>jbvNumeric</name></expr>:</case>
+			<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><operator>!</operator><name>is_key</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+			<comment type="block">/*
+			 * A normalized textual representation, free of trailing zeroes,
+			 * is required so that numerically equal values will produce equal
+			 * strings.
+			 *
+			 * It isn't ideal that numerics are stored in a relatively bulky
+			 * textual format.  However, it's a notationally convenient way of
+			 * storing a "union" type in the GIN B-Tree, and indexing Jsonb
+			 * strings takes precedence.
+			 */</comment>
+			<expr_stmt><expr><name>cstr</name> <operator>=</operator> <call><name>numeric_normalize</name><argument_list>(<argument><expr><name><name>scalarVal</name><operator>-&gt;</operator><name>val</name><operator>.</operator><name>numeric</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><name>item</name> <operator>=</operator> <call><name>make_text_key</name><argument_list>(<argument><expr><name>JGINFLAG_NUM</name></expr></argument>, <argument><expr><name>cstr</name></expr></argument>, <argument><expr><call><name>strlen</name><argument_list>(<argument><expr><name>cstr</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>pfree</name><argument_list>(<argument><expr><name>cstr</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<break>break;</break>
+		<case>case <expr><name>jbvString</name></expr>:</case>
+			<expr_stmt><expr><name>item</name> <operator>=</operator> <call><name>make_text_key</name><argument_list>(<argument><expr><ternary><condition><expr><name>is_key</name></expr> ?</condition><then> <expr><name>JGINFLAG_KEY</name></expr> </then><else>: <expr><name>JGINFLAG_STR</name></expr></else></ternary></expr></argument>,
+								 <argument><expr><name><name>scalarVal</name><operator>-&gt;</operator><name>val</name><operator>.</operator><name>string</name><operator>.</operator><name>val</name></name></expr></argument>,
+								 <argument><expr><name><name>scalarVal</name><operator>-&gt;</operator><name>val</name><operator>.</operator><name>string</name><operator>.</operator><name>len</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<break>break;</break>
+		<default>default:</default>
+			<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"unrecognized jsonb scalar type: %d"</literal></expr></argument>, <argument><expr><name><name>scalarVal</name><operator>-&gt;</operator><name>type</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><name>item</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>			<comment type="block">/* keep compiler quiet */</comment>
+			<break>break;</break>
+	</block_content>}</block></switch>
+
+	<return>return <expr><name>item</name></expr>;</return>
+</block_content>}</block></function>
+</unit>

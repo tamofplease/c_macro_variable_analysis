@@ -1,0 +1,1304 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<unit xmlns="http://www.srcML.org/srcML/src" xmlns:cpp="http://www.srcML.org/srcML/cpp" revision="1.0.0" language="C" filename="/cloned_projects/yugabyte-db/src/postgres/src/backend/utils/resowner/resowner.c"><comment type="block">/*-------------------------------------------------------------------------
+ *
+ * resowner.c
+ *	  POSTGRES resource owner management code.
+ *
+ * Query-lifespan resources are tracked by associating them with
+ * ResourceOwner objects.  This provides a simple mechanism for ensuring
+ * that such resources are freed at the right time.
+ * See utils/resowner/README for more info.
+ *
+ *
+ * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1994, Regents of the University of California
+ *
+ *
+ * IDENTIFICATION
+ *	  src/backend/utils/resowner/resowner.c
+ *
+ *-------------------------------------------------------------------------
+ */</comment>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"postgres.h"</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/hash.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"jit/jit.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/predicate.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/proc.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/memutils.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/rel.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/resowner_private.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/snapmgr.h"</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"pg_yb_utils.h"</cpp:file></cpp:include>
+
+<comment type="block">/*
+ * All resource IDs managed by this code are required to fit into a Datum,
+ * which is fine since they are generally pointers or integers.
+ *
+ * Provide Datum conversion macros for a couple of things that are really
+ * just "int".
+ */</comment>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>FileGetDatum</name><parameter_list>(<parameter><type><name>file</name></type></parameter>)</parameter_list></cpp:macro> <cpp:value>Int32GetDatum(file)</cpp:value></cpp:define>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>DatumGetFile</name><parameter_list>(<parameter><type><name>datum</name></type></parameter>)</parameter_list></cpp:macro> <cpp:value>((File) DatumGetInt32(datum))</cpp:value></cpp:define>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>BufferGetDatum</name><parameter_list>(<parameter><type><name>buffer</name></type></parameter>)</parameter_list></cpp:macro> <cpp:value>Int32GetDatum(buffer)</cpp:value></cpp:define>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>DatumGetBuffer</name><parameter_list>(<parameter><type><name>datum</name></type></parameter>)</parameter_list></cpp:macro> <cpp:value>((Buffer) DatumGetInt32(datum))</cpp:value></cpp:define>
+
+<comment type="block">/*
+ * ResourceArray is a common structure for storing all types of resource IDs.
+ *
+ * We manage small sets of resource IDs by keeping them in a simple array:
+ * itemsarr[k] holds an ID, for 0 &lt;= k &lt; nitems &lt;= maxitems = capacity.
+ *
+ * If a set grows large, we switch over to using open-addressing hashing.
+ * Then, itemsarr[] is a hash table of "capacity" slots, with each
+ * slot holding either an ID or "invalidval".  nitems is the number of valid
+ * items present; if it would exceed maxitems, we enlarge the array and
+ * re-hash.  In this mode, maxitems should be rather less than capacity so
+ * that we don't waste too much time searching for empty slots.
+ *
+ * In either mode, lastidx remembers the location of the last item inserted
+ * or returned by GetAny; this speeds up searches in ResourceArrayRemove.
+ */</comment>
+<typedef>typedef <type><struct>struct <name>ResourceArray</name>
+<block>{
+	<decl_stmt><decl><type><name>Datum</name>	   <modifier>*</modifier></type><name>itemsarr</name></decl>;</decl_stmt>		<comment type="block">/* buffer for storing values */</comment>
+	<decl_stmt><decl><type><name>Datum</name></type>		<name>invalidval</name></decl>;</decl_stmt>		<comment type="block">/* value that is considered invalid */</comment>
+	<decl_stmt><decl><type><name>uint32</name></type>		<name>capacity</name></decl>;</decl_stmt>		<comment type="block">/* allocated length of itemsarr[] */</comment>
+	<decl_stmt><decl><type><name>uint32</name></type>		<name>nitems</name></decl>;</decl_stmt>			<comment type="block">/* how many items are stored in items array */</comment>
+	<decl_stmt><decl><type><name>uint32</name></type>		<name>maxitems</name></decl>;</decl_stmt>		<comment type="block">/* current limit on nitems before enlarging */</comment>
+	<decl_stmt><decl><type><name>uint32</name></type>		<name>lastidx</name></decl>;</decl_stmt>		<comment type="block">/* index of last item returned by GetAny */</comment>
+}</block></struct></type> <name>ResourceArray</name>;</typedef>
+
+<comment type="block">/*
+ * Initially allocated size of a ResourceArray.  Must be power of two since
+ * we'll use (arraysize - 1) as mask for hashing.
+ */</comment>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>RESARRAY_INIT_SIZE</name></cpp:macro> <cpp:value>16</cpp:value></cpp:define>
+
+<comment type="block">/*
+ * When to switch to hashing vs. simple array logic in a ResourceArray.
+ */</comment>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>RESARRAY_MAX_ARRAY</name></cpp:macro> <cpp:value>64</cpp:value></cpp:define>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>RESARRAY_IS_ARRAY</name><parameter_list>(<parameter><type><name>resarr</name></type></parameter>)</parameter_list></cpp:macro> <cpp:value>((resarr)-&gt;capacity &lt;= RESARRAY_MAX_ARRAY)</cpp:value></cpp:define>
+
+<comment type="block">/*
+ * How many items may be stored in a resource array of given capacity.
+ * When this number is reached, we must resize.
+ */</comment>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>RESARRAY_MAX_ITEMS</name><parameter_list>(<parameter><type><name>capacity</name></type></parameter>)</parameter_list></cpp:macro> \
+	<cpp:value>((capacity) &lt;= RESARRAY_MAX_ARRAY ? (capacity) : (capacity)/4 * 3)</cpp:value></cpp:define>
+
+<comment type="block">/*
+ * To speed up bulk releasing or reassigning locks from a resource owner to
+ * its parent, each resource owner has a small cache of locks it owns. The
+ * lock manager has the same information in its local lock hash table, and
+ * we fall back on that if cache overflows, but traversing the hash table
+ * is slower when there are a lot of locks belonging to other resource owners.
+ *
+ * MAX_RESOWNER_LOCKS is the size of the per-resource owner cache. It's
+ * chosen based on some testing with pg_dump with a large schema. When the
+ * tests were done (on 9.2), resource owners in a pg_dump run contained up
+ * to 9 locks, regardless of the schema size, except for the top resource
+ * owner which contained much more (overflowing the cache). 15 seems like a
+ * nice round number that's somewhat higher than what pg_dump needs. Note that
+ * making this number larger is not free - the bigger the cache, the slower
+ * it is to release locks (in retail), when a resource owner holds many locks.
+ */</comment>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>MAX_RESOWNER_LOCKS</name></cpp:macro> <cpp:value>15</cpp:value></cpp:define>
+
+<comment type="block">/*
+ * ResourceOwner objects look like this
+ */</comment>
+<typedef>typedef <type><struct>struct <name>ResourceOwnerData</name>
+<block>{
+	<decl_stmt><decl><type><name>ResourceOwner</name></type> <name>parent</name></decl>;</decl_stmt>		<comment type="block">/* NULL if no parent (toplevel owner) */</comment>
+	<decl_stmt><decl><type><name>ResourceOwner</name></type> <name>firstchild</name></decl>;</decl_stmt>	<comment type="block">/* head of linked list of children */</comment>
+	<decl_stmt><decl><type><name>ResourceOwner</name></type> <name>nextchild</name></decl>;</decl_stmt>	<comment type="block">/* next child of same parent */</comment>
+	<decl_stmt><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>name</name></decl>;</decl_stmt>			<comment type="block">/* name (just for debugging) */</comment>
+
+	<comment type="block">/* We have built-in support for remembering: */</comment>
+	<decl_stmt><decl><type><name>ResourceArray</name></type> <name>bufferarr</name></decl>;</decl_stmt>	<comment type="block">/* owned buffers */</comment>
+	<decl_stmt><decl><type><name>ResourceArray</name></type> <name>catrefarr</name></decl>;</decl_stmt>	<comment type="block">/* catcache references */</comment>
+	<decl_stmt><decl><type><name>ResourceArray</name></type> <name>catlistrefarr</name></decl>;</decl_stmt>	<comment type="block">/* catcache-list pins */</comment>
+	<decl_stmt><decl><type><name>ResourceArray</name></type> <name>relrefarr</name></decl>;</decl_stmt>	<comment type="block">/* relcache references */</comment>
+	<decl_stmt><decl><type><name>ResourceArray</name></type> <name>planrefarr</name></decl>;</decl_stmt>	<comment type="block">/* plancache references */</comment>
+	<decl_stmt><decl><type><name>ResourceArray</name></type> <name>tupdescarr</name></decl>;</decl_stmt>	<comment type="block">/* tupdesc references */</comment>
+	<decl_stmt><decl><type><name>ResourceArray</name></type> <name>snapshotarr</name></decl>;</decl_stmt>	<comment type="block">/* snapshot references */</comment>
+	<decl_stmt><decl><type><name>ResourceArray</name></type> <name>filearr</name></decl>;</decl_stmt>		<comment type="block">/* open temporary files */</comment>
+	<decl_stmt><decl><type><name>ResourceArray</name></type> <name>dsmarr</name></decl>;</decl_stmt>		<comment type="block">/* dynamic shmem segments */</comment>
+	<decl_stmt><decl><type><name>ResourceArray</name></type> <name>jitarr</name></decl>;</decl_stmt>		<comment type="block">/* JIT contexts */</comment>
+
+	<comment type="block">/* We can remember up to MAX_RESOWNER_LOCKS references to local locks. */</comment>
+	<decl_stmt><decl><type><name>int</name></type>			<name>nlocks</name></decl>;</decl_stmt>			<comment type="block">/* number of owned locks */</comment>
+	<decl_stmt><decl><type><name>LOCALLOCK</name>  <modifier>*</modifier></type><name><name>locks</name><index>[<expr><name>MAX_RESOWNER_LOCKS</name></expr>]</index></name></decl>;</decl_stmt>	<comment type="block">/* list of owned locks */</comment>
+}</block></struct></type>			<name>ResourceOwnerData</name>;</typedef>
+
+
+<comment type="block" format="doxygen">/*****************************************************************************
+ *	  GLOBAL MEMORY															 *
+ *****************************************************************************/</comment>
+
+<decl_stmt><decl><type><name>ResourceOwner</name></type> <name>CurrentResourceOwner</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+<decl_stmt><decl><type><name>ResourceOwner</name></type> <name>CurTransactionResourceOwner</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+<decl_stmt><decl><type><name>ResourceOwner</name></type> <name>TopTransactionResourceOwner</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+
+<comment type="block">/*
+ * List of add-on callbacks for resource releasing
+ */</comment>
+<typedef>typedef <type><struct>struct <name>ResourceReleaseCallbackItem</name>
+<block>{
+	<decl_stmt><decl><type><name><name>struct</name> <name>ResourceReleaseCallbackItem</name></name> <modifier>*</modifier></type><name>next</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>ResourceReleaseCallback</name></type> <name>callback</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>void</name>	   <modifier>*</modifier></type><name>arg</name></decl>;</decl_stmt>
+}</block></struct></type> <name>ResourceReleaseCallbackItem</name>;</typedef>
+
+<decl_stmt><decl><type><specifier>static</specifier> <name>ResourceReleaseCallbackItem</name> <modifier>*</modifier></type><name>ResourceRelease_callbacks</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+
+
+<comment type="block">/* Internal routines */</comment>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>ResourceArrayInit</name><parameter_list>(<parameter><decl><type><name>ResourceArray</name> <modifier>*</modifier></type><name>resarr</name></decl></parameter>, <parameter><decl><type><name>Datum</name></type> <name>invalidval</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>ResourceArrayEnlarge</name><parameter_list>(<parameter><decl><type><name>ResourceArray</name> <modifier>*</modifier></type><name>resarr</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>ResourceArrayAdd</name><parameter_list>(<parameter><decl><type><name>ResourceArray</name> <modifier>*</modifier></type><name>resarr</name></decl></parameter>, <parameter><decl><type><name>Datum</name></type> <name>value</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>bool</name></type> <name>ResourceArrayRemove</name><parameter_list>(<parameter><decl><type><name>ResourceArray</name> <modifier>*</modifier></type><name>resarr</name></decl></parameter>, <parameter><decl><type><name>Datum</name></type> <name>value</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>bool</name></type> <name>ResourceArrayGetAny</name><parameter_list>(<parameter><decl><type><name>ResourceArray</name> <modifier>*</modifier></type><name>resarr</name></decl></parameter>, <parameter><decl><type><name>Datum</name> <modifier>*</modifier></type><name>value</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>ResourceArrayFree</name><parameter_list>(<parameter><decl><type><name>ResourceArray</name> <modifier>*</modifier></type><name>resarr</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>ResourceOwnerReleaseInternal</name><parameter_list>(<parameter><decl><type><name>ResourceOwner</name></type> <name>owner</name></decl></parameter>,
+							 <parameter><decl><type><name>ResourceReleasePhase</name></type> <name>phase</name></decl></parameter>,
+							 <parameter><decl><type><name>bool</name></type> <name>isCommit</name></decl></parameter>,
+							 <parameter><decl><type><name>bool</name></type> <name>isTopLevel</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>PrintRelCacheLeakWarning</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>rel</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>PrintPlanCacheLeakWarning</name><parameter_list>(<parameter><decl><type><name>CachedPlan</name> <modifier>*</modifier></type><name>plan</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>PrintTupleDescLeakWarning</name><parameter_list>(<parameter><decl><type><name>TupleDesc</name></type> <name>tupdesc</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>PrintSnapshotLeakWarning</name><parameter_list>(<parameter><decl><type><name>Snapshot</name></type> <name>snapshot</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>PrintFileLeakWarning</name><parameter_list>(<parameter><decl><type><name>File</name></type> <name>file</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>PrintDSMLeakWarning</name><parameter_list>(<parameter><decl><type><name>dsm_segment</name> <modifier>*</modifier></type><name>seg</name></decl></parameter>)</parameter_list>;</function_decl>
+
+<comment type="block" format="doxygen">/*****************************************************************************
+ *	  INTERNAL ROUTINES														 *
+ *****************************************************************************/</comment>
+
+
+<comment type="block">/*
+ * Initialize a ResourceArray
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>ResourceArrayInit</name><parameter_list>(<parameter><decl><type><name>ResourceArray</name> <modifier>*</modifier></type><name>resarr</name></decl></parameter>, <parameter><decl><type><name>Datum</name></type> <name>invalidval</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<comment type="block">/* Assert it's empty */</comment>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>resarr</name><operator>-&gt;</operator><name>itemsarr</name></name> <operator>==</operator> <name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>resarr</name><operator>-&gt;</operator><name>capacity</name></name> <operator>==</operator> <literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>resarr</name><operator>-&gt;</operator><name>nitems</name></name> <operator>==</operator> <literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>resarr</name><operator>-&gt;</operator><name>maxitems</name></name> <operator>==</operator> <literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<comment type="block">/* Remember the appropriate "invalid" value */</comment>
+	<expr_stmt><expr><name><name>resarr</name><operator>-&gt;</operator><name>invalidval</name></name> <operator>=</operator> <name>invalidval</name></expr>;</expr_stmt>
+	<comment type="block">/* We don't allocate any storage until needed */</comment>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Make sure there is room for at least one more resource in an array.
+ *
+ * This is separate from actually inserting a resource because if we run out
+ * of memory, it's critical to do so *before* acquiring the resource.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>ResourceArrayEnlarge</name><parameter_list>(<parameter><decl><type><name>ResourceArray</name> <modifier>*</modifier></type><name>resarr</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>uint32</name></type>		<name>i</name></decl>,
+				<decl><type ref="prev"/><name>oldcap</name></decl>,
+				<decl><type ref="prev"/><name>newcap</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Datum</name>	   <modifier>*</modifier></type><name>olditemsarr</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Datum</name>	   <modifier>*</modifier></type><name>newitemsarr</name></decl>;</decl_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name><name>resarr</name><operator>-&gt;</operator><name>nitems</name></name> <operator>&lt;</operator> <name><name>resarr</name><operator>-&gt;</operator><name>maxitems</name></name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return;</return></block_content></block></if></if_stmt>					<comment type="block">/* no work needed */</comment>
+
+	<expr_stmt><expr><name>olditemsarr</name> <operator>=</operator> <name><name>resarr</name><operator>-&gt;</operator><name>itemsarr</name></name></expr>;</expr_stmt>
+	<expr_stmt><expr><name>oldcap</name> <operator>=</operator> <name><name>resarr</name><operator>-&gt;</operator><name>capacity</name></name></expr>;</expr_stmt>
+
+	<comment type="block">/* Double the capacity of the array (capacity must stay a power of 2!) */</comment>
+	<expr_stmt><expr><name>newcap</name> <operator>=</operator> <ternary><condition><expr><operator>(</operator><name>oldcap</name> <operator>&gt;</operator> <literal type="number">0</literal><operator>)</operator></expr> ?</condition><then> <expr><name>oldcap</name> <operator>*</operator> <literal type="number">2</literal></expr> </then><else>: <expr><name>RESARRAY_INIT_SIZE</name></expr></else></ternary></expr>;</expr_stmt>
+	<expr_stmt><expr><name>newitemsarr</name> <operator>=</operator> <operator>(</operator><name>Datum</name> <operator>*</operator><operator>)</operator> <call><name>MemoryContextAlloc</name><argument_list>(<argument><expr><name>TopMemoryContext</name></expr></argument>,
+											   <argument><expr><name>newcap</name> <operator>*</operator> <sizeof>sizeof<argument_list>(<argument><expr><name>Datum</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name>newcap</name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control><block type="pseudo"><block_content>
+		<expr_stmt><expr><name><name>newitemsarr</name><index>[<expr><name>i</name></expr>]</index></name> <operator>=</operator> <name><name>resarr</name><operator>-&gt;</operator><name>invalidval</name></name></expr>;</expr_stmt></block_content></block></for>
+
+	<comment type="block">/* We assume we can't fail below this point, so OK to scribble on resarr */</comment>
+	<expr_stmt><expr><name><name>resarr</name><operator>-&gt;</operator><name>itemsarr</name></name> <operator>=</operator> <name>newitemsarr</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>resarr</name><operator>-&gt;</operator><name>capacity</name></name> <operator>=</operator> <name>newcap</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>resarr</name><operator>-&gt;</operator><name>maxitems</name></name> <operator>=</operator> <call><name>RESARRAY_MAX_ITEMS</name><argument_list>(<argument><expr><name>newcap</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>resarr</name><operator>-&gt;</operator><name>nitems</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>olditemsarr</name> <operator>!=</operator> <name>NULL</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/*
+		 * Transfer any pre-existing entries into the new array; they don't
+		 * necessarily go where they were before, so this simple logic is the
+		 * best way.  Note that if we were managing the set as a simple array,
+		 * the entries after nitems are garbage, but that shouldn't matter
+		 * because we won't get here unless nitems was equal to oldcap.
+		 */</comment>
+		<for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name>oldcap</name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control>
+		<block>{<block_content>
+			<if_stmt><if>if <condition>(<expr><name><name>olditemsarr</name><index>[<expr><name>i</name></expr>]</index></name> <operator>!=</operator> <name><name>resarr</name><operator>-&gt;</operator><name>invalidval</name></name></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><call><name>ResourceArrayAdd</name><argument_list>(<argument><expr><name>resarr</name></expr></argument>, <argument><expr><name><name>olditemsarr</name><index>[<expr><name>i</name></expr>]</index></name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+		</block_content>}</block></for>
+
+		<comment type="block">/* And release old array. */</comment>
+		<expr_stmt><expr><call><name>pfree</name><argument_list>(<argument><expr><name>olditemsarr</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>resarr</name><operator>-&gt;</operator><name>nitems</name></name> <operator>&lt;</operator> <name><name>resarr</name><operator>-&gt;</operator><name>maxitems</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Add a resource to ResourceArray
+ *
+ * Caller must have previously done ResourceArrayEnlarge()
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>ResourceArrayAdd</name><parameter_list>(<parameter><decl><type><name>ResourceArray</name> <modifier>*</modifier></type><name>resarr</name></decl></parameter>, <parameter><decl><type><name>Datum</name></type> <name>value</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>uint32</name></type>		<name>idx</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>value</name> <operator>!=</operator> <name><name>resarr</name><operator>-&gt;</operator><name>invalidval</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>resarr</name><operator>-&gt;</operator><name>nitems</name></name> <operator>&lt;</operator> <name><name>resarr</name><operator>-&gt;</operator><name>maxitems</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><call><name>RESARRAY_IS_ARRAY</name><argument_list>(<argument><expr><name>resarr</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* Append to linear array. */</comment>
+		<expr_stmt><expr><name>idx</name> <operator>=</operator> <name><name>resarr</name><operator>-&gt;</operator><name>nitems</name></name></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<else>else
+	<block>{<block_content>
+		<comment type="block">/* Insert into first free slot at or after hash location. */</comment>
+		<decl_stmt><decl><type><name>uint32</name></type>		<name>mask</name> <init>= <expr><name><name>resarr</name><operator>-&gt;</operator><name>capacity</name></name> <operator>-</operator> <literal type="number">1</literal></expr></init></decl>;</decl_stmt>
+
+		<expr_stmt><expr><name>idx</name> <operator>=</operator> <call><name>DatumGetUInt32</name><argument_list>(<argument><expr><call><name>hash_any</name><argument_list>(<argument><expr><operator>(</operator><name>void</name> <operator>*</operator><operator>)</operator> <operator>&amp;</operator><name>value</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>value</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call> <operator>&amp;</operator> <name>mask</name></expr>;</expr_stmt>
+		<for>for <control>(<init>;</init><condition>;</condition><incr/>)</control>
+		<block>{<block_content>
+			<if_stmt><if>if <condition>(<expr><name><name>resarr</name><operator>-&gt;</operator><name>itemsarr</name><index>[<expr><name>idx</name></expr>]</index></name> <operator>==</operator> <name><name>resarr</name><operator>-&gt;</operator><name>invalidval</name></name></expr>)</condition><block type="pseudo"><block_content>
+				<break>break;</break></block_content></block></if></if_stmt>
+			<expr_stmt><expr><name>idx</name> <operator>=</operator> <operator>(</operator><name>idx</name> <operator>+</operator> <literal type="number">1</literal><operator>)</operator> <operator>&amp;</operator> <name>mask</name></expr>;</expr_stmt>
+		</block_content>}</block></for>
+	</block_content>}</block></else></if_stmt>
+	<expr_stmt><expr><name><name>resarr</name><operator>-&gt;</operator><name>lastidx</name></name> <operator>=</operator> <name>idx</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>resarr</name><operator>-&gt;</operator><name>itemsarr</name><index>[<expr><name>idx</name></expr>]</index></name> <operator>=</operator> <name>value</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>resarr</name><operator>-&gt;</operator><name>nitems</name></name><operator>++</operator></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Remove a resource from ResourceArray
+ *
+ * Returns true on success, false if resource was not found.
+ *
+ * Note: if same resource ID appears more than once, one instance is removed.
+ */</comment>
+<function><type><specifier>static</specifier> <name>bool</name></type>
+<name>ResourceArrayRemove</name><parameter_list>(<parameter><decl><type><name>ResourceArray</name> <modifier>*</modifier></type><name>resarr</name></decl></parameter>, <parameter><decl><type><name>Datum</name></type> <name>value</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>uint32</name></type>		<name>i</name></decl>,
+				<decl><type ref="prev"/><name>idx</name></decl>,
+				<decl><type ref="prev"/><name>lastidx</name> <init>= <expr><name><name>resarr</name><operator>-&gt;</operator><name>lastidx</name></name></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>value</name> <operator>!=</operator> <name><name>resarr</name><operator>-&gt;</operator><name>invalidval</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Search through all items, but try lastidx first. */</comment>
+	<if_stmt><if>if <condition>(<expr><call><name>RESARRAY_IS_ARRAY</name><argument_list>(<argument><expr><name>resarr</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<if_stmt><if>if <condition>(<expr><name>lastidx</name> <operator>&lt;</operator> <name><name>resarr</name><operator>-&gt;</operator><name>nitems</name></name> <operator>&amp;&amp;</operator>
+			<name><name>resarr</name><operator>-&gt;</operator><name>itemsarr</name><index>[<expr><name>lastidx</name></expr>]</index></name> <operator>==</operator> <name>value</name></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><name><name>resarr</name><operator>-&gt;</operator><name>itemsarr</name><index>[<expr><name>lastidx</name></expr>]</index></name> <operator>=</operator> <name><name>resarr</name><operator>-&gt;</operator><name>itemsarr</name><index>[<expr><name><name>resarr</name><operator>-&gt;</operator><name>nitems</name></name> <operator>-</operator> <literal type="number">1</literal></expr>]</index></name></expr>;</expr_stmt>
+			<expr_stmt><expr><name><name>resarr</name><operator>-&gt;</operator><name>nitems</name></name><operator>--</operator></expr>;</expr_stmt>
+			<comment type="block">/* Update lastidx to make reverse-order removals fast. */</comment>
+			<expr_stmt><expr><name><name>resarr</name><operator>-&gt;</operator><name>lastidx</name></name> <operator>=</operator> <name><name>resarr</name><operator>-&gt;</operator><name>nitems</name></name> <operator>-</operator> <literal type="number">1</literal></expr>;</expr_stmt>
+			<return>return <expr><name>true</name></expr>;</return>
+		</block_content>}</block></if></if_stmt>
+		<for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name><name>resarr</name><operator>-&gt;</operator><name>nitems</name></name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control>
+		<block>{<block_content>
+			<if_stmt><if>if <condition>(<expr><name><name>resarr</name><operator>-&gt;</operator><name>itemsarr</name><index>[<expr><name>i</name></expr>]</index></name> <operator>==</operator> <name>value</name></expr>)</condition>
+			<block>{<block_content>
+				<expr_stmt><expr><name><name>resarr</name><operator>-&gt;</operator><name>itemsarr</name><index>[<expr><name>i</name></expr>]</index></name> <operator>=</operator> <name><name>resarr</name><operator>-&gt;</operator><name>itemsarr</name><index>[<expr><name><name>resarr</name><operator>-&gt;</operator><name>nitems</name></name> <operator>-</operator> <literal type="number">1</literal></expr>]</index></name></expr>;</expr_stmt>
+				<expr_stmt><expr><name><name>resarr</name><operator>-&gt;</operator><name>nitems</name></name><operator>--</operator></expr>;</expr_stmt>
+				<comment type="block">/* Update lastidx to make reverse-order removals fast. */</comment>
+				<expr_stmt><expr><name><name>resarr</name><operator>-&gt;</operator><name>lastidx</name></name> <operator>=</operator> <name><name>resarr</name><operator>-&gt;</operator><name>nitems</name></name> <operator>-</operator> <literal type="number">1</literal></expr>;</expr_stmt>
+				<return>return <expr><name>true</name></expr>;</return>
+			</block_content>}</block></if></if_stmt>
+		</block_content>}</block></for>
+	</block_content>}</block></if>
+	<else>else
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>uint32</name></type>		<name>mask</name> <init>= <expr><name><name>resarr</name><operator>-&gt;</operator><name>capacity</name></name> <operator>-</operator> <literal type="number">1</literal></expr></init></decl>;</decl_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name>lastidx</name> <operator>&lt;</operator> <name><name>resarr</name><operator>-&gt;</operator><name>capacity</name></name> <operator>&amp;&amp;</operator>
+			<name><name>resarr</name><operator>-&gt;</operator><name>itemsarr</name><index>[<expr><name>lastidx</name></expr>]</index></name> <operator>==</operator> <name>value</name></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><name><name>resarr</name><operator>-&gt;</operator><name>itemsarr</name><index>[<expr><name>lastidx</name></expr>]</index></name> <operator>=</operator> <name><name>resarr</name><operator>-&gt;</operator><name>invalidval</name></name></expr>;</expr_stmt>
+			<expr_stmt><expr><name><name>resarr</name><operator>-&gt;</operator><name>nitems</name></name><operator>--</operator></expr>;</expr_stmt>
+			<return>return <expr><name>true</name></expr>;</return>
+		</block_content>}</block></if></if_stmt>
+		<expr_stmt><expr><name>idx</name> <operator>=</operator> <call><name>DatumGetUInt32</name><argument_list>(<argument><expr><call><name>hash_any</name><argument_list>(<argument><expr><operator>(</operator><name>void</name> <operator>*</operator><operator>)</operator> <operator>&amp;</operator><name>value</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>value</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call> <operator>&amp;</operator> <name>mask</name></expr>;</expr_stmt>
+		<for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name><name>resarr</name><operator>-&gt;</operator><name>capacity</name></name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control>
+		<block>{<block_content>
+			<if_stmt><if>if <condition>(<expr><name><name>resarr</name><operator>-&gt;</operator><name>itemsarr</name><index>[<expr><name>idx</name></expr>]</index></name> <operator>==</operator> <name>value</name></expr>)</condition>
+			<block>{<block_content>
+				<expr_stmt><expr><name><name>resarr</name><operator>-&gt;</operator><name>itemsarr</name><index>[<expr><name>idx</name></expr>]</index></name> <operator>=</operator> <name><name>resarr</name><operator>-&gt;</operator><name>invalidval</name></name></expr>;</expr_stmt>
+				<expr_stmt><expr><name><name>resarr</name><operator>-&gt;</operator><name>nitems</name></name><operator>--</operator></expr>;</expr_stmt>
+				<return>return <expr><name>true</name></expr>;</return>
+			</block_content>}</block></if></if_stmt>
+			<expr_stmt><expr><name>idx</name> <operator>=</operator> <operator>(</operator><name>idx</name> <operator>+</operator> <literal type="number">1</literal><operator>)</operator> <operator>&amp;</operator> <name>mask</name></expr>;</expr_stmt>
+		</block_content>}</block></for>
+	</block_content>}</block></else></if_stmt>
+
+	<return>return <expr><name>false</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Get any convenient entry in a ResourceArray.
+ *
+ * "Convenient" is defined as "easy for ResourceArrayRemove to remove";
+ * we help that along by setting lastidx to match.  This avoids O(N^2) cost
+ * when removing all ResourceArray items during ResourceOwner destruction.
+ *
+ * Returns true if we found an element, or false if the array is empty.
+ */</comment>
+<function><type><specifier>static</specifier> <name>bool</name></type>
+<name>ResourceArrayGetAny</name><parameter_list>(<parameter><decl><type><name>ResourceArray</name> <modifier>*</modifier></type><name>resarr</name></decl></parameter>, <parameter><decl><type><name>Datum</name> <modifier>*</modifier></type><name>value</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<if_stmt><if>if <condition>(<expr><name><name>resarr</name><operator>-&gt;</operator><name>nitems</name></name> <operator>==</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>false</name></expr>;</return></block_content></block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><call><name>RESARRAY_IS_ARRAY</name><argument_list>(<argument><expr><name>resarr</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* Linear array: just return the first element. */</comment>
+		<expr_stmt><expr><name><name>resarr</name><operator>-&gt;</operator><name>lastidx</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<else>else
+	<block>{<block_content>
+		<comment type="block">/* Hash: search forward from wherever we were last. */</comment>
+		<decl_stmt><decl><type><name>uint32</name></type>		<name>mask</name> <init>= <expr><name><name>resarr</name><operator>-&gt;</operator><name>capacity</name></name> <operator>-</operator> <literal type="number">1</literal></expr></init></decl>;</decl_stmt>
+
+		<for>for <control>(<init>;</init><condition>;</condition><incr/>)</control>
+		<block>{<block_content>
+			<expr_stmt><expr><name><name>resarr</name><operator>-&gt;</operator><name>lastidx</name></name> <operator>&amp;=</operator> <name>mask</name></expr>;</expr_stmt>
+			<if_stmt><if>if <condition>(<expr><name><name>resarr</name><operator>-&gt;</operator><name>itemsarr</name><index>[<expr><name><name>resarr</name><operator>-&gt;</operator><name>lastidx</name></name></expr>]</index></name> <operator>!=</operator> <name><name>resarr</name><operator>-&gt;</operator><name>invalidval</name></name></expr>)</condition><block type="pseudo"><block_content>
+				<break>break;</break></block_content></block></if></if_stmt>
+			<expr_stmt><expr><name><name>resarr</name><operator>-&gt;</operator><name>lastidx</name></name><operator>++</operator></expr>;</expr_stmt>
+		</block_content>}</block></for>
+	</block_content>}</block></else></if_stmt>
+
+	<expr_stmt><expr><operator>*</operator><name>value</name> <operator>=</operator> <name><name>resarr</name><operator>-&gt;</operator><name>itemsarr</name><index>[<expr><name><name>resarr</name><operator>-&gt;</operator><name>lastidx</name></name></expr>]</index></name></expr>;</expr_stmt>
+	<return>return <expr><name>true</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Trash a ResourceArray (we don't care about its state after this)
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>ResourceArrayFree</name><parameter_list>(<parameter><decl><type><name>ResourceArray</name> <modifier>*</modifier></type><name>resarr</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<if_stmt><if>if <condition>(<expr><name><name>resarr</name><operator>-&gt;</operator><name>itemsarr</name></name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>pfree</name><argument_list>(<argument><expr><name><name>resarr</name><operator>-&gt;</operator><name>itemsarr</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+</block_content>}</block></function>
+
+
+<comment type="block" format="doxygen">/*****************************************************************************
+ *	  EXPORTED ROUTINES														 *
+ *****************************************************************************/</comment>
+
+
+<comment type="block">/*
+ * ResourceOwnerCreate
+ *		Create an empty ResourceOwner.
+ *
+ * All ResourceOwner objects are kept in TopMemoryContext, since they should
+ * only be freed explicitly.
+ */</comment>
+<function><type><name>ResourceOwner</name></type>
+<name>ResourceOwnerCreate</name><parameter_list>(<parameter><decl><type><name>ResourceOwner</name></type> <name>parent</name></decl></parameter>, <parameter><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>name</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>ResourceOwner</name></type> <name>owner</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name>owner</name> <operator>=</operator> <operator>(</operator><name>ResourceOwner</name><operator>)</operator> <call><name>MemoryContextAllocZero</name><argument_list>(<argument><expr><name>TopMemoryContext</name></expr></argument>,
+												   <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>ResourceOwnerData</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>owner</name><operator>-&gt;</operator><name>name</name></name> <operator>=</operator> <name>name</name></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>parent</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name><name>owner</name><operator>-&gt;</operator><name>parent</name></name> <operator>=</operator> <name>parent</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>owner</name><operator>-&gt;</operator><name>nextchild</name></name> <operator>=</operator> <name><name>parent</name><operator>-&gt;</operator><name>firstchild</name></name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>parent</name><operator>-&gt;</operator><name>firstchild</name></name> <operator>=</operator> <name>owner</name></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>ResourceArrayInit</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>owner</name><operator>-&gt;</operator><name>bufferarr</name></name><operator>)</operator></expr></argument>, <argument><expr><call><name>BufferGetDatum</name><argument_list>(<argument><expr><name>InvalidBuffer</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>ResourceArrayInit</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>owner</name><operator>-&gt;</operator><name>catrefarr</name></name><operator>)</operator></expr></argument>, <argument><expr><call><name>PointerGetDatum</name><argument_list>(<argument><expr><name>NULL</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>ResourceArrayInit</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>owner</name><operator>-&gt;</operator><name>catlistrefarr</name></name><operator>)</operator></expr></argument>, <argument><expr><call><name>PointerGetDatum</name><argument_list>(<argument><expr><name>NULL</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>ResourceArrayInit</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>owner</name><operator>-&gt;</operator><name>relrefarr</name></name><operator>)</operator></expr></argument>, <argument><expr><call><name>PointerGetDatum</name><argument_list>(<argument><expr><name>NULL</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>ResourceArrayInit</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>owner</name><operator>-&gt;</operator><name>planrefarr</name></name><operator>)</operator></expr></argument>, <argument><expr><call><name>PointerGetDatum</name><argument_list>(<argument><expr><name>NULL</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>ResourceArrayInit</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>owner</name><operator>-&gt;</operator><name>tupdescarr</name></name><operator>)</operator></expr></argument>, <argument><expr><call><name>PointerGetDatum</name><argument_list>(<argument><expr><name>NULL</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>ResourceArrayInit</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>owner</name><operator>-&gt;</operator><name>snapshotarr</name></name><operator>)</operator></expr></argument>, <argument><expr><call><name>PointerGetDatum</name><argument_list>(<argument><expr><name>NULL</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>ResourceArrayInit</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>owner</name><operator>-&gt;</operator><name>filearr</name></name><operator>)</operator></expr></argument>, <argument><expr><call><name>FileGetDatum</name><argument_list>(<argument><expr><operator>-</operator><literal type="number">1</literal></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>ResourceArrayInit</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>owner</name><operator>-&gt;</operator><name>dsmarr</name></name><operator>)</operator></expr></argument>, <argument><expr><call><name>PointerGetDatum</name><argument_list>(<argument><expr><name>NULL</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>ResourceArrayInit</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>owner</name><operator>-&gt;</operator><name>jitarr</name></name><operator>)</operator></expr></argument>, <argument><expr><call><name>PointerGetDatum</name><argument_list>(<argument><expr><name>NULL</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<return>return <expr><name>owner</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * ResourceOwnerRelease
+ *		Release all resources owned by a ResourceOwner and its descendants,
+ *		but don't delete the owner objects themselves.
+ *
+ * Note that this executes just one phase of release, and so typically
+ * must be called three times.  We do it this way because (a) we want to
+ * do all the recursion separately for each phase, thereby preserving
+ * the needed order of operations; and (b) xact.c may have other operations
+ * to do between the phases.
+ *
+ * phase: release phase to execute
+ * isCommit: true for successful completion of a query or transaction,
+ *			false for unsuccessful
+ * isTopLevel: true if completing a main transaction, else false
+ *
+ * isCommit is passed because some modules may expect that their resources
+ * were all released already if the transaction or portal finished normally.
+ * If so it is reasonable to give a warning (NOT an error) should any
+ * unreleased resources be present.  When isCommit is false, such warnings
+ * are generally inappropriate.
+ *
+ * isTopLevel is passed when we are releasing TopTransactionResourceOwner
+ * at completion of a main transaction.  This generally means that *all*
+ * resources will be released, and so we can optimize things a bit.
+ */</comment>
+<function><type><name>void</name></type>
+<name>ResourceOwnerRelease</name><parameter_list>(<parameter><decl><type><name>ResourceOwner</name></type> <name>owner</name></decl></parameter>,
+					 <parameter><decl><type><name>ResourceReleasePhase</name></type> <name>phase</name></decl></parameter>,
+					 <parameter><decl><type><name>bool</name></type> <name>isCommit</name></decl></parameter>,
+					 <parameter><decl><type><name>bool</name></type> <name>isTopLevel</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<comment type="block">/* There's not currently any setup needed before recursing */</comment>
+	<expr_stmt><expr><call><name>ResourceOwnerReleaseInternal</name><argument_list>(<argument><expr><name>owner</name></expr></argument>, <argument><expr><name>phase</name></expr></argument>, <argument><expr><name>isCommit</name></expr></argument>, <argument><expr><name>isTopLevel</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>ResourceOwnerReleaseInternal</name><parameter_list>(<parameter><decl><type><name>ResourceOwner</name></type> <name>owner</name></decl></parameter>,
+							 <parameter><decl><type><name>ResourceReleasePhase</name></type> <name>phase</name></decl></parameter>,
+							 <parameter><decl><type><name>bool</name></type> <name>isCommit</name></decl></parameter>,
+							 <parameter><decl><type><name>bool</name></type> <name>isTopLevel</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>ResourceOwner</name></type> <name>child</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>ResourceOwner</name></type> <name>save</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>ResourceReleaseCallbackItem</name> <modifier>*</modifier></type><name>item</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Datum</name></type>		<name>foundres</name></decl>;</decl_stmt>
+
+	<comment type="block">/* Recurse to handle descendants */</comment>
+	<for>for <control>(<init><expr><name>child</name> <operator>=</operator> <name><name>owner</name><operator>-&gt;</operator><name>firstchild</name></name></expr>;</init> <condition><expr><name>child</name> <operator>!=</operator> <name>NULL</name></expr>;</condition> <incr><expr><name>child</name> <operator>=</operator> <name><name>child</name><operator>-&gt;</operator><name>nextchild</name></name></expr></incr>)</control><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ResourceOwnerReleaseInternal</name><argument_list>(<argument><expr><name>child</name></expr></argument>, <argument><expr><name>phase</name></expr></argument>, <argument><expr><name>isCommit</name></expr></argument>, <argument><expr><name>isTopLevel</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></for>
+
+	<comment type="block">/*
+	 * Make CurrentResourceOwner point to me, so that ReleaseBuffer etc don't
+	 * get confused.
+	 */</comment>
+	<expr_stmt><expr><name>save</name> <operator>=</operator> <name>CurrentResourceOwner</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name>CurrentResourceOwner</name> <operator>=</operator> <name>owner</name></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>phase</name> <operator>==</operator> <name>RESOURCE_RELEASE_BEFORE_LOCKS</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/*
+		 * Release buffer pins.  Note that ReleaseBuffer will remove the
+		 * buffer entry from our array, so we just have to iterate till there
+		 * are none.
+		 *
+		 * During a commit, there shouldn't be any remaining pins --- that
+		 * would indicate failure to clean up the executor correctly --- so
+		 * issue warnings.  In the abort case, just clean up quietly.
+		 */</comment>
+		<while>while <condition>(<expr><call><name>ResourceArrayGetAny</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>owner</name><operator>-&gt;</operator><name>bufferarr</name></name><operator>)</operator></expr></argument>, <argument><expr><operator>&amp;</operator><name>foundres</name></expr></argument>)</argument_list></call></expr>)</condition>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>Buffer</name></type>		<name>res</name> <init>= <expr><call><name>DatumGetBuffer</name><argument_list>(<argument><expr><name>foundres</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+			<if_stmt><if>if <condition>(<expr><name>isCommit</name></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><call><name>PrintBufferLeakWarning</name><argument_list>(<argument><expr><name>res</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+			<expr_stmt><expr><call><name>ReleaseBuffer</name><argument_list>(<argument><expr><name>res</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></while>
+
+		<comment type="block">/* Ditto for relcache references */</comment>
+		<while>while <condition>(<expr><call><name>ResourceArrayGetAny</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>owner</name><operator>-&gt;</operator><name>relrefarr</name></name><operator>)</operator></expr></argument>, <argument><expr><operator>&amp;</operator><name>foundres</name></expr></argument>)</argument_list></call></expr>)</condition>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>Relation</name></type>	<name>res</name> <init>= <expr><operator>(</operator><name>Relation</name><operator>)</operator> <call><name>DatumGetPointer</name><argument_list>(<argument><expr><name>foundres</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+			<if_stmt><if>if <condition>(<expr><name>isCommit</name></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><call><name>PrintRelCacheLeakWarning</name><argument_list>(<argument><expr><name>res</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+			<expr_stmt><expr><call><name>RelationClose</name><argument_list>(<argument><expr><name>res</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></while>
+
+		<comment type="block">/* Ditto for dynamic shared memory segments */</comment>
+		<while>while <condition>(<expr><call><name>ResourceArrayGetAny</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>owner</name><operator>-&gt;</operator><name>dsmarr</name></name><operator>)</operator></expr></argument>, <argument><expr><operator>&amp;</operator><name>foundres</name></expr></argument>)</argument_list></call></expr>)</condition>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>dsm_segment</name> <modifier>*</modifier></type><name>res</name> <init>= <expr><operator>(</operator><name>dsm_segment</name> <operator>*</operator><operator>)</operator> <call><name>DatumGetPointer</name><argument_list>(<argument><expr><name>foundres</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+			<if_stmt><if>if <condition>(<expr><name>isCommit</name></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><call><name>PrintDSMLeakWarning</name><argument_list>(<argument><expr><name>res</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+			<expr_stmt><expr><call><name>dsm_detach</name><argument_list>(<argument><expr><name>res</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></while>
+
+		<comment type="block">/* Ditto for JIT contexts */</comment>
+		<while>while <condition>(<expr><call><name>ResourceArrayGetAny</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>owner</name><operator>-&gt;</operator><name>jitarr</name></name><operator>)</operator></expr></argument>, <argument><expr><operator>&amp;</operator><name>foundres</name></expr></argument>)</argument_list></call></expr>)</condition>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>JitContext</name> <modifier>*</modifier></type><name>context</name> <init>= <expr><operator>(</operator><name>JitContext</name> <operator>*</operator><operator>)</operator> <call><name>PointerGetDatum</name><argument_list>(<argument><expr><name>foundres</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+			<expr_stmt><expr><call><name>jit_release_context</name><argument_list>(<argument><expr><name>context</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></while>
+	</block_content>}</block></if>
+	<if type="elseif">else if <condition>(<expr><name>phase</name> <operator>==</operator> <name>RESOURCE_RELEASE_LOCKS</name></expr>)</condition>
+	<block>{<block_content>
+		<if_stmt><if>if <condition>(<expr><name>isTopLevel</name></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/*
+			 * For a top-level xact we are going to release all locks (or at
+			 * least all non-session locks), so just do a single lmgr call at
+			 * the top of the recursion.
+			 */</comment>
+			<if_stmt><if>if <condition>(<expr><name>owner</name> <operator>==</operator> <name>TopTransactionResourceOwner</name></expr>)</condition>
+			<block>{<block_content>
+				<expr_stmt><expr><call><name>ProcReleaseLocks</name><argument_list>(<argument><expr><name>isCommit</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<expr_stmt><expr><call><name>ReleasePredicateLocks</name><argument_list>(<argument><expr><name>isCommit</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			</block_content>}</block></if></if_stmt>
+		</block_content>}</block></if>
+		<else>else
+		<block>{<block_content>
+			<comment type="block">/*
+			 * Release locks retail.  Note that if we are committing a
+			 * subtransaction, we do NOT release its locks yet, but transfer
+			 * them to the parent.
+			 */</comment>
+			<decl_stmt><decl><type><name>LOCALLOCK</name> <modifier>*</modifier><modifier>*</modifier></type><name>locks</name></decl>;</decl_stmt>
+			<decl_stmt><decl><type><name>int</name></type>			<name>nlocks</name></decl>;</decl_stmt>
+
+			<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>owner</name><operator>-&gt;</operator><name>parent</name></name> <operator>!=</operator> <name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+			<comment type="block">/*
+			 * Pass the list of locks owned by this resource owner to the lock
+			 * manager, unless it has overflowed.
+			 */</comment>
+			<if_stmt><if>if <condition>(<expr><name><name>owner</name><operator>-&gt;</operator><name>nlocks</name></name> <operator>&gt;</operator> <name>MAX_RESOWNER_LOCKS</name></expr>)</condition>
+			<block>{<block_content>
+				<expr_stmt><expr><name>locks</name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+				<expr_stmt><expr><name>nlocks</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+			</block_content>}</block></if>
+			<else>else
+			<block>{<block_content>
+				<expr_stmt><expr><name>locks</name> <operator>=</operator> <name><name>owner</name><operator>-&gt;</operator><name>locks</name></name></expr>;</expr_stmt>
+				<expr_stmt><expr><name>nlocks</name> <operator>=</operator> <name><name>owner</name><operator>-&gt;</operator><name>nlocks</name></name></expr>;</expr_stmt>
+			</block_content>}</block></else></if_stmt>
+
+			<if_stmt><if>if <condition>(<expr><name>isCommit</name></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><call><name>LockReassignCurrentOwner</name><argument_list>(<argument><expr><name>locks</name></expr></argument>, <argument><expr><name>nlocks</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if>
+			<else>else<block type="pseudo"><block_content>
+				<expr_stmt><expr><call><name>LockReleaseCurrentOwner</name><argument_list>(<argument><expr><name>locks</name></expr></argument>, <argument><expr><name>nlocks</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></else></if_stmt>
+		</block_content>}</block></else></if_stmt>
+	</block_content>}</block></if>
+	<if type="elseif">else if <condition>(<expr><name>phase</name> <operator>==</operator> <name>RESOURCE_RELEASE_AFTER_LOCKS</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/*
+		 * Release catcache references.  Note that ReleaseCatCache will remove
+		 * the catref entry from our array, so we just have to iterate till
+		 * there are none.
+		 *
+		 * As with buffer pins, warn if any are left at commit time.
+		 */</comment>
+		<while>while <condition>(<expr><call><name>ResourceArrayGetAny</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>owner</name><operator>-&gt;</operator><name>catrefarr</name></name><operator>)</operator></expr></argument>, <argument><expr><operator>&amp;</operator><name>foundres</name></expr></argument>)</argument_list></call></expr>)</condition>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>HeapTuple</name></type>	<name>res</name> <init>= <expr><operator>(</operator><name>HeapTuple</name><operator>)</operator> <call><name>DatumGetPointer</name><argument_list>(<argument><expr><name>foundres</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+			<if_stmt><if>if <condition>(<expr><name>isCommit</name></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><call><name>PrintCatCacheLeakWarning</name><argument_list>(<argument><expr><name>res</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+			<expr_stmt><expr><call><name>ReleaseCatCache</name><argument_list>(<argument><expr><name>res</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></while>
+
+		<comment type="block">/* Ditto for catcache lists */</comment>
+		<while>while <condition>(<expr><call><name>ResourceArrayGetAny</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>owner</name><operator>-&gt;</operator><name>catlistrefarr</name></name><operator>)</operator></expr></argument>, <argument><expr><operator>&amp;</operator><name>foundres</name></expr></argument>)</argument_list></call></expr>)</condition>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>CatCList</name>   <modifier>*</modifier></type><name>res</name> <init>= <expr><operator>(</operator><name>CatCList</name> <operator>*</operator><operator>)</operator> <call><name>DatumGetPointer</name><argument_list>(<argument><expr><name>foundres</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+			<if_stmt><if>if <condition>(<expr><name>isCommit</name></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><call><name>PrintCatCacheListLeakWarning</name><argument_list>(<argument><expr><name>res</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+			<expr_stmt><expr><call><name>ReleaseCatCacheList</name><argument_list>(<argument><expr><name>res</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></while>
+
+		<comment type="block">/* Ditto for plancache references */</comment>
+		<while>while <condition>(<expr><call><name>ResourceArrayGetAny</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>owner</name><operator>-&gt;</operator><name>planrefarr</name></name><operator>)</operator></expr></argument>, <argument><expr><operator>&amp;</operator><name>foundres</name></expr></argument>)</argument_list></call></expr>)</condition>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>CachedPlan</name> <modifier>*</modifier></type><name>res</name> <init>= <expr><operator>(</operator><name>CachedPlan</name> <operator>*</operator><operator>)</operator> <call><name>DatumGetPointer</name><argument_list>(<argument><expr><name>foundres</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+			<if_stmt><if>if <condition>(<expr><name>isCommit</name></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><call><name>PrintPlanCacheLeakWarning</name><argument_list>(<argument><expr><name>res</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+			<expr_stmt><expr><call><name>ReleaseCachedPlan</name><argument_list>(<argument><expr><name>res</name></expr></argument>, <argument><expr><name>true</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></while>
+
+		<comment type="block">/* Ditto for tupdesc references */</comment>
+		<while>while <condition>(<expr><call><name>ResourceArrayGetAny</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>owner</name><operator>-&gt;</operator><name>tupdescarr</name></name><operator>)</operator></expr></argument>, <argument><expr><operator>&amp;</operator><name>foundres</name></expr></argument>)</argument_list></call></expr>)</condition>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>TupleDesc</name></type>	<name>res</name> <init>= <expr><operator>(</operator><name>TupleDesc</name><operator>)</operator> <call><name>DatumGetPointer</name><argument_list>(<argument><expr><name>foundres</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+			<if_stmt><if>if <condition>(<expr><name>isCommit</name></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><call><name>PrintTupleDescLeakWarning</name><argument_list>(<argument><expr><name>res</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+			<expr_stmt><expr><call><name>DecrTupleDescRefCount</name><argument_list>(<argument><expr><name>res</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></while>
+
+		<comment type="block">/* Ditto for snapshot references */</comment>
+		<while>while <condition>(<expr><call><name>ResourceArrayGetAny</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>owner</name><operator>-&gt;</operator><name>snapshotarr</name></name><operator>)</operator></expr></argument>, <argument><expr><operator>&amp;</operator><name>foundres</name></expr></argument>)</argument_list></call></expr>)</condition>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>Snapshot</name></type>	<name>res</name> <init>= <expr><operator>(</operator><name>Snapshot</name><operator>)</operator> <call><name>DatumGetPointer</name><argument_list>(<argument><expr><name>foundres</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+			<if_stmt><if>if <condition>(<expr><name>isCommit</name></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><call><name>PrintSnapshotLeakWarning</name><argument_list>(<argument><expr><name>res</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+			<expr_stmt><expr><call><name>UnregisterSnapshot</name><argument_list>(<argument><expr><name>res</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></while>
+
+		<comment type="block">/* Ditto for temporary files */</comment>
+		<while>while <condition>(<expr><call><name>ResourceArrayGetAny</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>owner</name><operator>-&gt;</operator><name>filearr</name></name><operator>)</operator></expr></argument>, <argument><expr><operator>&amp;</operator><name>foundres</name></expr></argument>)</argument_list></call></expr>)</condition>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>File</name></type>		<name>res</name> <init>= <expr><call><name>DatumGetFile</name><argument_list>(<argument><expr><name>foundres</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+			<if_stmt><if>if <condition>(<expr><name>isCommit</name></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><call><name>PrintFileLeakWarning</name><argument_list>(<argument><expr><name>res</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+			<expr_stmt><expr><call><name>FileClose</name><argument_list>(<argument><expr><name>res</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></while>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/* Let add-on modules get a chance too */</comment>
+	<for>for <control>(<init><expr><name>item</name> <operator>=</operator> <name>ResourceRelease_callbacks</name></expr>;</init> <condition><expr><name>item</name></expr>;</condition> <incr><expr><name>item</name> <operator>=</operator> <name><name>item</name><operator>-&gt;</operator><name>next</name></name></expr></incr>)</control><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name><name>item</name><operator>-&gt;</operator><name>callback</name></name><argument_list>(<argument><expr><name>phase</name></expr></argument>, <argument><expr><name>isCommit</name></expr></argument>, <argument><expr><name>isTopLevel</name></expr></argument>, <argument><expr><name><name>item</name><operator>-&gt;</operator><name>arg</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></for>
+
+	<expr_stmt><expr><name>CurrentResourceOwner</name> <operator>=</operator> <name>save</name></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * ResourceOwnerDelete
+ *		Delete an owner object and its descendants.
+ *
+ * The caller must have already released all resources in the object tree.
+ */</comment>
+<function><type><name>void</name></type>
+<name>ResourceOwnerDelete</name><parameter_list>(<parameter><decl><type><name>ResourceOwner</name></type> <name>owner</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<comment type="block">/* We had better not be deleting CurrentResourceOwner ... */</comment>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>owner</name> <operator>!=</operator> <name>CurrentResourceOwner</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* And it better not own any resources, either */</comment>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>owner</name><operator>-&gt;</operator><name>bufferarr</name><operator>.</operator><name>nitems</name></name> <operator>==</operator> <literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>owner</name><operator>-&gt;</operator><name>catrefarr</name><operator>.</operator><name>nitems</name></name> <operator>==</operator> <literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>owner</name><operator>-&gt;</operator><name>catlistrefarr</name><operator>.</operator><name>nitems</name></name> <operator>==</operator> <literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>owner</name><operator>-&gt;</operator><name>relrefarr</name><operator>.</operator><name>nitems</name></name> <operator>==</operator> <literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>owner</name><operator>-&gt;</operator><name>planrefarr</name><operator>.</operator><name>nitems</name></name> <operator>==</operator> <literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>owner</name><operator>-&gt;</operator><name>tupdescarr</name><operator>.</operator><name>nitems</name></name> <operator>==</operator> <literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>owner</name><operator>-&gt;</operator><name>snapshotarr</name><operator>.</operator><name>nitems</name></name> <operator>==</operator> <literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>owner</name><operator>-&gt;</operator><name>filearr</name><operator>.</operator><name>nitems</name></name> <operator>==</operator> <literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>owner</name><operator>-&gt;</operator><name>dsmarr</name><operator>.</operator><name>nitems</name></name> <operator>==</operator> <literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>owner</name><operator>-&gt;</operator><name>jitarr</name><operator>.</operator><name>nitems</name></name> <operator>==</operator> <literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>owner</name><operator>-&gt;</operator><name>nlocks</name></name> <operator>==</operator> <literal type="number">0</literal> <operator>||</operator> <name><name>owner</name><operator>-&gt;</operator><name>nlocks</name></name> <operator>==</operator> <name>MAX_RESOWNER_LOCKS</name> <operator>+</operator> <literal type="number">1</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Delete children.  The recursive call will delink the child from me, so
+	 * just iterate as long as there is a child.
+	 */</comment>
+	<while>while <condition>(<expr><name><name>owner</name><operator>-&gt;</operator><name>firstchild</name></name> <operator>!=</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ResourceOwnerDelete</name><argument_list>(<argument><expr><name><name>owner</name><operator>-&gt;</operator><name>firstchild</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></while>
+
+	<comment type="block">/*
+	 * We delink the owner from its parent before deleting it, so that if
+	 * there's an error we won't have deleted/busted owners still attached to
+	 * the owner tree.  Better a leak than a crash.
+	 */</comment>
+	<expr_stmt><expr><call><name>ResourceOwnerNewParent</name><argument_list>(<argument><expr><name>owner</name></expr></argument>, <argument><expr><name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* And free the object. */</comment>
+	<expr_stmt><expr><call><name>ResourceArrayFree</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>owner</name><operator>-&gt;</operator><name>bufferarr</name></name><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>ResourceArrayFree</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>owner</name><operator>-&gt;</operator><name>catrefarr</name></name><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>ResourceArrayFree</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>owner</name><operator>-&gt;</operator><name>catlistrefarr</name></name><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>ResourceArrayFree</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>owner</name><operator>-&gt;</operator><name>relrefarr</name></name><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>ResourceArrayFree</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>owner</name><operator>-&gt;</operator><name>planrefarr</name></name><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>ResourceArrayFree</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>owner</name><operator>-&gt;</operator><name>tupdescarr</name></name><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>ResourceArrayFree</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>owner</name><operator>-&gt;</operator><name>snapshotarr</name></name><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>ResourceArrayFree</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>owner</name><operator>-&gt;</operator><name>filearr</name></name><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>ResourceArrayFree</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>owner</name><operator>-&gt;</operator><name>dsmarr</name></name><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>ResourceArrayFree</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>owner</name><operator>-&gt;</operator><name>jitarr</name></name><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>pfree</name><argument_list>(<argument><expr><name>owner</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Fetch parent of a ResourceOwner (returns NULL if top-level owner)
+ */</comment>
+<function><type><name>ResourceOwner</name></type>
+<name>ResourceOwnerGetParent</name><parameter_list>(<parameter><decl><type><name>ResourceOwner</name></type> <name>owner</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<return>return <expr><name><name>owner</name><operator>-&gt;</operator><name>parent</name></name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Reassign a ResourceOwner to have a new parent
+ */</comment>
+<function><type><name>void</name></type>
+<name>ResourceOwnerNewParent</name><parameter_list>(<parameter><decl><type><name>ResourceOwner</name></type> <name>owner</name></decl></parameter>,
+					   <parameter><decl><type><name>ResourceOwner</name></type> <name>newparent</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>ResourceOwner</name></type> <name>oldparent</name> <init>= <expr><name><name>owner</name><operator>-&gt;</operator><name>parent</name></name></expr></init></decl>;</decl_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>oldparent</name></expr>)</condition>
+	<block>{<block_content>
+		<if_stmt><if>if <condition>(<expr><name>owner</name> <operator>==</operator> <name><name>oldparent</name><operator>-&gt;</operator><name>firstchild</name></name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><name><name>oldparent</name><operator>-&gt;</operator><name>firstchild</name></name> <operator>=</operator> <name><name>owner</name><operator>-&gt;</operator><name>nextchild</name></name></expr>;</expr_stmt></block_content></block></if>
+		<else>else
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>ResourceOwner</name></type> <name>child</name></decl>;</decl_stmt>
+
+			<for>for <control>(<init><expr><name>child</name> <operator>=</operator> <name><name>oldparent</name><operator>-&gt;</operator><name>firstchild</name></name></expr>;</init> <condition><expr><name>child</name></expr>;</condition> <incr><expr><name>child</name> <operator>=</operator> <name><name>child</name><operator>-&gt;</operator><name>nextchild</name></name></expr></incr>)</control>
+			<block>{<block_content>
+				<if_stmt><if>if <condition>(<expr><name>owner</name> <operator>==</operator> <name><name>child</name><operator>-&gt;</operator><name>nextchild</name></name></expr>)</condition>
+				<block>{<block_content>
+					<expr_stmt><expr><name><name>child</name><operator>-&gt;</operator><name>nextchild</name></name> <operator>=</operator> <name><name>owner</name><operator>-&gt;</operator><name>nextchild</name></name></expr>;</expr_stmt>
+					<break>break;</break>
+				</block_content>}</block></if></if_stmt>
+			</block_content>}</block></for>
+		</block_content>}</block></else></if_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>newparent</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>owner</name> <operator>!=</operator> <name>newparent</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>owner</name><operator>-&gt;</operator><name>parent</name></name> <operator>=</operator> <name>newparent</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>owner</name><operator>-&gt;</operator><name>nextchild</name></name> <operator>=</operator> <name><name>newparent</name><operator>-&gt;</operator><name>firstchild</name></name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>newparent</name><operator>-&gt;</operator><name>firstchild</name></name> <operator>=</operator> <name>owner</name></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<else>else
+	<block>{<block_content>
+		<expr_stmt><expr><name><name>owner</name><operator>-&gt;</operator><name>parent</name></name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>owner</name><operator>-&gt;</operator><name>nextchild</name></name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+	</block_content>}</block></else></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Register or deregister callback functions for resource cleanup
+ *
+ * These functions are intended for use by dynamically loaded modules.
+ * For built-in modules we generally just hardwire the appropriate calls.
+ *
+ * Note that the callback occurs post-commit or post-abort, so the callback
+ * functions can only do noncritical cleanup.
+ */</comment>
+<function><type><name>void</name></type>
+<name>RegisterResourceReleaseCallback</name><parameter_list>(<parameter><decl><type><name>ResourceReleaseCallback</name></type> <name>callback</name></decl></parameter>, <parameter><decl><type><name>void</name> <modifier>*</modifier></type><name>arg</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>ResourceReleaseCallbackItem</name> <modifier>*</modifier></type><name>item</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name>item</name> <operator>=</operator> <operator>(</operator><name>ResourceReleaseCallbackItem</name> <operator>*</operator><operator>)</operator>
+		<call><name>MemoryContextAlloc</name><argument_list>(<argument><expr><name>TopMemoryContext</name></expr></argument>,
+						   <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>ResourceReleaseCallbackItem</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>item</name><operator>-&gt;</operator><name>callback</name></name> <operator>=</operator> <name>callback</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>item</name><operator>-&gt;</operator><name>arg</name></name> <operator>=</operator> <name>arg</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>item</name><operator>-&gt;</operator><name>next</name></name> <operator>=</operator> <name>ResourceRelease_callbacks</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name>ResourceRelease_callbacks</name> <operator>=</operator> <name>item</name></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<function><type><name>void</name></type>
+<name>UnregisterResourceReleaseCallback</name><parameter_list>(<parameter><decl><type><name>ResourceReleaseCallback</name></type> <name>callback</name></decl></parameter>, <parameter><decl><type><name>void</name> <modifier>*</modifier></type><name>arg</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>ResourceReleaseCallbackItem</name> <modifier>*</modifier></type><name>item</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>ResourceReleaseCallbackItem</name> <modifier>*</modifier></type><name>prev</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name>prev</name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+	<for>for <control>(<init><expr><name>item</name> <operator>=</operator> <name>ResourceRelease_callbacks</name></expr>;</init> <condition><expr><name>item</name></expr>;</condition> <incr><expr><name>prev</name> <operator>=</operator> <name>item</name></expr><operator>,</operator> <expr><name>item</name> <operator>=</operator> <name><name>item</name><operator>-&gt;</operator><name>next</name></name></expr></incr>)</control>
+	<block>{<block_content>
+		<if_stmt><if>if <condition>(<expr><name><name>item</name><operator>-&gt;</operator><name>callback</name></name> <operator>==</operator> <name>callback</name> <operator>&amp;&amp;</operator> <name><name>item</name><operator>-&gt;</operator><name>arg</name></name> <operator>==</operator> <name>arg</name></expr>)</condition>
+		<block>{<block_content>
+			<if_stmt><if>if <condition>(<expr><name>prev</name></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><name><name>prev</name><operator>-&gt;</operator><name>next</name></name> <operator>=</operator> <name><name>item</name><operator>-&gt;</operator><name>next</name></name></expr>;</expr_stmt></block_content></block></if>
+			<else>else<block type="pseudo"><block_content>
+				<expr_stmt><expr><name>ResourceRelease_callbacks</name> <operator>=</operator> <name><name>item</name><operator>-&gt;</operator><name>next</name></name></expr>;</expr_stmt></block_content></block></else></if_stmt>
+			<expr_stmt><expr><call><name>pfree</name><argument_list>(<argument><expr><name>item</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<break>break;</break>
+		</block_content>}</block></if></if_stmt>
+	</block_content>}</block></for>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * Make sure there is room for at least one more entry in a ResourceOwner's
+ * buffer array.
+ *
+ * This is separate from actually inserting an entry because if we run out
+ * of memory, it's critical to do so *before* acquiring the resource.
+ *
+ * We allow the case owner == NULL because the bufmgr is sometimes invoked
+ * outside any transaction (for example, during WAL recovery).
+ */</comment>
+<function><type><name>void</name></type>
+<name>ResourceOwnerEnlargeBuffers</name><parameter_list>(<parameter><decl><type><name>ResourceOwner</name></type> <name>owner</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<if_stmt><if>if <condition>(<expr><name>owner</name> <operator>==</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return;</return></block_content></block></if></if_stmt>
+	<expr_stmt><expr><call><name>ResourceArrayEnlarge</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>owner</name><operator>-&gt;</operator><name>bufferarr</name></name><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Remember that a buffer pin is owned by a ResourceOwner
+ *
+ * Caller must have previously done ResourceOwnerEnlargeBuffers()
+ *
+ * We allow the case owner == NULL because the bufmgr is sometimes invoked
+ * outside any transaction (for example, during WAL recovery).
+ */</comment>
+<function><type><name>void</name></type>
+<name>ResourceOwnerRememberBuffer</name><parameter_list>(<parameter><decl><type><name>ResourceOwner</name></type> <name>owner</name></decl></parameter>, <parameter><decl><type><name>Buffer</name></type> <name>buffer</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<if_stmt><if>if <condition>(<expr><name>owner</name> <operator>==</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return;</return></block_content></block></if></if_stmt>
+	<expr_stmt><expr><call><name>ResourceArrayAdd</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>owner</name><operator>-&gt;</operator><name>bufferarr</name></name><operator>)</operator></expr></argument>, <argument><expr><call><name>BufferGetDatum</name><argument_list>(<argument><expr><name>buffer</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Forget that a buffer pin is owned by a ResourceOwner
+ *
+ * We allow the case owner == NULL because the bufmgr is sometimes invoked
+ * outside any transaction (for example, during WAL recovery).
+ */</comment>
+<function><type><name>void</name></type>
+<name>ResourceOwnerForgetBuffer</name><parameter_list>(<parameter><decl><type><name>ResourceOwner</name></type> <name>owner</name></decl></parameter>, <parameter><decl><type><name>Buffer</name></type> <name>buffer</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<if_stmt><if>if <condition>(<expr><name>owner</name> <operator>==</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return;</return></block_content></block></if></if_stmt>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>ResourceArrayRemove</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>owner</name><operator>-&gt;</operator><name>bufferarr</name></name><operator>)</operator></expr></argument>, <argument><expr><call><name>BufferGetDatum</name><argument_list>(<argument><expr><name>buffer</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"buffer %d is not owned by resource owner %s"</literal></expr></argument>,
+			 <argument><expr><name>buffer</name></expr></argument>, <argument><expr><name><name>owner</name><operator>-&gt;</operator><name>name</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Remember that a Local Lock is owned by a ResourceOwner
+ *
+ * This is different from the other Remember functions in that the list of
+ * locks is only a lossy cache. It can hold up to MAX_RESOWNER_LOCKS entries,
+ * and when it overflows, we stop tracking locks. The point of only remembering
+ * only up to MAX_RESOWNER_LOCKS entries is that if a lot of locks are held,
+ * ResourceOwnerForgetLock doesn't need to scan through a large array to find
+ * the entry.
+ */</comment>
+<function><type><name>void</name></type>
+<name>ResourceOwnerRememberLock</name><parameter_list>(<parameter><decl><type><name>ResourceOwner</name></type> <name>owner</name></decl></parameter>, <parameter><decl><type><name>LOCALLOCK</name> <modifier>*</modifier></type><name>locallock</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>locallock</name> <operator>!=</operator> <name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name><name>owner</name><operator>-&gt;</operator><name>nlocks</name></name> <operator>&gt;</operator> <name>MAX_RESOWNER_LOCKS</name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return;</return></block_content></block></if></if_stmt>					<comment type="block">/* we have already overflowed */</comment>
+
+	<if_stmt><if>if <condition>(<expr><name><name>owner</name><operator>-&gt;</operator><name>nlocks</name></name> <operator>&lt;</operator> <name>MAX_RESOWNER_LOCKS</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name><name>owner</name><operator>-&gt;</operator><name>locks</name><index>[<expr><name><name>owner</name><operator>-&gt;</operator><name>nlocks</name></name></expr>]</index></name> <operator>=</operator> <name>locallock</name></expr>;</expr_stmt></block_content></block></if>
+	<else>else
+	<block>{<block_content>
+		<comment type="block">/* overflowed */</comment>
+	</block_content>}</block></else></if_stmt>
+	<expr_stmt><expr><name><name>owner</name><operator>-&gt;</operator><name>nlocks</name></name><operator>++</operator></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Forget that a Local Lock is owned by a ResourceOwner
+ */</comment>
+<function><type><name>void</name></type>
+<name>ResourceOwnerForgetLock</name><parameter_list>(<parameter><decl><type><name>ResourceOwner</name></type> <name>owner</name></decl></parameter>, <parameter><decl><type><name>LOCALLOCK</name> <modifier>*</modifier></type><name>locallock</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>int</name></type>			<name>i</name></decl>;</decl_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name><name>owner</name><operator>-&gt;</operator><name>nlocks</name></name> <operator>&gt;</operator> <name>MAX_RESOWNER_LOCKS</name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return;</return></block_content></block></if></if_stmt>					<comment type="block">/* we have overflowed */</comment>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>owner</name><operator>-&gt;</operator><name>nlocks</name></name> <operator>&gt;</operator> <literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<for>for <control>(<init><expr><name>i</name> <operator>=</operator> <name><name>owner</name><operator>-&gt;</operator><name>nlocks</name></name> <operator>-</operator> <literal type="number">1</literal></expr>;</init> <condition><expr><name>i</name> <operator>&gt;=</operator> <literal type="number">0</literal></expr>;</condition> <incr><expr><name>i</name><operator>--</operator></expr></incr>)</control>
+	<block>{<block_content>
+		<if_stmt><if>if <condition>(<expr><name>locallock</name> <operator>==</operator> <name><name>owner</name><operator>-&gt;</operator><name>locks</name><index>[<expr><name>i</name></expr>]</index></name></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><name><name>owner</name><operator>-&gt;</operator><name>locks</name><index>[<expr><name>i</name></expr>]</index></name> <operator>=</operator> <name><name>owner</name><operator>-&gt;</operator><name>locks</name><index>[<expr><name><name>owner</name><operator>-&gt;</operator><name>nlocks</name></name> <operator>-</operator> <literal type="number">1</literal></expr>]</index></name></expr>;</expr_stmt>
+			<expr_stmt><expr><name><name>owner</name><operator>-&gt;</operator><name>nlocks</name></name><operator>--</operator></expr>;</expr_stmt>
+			<return>return;</return>
+		</block_content>}</block></if></if_stmt>
+	</block_content>}</block></for>
+	<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"lock reference %p is not owned by resource owner %s"</literal></expr></argument>,
+		 <argument><expr><name>locallock</name></expr></argument>, <argument><expr><name><name>owner</name><operator>-&gt;</operator><name>name</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Make sure there is room for at least one more entry in a ResourceOwner's
+ * catcache reference array.
+ *
+ * This is separate from actually inserting an entry because if we run out
+ * of memory, it's critical to do so *before* acquiring the resource.
+ */</comment>
+<function><type><name>void</name></type>
+<name>ResourceOwnerEnlargeCatCacheRefs</name><parameter_list>(<parameter><decl><type><name>ResourceOwner</name></type> <name>owner</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>ResourceArrayEnlarge</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>owner</name><operator>-&gt;</operator><name>catrefarr</name></name><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Remember that a catcache reference is owned by a ResourceOwner
+ *
+ * Caller must have previously done ResourceOwnerEnlargeCatCacheRefs()
+ */</comment>
+<function><type><name>void</name></type>
+<name>ResourceOwnerRememberCatCacheRef</name><parameter_list>(<parameter><decl><type><name>ResourceOwner</name></type> <name>owner</name></decl></parameter>, <parameter><decl><type><name>HeapTuple</name></type> <name>tuple</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>ResourceArrayAdd</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>owner</name><operator>-&gt;</operator><name>catrefarr</name></name><operator>)</operator></expr></argument>, <argument><expr><call><name>PointerGetDatum</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Forget that a catcache reference is owned by a ResourceOwner
+ */</comment>
+<function><type><name>void</name></type>
+<name>ResourceOwnerForgetCatCacheRef</name><parameter_list>(<parameter><decl><type><name>ResourceOwner</name></type> <name>owner</name></decl></parameter>, <parameter><decl><type><name>HeapTuple</name></type> <name>tuple</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>ResourceArrayRemove</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>owner</name><operator>-&gt;</operator><name>catrefarr</name></name><operator>)</operator></expr></argument>, <argument><expr><call><name>PointerGetDatum</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"catcache reference %p is not owned by resource owner %s"</literal></expr></argument>,
+			 <argument><expr><name>tuple</name></expr></argument>, <argument><expr><name><name>owner</name><operator>-&gt;</operator><name>name</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Make sure there is room for at least one more entry in a ResourceOwner's
+ * catcache-list reference array.
+ *
+ * This is separate from actually inserting an entry because if we run out
+ * of memory, it's critical to do so *before* acquiring the resource.
+ */</comment>
+<function><type><name>void</name></type>
+<name>ResourceOwnerEnlargeCatCacheListRefs</name><parameter_list>(<parameter><decl><type><name>ResourceOwner</name></type> <name>owner</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>ResourceArrayEnlarge</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>owner</name><operator>-&gt;</operator><name>catlistrefarr</name></name><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Remember that a catcache-list reference is owned by a ResourceOwner
+ *
+ * Caller must have previously done ResourceOwnerEnlargeCatCacheListRefs()
+ */</comment>
+<function><type><name>void</name></type>
+<name>ResourceOwnerRememberCatCacheListRef</name><parameter_list>(<parameter><decl><type><name>ResourceOwner</name></type> <name>owner</name></decl></parameter>, <parameter><decl><type><name>CatCList</name> <modifier>*</modifier></type><name>list</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>ResourceArrayAdd</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>owner</name><operator>-&gt;</operator><name>catlistrefarr</name></name><operator>)</operator></expr></argument>, <argument><expr><call><name>PointerGetDatum</name><argument_list>(<argument><expr><name>list</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Forget that a catcache-list reference is owned by a ResourceOwner
+ */</comment>
+<function><type><name>void</name></type>
+<name>ResourceOwnerForgetCatCacheListRef</name><parameter_list>(<parameter><decl><type><name>ResourceOwner</name></type> <name>owner</name></decl></parameter>, <parameter><decl><type><name>CatCList</name> <modifier>*</modifier></type><name>list</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>ResourceArrayRemove</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>owner</name><operator>-&gt;</operator><name>catlistrefarr</name></name><operator>)</operator></expr></argument>, <argument><expr><call><name>PointerGetDatum</name><argument_list>(<argument><expr><name>list</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"catcache list reference %p is not owned by resource owner %s"</literal></expr></argument>,
+			 <argument><expr><name>list</name></expr></argument>, <argument><expr><name><name>owner</name><operator>-&gt;</operator><name>name</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Make sure there is room for at least one more entry in a ResourceOwner's
+ * relcache reference array.
+ *
+ * This is separate from actually inserting an entry because if we run out
+ * of memory, it's critical to do so *before* acquiring the resource.
+ */</comment>
+<function><type><name>void</name></type>
+<name>ResourceOwnerEnlargeRelationRefs</name><parameter_list>(<parameter><decl><type><name>ResourceOwner</name></type> <name>owner</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>ResourceArrayEnlarge</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>owner</name><operator>-&gt;</operator><name>relrefarr</name></name><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Remember that a relcache reference is owned by a ResourceOwner
+ *
+ * Caller must have previously done ResourceOwnerEnlargeRelationRefs()
+ */</comment>
+<function><type><name>void</name></type>
+<name>ResourceOwnerRememberRelationRef</name><parameter_list>(<parameter><decl><type><name>ResourceOwner</name></type> <name>owner</name></decl></parameter>, <parameter><decl><type><name>Relation</name></type> <name>rel</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>ResourceArrayAdd</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>owner</name><operator>-&gt;</operator><name>relrefarr</name></name><operator>)</operator></expr></argument>, <argument><expr><call><name>PointerGetDatum</name><argument_list>(<argument><expr><name>rel</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Forget that a relcache reference is owned by a ResourceOwner
+ */</comment>
+<function><type><name>void</name></type>
+<name>ResourceOwnerForgetRelationRef</name><parameter_list>(<parameter><decl><type><name>ResourceOwner</name></type> <name>owner</name></decl></parameter>, <parameter><decl><type><name>Relation</name></type> <name>rel</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>ResourceArrayRemove</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>owner</name><operator>-&gt;</operator><name>relrefarr</name></name><operator>)</operator></expr></argument>, <argument><expr><call><name>PointerGetDatum</name><argument_list>(<argument><expr><name>rel</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"relcache reference %s is not owned by resource owner %s"</literal></expr></argument>,
+			 <argument><expr><call><name>RelationGetRelationName</name><argument_list>(<argument><expr><name>rel</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name><name>owner</name><operator>-&gt;</operator><name>name</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Debugging subroutine
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>PrintRelCacheLeakWarning</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>rel</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>WARNING</name></expr></argument>, <argument><expr><literal type="string">"relcache reference leak: relation \"%s\" not closed"</literal></expr></argument>,
+		 <argument><expr><call><name>RelationGetRelationName</name><argument_list>(<argument><expr><name>rel</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Make sure there is room for at least one more entry in a ResourceOwner's
+ * plancache reference array.
+ *
+ * This is separate from actually inserting an entry because if we run out
+ * of memory, it's critical to do so *before* acquiring the resource.
+ */</comment>
+<function><type><name>void</name></type>
+<name>ResourceOwnerEnlargePlanCacheRefs</name><parameter_list>(<parameter><decl><type><name>ResourceOwner</name></type> <name>owner</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>ResourceArrayEnlarge</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>owner</name><operator>-&gt;</operator><name>planrefarr</name></name><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Remember that a plancache reference is owned by a ResourceOwner
+ *
+ * Caller must have previously done ResourceOwnerEnlargePlanCacheRefs()
+ */</comment>
+<function><type><name>void</name></type>
+<name>ResourceOwnerRememberPlanCacheRef</name><parameter_list>(<parameter><decl><type><name>ResourceOwner</name></type> <name>owner</name></decl></parameter>, <parameter><decl><type><name>CachedPlan</name> <modifier>*</modifier></type><name>plan</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>ResourceArrayAdd</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>owner</name><operator>-&gt;</operator><name>planrefarr</name></name><operator>)</operator></expr></argument>, <argument><expr><call><name>PointerGetDatum</name><argument_list>(<argument><expr><name>plan</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Forget that a plancache reference is owned by a ResourceOwner
+ */</comment>
+<function><type><name>void</name></type>
+<name>ResourceOwnerForgetPlanCacheRef</name><parameter_list>(<parameter><decl><type><name>ResourceOwner</name></type> <name>owner</name></decl></parameter>, <parameter><decl><type><name>CachedPlan</name> <modifier>*</modifier></type><name>plan</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>ResourceArrayRemove</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>owner</name><operator>-&gt;</operator><name>planrefarr</name></name><operator>)</operator></expr></argument>, <argument><expr><call><name>PointerGetDatum</name><argument_list>(<argument><expr><name>plan</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"plancache reference %p is not owned by resource owner %s"</literal></expr></argument>,
+			 <argument><expr><name>plan</name></expr></argument>, <argument><expr><name><name>owner</name><operator>-&gt;</operator><name>name</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Debugging subroutine
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>PrintPlanCacheLeakWarning</name><parameter_list>(<parameter><decl><type><name>CachedPlan</name> <modifier>*</modifier></type><name>plan</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>WARNING</name></expr></argument>, <argument><expr><literal type="string">"plancache reference leak: plan %p not closed"</literal></expr></argument>, <argument><expr><name>plan</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Make sure there is room for at least one more entry in a ResourceOwner's
+ * tupdesc reference array.
+ *
+ * This is separate from actually inserting an entry because if we run out
+ * of memory, it's critical to do so *before* acquiring the resource.
+ */</comment>
+<function><type><name>void</name></type>
+<name>ResourceOwnerEnlargeTupleDescs</name><parameter_list>(<parameter><decl><type><name>ResourceOwner</name></type> <name>owner</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>ResourceArrayEnlarge</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>owner</name><operator>-&gt;</operator><name>tupdescarr</name></name><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Remember that a tupdesc reference is owned by a ResourceOwner
+ *
+ * Caller must have previously done ResourceOwnerEnlargeTupleDescs()
+ */</comment>
+<function><type><name>void</name></type>
+<name>ResourceOwnerRememberTupleDesc</name><parameter_list>(<parameter><decl><type><name>ResourceOwner</name></type> <name>owner</name></decl></parameter>, <parameter><decl><type><name>TupleDesc</name></type> <name>tupdesc</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>ResourceArrayAdd</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>owner</name><operator>-&gt;</operator><name>tupdescarr</name></name><operator>)</operator></expr></argument>, <argument><expr><call><name>PointerGetDatum</name><argument_list>(<argument><expr><name>tupdesc</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Forget that a tupdesc reference is owned by a ResourceOwner
+ */</comment>
+<function><type><name>void</name></type>
+<name>ResourceOwnerForgetTupleDesc</name><parameter_list>(<parameter><decl><type><name>ResourceOwner</name></type> <name>owner</name></decl></parameter>, <parameter><decl><type><name>TupleDesc</name></type> <name>tupdesc</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>ResourceArrayRemove</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>owner</name><operator>-&gt;</operator><name>tupdescarr</name></name><operator>)</operator></expr></argument>, <argument><expr><call><name>PointerGetDatum</name><argument_list>(<argument><expr><name>tupdesc</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"tupdesc reference %p is not owned by resource owner %s"</literal></expr></argument>,
+			 <argument><expr><name>tupdesc</name></expr></argument>, <argument><expr><name><name>owner</name><operator>-&gt;</operator><name>name</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Debugging subroutine
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>PrintTupleDescLeakWarning</name><parameter_list>(<parameter><decl><type><name>TupleDesc</name></type> <name>tupdesc</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>WARNING</name></expr></argument>,
+		 <argument><expr><literal type="string">"TupleDesc reference leak: TupleDesc %p (%u,%d) still referenced"</literal></expr></argument>,
+		 <argument><expr><name>tupdesc</name></expr></argument>, <argument><expr><name><name>tupdesc</name><operator>-&gt;</operator><name>tdtypeid</name></name></expr></argument>, <argument><expr><name><name>tupdesc</name><operator>-&gt;</operator><name>tdtypmod</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Make sure there is room for at least one more entry in a ResourceOwner's
+ * snapshot reference array.
+ *
+ * This is separate from actually inserting an entry because if we run out
+ * of memory, it's critical to do so *before* acquiring the resource.
+ */</comment>
+<function><type><name>void</name></type>
+<name>ResourceOwnerEnlargeSnapshots</name><parameter_list>(<parameter><decl><type><name>ResourceOwner</name></type> <name>owner</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>ResourceArrayEnlarge</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>owner</name><operator>-&gt;</operator><name>snapshotarr</name></name><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Remember that a snapshot reference is owned by a ResourceOwner
+ *
+ * Caller must have previously done ResourceOwnerEnlargeSnapshots()
+ */</comment>
+<function><type><name>void</name></type>
+<name>ResourceOwnerRememberSnapshot</name><parameter_list>(<parameter><decl><type><name>ResourceOwner</name></type> <name>owner</name></decl></parameter>, <parameter><decl><type><name>Snapshot</name></type> <name>snapshot</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>ResourceArrayAdd</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>owner</name><operator>-&gt;</operator><name>snapshotarr</name></name><operator>)</operator></expr></argument>, <argument><expr><call><name>PointerGetDatum</name><argument_list>(<argument><expr><name>snapshot</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Forget that a snapshot reference is owned by a ResourceOwner
+ */</comment>
+<function><type><name>void</name></type>
+<name>ResourceOwnerForgetSnapshot</name><parameter_list>(<parameter><decl><type><name>ResourceOwner</name></type> <name>owner</name></decl></parameter>, <parameter><decl><type><name>Snapshot</name></type> <name>snapshot</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>ResourceArrayRemove</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>owner</name><operator>-&gt;</operator><name>snapshotarr</name></name><operator>)</operator></expr></argument>, <argument><expr><call><name>PointerGetDatum</name><argument_list>(<argument><expr><name>snapshot</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"snapshot reference %p is not owned by resource owner %s"</literal></expr></argument>,
+			 <argument><expr><name>snapshot</name></expr></argument>, <argument><expr><name><name>owner</name><operator>-&gt;</operator><name>name</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Debugging subroutine
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>PrintSnapshotLeakWarning</name><parameter_list>(<parameter><decl><type><name>Snapshot</name></type> <name>snapshot</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>WARNING</name></expr></argument>, <argument><expr><literal type="string">"Snapshot reference leak: Snapshot %p still referenced"</literal></expr></argument>,
+		 <argument><expr><name>snapshot</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * Make sure there is room for at least one more entry in a ResourceOwner's
+ * files reference array.
+ *
+ * This is separate from actually inserting an entry because if we run out
+ * of memory, it's critical to do so *before* acquiring the resource.
+ */</comment>
+<function><type><name>void</name></type>
+<name>ResourceOwnerEnlargeFiles</name><parameter_list>(<parameter><decl><type><name>ResourceOwner</name></type> <name>owner</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>ResourceArrayEnlarge</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>owner</name><operator>-&gt;</operator><name>filearr</name></name><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Remember that a temporary file is owned by a ResourceOwner
+ *
+ * Caller must have previously done ResourceOwnerEnlargeFiles()
+ */</comment>
+<function><type><name>void</name></type>
+<name>ResourceOwnerRememberFile</name><parameter_list>(<parameter><decl><type><name>ResourceOwner</name></type> <name>owner</name></decl></parameter>, <parameter><decl><type><name>File</name></type> <name>file</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>ResourceArrayAdd</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>owner</name><operator>-&gt;</operator><name>filearr</name></name><operator>)</operator></expr></argument>, <argument><expr><call><name>FileGetDatum</name><argument_list>(<argument><expr><name>file</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Forget that a temporary file is owned by a ResourceOwner
+ */</comment>
+<function><type><name>void</name></type>
+<name>ResourceOwnerForgetFile</name><parameter_list>(<parameter><decl><type><name>ResourceOwner</name></type> <name>owner</name></decl></parameter>, <parameter><decl><type><name>File</name></type> <name>file</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>ResourceArrayRemove</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>owner</name><operator>-&gt;</operator><name>filearr</name></name><operator>)</operator></expr></argument>, <argument><expr><call><name>FileGetDatum</name><argument_list>(<argument><expr><name>file</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"temporary file %d is not owned by resource owner %s"</literal></expr></argument>,
+			 <argument><expr><name>file</name></expr></argument>, <argument><expr><name><name>owner</name><operator>-&gt;</operator><name>name</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Debugging subroutine
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>PrintFileLeakWarning</name><parameter_list>(<parameter><decl><type><name>File</name></type> <name>file</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>WARNING</name></expr></argument>, <argument><expr><literal type="string">"temporary file leak: File %d still referenced"</literal></expr></argument>,
+		 <argument><expr><name>file</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Make sure there is room for at least one more entry in a ResourceOwner's
+ * dynamic shmem segment reference array.
+ *
+ * This is separate from actually inserting an entry because if we run out
+ * of memory, it's critical to do so *before* acquiring the resource.
+ */</comment>
+<function><type><name>void</name></type>
+<name>ResourceOwnerEnlargeDSMs</name><parameter_list>(<parameter><decl><type><name>ResourceOwner</name></type> <name>owner</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>ResourceArrayEnlarge</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>owner</name><operator>-&gt;</operator><name>dsmarr</name></name><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Remember that a dynamic shmem segment is owned by a ResourceOwner
+ *
+ * Caller must have previously done ResourceOwnerEnlargeDSMs()
+ */</comment>
+<function><type><name>void</name></type>
+<name>ResourceOwnerRememberDSM</name><parameter_list>(<parameter><decl><type><name>ResourceOwner</name></type> <name>owner</name></decl></parameter>, <parameter><decl><type><name>dsm_segment</name> <modifier>*</modifier></type><name>seg</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>ResourceArrayAdd</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>owner</name><operator>-&gt;</operator><name>dsmarr</name></name><operator>)</operator></expr></argument>, <argument><expr><call><name>PointerGetDatum</name><argument_list>(<argument><expr><name>seg</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Forget that a dynamic shmem segment is owned by a ResourceOwner
+ */</comment>
+<function><type><name>void</name></type>
+<name>ResourceOwnerForgetDSM</name><parameter_list>(<parameter><decl><type><name>ResourceOwner</name></type> <name>owner</name></decl></parameter>, <parameter><decl><type><name>dsm_segment</name> <modifier>*</modifier></type><name>seg</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>ResourceArrayRemove</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>owner</name><operator>-&gt;</operator><name>dsmarr</name></name><operator>)</operator></expr></argument>, <argument><expr><call><name>PointerGetDatum</name><argument_list>(<argument><expr><name>seg</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"dynamic shared memory segment %u is not owned by resource owner %s"</literal></expr></argument>,
+			 <argument><expr><call><name>dsm_segment_handle</name><argument_list>(<argument><expr><name>seg</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name><name>owner</name><operator>-&gt;</operator><name>name</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Debugging subroutine
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>PrintDSMLeakWarning</name><parameter_list>(<parameter><decl><type><name>dsm_segment</name> <modifier>*</modifier></type><name>seg</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>WARNING</name></expr></argument>, <argument><expr><literal type="string">"dynamic shared memory leak: segment %u still referenced"</literal></expr></argument>,
+		 <argument><expr><call><name>dsm_segment_handle</name><argument_list>(<argument><expr><name>seg</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Make sure there is room for at least one more entry in a ResourceOwner's
+ * JIT context reference array.
+ *
+ * This is separate from actually inserting an entry because if we run out of
+ * memory, it's critical to do so *before* acquiring the resource.
+ */</comment>
+<function><type><name>void</name></type>
+<name>ResourceOwnerEnlargeJIT</name><parameter_list>(<parameter><decl><type><name>ResourceOwner</name></type> <name>owner</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>ResourceArrayEnlarge</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>owner</name><operator>-&gt;</operator><name>jitarr</name></name><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Remember that a JIT context is owned by a ResourceOwner
+ *
+ * Caller must have previously done ResourceOwnerEnlargeJIT()
+ */</comment>
+<function><type><name>void</name></type>
+<name>ResourceOwnerRememberJIT</name><parameter_list>(<parameter><decl><type><name>ResourceOwner</name></type> <name>owner</name></decl></parameter>, <parameter><decl><type><name>Datum</name></type> <name>handle</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>ResourceArrayAdd</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>owner</name><operator>-&gt;</operator><name>jitarr</name></name><operator>)</operator></expr></argument>, <argument><expr><name>handle</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Forget that a JIT context is owned by a ResourceOwner
+ */</comment>
+<function><type><name>void</name></type>
+<name>ResourceOwnerForgetJIT</name><parameter_list>(<parameter><decl><type><name>ResourceOwner</name></type> <name>owner</name></decl></parameter>, <parameter><decl><type><name>Datum</name></type> <name>handle</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>ResourceArrayRemove</name><argument_list>(<argument><expr><operator>&amp;</operator><operator>(</operator><name><name>owner</name><operator>-&gt;</operator><name>jitarr</name></name><operator>)</operator></expr></argument>, <argument><expr><name>handle</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"JIT context %p is not owned by resource owner %s"</literal></expr></argument>,
+			 <argument><expr><call><name>DatumGetPointer</name><argument_list>(<argument><expr><name>handle</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name><name>owner</name><operator>-&gt;</operator><name>name</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+</block_content>}</block></function>
+</unit>

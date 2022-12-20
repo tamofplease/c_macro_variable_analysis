@@ -1,0 +1,1800 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<unit xmlns="http://www.srcML.org/srcML/src" xmlns:cpp="http://www.srcML.org/srcML/cpp" revision="1.0.0" language="C" filename="/cloned_projects/yugabyte-db/src/postgres/src/backend/utils/time/tqual.c"><comment type="block">/*-------------------------------------------------------------------------
+ *
+ * tqual.c
+ *	  POSTGRES "time qualification" code, ie, tuple visibility rules.
+ *
+ * NOTE: all the HeapTupleSatisfies routines will update the tuple's
+ * "hint" status bits if we see that the inserting or deleting transaction
+ * has now committed or aborted (and it is safe to set the hint bits).
+ * If the hint bits are changed, MarkBufferDirtyHint is called on
+ * the passed-in buffer.  The caller must hold not only a pin, but at least
+ * shared buffer content lock on the buffer containing the tuple.
+ *
+ * NOTE: When using a non-MVCC snapshot, we must check
+ * TransactionIdIsInProgress (which looks in the PGXACT array)
+ * before TransactionIdDidCommit/TransactionIdDidAbort (which look in
+ * pg_xact).  Otherwise we have a race condition: we might decide that a
+ * just-committed transaction crashed, because none of the tests succeed.
+ * xact.c is careful to record commit/abort in pg_xact before it unsets
+ * MyPgXact-&gt;xid in the PGXACT array.  That fixes that problem, but it
+ * also means there is a window where TransactionIdIsInProgress and
+ * TransactionIdDidCommit will both return true.  If we check only
+ * TransactionIdDidCommit, we could consider a tuple committed when a
+ * later GetSnapshotData call will still think the originating transaction
+ * is in progress, which leads to application-level inconsistency.  The
+ * upshot is that we gotta check TransactionIdIsInProgress first in all
+ * code paths, except for a few cases where we are looking at
+ * subtransactions of our own main transaction and so there can't be any
+ * race condition.
+ *
+ * When using an MVCC snapshot, we rely on XidInMVCCSnapshot rather than
+ * TransactionIdIsInProgress, but the logic is otherwise the same: do not
+ * check pg_xact until after deciding that the xact is no longer in progress.
+ *
+ *
+ * Summary of visibility functions:
+ *
+ *	 HeapTupleSatisfiesMVCC()
+ *		  visible to supplied snapshot, excludes current command
+ *	 HeapTupleSatisfiesUpdate()
+ *		  visible to instant snapshot, with user-supplied command
+ *		  counter and more complex result
+ *	 HeapTupleSatisfiesSelf()
+ *		  visible to instant snapshot and current command
+ *	 HeapTupleSatisfiesDirty()
+ *		  like HeapTupleSatisfiesSelf(), but includes open transactions
+ *	 HeapTupleSatisfiesVacuum()
+ *		  visible to any running transaction, used by VACUUM
+ *	 HeapTupleSatisfiesNonVacuumable()
+ *		  Snapshot-style API for HeapTupleSatisfiesVacuum
+ *	 HeapTupleSatisfiesToast()
+ *		  visible unless part of interrupted vacuum, used for TOAST
+ *	 HeapTupleSatisfiesAny()
+ *		  all tuples are visible
+ *
+ * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1994, Regents of the University of California
+ *
+ * IDENTIFICATION
+ *	  src/backend/utils/time/tqual.c
+ *
+ *-------------------------------------------------------------------------
+ */</comment>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"postgres.h"</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/htup_details.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/multixact.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/subtrans.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/transam.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/xact.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/xlog.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/bufmgr.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/procarray.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/builtins.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/combocid.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/snapmgr.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/tqual.h"</cpp:file></cpp:include>
+
+
+<comment type="block">/* Static variables representing various special snapshot semantics */</comment>
+<decl_stmt><decl><type><name>SnapshotData</name></type> <name>SnapshotSelfData</name> <init>= <expr><block>{<expr><name>HeapTupleSatisfiesSelf</name></expr>}</block></expr></init></decl>;</decl_stmt>
+<decl_stmt><decl><type><name>SnapshotData</name></type> <name>SnapshotAnyData</name> <init>= <expr><block>{<expr><name>HeapTupleSatisfiesAny</name></expr>}</block></expr></init></decl>;</decl_stmt>
+
+
+<comment type="block">/*
+ * SetHintBits()
+ *
+ * Set commit/abort hint bits on a tuple, if appropriate at this time.
+ *
+ * It is only safe to set a transaction-committed hint bit if we know the
+ * transaction's commit record is guaranteed to be flushed to disk before the
+ * buffer, or if the table is temporary or unlogged and will be obliterated by
+ * a crash anyway.  We cannot change the LSN of the page here, because we may
+ * hold only a share lock on the buffer, so we can only use the LSN to
+ * interlock this if the buffer's LSN already is newer than the commit LSN;
+ * otherwise we have to just refrain from setting the hint bit until some
+ * future re-examination of the tuple.
+ *
+ * We can always set hint bits when marking a transaction aborted.  (Some
+ * code in heapam.c relies on that!)
+ *
+ * Also, if we are cleaning up HEAP_MOVED_IN or HEAP_MOVED_OFF entries, then
+ * we can always set the hint bits, since pre-9.0 VACUUM FULL always used
+ * synchronous commits and didn't move tuples that weren't previously
+ * hinted.  (This is not known by this subroutine, but is applied by its
+ * callers.)  Note: old-style VACUUM FULL is gone, but we have to keep this
+ * module's support for MOVED_OFF/MOVED_IN flag bits for as long as we
+ * support in-place update from pre-9.0 databases.
+ *
+ * Normal commits may be asynchronous, so for those we need to get the LSN
+ * of the transaction and then check whether this is flushed.
+ *
+ * The caller should pass xid as the XID of the transaction to check, or
+ * InvalidTransactionId if no check is needed.
+ */</comment>
+<function><type><specifier>static</specifier> <specifier>inline</specifier> <name>void</name></type>
+<name>SetHintBits</name><parameter_list>(<parameter><decl><type><name>HeapTupleHeader</name></type> <name>tuple</name></decl></parameter>, <parameter><decl><type><name>Buffer</name></type> <name>buffer</name></decl></parameter>,
+			<parameter><decl><type><name>uint16</name></type> <name>infomask</name></decl></parameter>, <parameter><decl><type><name>TransactionId</name></type> <name>xid</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<if_stmt><if>if <condition>(<expr><call><name>TransactionIdIsValid</name><argument_list>(<argument><expr><name>xid</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* NB: xid must be known committed here! */</comment>
+		<decl_stmt><decl><type><name>XLogRecPtr</name></type>	<name>commitLSN</name> <init>= <expr><call><name>TransactionIdGetCommitLSN</name><argument_list>(<argument><expr><name>xid</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+		<if_stmt><if>if <condition>(<expr><call><name>BufferIsPermanent</name><argument_list>(<argument><expr><name>buffer</name></expr></argument>)</argument_list></call> <operator>&amp;&amp;</operator> <call><name>XLogNeedsFlush</name><argument_list>(<argument><expr><name>commitLSN</name></expr></argument>)</argument_list></call> <operator>&amp;&amp;</operator>
+			<call><name>BufferGetLSNAtomic</name><argument_list>(<argument><expr><name>buffer</name></expr></argument>)</argument_list></call> <operator>&lt;</operator> <name>commitLSN</name></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/* not flushed and no LSN interlock, so don't set hint */</comment>
+			<return>return;</return>
+		</block_content>}</block></if></if_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<expr_stmt><expr><name><name>tuple</name><operator>-&gt;</operator><name>t_infomask</name></name> <operator>|=</operator> <name>infomask</name></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>MarkBufferDirtyHint</name><argument_list>(<argument><expr><name>buffer</name></expr></argument>, <argument><expr><name>true</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * HeapTupleSetHintBits --- exported version of SetHintBits()
+ *
+ * This must be separate because of C99's brain-dead notions about how to
+ * implement inline functions.
+ */</comment>
+<function><type><name>void</name></type>
+<name>HeapTupleSetHintBits</name><parameter_list>(<parameter><decl><type><name>HeapTupleHeader</name></type> <name>tuple</name></decl></parameter>, <parameter><decl><type><name>Buffer</name></type> <name>buffer</name></decl></parameter>,
+					 <parameter><decl><type><name>uint16</name></type> <name>infomask</name></decl></parameter>, <parameter><decl><type><name>TransactionId</name></type> <name>xid</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>SetHintBits</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>, <argument><expr><name>buffer</name></expr></argument>, <argument><expr><name>infomask</name></expr></argument>, <argument><expr><name>xid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * HeapTupleSatisfiesSelf
+ *		True iff heap tuple is valid "for itself".
+ *
+ *	Here, we consider the effects of:
+ *		all committed transactions (as of the current instant)
+ *		previous commands of this transaction
+ *		changes made by the current command
+ *
+ * Note:
+ *		Assumes heap tuple is valid.
+ *
+ * The satisfaction of "itself" requires the following:
+ *
+ * ((Xmin == my-transaction &amp;&amp;				the row was updated by the current transaction, and
+ *		(Xmax is null						it was not deleted
+ *		 [|| Xmax != my-transaction)])			[or it was deleted by another transaction]
+ * ||
+ *
+ * (Xmin is committed &amp;&amp;					the row was modified by a committed transaction, and
+ *		(Xmax is null ||					the row has not been deleted, or
+ *			(Xmax != my-transaction &amp;&amp;			the row was deleted by another transaction
+ *			 Xmax is not committed)))			that has not been committed
+ */</comment>
+<function><type><name>bool</name></type>
+<name>HeapTupleSatisfiesSelf</name><parameter_list>(<parameter><decl><type><name>HeapTuple</name></type> <name>htup</name></decl></parameter>, <parameter><decl><type><name>Snapshot</name></type> <name>snapshot</name></decl></parameter>, <parameter><decl><type><name>Buffer</name></type> <name>buffer</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>HeapTupleHeader</name></type> <name>tuple</name> <init>= <expr><name><name>htup</name><operator>-&gt;</operator><name>t_data</name></name></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>ItemPointerIsValid</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>htup</name><operator>-&gt;</operator><name>t_self</name></name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>htup</name><operator>-&gt;</operator><name>t_tableOid</name></name> <operator>!=</operator> <name>InvalidOid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>HeapTupleHeaderXminCommitted</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<if_stmt><if>if <condition>(<expr><call><name>HeapTupleHeaderXminInvalid</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<return>return <expr><name>false</name></expr>;</return></block_content></block></if></if_stmt>
+
+		<comment type="block">/* Used by pre-9.0 binary upgrades */</comment>
+		<if_stmt><if>if <condition>(<expr><name><name>tuple</name><operator>-&gt;</operator><name>t_infomask</name></name> <operator>&amp;</operator> <name>HEAP_MOVED_OFF</name></expr>)</condition>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>TransactionId</name></type> <name>xvac</name> <init>= <expr><call><name>HeapTupleHeaderGetXvac</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+			<if_stmt><if>if <condition>(<expr><call><name>TransactionIdIsCurrentTransactionId</name><argument_list>(<argument><expr><name>xvac</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+				<return>return <expr><name>false</name></expr>;</return></block_content></block></if></if_stmt>
+			<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>TransactionIdIsInProgress</name><argument_list>(<argument><expr><name>xvac</name></expr></argument>)</argument_list></call></expr>)</condition>
+			<block>{<block_content>
+				<if_stmt><if>if <condition>(<expr><call><name>TransactionIdDidCommit</name><argument_list>(<argument><expr><name>xvac</name></expr></argument>)</argument_list></call></expr>)</condition>
+				<block>{<block_content>
+					<expr_stmt><expr><call><name>SetHintBits</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>, <argument><expr><name>buffer</name></expr></argument>, <argument><expr><name>HEAP_XMIN_INVALID</name></expr></argument>,
+								<argument><expr><name>InvalidTransactionId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+					<return>return <expr><name>false</name></expr>;</return>
+				</block_content>}</block></if></if_stmt>
+				<expr_stmt><expr><call><name>SetHintBits</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>, <argument><expr><name>buffer</name></expr></argument>, <argument><expr><name>HEAP_XMIN_COMMITTED</name></expr></argument>,
+							<argument><expr><name>InvalidTransactionId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			</block_content>}</block></if></if_stmt>
+		</block_content>}</block></if>
+		<comment type="block">/* Used by pre-9.0 binary upgrades */</comment>
+		<if type="elseif">else if <condition>(<expr><name><name>tuple</name><operator>-&gt;</operator><name>t_infomask</name></name> <operator>&amp;</operator> <name>HEAP_MOVED_IN</name></expr>)</condition>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>TransactionId</name></type> <name>xvac</name> <init>= <expr><call><name>HeapTupleHeaderGetXvac</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+			<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>TransactionIdIsCurrentTransactionId</name><argument_list>(<argument><expr><name>xvac</name></expr></argument>)</argument_list></call></expr>)</condition>
+			<block>{<block_content>
+				<if_stmt><if>if <condition>(<expr><call><name>TransactionIdIsInProgress</name><argument_list>(<argument><expr><name>xvac</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+					<return>return <expr><name>false</name></expr>;</return></block_content></block></if></if_stmt>
+				<if_stmt><if>if <condition>(<expr><call><name>TransactionIdDidCommit</name><argument_list>(<argument><expr><name>xvac</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+					<expr_stmt><expr><call><name>SetHintBits</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>, <argument><expr><name>buffer</name></expr></argument>, <argument><expr><name>HEAP_XMIN_COMMITTED</name></expr></argument>,
+								<argument><expr><name>InvalidTransactionId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if>
+				<else>else
+				<block>{<block_content>
+					<expr_stmt><expr><call><name>SetHintBits</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>, <argument><expr><name>buffer</name></expr></argument>, <argument><expr><name>HEAP_XMIN_INVALID</name></expr></argument>,
+								<argument><expr><name>InvalidTransactionId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+					<return>return <expr><name>false</name></expr>;</return>
+				</block_content>}</block></else></if_stmt>
+			</block_content>}</block></if></if_stmt>
+		</block_content>}</block></if>
+		<if type="elseif">else if <condition>(<expr><call><name>TransactionIdIsCurrentTransactionId</name><argument_list>(<argument><expr><call><name>HeapTupleHeaderGetRawXmin</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>)</condition>
+		<block>{<block_content>
+			<if_stmt><if>if <condition>(<expr><name><name>tuple</name><operator>-&gt;</operator><name>t_infomask</name></name> <operator>&amp;</operator> <name>HEAP_XMAX_INVALID</name></expr>)</condition><block type="pseudo"><block_content>	<comment type="block">/* xid invalid */</comment>
+				<return>return <expr><name>true</name></expr>;</return></block_content></block></if></if_stmt>
+
+			<if_stmt><if>if <condition>(<expr><call><name>HEAP_XMAX_IS_LOCKED_ONLY</name><argument_list>(<argument><expr><name><name>tuple</name><operator>-&gt;</operator><name>t_infomask</name></name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>	<comment type="block">/* not deleter */</comment>
+				<return>return <expr><name>true</name></expr>;</return></block_content></block></if></if_stmt>
+
+			<if_stmt><if>if <condition>(<expr><name><name>tuple</name><operator>-&gt;</operator><name>t_infomask</name></name> <operator>&amp;</operator> <name>HEAP_XMAX_IS_MULTI</name></expr>)</condition>
+			<block>{<block_content>
+				<decl_stmt><decl><type><name>TransactionId</name></type> <name>xmax</name></decl>;</decl_stmt>
+
+				<expr_stmt><expr><name>xmax</name> <operator>=</operator> <call><name>HeapTupleGetUpdateXid</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+				<comment type="block">/* not LOCKED_ONLY, so it has to have an xmax */</comment>
+				<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>TransactionIdIsValid</name><argument_list>(<argument><expr><name>xmax</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+				<comment type="block">/* updating subtransaction must have aborted */</comment>
+				<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>TransactionIdIsCurrentTransactionId</name><argument_list>(<argument><expr><name>xmax</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+					<return>return <expr><name>true</name></expr>;</return></block_content></block></if>
+				<else>else<block type="pseudo"><block_content>
+					<return>return <expr><name>false</name></expr>;</return></block_content></block></else></if_stmt>
+			</block_content>}</block></if></if_stmt>
+
+			<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>TransactionIdIsCurrentTransactionId</name><argument_list>(<argument><expr><call><name>HeapTupleHeaderGetRawXmax</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>)</condition>
+			<block>{<block_content>
+				<comment type="block">/* deleting subtransaction must have aborted */</comment>
+				<expr_stmt><expr><call><name>SetHintBits</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>, <argument><expr><name>buffer</name></expr></argument>, <argument><expr><name>HEAP_XMAX_INVALID</name></expr></argument>,
+							<argument><expr><name>InvalidTransactionId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<return>return <expr><name>true</name></expr>;</return>
+			</block_content>}</block></if></if_stmt>
+
+			<return>return <expr><name>false</name></expr>;</return>
+		</block_content>}</block></if>
+		<if type="elseif">else if <condition>(<expr><call><name>TransactionIdIsInProgress</name><argument_list>(<argument><expr><call><name>HeapTupleHeaderGetRawXmin</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<return>return <expr><name>false</name></expr>;</return></block_content></block></if>
+		<if type="elseif">else if <condition>(<expr><call><name>TransactionIdDidCommit</name><argument_list>(<argument><expr><call><name>HeapTupleHeaderGetRawXmin</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>SetHintBits</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>, <argument><expr><name>buffer</name></expr></argument>, <argument><expr><name>HEAP_XMIN_COMMITTED</name></expr></argument>,
+						<argument><expr><call><name>HeapTupleHeaderGetRawXmin</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if>
+		<else>else
+		<block>{<block_content>
+			<comment type="block">/* it must have aborted or crashed */</comment>
+			<expr_stmt><expr><call><name>SetHintBits</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>, <argument><expr><name>buffer</name></expr></argument>, <argument><expr><name>HEAP_XMIN_INVALID</name></expr></argument>,
+						<argument><expr><name>InvalidTransactionId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<return>return <expr><name>false</name></expr>;</return>
+		</block_content>}</block></else></if_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/* by here, the inserting transaction has committed */</comment>
+
+	<if_stmt><if>if <condition>(<expr><name><name>tuple</name><operator>-&gt;</operator><name>t_infomask</name></name> <operator>&amp;</operator> <name>HEAP_XMAX_INVALID</name></expr>)</condition><block type="pseudo"><block_content>	<comment type="block">/* xid invalid or aborted */</comment>
+		<return>return <expr><name>true</name></expr>;</return></block_content></block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name><name>tuple</name><operator>-&gt;</operator><name>t_infomask</name></name> <operator>&amp;</operator> <name>HEAP_XMAX_COMMITTED</name></expr>)</condition>
+	<block>{<block_content>
+		<if_stmt><if>if <condition>(<expr><call><name>HEAP_XMAX_IS_LOCKED_ONLY</name><argument_list>(<argument><expr><name><name>tuple</name><operator>-&gt;</operator><name>t_infomask</name></name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<return>return <expr><name>true</name></expr>;</return></block_content></block></if></if_stmt>
+		<return>return <expr><name>false</name></expr>;</return>			<comment type="block">/* updated by other */</comment>
+	</block_content>}</block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name><name>tuple</name><operator>-&gt;</operator><name>t_infomask</name></name> <operator>&amp;</operator> <name>HEAP_XMAX_IS_MULTI</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>TransactionId</name></type> <name>xmax</name></decl>;</decl_stmt>
+
+		<if_stmt><if>if <condition>(<expr><call><name>HEAP_XMAX_IS_LOCKED_ONLY</name><argument_list>(<argument><expr><name><name>tuple</name><operator>-&gt;</operator><name>t_infomask</name></name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<return>return <expr><name>true</name></expr>;</return></block_content></block></if></if_stmt>
+
+		<expr_stmt><expr><name>xmax</name> <operator>=</operator> <call><name>HeapTupleGetUpdateXid</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/* not LOCKED_ONLY, so it has to have an xmax */</comment>
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>TransactionIdIsValid</name><argument_list>(<argument><expr><name>xmax</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<if_stmt><if>if <condition>(<expr><call><name>TransactionIdIsCurrentTransactionId</name><argument_list>(<argument><expr><name>xmax</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<return>return <expr><name>false</name></expr>;</return></block_content></block></if></if_stmt>
+		<if_stmt><if>if <condition>(<expr><call><name>TransactionIdIsInProgress</name><argument_list>(<argument><expr><name>xmax</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<return>return <expr><name>true</name></expr>;</return></block_content></block></if></if_stmt>
+		<if_stmt><if>if <condition>(<expr><call><name>TransactionIdDidCommit</name><argument_list>(<argument><expr><name>xmax</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<return>return <expr><name>false</name></expr>;</return></block_content></block></if></if_stmt>
+		<comment type="block">/* it must have aborted or crashed */</comment>
+		<return>return <expr><name>true</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><call><name>TransactionIdIsCurrentTransactionId</name><argument_list>(<argument><expr><call><name>HeapTupleHeaderGetRawXmax</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<if_stmt><if>if <condition>(<expr><call><name>HEAP_XMAX_IS_LOCKED_ONLY</name><argument_list>(<argument><expr><name><name>tuple</name><operator>-&gt;</operator><name>t_infomask</name></name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<return>return <expr><name>true</name></expr>;</return></block_content></block></if></if_stmt>
+		<return>return <expr><name>false</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><call><name>TransactionIdIsInProgress</name><argument_list>(<argument><expr><call><name>HeapTupleHeaderGetRawXmax</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>true</name></expr>;</return></block_content></block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>TransactionIdDidCommit</name><argument_list>(<argument><expr><call><name>HeapTupleHeaderGetRawXmax</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* it must have aborted or crashed */</comment>
+		<expr_stmt><expr><call><name>SetHintBits</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>, <argument><expr><name>buffer</name></expr></argument>, <argument><expr><name>HEAP_XMAX_INVALID</name></expr></argument>,
+					<argument><expr><name>InvalidTransactionId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<return>return <expr><name>true</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/* xmax transaction committed */</comment>
+
+	<if_stmt><if>if <condition>(<expr><call><name>HEAP_XMAX_IS_LOCKED_ONLY</name><argument_list>(<argument><expr><name><name>tuple</name><operator>-&gt;</operator><name>t_infomask</name></name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>SetHintBits</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>, <argument><expr><name>buffer</name></expr></argument>, <argument><expr><name>HEAP_XMAX_INVALID</name></expr></argument>,
+					<argument><expr><name>InvalidTransactionId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<return>return <expr><name>true</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>SetHintBits</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>, <argument><expr><name>buffer</name></expr></argument>, <argument><expr><name>HEAP_XMAX_COMMITTED</name></expr></argument>,
+				<argument><expr><call><name>HeapTupleHeaderGetRawXmax</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<return>return <expr><name>false</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * HeapTupleSatisfiesAny
+ *		Dummy "satisfies" routine: any tuple satisfies SnapshotAny.
+ */</comment>
+<function><type><name>bool</name></type>
+<name>HeapTupleSatisfiesAny</name><parameter_list>(<parameter><decl><type><name>HeapTuple</name></type> <name>htup</name></decl></parameter>, <parameter><decl><type><name>Snapshot</name></type> <name>snapshot</name></decl></parameter>, <parameter><decl><type><name>Buffer</name></type> <name>buffer</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<return>return <expr><name>true</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * HeapTupleSatisfiesToast
+ *		True iff heap tuple is valid as a TOAST row.
+ *
+ * This is a simplified version that only checks for VACUUM moving conditions.
+ * It's appropriate for TOAST usage because TOAST really doesn't want to do
+ * its own time qual checks; if you can see the main table row that contains
+ * a TOAST reference, you should be able to see the TOASTed value.  However,
+ * vacuuming a TOAST table is independent of the main table, and in case such
+ * a vacuum fails partway through, we'd better do this much checking.
+ *
+ * Among other things, this means you can't do UPDATEs of rows in a TOAST
+ * table.
+ */</comment>
+<function><type><name>bool</name></type>
+<name>HeapTupleSatisfiesToast</name><parameter_list>(<parameter><decl><type><name>HeapTuple</name></type> <name>htup</name></decl></parameter>, <parameter><decl><type><name>Snapshot</name></type> <name>snapshot</name></decl></parameter>,
+						<parameter><decl><type><name>Buffer</name></type> <name>buffer</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>HeapTupleHeader</name></type> <name>tuple</name> <init>= <expr><name><name>htup</name><operator>-&gt;</operator><name>t_data</name></name></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>ItemPointerIsValid</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>htup</name><operator>-&gt;</operator><name>t_self</name></name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>htup</name><operator>-&gt;</operator><name>t_tableOid</name></name> <operator>!=</operator> <name>InvalidOid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>HeapTupleHeaderXminCommitted</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<if_stmt><if>if <condition>(<expr><call><name>HeapTupleHeaderXminInvalid</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<return>return <expr><name>false</name></expr>;</return></block_content></block></if></if_stmt>
+
+		<comment type="block">/* Used by pre-9.0 binary upgrades */</comment>
+		<if_stmt><if>if <condition>(<expr><name><name>tuple</name><operator>-&gt;</operator><name>t_infomask</name></name> <operator>&amp;</operator> <name>HEAP_MOVED_OFF</name></expr>)</condition>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>TransactionId</name></type> <name>xvac</name> <init>= <expr><call><name>HeapTupleHeaderGetXvac</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+			<if_stmt><if>if <condition>(<expr><call><name>TransactionIdIsCurrentTransactionId</name><argument_list>(<argument><expr><name>xvac</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+				<return>return <expr><name>false</name></expr>;</return></block_content></block></if></if_stmt>
+			<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>TransactionIdIsInProgress</name><argument_list>(<argument><expr><name>xvac</name></expr></argument>)</argument_list></call></expr>)</condition>
+			<block>{<block_content>
+				<if_stmt><if>if <condition>(<expr><call><name>TransactionIdDidCommit</name><argument_list>(<argument><expr><name>xvac</name></expr></argument>)</argument_list></call></expr>)</condition>
+				<block>{<block_content>
+					<expr_stmt><expr><call><name>SetHintBits</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>, <argument><expr><name>buffer</name></expr></argument>, <argument><expr><name>HEAP_XMIN_INVALID</name></expr></argument>,
+								<argument><expr><name>InvalidTransactionId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+					<return>return <expr><name>false</name></expr>;</return>
+				</block_content>}</block></if></if_stmt>
+				<expr_stmt><expr><call><name>SetHintBits</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>, <argument><expr><name>buffer</name></expr></argument>, <argument><expr><name>HEAP_XMIN_COMMITTED</name></expr></argument>,
+							<argument><expr><name>InvalidTransactionId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			</block_content>}</block></if></if_stmt>
+		</block_content>}</block></if>
+		<comment type="block">/* Used by pre-9.0 binary upgrades */</comment>
+		<if type="elseif">else if <condition>(<expr><name><name>tuple</name><operator>-&gt;</operator><name>t_infomask</name></name> <operator>&amp;</operator> <name>HEAP_MOVED_IN</name></expr>)</condition>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>TransactionId</name></type> <name>xvac</name> <init>= <expr><call><name>HeapTupleHeaderGetXvac</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+			<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>TransactionIdIsCurrentTransactionId</name><argument_list>(<argument><expr><name>xvac</name></expr></argument>)</argument_list></call></expr>)</condition>
+			<block>{<block_content>
+				<if_stmt><if>if <condition>(<expr><call><name>TransactionIdIsInProgress</name><argument_list>(<argument><expr><name>xvac</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+					<return>return <expr><name>false</name></expr>;</return></block_content></block></if></if_stmt>
+				<if_stmt><if>if <condition>(<expr><call><name>TransactionIdDidCommit</name><argument_list>(<argument><expr><name>xvac</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+					<expr_stmt><expr><call><name>SetHintBits</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>, <argument><expr><name>buffer</name></expr></argument>, <argument><expr><name>HEAP_XMIN_COMMITTED</name></expr></argument>,
+								<argument><expr><name>InvalidTransactionId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if>
+				<else>else
+				<block>{<block_content>
+					<expr_stmt><expr><call><name>SetHintBits</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>, <argument><expr><name>buffer</name></expr></argument>, <argument><expr><name>HEAP_XMIN_INVALID</name></expr></argument>,
+								<argument><expr><name>InvalidTransactionId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+					<return>return <expr><name>false</name></expr>;</return>
+				</block_content>}</block></else></if_stmt>
+			</block_content>}</block></if></if_stmt>
+		</block_content>}</block></if>
+
+		<comment type="block">/*
+		 * An invalid Xmin can be left behind by a speculative insertion that
+		 * is canceled by super-deleting the tuple.  This also applies to
+		 * TOAST tuples created during speculative insertion.
+		 */</comment>
+		<if type="elseif">else if <condition>(<expr><operator>!</operator><call><name>TransactionIdIsValid</name><argument_list>(<argument><expr><call><name>HeapTupleHeaderGetXmin</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<return>return <expr><name>false</name></expr>;</return></block_content></block></if></if_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/* otherwise assume the tuple is valid for TOAST. */</comment>
+	<return>return <expr><name>true</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * HeapTupleSatisfiesUpdate
+ *
+ *	This function returns a more detailed result code than most of the
+ *	functions in this file, since UPDATE needs to know more than "is it
+ *	visible?".  It also allows for user-supplied CommandId rather than
+ *	relying on CurrentCommandId.
+ *
+ *	The possible return codes are:
+ *
+ *	HeapTupleInvisible: the tuple didn't exist at all when the scan started,
+ *	e.g. it was created by a later CommandId.
+ *
+ *	HeapTupleMayBeUpdated: The tuple is valid and visible, so it may be
+ *	updated.
+ *
+ *	HeapTupleSelfUpdated: The tuple was updated by the current transaction,
+ *	after the current scan started.
+ *
+ *	HeapTupleUpdated: The tuple was updated by a committed transaction.
+ *
+ *	HeapTupleBeingUpdated: The tuple is being updated by an in-progress
+ *	transaction other than the current transaction.  (Note: this includes
+ *	the case where the tuple is share-locked by a MultiXact, even if the
+ *	MultiXact includes the current transaction.  Callers that want to
+ *	distinguish that case must test for it themselves.)
+ */</comment>
+<function><type><name>HTSU_Result</name></type>
+<name>HeapTupleSatisfiesUpdate</name><parameter_list>(<parameter><decl><type><name>HeapTuple</name></type> <name>htup</name></decl></parameter>, <parameter><decl><type><name>CommandId</name></type> <name>curcid</name></decl></parameter>,
+						 <parameter><decl><type><name>Buffer</name></type> <name>buffer</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>HeapTupleHeader</name></type> <name>tuple</name> <init>= <expr><name><name>htup</name><operator>-&gt;</operator><name>t_data</name></name></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>ItemPointerIsValid</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>htup</name><operator>-&gt;</operator><name>t_self</name></name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>htup</name><operator>-&gt;</operator><name>t_tableOid</name></name> <operator>!=</operator> <name>InvalidOid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>HeapTupleHeaderXminCommitted</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<if_stmt><if>if <condition>(<expr><call><name>HeapTupleHeaderXminInvalid</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<return>return <expr><name>HeapTupleInvisible</name></expr>;</return></block_content></block></if></if_stmt>
+
+		<comment type="block">/* Used by pre-9.0 binary upgrades */</comment>
+		<if_stmt><if>if <condition>(<expr><name><name>tuple</name><operator>-&gt;</operator><name>t_infomask</name></name> <operator>&amp;</operator> <name>HEAP_MOVED_OFF</name></expr>)</condition>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>TransactionId</name></type> <name>xvac</name> <init>= <expr><call><name>HeapTupleHeaderGetXvac</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+			<if_stmt><if>if <condition>(<expr><call><name>TransactionIdIsCurrentTransactionId</name><argument_list>(<argument><expr><name>xvac</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+				<return>return <expr><name>HeapTupleInvisible</name></expr>;</return></block_content></block></if></if_stmt>
+			<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>TransactionIdIsInProgress</name><argument_list>(<argument><expr><name>xvac</name></expr></argument>)</argument_list></call></expr>)</condition>
+			<block>{<block_content>
+				<if_stmt><if>if <condition>(<expr><call><name>TransactionIdDidCommit</name><argument_list>(<argument><expr><name>xvac</name></expr></argument>)</argument_list></call></expr>)</condition>
+				<block>{<block_content>
+					<expr_stmt><expr><call><name>SetHintBits</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>, <argument><expr><name>buffer</name></expr></argument>, <argument><expr><name>HEAP_XMIN_INVALID</name></expr></argument>,
+								<argument><expr><name>InvalidTransactionId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+					<return>return <expr><name>HeapTupleInvisible</name></expr>;</return>
+				</block_content>}</block></if></if_stmt>
+				<expr_stmt><expr><call><name>SetHintBits</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>, <argument><expr><name>buffer</name></expr></argument>, <argument><expr><name>HEAP_XMIN_COMMITTED</name></expr></argument>,
+							<argument><expr><name>InvalidTransactionId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			</block_content>}</block></if></if_stmt>
+		</block_content>}</block></if>
+		<comment type="block">/* Used by pre-9.0 binary upgrades */</comment>
+		<if type="elseif">else if <condition>(<expr><name><name>tuple</name><operator>-&gt;</operator><name>t_infomask</name></name> <operator>&amp;</operator> <name>HEAP_MOVED_IN</name></expr>)</condition>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>TransactionId</name></type> <name>xvac</name> <init>= <expr><call><name>HeapTupleHeaderGetXvac</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+			<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>TransactionIdIsCurrentTransactionId</name><argument_list>(<argument><expr><name>xvac</name></expr></argument>)</argument_list></call></expr>)</condition>
+			<block>{<block_content>
+				<if_stmt><if>if <condition>(<expr><call><name>TransactionIdIsInProgress</name><argument_list>(<argument><expr><name>xvac</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+					<return>return <expr><name>HeapTupleInvisible</name></expr>;</return></block_content></block></if></if_stmt>
+				<if_stmt><if>if <condition>(<expr><call><name>TransactionIdDidCommit</name><argument_list>(<argument><expr><name>xvac</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+					<expr_stmt><expr><call><name>SetHintBits</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>, <argument><expr><name>buffer</name></expr></argument>, <argument><expr><name>HEAP_XMIN_COMMITTED</name></expr></argument>,
+								<argument><expr><name>InvalidTransactionId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if>
+				<else>else
+				<block>{<block_content>
+					<expr_stmt><expr><call><name>SetHintBits</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>, <argument><expr><name>buffer</name></expr></argument>, <argument><expr><name>HEAP_XMIN_INVALID</name></expr></argument>,
+								<argument><expr><name>InvalidTransactionId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+					<return>return <expr><name>HeapTupleInvisible</name></expr>;</return>
+				</block_content>}</block></else></if_stmt>
+			</block_content>}</block></if></if_stmt>
+		</block_content>}</block></if>
+		<if type="elseif">else if <condition>(<expr><call><name>TransactionIdIsCurrentTransactionId</name><argument_list>(<argument><expr><call><name>HeapTupleHeaderGetRawXmin</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>)</condition>
+		<block>{<block_content>
+			<if_stmt><if>if <condition>(<expr><call><name>HeapTupleHeaderGetCmin</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call> <operator>&gt;=</operator> <name>curcid</name></expr>)</condition><block type="pseudo"><block_content>
+				<return>return <expr><name>HeapTupleInvisible</name></expr>;</return></block_content></block></if></if_stmt>	<comment type="block">/* inserted after scan started */</comment>
+
+			<if_stmt><if>if <condition>(<expr><name><name>tuple</name><operator>-&gt;</operator><name>t_infomask</name></name> <operator>&amp;</operator> <name>HEAP_XMAX_INVALID</name></expr>)</condition><block type="pseudo"><block_content>	<comment type="block">/* xid invalid */</comment>
+				<return>return <expr><name>HeapTupleMayBeUpdated</name></expr>;</return></block_content></block></if></if_stmt>
+
+			<if_stmt><if>if <condition>(<expr><call><name>HEAP_XMAX_IS_LOCKED_ONLY</name><argument_list>(<argument><expr><name><name>tuple</name><operator>-&gt;</operator><name>t_infomask</name></name></expr></argument>)</argument_list></call></expr>)</condition>
+			<block>{<block_content>
+				<decl_stmt><decl><type><name>TransactionId</name></type> <name>xmax</name></decl>;</decl_stmt>
+
+				<expr_stmt><expr><name>xmax</name> <operator>=</operator> <call><name>HeapTupleHeaderGetRawXmax</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+				<comment type="block">/*
+				 * Careful here: even though this tuple was created by our own
+				 * transaction, it might be locked by other transactions, if
+				 * the original version was key-share locked when we updated
+				 * it.
+				 */</comment>
+
+				<if_stmt><if>if <condition>(<expr><name><name>tuple</name><operator>-&gt;</operator><name>t_infomask</name></name> <operator>&amp;</operator> <name>HEAP_XMAX_IS_MULTI</name></expr>)</condition>
+				<block>{<block_content>
+					<if_stmt><if>if <condition>(<expr><call><name>MultiXactIdIsRunning</name><argument_list>(<argument><expr><name>xmax</name></expr></argument>, <argument><expr><name>true</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+						<return>return <expr><name>HeapTupleBeingUpdated</name></expr>;</return></block_content></block></if>
+					<else>else<block type="pseudo"><block_content>
+						<return>return <expr><name>HeapTupleMayBeUpdated</name></expr>;</return></block_content></block></else></if_stmt>
+				</block_content>}</block></if></if_stmt>
+
+				<comment type="block">/*
+				 * If the locker is gone, then there is nothing of interest
+				 * left in this Xmax; otherwise, report the tuple as
+				 * locked/updated.
+				 */</comment>
+				<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>TransactionIdIsInProgress</name><argument_list>(<argument><expr><name>xmax</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+					<return>return <expr><name>HeapTupleMayBeUpdated</name></expr>;</return></block_content></block></if></if_stmt>
+				<return>return <expr><name>HeapTupleBeingUpdated</name></expr>;</return>
+			</block_content>}</block></if></if_stmt>
+
+			<if_stmt><if>if <condition>(<expr><name><name>tuple</name><operator>-&gt;</operator><name>t_infomask</name></name> <operator>&amp;</operator> <name>HEAP_XMAX_IS_MULTI</name></expr>)</condition>
+			<block>{<block_content>
+				<decl_stmt><decl><type><name>TransactionId</name></type> <name>xmax</name></decl>;</decl_stmt>
+
+				<expr_stmt><expr><name>xmax</name> <operator>=</operator> <call><name>HeapTupleGetUpdateXid</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+				<comment type="block">/* not LOCKED_ONLY, so it has to have an xmax */</comment>
+				<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>TransactionIdIsValid</name><argument_list>(<argument><expr><name>xmax</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+				<comment type="block">/* deleting subtransaction must have aborted */</comment>
+				<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>TransactionIdIsCurrentTransactionId</name><argument_list>(<argument><expr><name>xmax</name></expr></argument>)</argument_list></call></expr>)</condition>
+				<block>{<block_content>
+					<if_stmt><if>if <condition>(<expr><call><name>MultiXactIdIsRunning</name><argument_list>(<argument><expr><call><name>HeapTupleHeaderGetRawXmax</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></argument>,
+											 <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+						<return>return <expr><name>HeapTupleBeingUpdated</name></expr>;</return></block_content></block></if></if_stmt>
+					<return>return <expr><name>HeapTupleMayBeUpdated</name></expr>;</return>
+				</block_content>}</block></if>
+				<else>else
+				<block>{<block_content>
+					<if_stmt><if>if <condition>(<expr><call><name>HeapTupleHeaderGetCmax</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call> <operator>&gt;=</operator> <name>curcid</name></expr>)</condition><block type="pseudo"><block_content>
+						<return>return <expr><name>HeapTupleSelfUpdated</name></expr>;</return></block_content></block></if>	<comment type="block">/* updated after scan
+														 * started */</comment>
+					<else>else<block type="pseudo"><block_content>
+						<return>return <expr><name>HeapTupleInvisible</name></expr>;</return></block_content></block></else></if_stmt>	<comment type="block">/* updated before scan
+													 * started */</comment>
+				</block_content>}</block></else></if_stmt>
+			</block_content>}</block></if></if_stmt>
+
+			<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>TransactionIdIsCurrentTransactionId</name><argument_list>(<argument><expr><call><name>HeapTupleHeaderGetRawXmax</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>)</condition>
+			<block>{<block_content>
+				<comment type="block">/* deleting subtransaction must have aborted */</comment>
+				<expr_stmt><expr><call><name>SetHintBits</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>, <argument><expr><name>buffer</name></expr></argument>, <argument><expr><name>HEAP_XMAX_INVALID</name></expr></argument>,
+							<argument><expr><name>InvalidTransactionId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<return>return <expr><name>HeapTupleMayBeUpdated</name></expr>;</return>
+			</block_content>}</block></if></if_stmt>
+
+			<if_stmt><if>if <condition>(<expr><call><name>HeapTupleHeaderGetCmax</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call> <operator>&gt;=</operator> <name>curcid</name></expr>)</condition><block type="pseudo"><block_content>
+				<return>return <expr><name>HeapTupleSelfUpdated</name></expr>;</return></block_content></block></if>	<comment type="block">/* updated after scan started */</comment>
+			<else>else<block type="pseudo"><block_content>
+				<return>return <expr><name>HeapTupleInvisible</name></expr>;</return></block_content></block></else></if_stmt>	<comment type="block">/* updated before scan started */</comment>
+		</block_content>}</block></if>
+		<if type="elseif">else if <condition>(<expr><call><name>TransactionIdIsInProgress</name><argument_list>(<argument><expr><call><name>HeapTupleHeaderGetRawXmin</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<return>return <expr><name>HeapTupleInvisible</name></expr>;</return></block_content></block></if>
+		<if type="elseif">else if <condition>(<expr><call><name>TransactionIdDidCommit</name><argument_list>(<argument><expr><call><name>HeapTupleHeaderGetRawXmin</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>SetHintBits</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>, <argument><expr><name>buffer</name></expr></argument>, <argument><expr><name>HEAP_XMIN_COMMITTED</name></expr></argument>,
+						<argument><expr><call><name>HeapTupleHeaderGetRawXmin</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if>
+		<else>else
+		<block>{<block_content>
+			<comment type="block">/* it must have aborted or crashed */</comment>
+			<expr_stmt><expr><call><name>SetHintBits</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>, <argument><expr><name>buffer</name></expr></argument>, <argument><expr><name>HEAP_XMIN_INVALID</name></expr></argument>,
+						<argument><expr><name>InvalidTransactionId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<return>return <expr><name>HeapTupleInvisible</name></expr>;</return>
+		</block_content>}</block></else></if_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/* by here, the inserting transaction has committed */</comment>
+
+	<if_stmt><if>if <condition>(<expr><name><name>tuple</name><operator>-&gt;</operator><name>t_infomask</name></name> <operator>&amp;</operator> <name>HEAP_XMAX_INVALID</name></expr>)</condition><block type="pseudo"><block_content>	<comment type="block">/* xid invalid or aborted */</comment>
+		<return>return <expr><name>HeapTupleMayBeUpdated</name></expr>;</return></block_content></block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name><name>tuple</name><operator>-&gt;</operator><name>t_infomask</name></name> <operator>&amp;</operator> <name>HEAP_XMAX_COMMITTED</name></expr>)</condition>
+	<block>{<block_content>
+		<if_stmt><if>if <condition>(<expr><call><name>HEAP_XMAX_IS_LOCKED_ONLY</name><argument_list>(<argument><expr><name><name>tuple</name><operator>-&gt;</operator><name>t_infomask</name></name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<return>return <expr><name>HeapTupleMayBeUpdated</name></expr>;</return></block_content></block></if></if_stmt>
+		<return>return <expr><name>HeapTupleUpdated</name></expr>;</return>	<comment type="block">/* updated by other */</comment>
+	</block_content>}</block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name><name>tuple</name><operator>-&gt;</operator><name>t_infomask</name></name> <operator>&amp;</operator> <name>HEAP_XMAX_IS_MULTI</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>TransactionId</name></type> <name>xmax</name></decl>;</decl_stmt>
+
+		<if_stmt><if>if <condition>(<expr><call><name>HEAP_LOCKED_UPGRADED</name><argument_list>(<argument><expr><name><name>tuple</name><operator>-&gt;</operator><name>t_infomask</name></name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<return>return <expr><name>HeapTupleMayBeUpdated</name></expr>;</return></block_content></block></if></if_stmt>
+
+		<if_stmt><if>if <condition>(<expr><call><name>HEAP_XMAX_IS_LOCKED_ONLY</name><argument_list>(<argument><expr><name><name>tuple</name><operator>-&gt;</operator><name>t_infomask</name></name></expr></argument>)</argument_list></call></expr>)</condition>
+		<block>{<block_content>
+			<if_stmt><if>if <condition>(<expr><call><name>MultiXactIdIsRunning</name><argument_list>(<argument><expr><call><name>HeapTupleHeaderGetRawXmax</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>true</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+				<return>return <expr><name>HeapTupleBeingUpdated</name></expr>;</return></block_content></block></if></if_stmt>
+
+			<expr_stmt><expr><call><name>SetHintBits</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>, <argument><expr><name>buffer</name></expr></argument>, <argument><expr><name>HEAP_XMAX_INVALID</name></expr></argument>, <argument><expr><name>InvalidTransactionId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<return>return <expr><name>HeapTupleMayBeUpdated</name></expr>;</return>
+		</block_content>}</block></if></if_stmt>
+
+		<expr_stmt><expr><name>xmax</name> <operator>=</operator> <call><name>HeapTupleGetUpdateXid</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>TransactionIdIsValid</name><argument_list>(<argument><expr><name>xmax</name></expr></argument>)</argument_list></call></expr>)</condition>
+		<block>{<block_content>
+			<if_stmt><if>if <condition>(<expr><call><name>MultiXactIdIsRunning</name><argument_list>(<argument><expr><call><name>HeapTupleHeaderGetRawXmax</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+				<return>return <expr><name>HeapTupleBeingUpdated</name></expr>;</return></block_content></block></if></if_stmt>
+		</block_content>}</block></if></if_stmt>
+
+		<comment type="block">/* not LOCKED_ONLY, so it has to have an xmax */</comment>
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>TransactionIdIsValid</name><argument_list>(<argument><expr><name>xmax</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<if_stmt><if>if <condition>(<expr><call><name>TransactionIdIsCurrentTransactionId</name><argument_list>(<argument><expr><name>xmax</name></expr></argument>)</argument_list></call></expr>)</condition>
+		<block>{<block_content>
+			<if_stmt><if>if <condition>(<expr><call><name>HeapTupleHeaderGetCmax</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call> <operator>&gt;=</operator> <name>curcid</name></expr>)</condition><block type="pseudo"><block_content>
+				<return>return <expr><name>HeapTupleSelfUpdated</name></expr>;</return></block_content></block></if>	<comment type="block">/* updated after scan started */</comment>
+			<else>else<block type="pseudo"><block_content>
+				<return>return <expr><name>HeapTupleInvisible</name></expr>;</return></block_content></block></else></if_stmt>	<comment type="block">/* updated before scan started */</comment>
+		</block_content>}</block></if></if_stmt>
+
+		<if_stmt><if>if <condition>(<expr><call><name>MultiXactIdIsRunning</name><argument_list>(<argument><expr><call><name>HeapTupleHeaderGetRawXmax</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<return>return <expr><name>HeapTupleBeingUpdated</name></expr>;</return></block_content></block></if></if_stmt>
+
+		<if_stmt><if>if <condition>(<expr><call><name>TransactionIdDidCommit</name><argument_list>(<argument><expr><name>xmax</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<return>return <expr><name>HeapTupleUpdated</name></expr>;</return></block_content></block></if></if_stmt>
+
+		<comment type="block">/*
+		 * By here, the update in the Xmax is either aborted or crashed, but
+		 * what about the other members?
+		 */</comment>
+
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>MultiXactIdIsRunning</name><argument_list>(<argument><expr><call><name>HeapTupleHeaderGetRawXmax</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/*
+			 * There's no member, even just a locker, alive anymore, so we can
+			 * mark the Xmax as invalid.
+			 */</comment>
+			<expr_stmt><expr><call><name>SetHintBits</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>, <argument><expr><name>buffer</name></expr></argument>, <argument><expr><name>HEAP_XMAX_INVALID</name></expr></argument>,
+						<argument><expr><name>InvalidTransactionId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<return>return <expr><name>HeapTupleMayBeUpdated</name></expr>;</return>
+		</block_content>}</block></if>
+		<else>else
+		<block>{<block_content>
+			<comment type="block">/* There are lockers running */</comment>
+			<return>return <expr><name>HeapTupleBeingUpdated</name></expr>;</return>
+		</block_content>}</block></else></if_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><call><name>TransactionIdIsCurrentTransactionId</name><argument_list>(<argument><expr><call><name>HeapTupleHeaderGetRawXmax</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<if_stmt><if>if <condition>(<expr><call><name>HEAP_XMAX_IS_LOCKED_ONLY</name><argument_list>(<argument><expr><name><name>tuple</name><operator>-&gt;</operator><name>t_infomask</name></name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<return>return <expr><name>HeapTupleBeingUpdated</name></expr>;</return></block_content></block></if></if_stmt>
+		<if_stmt><if>if <condition>(<expr><call><name>HeapTupleHeaderGetCmax</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call> <operator>&gt;=</operator> <name>curcid</name></expr>)</condition><block type="pseudo"><block_content>
+			<return>return <expr><name>HeapTupleSelfUpdated</name></expr>;</return></block_content></block></if>	<comment type="block">/* updated after scan started */</comment>
+		<else>else<block type="pseudo"><block_content>
+			<return>return <expr><name>HeapTupleInvisible</name></expr>;</return></block_content></block></else></if_stmt>	<comment type="block">/* updated before scan started */</comment>
+	</block_content>}</block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><call><name>TransactionIdIsInProgress</name><argument_list>(<argument><expr><call><name>HeapTupleHeaderGetRawXmax</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>HeapTupleBeingUpdated</name></expr>;</return></block_content></block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>TransactionIdDidCommit</name><argument_list>(<argument><expr><call><name>HeapTupleHeaderGetRawXmax</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* it must have aborted or crashed */</comment>
+		<expr_stmt><expr><call><name>SetHintBits</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>, <argument><expr><name>buffer</name></expr></argument>, <argument><expr><name>HEAP_XMAX_INVALID</name></expr></argument>,
+					<argument><expr><name>InvalidTransactionId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<return>return <expr><name>HeapTupleMayBeUpdated</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/* xmax transaction committed */</comment>
+
+	<if_stmt><if>if <condition>(<expr><call><name>HEAP_XMAX_IS_LOCKED_ONLY</name><argument_list>(<argument><expr><name><name>tuple</name><operator>-&gt;</operator><name>t_infomask</name></name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>SetHintBits</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>, <argument><expr><name>buffer</name></expr></argument>, <argument><expr><name>HEAP_XMAX_INVALID</name></expr></argument>,
+					<argument><expr><name>InvalidTransactionId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<return>return <expr><name>HeapTupleMayBeUpdated</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>SetHintBits</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>, <argument><expr><name>buffer</name></expr></argument>, <argument><expr><name>HEAP_XMAX_COMMITTED</name></expr></argument>,
+				<argument><expr><call><name>HeapTupleHeaderGetRawXmax</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<return>return <expr><name>HeapTupleUpdated</name></expr>;</return>	<comment type="block">/* updated by other */</comment>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * HeapTupleSatisfiesDirty
+ *		True iff heap tuple is valid including effects of open transactions.
+ *
+ *	Here, we consider the effects of:
+ *		all committed and in-progress transactions (as of the current instant)
+ *		previous commands of this transaction
+ *		changes made by the current command
+ *
+ * This is essentially like HeapTupleSatisfiesSelf as far as effects of
+ * the current transaction and committed/aborted xacts are concerned.
+ * However, we also include the effects of other xacts still in progress.
+ *
+ * A special hack is that the passed-in snapshot struct is used as an
+ * output argument to return the xids of concurrent xacts that affected the
+ * tuple.  snapshot-&gt;xmin is set to the tuple's xmin if that is another
+ * transaction that's still in progress; or to InvalidTransactionId if the
+ * tuple's xmin is committed good, committed dead, or my own xact.
+ * Similarly for snapshot-&gt;xmax and the tuple's xmax.  If the tuple was
+ * inserted speculatively, meaning that the inserter might still back down
+ * on the insertion without aborting the whole transaction, the associated
+ * token is also returned in snapshot-&gt;speculativeToken.
+ */</comment>
+<function><type><name>bool</name></type>
+<name>HeapTupleSatisfiesDirty</name><parameter_list>(<parameter><decl><type><name>HeapTuple</name></type> <name>htup</name></decl></parameter>, <parameter><decl><type><name>Snapshot</name></type> <name>snapshot</name></decl></parameter>,
+						<parameter><decl><type><name>Buffer</name></type> <name>buffer</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>HeapTupleHeader</name></type> <name>tuple</name> <init>= <expr><name><name>htup</name><operator>-&gt;</operator><name>t_data</name></name></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>ItemPointerIsValid</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>htup</name><operator>-&gt;</operator><name>t_self</name></name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>htup</name><operator>-&gt;</operator><name>t_tableOid</name></name> <operator>!=</operator> <name>InvalidOid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name><name>snapshot</name><operator>-&gt;</operator><name>xmin</name></name> <operator>=</operator> <name><name>snapshot</name><operator>-&gt;</operator><name>xmax</name></name> <operator>=</operator> <name>InvalidTransactionId</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>snapshot</name><operator>-&gt;</operator><name>speculativeToken</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>HeapTupleHeaderXminCommitted</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<if_stmt><if>if <condition>(<expr><call><name>HeapTupleHeaderXminInvalid</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<return>return <expr><name>false</name></expr>;</return></block_content></block></if></if_stmt>
+
+		<comment type="block">/* Used by pre-9.0 binary upgrades */</comment>
+		<if_stmt><if>if <condition>(<expr><name><name>tuple</name><operator>-&gt;</operator><name>t_infomask</name></name> <operator>&amp;</operator> <name>HEAP_MOVED_OFF</name></expr>)</condition>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>TransactionId</name></type> <name>xvac</name> <init>= <expr><call><name>HeapTupleHeaderGetXvac</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+			<if_stmt><if>if <condition>(<expr><call><name>TransactionIdIsCurrentTransactionId</name><argument_list>(<argument><expr><name>xvac</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+				<return>return <expr><name>false</name></expr>;</return></block_content></block></if></if_stmt>
+			<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>TransactionIdIsInProgress</name><argument_list>(<argument><expr><name>xvac</name></expr></argument>)</argument_list></call></expr>)</condition>
+			<block>{<block_content>
+				<if_stmt><if>if <condition>(<expr><call><name>TransactionIdDidCommit</name><argument_list>(<argument><expr><name>xvac</name></expr></argument>)</argument_list></call></expr>)</condition>
+				<block>{<block_content>
+					<expr_stmt><expr><call><name>SetHintBits</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>, <argument><expr><name>buffer</name></expr></argument>, <argument><expr><name>HEAP_XMIN_INVALID</name></expr></argument>,
+								<argument><expr><name>InvalidTransactionId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+					<return>return <expr><name>false</name></expr>;</return>
+				</block_content>}</block></if></if_stmt>
+				<expr_stmt><expr><call><name>SetHintBits</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>, <argument><expr><name>buffer</name></expr></argument>, <argument><expr><name>HEAP_XMIN_COMMITTED</name></expr></argument>,
+							<argument><expr><name>InvalidTransactionId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			</block_content>}</block></if></if_stmt>
+		</block_content>}</block></if>
+		<comment type="block">/* Used by pre-9.0 binary upgrades */</comment>
+		<if type="elseif">else if <condition>(<expr><name><name>tuple</name><operator>-&gt;</operator><name>t_infomask</name></name> <operator>&amp;</operator> <name>HEAP_MOVED_IN</name></expr>)</condition>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>TransactionId</name></type> <name>xvac</name> <init>= <expr><call><name>HeapTupleHeaderGetXvac</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+			<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>TransactionIdIsCurrentTransactionId</name><argument_list>(<argument><expr><name>xvac</name></expr></argument>)</argument_list></call></expr>)</condition>
+			<block>{<block_content>
+				<if_stmt><if>if <condition>(<expr><call><name>TransactionIdIsInProgress</name><argument_list>(<argument><expr><name>xvac</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+					<return>return <expr><name>false</name></expr>;</return></block_content></block></if></if_stmt>
+				<if_stmt><if>if <condition>(<expr><call><name>TransactionIdDidCommit</name><argument_list>(<argument><expr><name>xvac</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+					<expr_stmt><expr><call><name>SetHintBits</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>, <argument><expr><name>buffer</name></expr></argument>, <argument><expr><name>HEAP_XMIN_COMMITTED</name></expr></argument>,
+								<argument><expr><name>InvalidTransactionId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if>
+				<else>else
+				<block>{<block_content>
+					<expr_stmt><expr><call><name>SetHintBits</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>, <argument><expr><name>buffer</name></expr></argument>, <argument><expr><name>HEAP_XMIN_INVALID</name></expr></argument>,
+								<argument><expr><name>InvalidTransactionId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+					<return>return <expr><name>false</name></expr>;</return>
+				</block_content>}</block></else></if_stmt>
+			</block_content>}</block></if></if_stmt>
+		</block_content>}</block></if>
+		<if type="elseif">else if <condition>(<expr><call><name>TransactionIdIsCurrentTransactionId</name><argument_list>(<argument><expr><call><name>HeapTupleHeaderGetRawXmin</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>)</condition>
+		<block>{<block_content>
+			<if_stmt><if>if <condition>(<expr><name><name>tuple</name><operator>-&gt;</operator><name>t_infomask</name></name> <operator>&amp;</operator> <name>HEAP_XMAX_INVALID</name></expr>)</condition><block type="pseudo"><block_content>	<comment type="block">/* xid invalid */</comment>
+				<return>return <expr><name>true</name></expr>;</return></block_content></block></if></if_stmt>
+
+			<if_stmt><if>if <condition>(<expr><call><name>HEAP_XMAX_IS_LOCKED_ONLY</name><argument_list>(<argument><expr><name><name>tuple</name><operator>-&gt;</operator><name>t_infomask</name></name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>	<comment type="block">/* not deleter */</comment>
+				<return>return <expr><name>true</name></expr>;</return></block_content></block></if></if_stmt>
+
+			<if_stmt><if>if <condition>(<expr><name><name>tuple</name><operator>-&gt;</operator><name>t_infomask</name></name> <operator>&amp;</operator> <name>HEAP_XMAX_IS_MULTI</name></expr>)</condition>
+			<block>{<block_content>
+				<decl_stmt><decl><type><name>TransactionId</name></type> <name>xmax</name></decl>;</decl_stmt>
+
+				<expr_stmt><expr><name>xmax</name> <operator>=</operator> <call><name>HeapTupleGetUpdateXid</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+				<comment type="block">/* not LOCKED_ONLY, so it has to have an xmax */</comment>
+				<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>TransactionIdIsValid</name><argument_list>(<argument><expr><name>xmax</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+				<comment type="block">/* updating subtransaction must have aborted */</comment>
+				<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>TransactionIdIsCurrentTransactionId</name><argument_list>(<argument><expr><name>xmax</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+					<return>return <expr><name>true</name></expr>;</return></block_content></block></if>
+				<else>else<block type="pseudo"><block_content>
+					<return>return <expr><name>false</name></expr>;</return></block_content></block></else></if_stmt>
+			</block_content>}</block></if></if_stmt>
+
+			<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>TransactionIdIsCurrentTransactionId</name><argument_list>(<argument><expr><call><name>HeapTupleHeaderGetRawXmax</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>)</condition>
+			<block>{<block_content>
+				<comment type="block">/* deleting subtransaction must have aborted */</comment>
+				<expr_stmt><expr><call><name>SetHintBits</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>, <argument><expr><name>buffer</name></expr></argument>, <argument><expr><name>HEAP_XMAX_INVALID</name></expr></argument>,
+							<argument><expr><name>InvalidTransactionId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<return>return <expr><name>true</name></expr>;</return>
+			</block_content>}</block></if></if_stmt>
+
+			<return>return <expr><name>false</name></expr>;</return>
+		</block_content>}</block></if>
+		<if type="elseif">else if <condition>(<expr><call><name>TransactionIdIsInProgress</name><argument_list>(<argument><expr><call><name>HeapTupleHeaderGetRawXmin</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/*
+			 * Return the speculative token to caller.  Caller can worry about
+			 * xmax, since it requires a conclusively locked row version, and
+			 * a concurrent update to this tuple is a conflict of its
+			 * purposes.
+			 */</comment>
+			<if_stmt><if>if <condition>(<expr><call><name>HeapTupleHeaderIsSpeculative</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr>)</condition>
+			<block>{<block_content>
+				<expr_stmt><expr><name><name>snapshot</name><operator>-&gt;</operator><name>speculativeToken</name></name> <operator>=</operator>
+					<call><name>HeapTupleHeaderGetSpeculativeToken</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+				<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>snapshot</name><operator>-&gt;</operator><name>speculativeToken</name></name> <operator>!=</operator> <literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			</block_content>}</block></if></if_stmt>
+
+			<expr_stmt><expr><name><name>snapshot</name><operator>-&gt;</operator><name>xmin</name></name> <operator>=</operator> <call><name>HeapTupleHeaderGetRawXmin</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<comment type="block">/* XXX shouldn't we fall through to look at xmax? */</comment>
+			<return>return <expr><name>true</name></expr>;</return>		<comment type="block">/* in insertion by other */</comment>
+		</block_content>}</block></if>
+		<if type="elseif">else if <condition>(<expr><call><name>TransactionIdDidCommit</name><argument_list>(<argument><expr><call><name>HeapTupleHeaderGetRawXmin</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>SetHintBits</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>, <argument><expr><name>buffer</name></expr></argument>, <argument><expr><name>HEAP_XMIN_COMMITTED</name></expr></argument>,
+						<argument><expr><call><name>HeapTupleHeaderGetRawXmin</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if>
+		<else>else
+		<block>{<block_content>
+			<comment type="block">/* it must have aborted or crashed */</comment>
+			<expr_stmt><expr><call><name>SetHintBits</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>, <argument><expr><name>buffer</name></expr></argument>, <argument><expr><name>HEAP_XMIN_INVALID</name></expr></argument>,
+						<argument><expr><name>InvalidTransactionId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<return>return <expr><name>false</name></expr>;</return>
+		</block_content>}</block></else></if_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/* by here, the inserting transaction has committed */</comment>
+
+	<if_stmt><if>if <condition>(<expr><name><name>tuple</name><operator>-&gt;</operator><name>t_infomask</name></name> <operator>&amp;</operator> <name>HEAP_XMAX_INVALID</name></expr>)</condition><block type="pseudo"><block_content>	<comment type="block">/* xid invalid or aborted */</comment>
+		<return>return <expr><name>true</name></expr>;</return></block_content></block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name><name>tuple</name><operator>-&gt;</operator><name>t_infomask</name></name> <operator>&amp;</operator> <name>HEAP_XMAX_COMMITTED</name></expr>)</condition>
+	<block>{<block_content>
+		<if_stmt><if>if <condition>(<expr><call><name>HEAP_XMAX_IS_LOCKED_ONLY</name><argument_list>(<argument><expr><name><name>tuple</name><operator>-&gt;</operator><name>t_infomask</name></name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<return>return <expr><name>true</name></expr>;</return></block_content></block></if></if_stmt>
+		<return>return <expr><name>false</name></expr>;</return>			<comment type="block">/* updated by other */</comment>
+	</block_content>}</block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name><name>tuple</name><operator>-&gt;</operator><name>t_infomask</name></name> <operator>&amp;</operator> <name>HEAP_XMAX_IS_MULTI</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>TransactionId</name></type> <name>xmax</name></decl>;</decl_stmt>
+
+		<if_stmt><if>if <condition>(<expr><call><name>HEAP_XMAX_IS_LOCKED_ONLY</name><argument_list>(<argument><expr><name><name>tuple</name><operator>-&gt;</operator><name>t_infomask</name></name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<return>return <expr><name>true</name></expr>;</return></block_content></block></if></if_stmt>
+
+		<expr_stmt><expr><name>xmax</name> <operator>=</operator> <call><name>HeapTupleGetUpdateXid</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/* not LOCKED_ONLY, so it has to have an xmax */</comment>
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>TransactionIdIsValid</name><argument_list>(<argument><expr><name>xmax</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<if_stmt><if>if <condition>(<expr><call><name>TransactionIdIsCurrentTransactionId</name><argument_list>(<argument><expr><name>xmax</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<return>return <expr><name>false</name></expr>;</return></block_content></block></if></if_stmt>
+		<if_stmt><if>if <condition>(<expr><call><name>TransactionIdIsInProgress</name><argument_list>(<argument><expr><name>xmax</name></expr></argument>)</argument_list></call></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><name><name>snapshot</name><operator>-&gt;</operator><name>xmax</name></name> <operator>=</operator> <name>xmax</name></expr>;</expr_stmt>
+			<return>return <expr><name>true</name></expr>;</return>
+		</block_content>}</block></if></if_stmt>
+		<if_stmt><if>if <condition>(<expr><call><name>TransactionIdDidCommit</name><argument_list>(<argument><expr><name>xmax</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<return>return <expr><name>false</name></expr>;</return></block_content></block></if></if_stmt>
+		<comment type="block">/* it must have aborted or crashed */</comment>
+		<return>return <expr><name>true</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><call><name>TransactionIdIsCurrentTransactionId</name><argument_list>(<argument><expr><call><name>HeapTupleHeaderGetRawXmax</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<if_stmt><if>if <condition>(<expr><call><name>HEAP_XMAX_IS_LOCKED_ONLY</name><argument_list>(<argument><expr><name><name>tuple</name><operator>-&gt;</operator><name>t_infomask</name></name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<return>return <expr><name>true</name></expr>;</return></block_content></block></if></if_stmt>
+		<return>return <expr><name>false</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><call><name>TransactionIdIsInProgress</name><argument_list>(<argument><expr><call><name>HeapTupleHeaderGetRawXmax</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>HEAP_XMAX_IS_LOCKED_ONLY</name><argument_list>(<argument><expr><name><name>tuple</name><operator>-&gt;</operator><name>t_infomask</name></name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><name><name>snapshot</name><operator>-&gt;</operator><name>xmax</name></name> <operator>=</operator> <call><name>HeapTupleHeaderGetRawXmax</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+		<return>return <expr><name>true</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>TransactionIdDidCommit</name><argument_list>(<argument><expr><call><name>HeapTupleHeaderGetRawXmax</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* it must have aborted or crashed */</comment>
+		<expr_stmt><expr><call><name>SetHintBits</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>, <argument><expr><name>buffer</name></expr></argument>, <argument><expr><name>HEAP_XMAX_INVALID</name></expr></argument>,
+					<argument><expr><name>InvalidTransactionId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<return>return <expr><name>true</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/* xmax transaction committed */</comment>
+
+	<if_stmt><if>if <condition>(<expr><call><name>HEAP_XMAX_IS_LOCKED_ONLY</name><argument_list>(<argument><expr><name><name>tuple</name><operator>-&gt;</operator><name>t_infomask</name></name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>SetHintBits</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>, <argument><expr><name>buffer</name></expr></argument>, <argument><expr><name>HEAP_XMAX_INVALID</name></expr></argument>,
+					<argument><expr><name>InvalidTransactionId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<return>return <expr><name>true</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>SetHintBits</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>, <argument><expr><name>buffer</name></expr></argument>, <argument><expr><name>HEAP_XMAX_COMMITTED</name></expr></argument>,
+				<argument><expr><call><name>HeapTupleHeaderGetRawXmax</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<return>return <expr><name>false</name></expr>;</return>				<comment type="block">/* updated by other */</comment>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * HeapTupleSatisfiesMVCC
+ *		True iff heap tuple is valid for the given MVCC snapshot.
+ *
+ *	Here, we consider the effects of:
+ *		all transactions committed as of the time of the given snapshot
+ *		previous commands of this transaction
+ *
+ *	Does _not_ include:
+ *		transactions shown as in-progress by the snapshot
+ *		transactions started after the snapshot was taken
+ *		changes made by the current command
+ *
+ * Notice that here, we will not update the tuple status hint bits if the
+ * inserting/deleting transaction is still running according to our snapshot,
+ * even if in reality it's committed or aborted by now.  This is intentional.
+ * Checking the true transaction state would require access to high-traffic
+ * shared data structures, creating contention we'd rather do without, and it
+ * would not change the result of our visibility check anyway.  The hint bits
+ * will be updated by the first visitor that has a snapshot new enough to see
+ * the inserting/deleting transaction as done.  In the meantime, the cost of
+ * leaving the hint bits unset is basically that each HeapTupleSatisfiesMVCC
+ * call will need to run TransactionIdIsCurrentTransactionId in addition to
+ * XidInMVCCSnapshot (but it would have to do the latter anyway).  In the old
+ * coding where we tried to set the hint bits as soon as possible, we instead
+ * did TransactionIdIsInProgress in each call --- to no avail, as long as the
+ * inserting/deleting transaction was still running --- which was more cycles
+ * and more contention on the PGXACT array.
+ */</comment>
+<function><type><name>bool</name></type>
+<name>HeapTupleSatisfiesMVCC</name><parameter_list>(<parameter><decl><type><name>HeapTuple</name></type> <name>htup</name></decl></parameter>, <parameter><decl><type><name>Snapshot</name></type> <name>snapshot</name></decl></parameter>,
+					   <parameter><decl><type><name>Buffer</name></type> <name>buffer</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>HeapTupleHeader</name></type> <name>tuple</name> <init>= <expr><name><name>htup</name><operator>-&gt;</operator><name>t_data</name></name></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>ItemPointerIsValid</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>htup</name><operator>-&gt;</operator><name>t_self</name></name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>htup</name><operator>-&gt;</operator><name>t_tableOid</name></name> <operator>!=</operator> <name>InvalidOid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>HeapTupleHeaderXminCommitted</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<if_stmt><if>if <condition>(<expr><call><name>HeapTupleHeaderXminInvalid</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<return>return <expr><name>false</name></expr>;</return></block_content></block></if></if_stmt>
+
+		<comment type="block">/* Used by pre-9.0 binary upgrades */</comment>
+		<if_stmt><if>if <condition>(<expr><name><name>tuple</name><operator>-&gt;</operator><name>t_infomask</name></name> <operator>&amp;</operator> <name>HEAP_MOVED_OFF</name></expr>)</condition>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>TransactionId</name></type> <name>xvac</name> <init>= <expr><call><name>HeapTupleHeaderGetXvac</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+			<if_stmt><if>if <condition>(<expr><call><name>TransactionIdIsCurrentTransactionId</name><argument_list>(<argument><expr><name>xvac</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+				<return>return <expr><name>false</name></expr>;</return></block_content></block></if></if_stmt>
+			<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>XidInMVCCSnapshot</name><argument_list>(<argument><expr><name>xvac</name></expr></argument>, <argument><expr><name>snapshot</name></expr></argument>)</argument_list></call></expr>)</condition>
+			<block>{<block_content>
+				<if_stmt><if>if <condition>(<expr><call><name>TransactionIdDidCommit</name><argument_list>(<argument><expr><name>xvac</name></expr></argument>)</argument_list></call></expr>)</condition>
+				<block>{<block_content>
+					<expr_stmt><expr><call><name>SetHintBits</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>, <argument><expr><name>buffer</name></expr></argument>, <argument><expr><name>HEAP_XMIN_INVALID</name></expr></argument>,
+								<argument><expr><name>InvalidTransactionId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+					<return>return <expr><name>false</name></expr>;</return>
+				</block_content>}</block></if></if_stmt>
+				<expr_stmt><expr><call><name>SetHintBits</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>, <argument><expr><name>buffer</name></expr></argument>, <argument><expr><name>HEAP_XMIN_COMMITTED</name></expr></argument>,
+							<argument><expr><name>InvalidTransactionId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			</block_content>}</block></if></if_stmt>
+		</block_content>}</block></if>
+		<comment type="block">/* Used by pre-9.0 binary upgrades */</comment>
+		<if type="elseif">else if <condition>(<expr><name><name>tuple</name><operator>-&gt;</operator><name>t_infomask</name></name> <operator>&amp;</operator> <name>HEAP_MOVED_IN</name></expr>)</condition>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>TransactionId</name></type> <name>xvac</name> <init>= <expr><call><name>HeapTupleHeaderGetXvac</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+			<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>TransactionIdIsCurrentTransactionId</name><argument_list>(<argument><expr><name>xvac</name></expr></argument>)</argument_list></call></expr>)</condition>
+			<block>{<block_content>
+				<if_stmt><if>if <condition>(<expr><call><name>XidInMVCCSnapshot</name><argument_list>(<argument><expr><name>xvac</name></expr></argument>, <argument><expr><name>snapshot</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+					<return>return <expr><name>false</name></expr>;</return></block_content></block></if></if_stmt>
+				<if_stmt><if>if <condition>(<expr><call><name>TransactionIdDidCommit</name><argument_list>(<argument><expr><name>xvac</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+					<expr_stmt><expr><call><name>SetHintBits</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>, <argument><expr><name>buffer</name></expr></argument>, <argument><expr><name>HEAP_XMIN_COMMITTED</name></expr></argument>,
+								<argument><expr><name>InvalidTransactionId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if>
+				<else>else
+				<block>{<block_content>
+					<expr_stmt><expr><call><name>SetHintBits</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>, <argument><expr><name>buffer</name></expr></argument>, <argument><expr><name>HEAP_XMIN_INVALID</name></expr></argument>,
+								<argument><expr><name>InvalidTransactionId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+					<return>return <expr><name>false</name></expr>;</return>
+				</block_content>}</block></else></if_stmt>
+			</block_content>}</block></if></if_stmt>
+		</block_content>}</block></if>
+		<if type="elseif">else if <condition>(<expr><call><name>TransactionIdIsCurrentTransactionId</name><argument_list>(<argument><expr><call><name>HeapTupleHeaderGetRawXmin</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>)</condition>
+		<block>{<block_content>
+			<if_stmt><if>if <condition>(<expr><call><name>HeapTupleHeaderGetCmin</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call> <operator>&gt;=</operator> <name><name>snapshot</name><operator>-&gt;</operator><name>curcid</name></name></expr>)</condition><block type="pseudo"><block_content>
+				<return>return <expr><name>false</name></expr>;</return></block_content></block></if></if_stmt>	<comment type="block">/* inserted after scan started */</comment>
+
+			<if_stmt><if>if <condition>(<expr><name><name>tuple</name><operator>-&gt;</operator><name>t_infomask</name></name> <operator>&amp;</operator> <name>HEAP_XMAX_INVALID</name></expr>)</condition><block type="pseudo"><block_content>	<comment type="block">/* xid invalid */</comment>
+				<return>return <expr><name>true</name></expr>;</return></block_content></block></if></if_stmt>
+
+			<if_stmt><if>if <condition>(<expr><call><name>HEAP_XMAX_IS_LOCKED_ONLY</name><argument_list>(<argument><expr><name><name>tuple</name><operator>-&gt;</operator><name>t_infomask</name></name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>	<comment type="block">/* not deleter */</comment>
+				<return>return <expr><name>true</name></expr>;</return></block_content></block></if></if_stmt>
+
+			<if_stmt><if>if <condition>(<expr><name><name>tuple</name><operator>-&gt;</operator><name>t_infomask</name></name> <operator>&amp;</operator> <name>HEAP_XMAX_IS_MULTI</name></expr>)</condition>
+			<block>{<block_content>
+				<decl_stmt><decl><type><name>TransactionId</name></type> <name>xmax</name></decl>;</decl_stmt>
+
+				<expr_stmt><expr><name>xmax</name> <operator>=</operator> <call><name>HeapTupleGetUpdateXid</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+				<comment type="block">/* not LOCKED_ONLY, so it has to have an xmax */</comment>
+				<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>TransactionIdIsValid</name><argument_list>(<argument><expr><name>xmax</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+				<comment type="block">/* updating subtransaction must have aborted */</comment>
+				<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>TransactionIdIsCurrentTransactionId</name><argument_list>(<argument><expr><name>xmax</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+					<return>return <expr><name>true</name></expr>;</return></block_content></block></if>
+				<if type="elseif">else if <condition>(<expr><call><name>HeapTupleHeaderGetCmax</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call> <operator>&gt;=</operator> <name><name>snapshot</name><operator>-&gt;</operator><name>curcid</name></name></expr>)</condition><block type="pseudo"><block_content>
+					<return>return <expr><name>true</name></expr>;</return></block_content></block></if>	<comment type="block">/* updated after scan started */</comment>
+				<else>else<block type="pseudo"><block_content>
+					<return>return <expr><name>false</name></expr>;</return></block_content></block></else></if_stmt>	<comment type="block">/* updated before scan started */</comment>
+			</block_content>}</block></if></if_stmt>
+
+			<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>TransactionIdIsCurrentTransactionId</name><argument_list>(<argument><expr><call><name>HeapTupleHeaderGetRawXmax</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>)</condition>
+			<block>{<block_content>
+				<comment type="block">/* deleting subtransaction must have aborted */</comment>
+				<expr_stmt><expr><call><name>SetHintBits</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>, <argument><expr><name>buffer</name></expr></argument>, <argument><expr><name>HEAP_XMAX_INVALID</name></expr></argument>,
+							<argument><expr><name>InvalidTransactionId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<return>return <expr><name>true</name></expr>;</return>
+			</block_content>}</block></if></if_stmt>
+
+			<if_stmt><if>if <condition>(<expr><call><name>HeapTupleHeaderGetCmax</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call> <operator>&gt;=</operator> <name><name>snapshot</name><operator>-&gt;</operator><name>curcid</name></name></expr>)</condition><block type="pseudo"><block_content>
+				<return>return <expr><name>true</name></expr>;</return></block_content></block></if>	<comment type="block">/* deleted after scan started */</comment>
+			<else>else<block type="pseudo"><block_content>
+				<return>return <expr><name>false</name></expr>;</return></block_content></block></else></if_stmt>	<comment type="block">/* deleted before scan started */</comment>
+		</block_content>}</block></if>
+		<if type="elseif">else if <condition>(<expr><call><name>XidInMVCCSnapshot</name><argument_list>(<argument><expr><call><name>HeapTupleHeaderGetRawXmin</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>snapshot</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<return>return <expr><name>false</name></expr>;</return></block_content></block></if>
+		<if type="elseif">else if <condition>(<expr><call><name>TransactionIdDidCommit</name><argument_list>(<argument><expr><call><name>HeapTupleHeaderGetRawXmin</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>SetHintBits</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>, <argument><expr><name>buffer</name></expr></argument>, <argument><expr><name>HEAP_XMIN_COMMITTED</name></expr></argument>,
+						<argument><expr><call><name>HeapTupleHeaderGetRawXmin</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if>
+		<else>else
+		<block>{<block_content>
+			<comment type="block">/* it must have aborted or crashed */</comment>
+			<expr_stmt><expr><call><name>SetHintBits</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>, <argument><expr><name>buffer</name></expr></argument>, <argument><expr><name>HEAP_XMIN_INVALID</name></expr></argument>,
+						<argument><expr><name>InvalidTransactionId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<return>return <expr><name>false</name></expr>;</return>
+		</block_content>}</block></else></if_stmt>
+	</block_content>}</block></if>
+	<else>else
+	<block>{<block_content>
+		<comment type="block">/* xmin is committed, but maybe not according to our snapshot */</comment>
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>HeapTupleHeaderXminFrozen</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call> <operator>&amp;&amp;</operator>
+			<call><name>XidInMVCCSnapshot</name><argument_list>(<argument><expr><call><name>HeapTupleHeaderGetRawXmin</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>snapshot</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<return>return <expr><name>false</name></expr>;</return></block_content></block></if></if_stmt>		<comment type="block">/* treat as still in progress */</comment>
+	</block_content>}</block></else></if_stmt>
+
+	<comment type="block">/* by here, the inserting transaction has committed */</comment>
+
+	<if_stmt><if>if <condition>(<expr><name><name>tuple</name><operator>-&gt;</operator><name>t_infomask</name></name> <operator>&amp;</operator> <name>HEAP_XMAX_INVALID</name></expr>)</condition><block type="pseudo"><block_content>	<comment type="block">/* xid invalid or aborted */</comment>
+		<return>return <expr><name>true</name></expr>;</return></block_content></block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><call><name>HEAP_XMAX_IS_LOCKED_ONLY</name><argument_list>(<argument><expr><name><name>tuple</name><operator>-&gt;</operator><name>t_infomask</name></name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>true</name></expr>;</return></block_content></block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name><name>tuple</name><operator>-&gt;</operator><name>t_infomask</name></name> <operator>&amp;</operator> <name>HEAP_XMAX_IS_MULTI</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>TransactionId</name></type> <name>xmax</name></decl>;</decl_stmt>
+
+		<comment type="block">/* already checked above */</comment>
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><operator>!</operator><call><name>HEAP_XMAX_IS_LOCKED_ONLY</name><argument_list>(<argument><expr><name><name>tuple</name><operator>-&gt;</operator><name>t_infomask</name></name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><name>xmax</name> <operator>=</operator> <call><name>HeapTupleGetUpdateXid</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/* not LOCKED_ONLY, so it has to have an xmax */</comment>
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>TransactionIdIsValid</name><argument_list>(<argument><expr><name>xmax</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<if_stmt><if>if <condition>(<expr><call><name>TransactionIdIsCurrentTransactionId</name><argument_list>(<argument><expr><name>xmax</name></expr></argument>)</argument_list></call></expr>)</condition>
+		<block>{<block_content>
+			<if_stmt><if>if <condition>(<expr><call><name>HeapTupleHeaderGetCmax</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call> <operator>&gt;=</operator> <name><name>snapshot</name><operator>-&gt;</operator><name>curcid</name></name></expr>)</condition><block type="pseudo"><block_content>
+				<return>return <expr><name>true</name></expr>;</return></block_content></block></if>	<comment type="block">/* deleted after scan started */</comment>
+			<else>else<block type="pseudo"><block_content>
+				<return>return <expr><name>false</name></expr>;</return></block_content></block></else></if_stmt>	<comment type="block">/* deleted before scan started */</comment>
+		</block_content>}</block></if></if_stmt>
+		<if_stmt><if>if <condition>(<expr><call><name>XidInMVCCSnapshot</name><argument_list>(<argument><expr><name>xmax</name></expr></argument>, <argument><expr><name>snapshot</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<return>return <expr><name>true</name></expr>;</return></block_content></block></if></if_stmt>
+		<if_stmt><if>if <condition>(<expr><call><name>TransactionIdDidCommit</name><argument_list>(<argument><expr><name>xmax</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<return>return <expr><name>false</name></expr>;</return></block_content></block></if></if_stmt>		<comment type="block">/* updating transaction committed */</comment>
+		<comment type="block">/* it must have aborted or crashed */</comment>
+		<return>return <expr><name>true</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><operator>(</operator><name><name>tuple</name><operator>-&gt;</operator><name>t_infomask</name></name> <operator>&amp;</operator> <name>HEAP_XMAX_COMMITTED</name><operator>)</operator></expr>)</condition>
+	<block>{<block_content>
+		<if_stmt><if>if <condition>(<expr><call><name>TransactionIdIsCurrentTransactionId</name><argument_list>(<argument><expr><call><name>HeapTupleHeaderGetRawXmax</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>)</condition>
+		<block>{<block_content>
+			<if_stmt><if>if <condition>(<expr><call><name>HeapTupleHeaderGetCmax</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call> <operator>&gt;=</operator> <name><name>snapshot</name><operator>-&gt;</operator><name>curcid</name></name></expr>)</condition><block type="pseudo"><block_content>
+				<return>return <expr><name>true</name></expr>;</return></block_content></block></if>	<comment type="block">/* deleted after scan started */</comment>
+			<else>else<block type="pseudo"><block_content>
+				<return>return <expr><name>false</name></expr>;</return></block_content></block></else></if_stmt>	<comment type="block">/* deleted before scan started */</comment>
+		</block_content>}</block></if></if_stmt>
+
+		<if_stmt><if>if <condition>(<expr><call><name>XidInMVCCSnapshot</name><argument_list>(<argument><expr><call><name>HeapTupleHeaderGetRawXmax</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>snapshot</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<return>return <expr><name>true</name></expr>;</return></block_content></block></if></if_stmt>
+
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>TransactionIdDidCommit</name><argument_list>(<argument><expr><call><name>HeapTupleHeaderGetRawXmax</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/* it must have aborted or crashed */</comment>
+			<expr_stmt><expr><call><name>SetHintBits</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>, <argument><expr><name>buffer</name></expr></argument>, <argument><expr><name>HEAP_XMAX_INVALID</name></expr></argument>,
+						<argument><expr><name>InvalidTransactionId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<return>return <expr><name>true</name></expr>;</return>
+		</block_content>}</block></if></if_stmt>
+
+		<comment type="block">/* xmax transaction committed */</comment>
+		<expr_stmt><expr><call><name>SetHintBits</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>, <argument><expr><name>buffer</name></expr></argument>, <argument><expr><name>HEAP_XMAX_COMMITTED</name></expr></argument>,
+					<argument><expr><call><name>HeapTupleHeaderGetRawXmax</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<else>else
+	<block>{<block_content>
+		<comment type="block">/* xmax is committed, but maybe not according to our snapshot */</comment>
+		<if_stmt><if>if <condition>(<expr><call><name>XidInMVCCSnapshot</name><argument_list>(<argument><expr><call><name>HeapTupleHeaderGetRawXmax</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>snapshot</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<return>return <expr><name>true</name></expr>;</return></block_content></block></if></if_stmt>		<comment type="block">/* treat as still in progress */</comment>
+	</block_content>}</block></else></if_stmt>
+
+	<comment type="block">/* xmax transaction committed */</comment>
+
+	<return>return <expr><name>false</name></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * HeapTupleSatisfiesVacuum
+ *
+ *	Determine the status of tuples for VACUUM purposes.  Here, what
+ *	we mainly want to know is if a tuple is potentially visible to *any*
+ *	running transaction.  If so, it can't be removed yet by VACUUM.
+ *
+ * OldestXmin is a cutoff XID (obtained from GetOldestXmin()).  Tuples
+ * deleted by XIDs &gt;= OldestXmin are deemed "recently dead"; they might
+ * still be visible to some open transaction, so we can't remove them,
+ * even if we see that the deleting transaction has committed.
+ */</comment>
+<function><type><name>HTSV_Result</name></type>
+<name>HeapTupleSatisfiesVacuum</name><parameter_list>(<parameter><decl><type><name>HeapTuple</name></type> <name>htup</name></decl></parameter>, <parameter><decl><type><name>TransactionId</name></type> <name>OldestXmin</name></decl></parameter>,
+						 <parameter><decl><type><name>Buffer</name></type> <name>buffer</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>HeapTupleHeader</name></type> <name>tuple</name> <init>= <expr><name><name>htup</name><operator>-&gt;</operator><name>t_data</name></name></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>ItemPointerIsValid</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>htup</name><operator>-&gt;</operator><name>t_self</name></name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>htup</name><operator>-&gt;</operator><name>t_tableOid</name></name> <operator>!=</operator> <name>InvalidOid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Has inserting transaction committed?
+	 *
+	 * If the inserting transaction aborted, then the tuple was never visible
+	 * to any other transaction, so we can delete it immediately.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>HeapTupleHeaderXminCommitted</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<if_stmt><if>if <condition>(<expr><call><name>HeapTupleHeaderXminInvalid</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<return>return <expr><name>HEAPTUPLE_DEAD</name></expr>;</return></block_content></block></if>
+		<comment type="block">/* Used by pre-9.0 binary upgrades */</comment>
+		<if type="elseif">else if <condition>(<expr><name><name>tuple</name><operator>-&gt;</operator><name>t_infomask</name></name> <operator>&amp;</operator> <name>HEAP_MOVED_OFF</name></expr>)</condition>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>TransactionId</name></type> <name>xvac</name> <init>= <expr><call><name>HeapTupleHeaderGetXvac</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+			<if_stmt><if>if <condition>(<expr><call><name>TransactionIdIsCurrentTransactionId</name><argument_list>(<argument><expr><name>xvac</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+				<return>return <expr><name>HEAPTUPLE_DELETE_IN_PROGRESS</name></expr>;</return></block_content></block></if></if_stmt>
+			<if_stmt><if>if <condition>(<expr><call><name>TransactionIdIsInProgress</name><argument_list>(<argument><expr><name>xvac</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+				<return>return <expr><name>HEAPTUPLE_DELETE_IN_PROGRESS</name></expr>;</return></block_content></block></if></if_stmt>
+			<if_stmt><if>if <condition>(<expr><call><name>TransactionIdDidCommit</name><argument_list>(<argument><expr><name>xvac</name></expr></argument>)</argument_list></call></expr>)</condition>
+			<block>{<block_content>
+				<expr_stmt><expr><call><name>SetHintBits</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>, <argument><expr><name>buffer</name></expr></argument>, <argument><expr><name>HEAP_XMIN_INVALID</name></expr></argument>,
+							<argument><expr><name>InvalidTransactionId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<return>return <expr><name>HEAPTUPLE_DEAD</name></expr>;</return>
+			</block_content>}</block></if></if_stmt>
+			<expr_stmt><expr><call><name>SetHintBits</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>, <argument><expr><name>buffer</name></expr></argument>, <argument><expr><name>HEAP_XMIN_COMMITTED</name></expr></argument>,
+						<argument><expr><name>InvalidTransactionId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></if>
+		<comment type="block">/* Used by pre-9.0 binary upgrades */</comment>
+		<if type="elseif">else if <condition>(<expr><name><name>tuple</name><operator>-&gt;</operator><name>t_infomask</name></name> <operator>&amp;</operator> <name>HEAP_MOVED_IN</name></expr>)</condition>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>TransactionId</name></type> <name>xvac</name> <init>= <expr><call><name>HeapTupleHeaderGetXvac</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+			<if_stmt><if>if <condition>(<expr><call><name>TransactionIdIsCurrentTransactionId</name><argument_list>(<argument><expr><name>xvac</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+				<return>return <expr><name>HEAPTUPLE_INSERT_IN_PROGRESS</name></expr>;</return></block_content></block></if></if_stmt>
+			<if_stmt><if>if <condition>(<expr><call><name>TransactionIdIsInProgress</name><argument_list>(<argument><expr><name>xvac</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+				<return>return <expr><name>HEAPTUPLE_INSERT_IN_PROGRESS</name></expr>;</return></block_content></block></if></if_stmt>
+			<if_stmt><if>if <condition>(<expr><call><name>TransactionIdDidCommit</name><argument_list>(<argument><expr><name>xvac</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><call><name>SetHintBits</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>, <argument><expr><name>buffer</name></expr></argument>, <argument><expr><name>HEAP_XMIN_COMMITTED</name></expr></argument>,
+							<argument><expr><name>InvalidTransactionId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if>
+			<else>else
+			<block>{<block_content>
+				<expr_stmt><expr><call><name>SetHintBits</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>, <argument><expr><name>buffer</name></expr></argument>, <argument><expr><name>HEAP_XMIN_INVALID</name></expr></argument>,
+							<argument><expr><name>InvalidTransactionId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<return>return <expr><name>HEAPTUPLE_DEAD</name></expr>;</return>
+			</block_content>}</block></else></if_stmt>
+		</block_content>}</block></if>
+		<if type="elseif">else if <condition>(<expr><call><name>TransactionIdIsCurrentTransactionId</name><argument_list>(<argument><expr><call><name>HeapTupleHeaderGetRawXmin</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>)</condition>
+		<block>{<block_content>
+			<if_stmt><if>if <condition>(<expr><name><name>tuple</name><operator>-&gt;</operator><name>t_infomask</name></name> <operator>&amp;</operator> <name>HEAP_XMAX_INVALID</name></expr>)</condition><block type="pseudo"><block_content>	<comment type="block">/* xid invalid */</comment>
+				<return>return <expr><name>HEAPTUPLE_INSERT_IN_PROGRESS</name></expr>;</return></block_content></block></if></if_stmt>
+			<comment type="block">/* only locked? run infomask-only check first, for performance */</comment>
+			<if_stmt><if>if <condition>(<expr><call><name>HEAP_XMAX_IS_LOCKED_ONLY</name><argument_list>(<argument><expr><name><name>tuple</name><operator>-&gt;</operator><name>t_infomask</name></name></expr></argument>)</argument_list></call> <operator>||</operator>
+				<call><name>HeapTupleHeaderIsOnlyLocked</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+				<return>return <expr><name>HEAPTUPLE_INSERT_IN_PROGRESS</name></expr>;</return></block_content></block></if></if_stmt>
+			<comment type="block">/* inserted and then deleted by same xact */</comment>
+			<if_stmt><if>if <condition>(<expr><call><name>TransactionIdIsCurrentTransactionId</name><argument_list>(<argument><expr><call><name>HeapTupleHeaderGetUpdateXid</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+				<return>return <expr><name>HEAPTUPLE_DELETE_IN_PROGRESS</name></expr>;</return></block_content></block></if></if_stmt>
+			<comment type="block">/* deleting subtransaction must have aborted */</comment>
+			<return>return <expr><name>HEAPTUPLE_INSERT_IN_PROGRESS</name></expr>;</return>
+		</block_content>}</block></if>
+		<if type="elseif">else if <condition>(<expr><call><name>TransactionIdIsInProgress</name><argument_list>(<argument><expr><call><name>HeapTupleHeaderGetRawXmin</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/*
+			 * It'd be possible to discern between INSERT/DELETE in progress
+			 * here by looking at xmax - but that doesn't seem beneficial for
+			 * the majority of callers and even detrimental for some. We'd
+			 * rather have callers look at/wait for xmin than xmax. It's
+			 * always correct to return INSERT_IN_PROGRESS because that's
+			 * what's happening from the view of other backends.
+			 */</comment>
+			<return>return <expr><name>HEAPTUPLE_INSERT_IN_PROGRESS</name></expr>;</return>
+		</block_content>}</block></if>
+		<if type="elseif">else if <condition>(<expr><call><name>TransactionIdDidCommit</name><argument_list>(<argument><expr><call><name>HeapTupleHeaderGetRawXmin</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>SetHintBits</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>, <argument><expr><name>buffer</name></expr></argument>, <argument><expr><name>HEAP_XMIN_COMMITTED</name></expr></argument>,
+						<argument><expr><call><name>HeapTupleHeaderGetRawXmin</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if>
+		<else>else
+		<block>{<block_content>
+			<comment type="block">/*
+			 * Not in Progress, Not Committed, so either Aborted or crashed
+			 */</comment>
+			<expr_stmt><expr><call><name>SetHintBits</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>, <argument><expr><name>buffer</name></expr></argument>, <argument><expr><name>HEAP_XMIN_INVALID</name></expr></argument>,
+						<argument><expr><name>InvalidTransactionId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<return>return <expr><name>HEAPTUPLE_DEAD</name></expr>;</return>
+		</block_content>}</block></else></if_stmt>
+
+		<comment type="block">/*
+		 * At this point the xmin is known committed, but we might not have
+		 * been able to set the hint bit yet; so we can no longer Assert that
+		 * it's set.
+		 */</comment>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/*
+	 * Okay, the inserter committed, so it was good at some point.  Now what
+	 * about the deleting transaction?
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>tuple</name><operator>-&gt;</operator><name>t_infomask</name></name> <operator>&amp;</operator> <name>HEAP_XMAX_INVALID</name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>HEAPTUPLE_LIVE</name></expr>;</return></block_content></block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><call><name>HEAP_XMAX_IS_LOCKED_ONLY</name><argument_list>(<argument><expr><name><name>tuple</name><operator>-&gt;</operator><name>t_infomask</name></name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/*
+		 * "Deleting" xact really only locked it, so the tuple is live in any
+		 * case.  However, we should make sure that either XMAX_COMMITTED or
+		 * XMAX_INVALID gets set once the xact is gone, to reduce the costs of
+		 * examining the tuple for future xacts.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><operator>(</operator><name><name>tuple</name><operator>-&gt;</operator><name>t_infomask</name></name> <operator>&amp;</operator> <name>HEAP_XMAX_COMMITTED</name><operator>)</operator></expr>)</condition>
+		<block>{<block_content>
+			<if_stmt><if>if <condition>(<expr><name><name>tuple</name><operator>-&gt;</operator><name>t_infomask</name></name> <operator>&amp;</operator> <name>HEAP_XMAX_IS_MULTI</name></expr>)</condition>
+			<block>{<block_content>
+				<comment type="block">/*
+				 * If it's a pre-pg_upgrade tuple, the multixact cannot
+				 * possibly be running; otherwise have to check.
+				 */</comment>
+				<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>HEAP_LOCKED_UPGRADED</name><argument_list>(<argument><expr><name><name>tuple</name><operator>-&gt;</operator><name>t_infomask</name></name></expr></argument>)</argument_list></call> <operator>&amp;&amp;</operator>
+					<call><name>MultiXactIdIsRunning</name><argument_list>(<argument><expr><call><name>HeapTupleHeaderGetRawXmax</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></argument>,
+										 <argument><expr><name>true</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+					<return>return <expr><name>HEAPTUPLE_LIVE</name></expr>;</return></block_content></block></if></if_stmt>
+				<expr_stmt><expr><call><name>SetHintBits</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>, <argument><expr><name>buffer</name></expr></argument>, <argument><expr><name>HEAP_XMAX_INVALID</name></expr></argument>, <argument><expr><name>InvalidTransactionId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			</block_content>}</block></if>
+			<else>else
+			<block>{<block_content>
+				<if_stmt><if>if <condition>(<expr><call><name>TransactionIdIsInProgress</name><argument_list>(<argument><expr><call><name>HeapTupleHeaderGetRawXmax</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+					<return>return <expr><name>HEAPTUPLE_LIVE</name></expr>;</return></block_content></block></if></if_stmt>
+				<expr_stmt><expr><call><name>SetHintBits</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>, <argument><expr><name>buffer</name></expr></argument>, <argument><expr><name>HEAP_XMAX_INVALID</name></expr></argument>,
+							<argument><expr><name>InvalidTransactionId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			</block_content>}</block></else></if_stmt>
+		</block_content>}</block></if></if_stmt>
+
+		<comment type="block">/*
+		 * We don't really care whether xmax did commit, abort or crash. We
+		 * know that xmax did lock the tuple, but it did not and will never
+		 * actually update it.
+		 */</comment>
+
+		<return>return <expr><name>HEAPTUPLE_LIVE</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name><name>tuple</name><operator>-&gt;</operator><name>t_infomask</name></name> <operator>&amp;</operator> <name>HEAP_XMAX_IS_MULTI</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>TransactionId</name></type> <name>xmax</name> <init>= <expr><call><name>HeapTupleGetUpdateXid</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+		<comment type="block">/* already checked above */</comment>
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><operator>!</operator><call><name>HEAP_XMAX_IS_LOCKED_ONLY</name><argument_list>(<argument><expr><name><name>tuple</name><operator>-&gt;</operator><name>t_infomask</name></name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/* not LOCKED_ONLY, so it has to have an xmax */</comment>
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>TransactionIdIsValid</name><argument_list>(<argument><expr><name>xmax</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<if_stmt><if>if <condition>(<expr><call><name>TransactionIdIsInProgress</name><argument_list>(<argument><expr><name>xmax</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<return>return <expr><name>HEAPTUPLE_DELETE_IN_PROGRESS</name></expr>;</return></block_content></block></if>
+		<if type="elseif">else if <condition>(<expr><call><name>TransactionIdDidCommit</name><argument_list>(<argument><expr><name>xmax</name></expr></argument>)</argument_list></call></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/*
+			 * The multixact might still be running due to lockers.  If the
+			 * updater is below the xid horizon, we have to return DEAD
+			 * regardless -- otherwise we could end up with a tuple where the
+			 * updater has to be removed due to the horizon, but is not pruned
+			 * away.  It's not a problem to prune that tuple, because any
+			 * remaining lockers will also be present in newer tuple versions.
+			 */</comment>
+			<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>TransactionIdPrecedes</name><argument_list>(<argument><expr><name>xmax</name></expr></argument>, <argument><expr><name>OldestXmin</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+				<return>return <expr><name>HEAPTUPLE_RECENTLY_DEAD</name></expr>;</return></block_content></block></if></if_stmt>
+
+			<return>return <expr><name>HEAPTUPLE_DEAD</name></expr>;</return>
+		</block_content>}</block></if>
+		<if type="elseif">else if <condition>(<expr><operator>!</operator><call><name>MultiXactIdIsRunning</name><argument_list>(<argument><expr><call><name>HeapTupleHeaderGetRawXmax</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/*
+			 * Not in Progress, Not Committed, so either Aborted or crashed.
+			 * Mark the Xmax as invalid.
+			 */</comment>
+			<expr_stmt><expr><call><name>SetHintBits</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>, <argument><expr><name>buffer</name></expr></argument>, <argument><expr><name>HEAP_XMAX_INVALID</name></expr></argument>, <argument><expr><name>InvalidTransactionId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+
+		<return>return <expr><name>HEAPTUPLE_LIVE</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><operator>(</operator><name><name>tuple</name><operator>-&gt;</operator><name>t_infomask</name></name> <operator>&amp;</operator> <name>HEAP_XMAX_COMMITTED</name><operator>)</operator></expr>)</condition>
+	<block>{<block_content>
+		<if_stmt><if>if <condition>(<expr><call><name>TransactionIdIsInProgress</name><argument_list>(<argument><expr><call><name>HeapTupleHeaderGetRawXmax</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<return>return <expr><name>HEAPTUPLE_DELETE_IN_PROGRESS</name></expr>;</return></block_content></block></if>
+		<if type="elseif">else if <condition>(<expr><call><name>TransactionIdDidCommit</name><argument_list>(<argument><expr><call><name>HeapTupleHeaderGetRawXmax</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>SetHintBits</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>, <argument><expr><name>buffer</name></expr></argument>, <argument><expr><name>HEAP_XMAX_COMMITTED</name></expr></argument>,
+						<argument><expr><call><name>HeapTupleHeaderGetRawXmax</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if>
+		<else>else
+		<block>{<block_content>
+			<comment type="block">/*
+			 * Not in Progress, Not Committed, so either Aborted or crashed
+			 */</comment>
+			<expr_stmt><expr><call><name>SetHintBits</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>, <argument><expr><name>buffer</name></expr></argument>, <argument><expr><name>HEAP_XMAX_INVALID</name></expr></argument>,
+						<argument><expr><name>InvalidTransactionId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<return>return <expr><name>HEAPTUPLE_LIVE</name></expr>;</return>
+		</block_content>}</block></else></if_stmt>
+
+		<comment type="block">/*
+		 * At this point the xmax is known committed, but we might not have
+		 * been able to set the hint bit yet; so we can no longer Assert that
+		 * it's set.
+		 */</comment>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/*
+	 * Deleter committed, but perhaps it was recent enough that some open
+	 * transactions could still see the tuple.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>TransactionIdPrecedes</name><argument_list>(<argument><expr><call><name>HeapTupleHeaderGetRawXmax</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>OldestXmin</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>HEAPTUPLE_RECENTLY_DEAD</name></expr>;</return></block_content></block></if></if_stmt>
+
+	<comment type="block">/* Otherwise, it's dead and removable */</comment>
+	<return>return <expr><name>HEAPTUPLE_DEAD</name></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * HeapTupleSatisfiesNonVacuumable
+ *
+ *	True if tuple might be visible to some transaction; false if it's
+ *	surely dead to everyone, ie, vacuumable.
+ *
+ *	This is an interface to HeapTupleSatisfiesVacuum that meets the
+ *	SnapshotSatisfiesFunc API, so it can be used through a Snapshot.
+ *	snapshot-&gt;xmin must have been set up with the xmin horizon to use.
+ */</comment>
+<function><type><name>bool</name></type>
+<name>HeapTupleSatisfiesNonVacuumable</name><parameter_list>(<parameter><decl><type><name>HeapTuple</name></type> <name>htup</name></decl></parameter>, <parameter><decl><type><name>Snapshot</name></type> <name>snapshot</name></decl></parameter>,
+								<parameter><decl><type><name>Buffer</name></type> <name>buffer</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<return>return <expr><call><name>HeapTupleSatisfiesVacuum</name><argument_list>(<argument><expr><name>htup</name></expr></argument>, <argument><expr><name><name>snapshot</name><operator>-&gt;</operator><name>xmin</name></name></expr></argument>, <argument><expr><name>buffer</name></expr></argument>)</argument_list></call>
+		<operator>!=</operator> <name>HEAPTUPLE_DEAD</name></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * HeapTupleIsSurelyDead
+ *
+ *	Cheaply determine whether a tuple is surely dead to all onlookers.
+ *	We sometimes use this in lieu of HeapTupleSatisfiesVacuum when the
+ *	tuple has just been tested by another visibility routine (usually
+ *	HeapTupleSatisfiesMVCC) and, therefore, any hint bits that can be set
+ *	should already be set.  We assume that if no hint bits are set, the xmin
+ *	or xmax transaction is still running.  This is therefore faster than
+ *	HeapTupleSatisfiesVacuum, because we don't consult PGXACT nor CLOG.
+ *	It's okay to return false when in doubt, but we must return true only
+ *	if the tuple is removable.
+ */</comment>
+<function><type><name>bool</name></type>
+<name>HeapTupleIsSurelyDead</name><parameter_list>(<parameter><decl><type><name>HeapTuple</name></type> <name>htup</name></decl></parameter>, <parameter><decl><type><name>TransactionId</name></type> <name>OldestXmin</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>HeapTupleHeader</name></type> <name>tuple</name> <init>= <expr><name><name>htup</name><operator>-&gt;</operator><name>t_data</name></name></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>ItemPointerIsValid</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>htup</name><operator>-&gt;</operator><name>t_self</name></name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>htup</name><operator>-&gt;</operator><name>t_tableOid</name></name> <operator>!=</operator> <name>InvalidOid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * If the inserting transaction is marked invalid, then it aborted, and
+	 * the tuple is definitely dead.  If it's marked neither committed nor
+	 * invalid, then we assume it's still alive (since the presumption is that
+	 * all relevant hint bits were just set moments ago).
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>HeapTupleHeaderXminCommitted</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><ternary><condition><expr><call><name>HeapTupleHeaderXminInvalid</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr> ?</condition><then> <expr><name>true</name></expr> </then><else>: <expr><name>false</name></expr></else></ternary></expr>;</return></block_content></block></if></if_stmt>
+
+	<comment type="block">/*
+	 * If the inserting transaction committed, but any deleting transaction
+	 * aborted, the tuple is still alive.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>tuple</name><operator>-&gt;</operator><name>t_infomask</name></name> <operator>&amp;</operator> <name>HEAP_XMAX_INVALID</name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>false</name></expr>;</return></block_content></block></if></if_stmt>
+
+	<comment type="block">/*
+	 * If the XMAX is just a lock, the tuple is still alive.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><call><name>HEAP_XMAX_IS_LOCKED_ONLY</name><argument_list>(<argument><expr><name><name>tuple</name><operator>-&gt;</operator><name>t_infomask</name></name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>false</name></expr>;</return></block_content></block></if></if_stmt>
+
+	<comment type="block">/*
+	 * If the Xmax is a MultiXact, it might be dead or alive, but we cannot
+	 * know without checking pg_multixact.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>tuple</name><operator>-&gt;</operator><name>t_infomask</name></name> <operator>&amp;</operator> <name>HEAP_XMAX_IS_MULTI</name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>false</name></expr>;</return></block_content></block></if></if_stmt>
+
+	<comment type="block">/* If deleter isn't known to have committed, assume it's still running. */</comment>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><operator>(</operator><name><name>tuple</name><operator>-&gt;</operator><name>t_infomask</name></name> <operator>&amp;</operator> <name>HEAP_XMAX_COMMITTED</name><operator>)</operator></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>false</name></expr>;</return></block_content></block></if></if_stmt>
+
+	<comment type="block">/* Deleter committed, so tuple is dead if the XID is old enough. */</comment>
+	<return>return <expr><call><name>TransactionIdPrecedes</name><argument_list>(<argument><expr><call><name>HeapTupleHeaderGetRawXmax</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>OldestXmin</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * XidInMVCCSnapshot
+ *		Is the given XID still-in-progress according to the snapshot?
+ *
+ * Note: GetSnapshotData never stores either top xid or subxids of our own
+ * backend into a snapshot, so these xids will not be reported as "running"
+ * by this function.  This is OK for current uses, because we always check
+ * TransactionIdIsCurrentTransactionId first, except when it's known the
+ * XID could not be ours anyway.
+ */</comment>
+<function><type><name>bool</name></type>
+<name>XidInMVCCSnapshot</name><parameter_list>(<parameter><decl><type><name>TransactionId</name></type> <name>xid</name></decl></parameter>, <parameter><decl><type><name>Snapshot</name></type> <name>snapshot</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>uint32</name></type>		<name>i</name></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * Make a quick range check to eliminate most XIDs without looking at the
+	 * xip arrays.  Note that this is OK even if we convert a subxact XID to
+	 * its parent below, because a subxact with XID &lt; xmin has surely also got
+	 * a parent with XID &lt; xmin, while one with XID &gt;= xmax must belong to a
+	 * parent that was not yet committed at the time of this snapshot.
+	 */</comment>
+
+	<comment type="block">/* Any xid &lt; xmin is not in-progress */</comment>
+	<if_stmt><if>if <condition>(<expr><call><name>TransactionIdPrecedes</name><argument_list>(<argument><expr><name>xid</name></expr></argument>, <argument><expr><name><name>snapshot</name><operator>-&gt;</operator><name>xmin</name></name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>false</name></expr>;</return></block_content></block></if></if_stmt>
+	<comment type="block">/* Any xid &gt;= xmax is in-progress */</comment>
+	<if_stmt><if>if <condition>(<expr><call><name>TransactionIdFollowsOrEquals</name><argument_list>(<argument><expr><name>xid</name></expr></argument>, <argument><expr><name><name>snapshot</name><operator>-&gt;</operator><name>xmax</name></name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>true</name></expr>;</return></block_content></block></if></if_stmt>
+
+	<comment type="block">/*
+	 * Snapshot information is stored slightly differently in snapshots taken
+	 * during recovery.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><name><name>snapshot</name><operator>-&gt;</operator><name>takenDuringRecovery</name></name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/*
+		 * If the snapshot contains full subxact data, the fastest way to
+		 * check things is just to compare the given XID against both subxact
+		 * XIDs and top-level XIDs.  If the snapshot overflowed, we have to
+		 * use pg_subtrans to convert a subxact XID to its parent XID, but
+		 * then we need only look at top-level XIDs not subxacts.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><name><name>snapshot</name><operator>-&gt;</operator><name>suboverflowed</name></name></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/* we have full data, so search subxip */</comment>
+			<decl_stmt><decl><type><name>int32</name></type>		<name>j</name></decl>;</decl_stmt>
+
+			<for>for <control>(<init><expr><name>j</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>j</name> <operator>&lt;</operator> <name><name>snapshot</name><operator>-&gt;</operator><name>subxcnt</name></name></expr>;</condition> <incr><expr><name>j</name><operator>++</operator></expr></incr>)</control>
+			<block>{<block_content>
+				<if_stmt><if>if <condition>(<expr><call><name>TransactionIdEquals</name><argument_list>(<argument><expr><name>xid</name></expr></argument>, <argument><expr><name><name>snapshot</name><operator>-&gt;</operator><name>subxip</name><index>[<expr><name>j</name></expr>]</index></name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+					<return>return <expr><name>true</name></expr>;</return></block_content></block></if></if_stmt>
+			</block_content>}</block></for>
+
+			<comment type="block">/* not there, fall through to search xip[] */</comment>
+		</block_content>}</block></if>
+		<else>else
+		<block>{<block_content>
+			<comment type="block">/*
+			 * Snapshot overflowed, so convert xid to top-level.  This is safe
+			 * because we eliminated too-old XIDs above.
+			 */</comment>
+			<expr_stmt><expr><name>xid</name> <operator>=</operator> <call><name>SubTransGetTopmostTransaction</name><argument_list>(<argument><expr><name>xid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+			<comment type="block">/*
+			 * If xid was indeed a subxact, we might now have an xid &lt; xmin,
+			 * so recheck to avoid an array scan.  No point in rechecking
+			 * xmax.
+			 */</comment>
+			<if_stmt><if>if <condition>(<expr><call><name>TransactionIdPrecedes</name><argument_list>(<argument><expr><name>xid</name></expr></argument>, <argument><expr><name><name>snapshot</name><operator>-&gt;</operator><name>xmin</name></name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+				<return>return <expr><name>false</name></expr>;</return></block_content></block></if></if_stmt>
+		</block_content>}</block></else></if_stmt>
+
+		<for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name><name>snapshot</name><operator>-&gt;</operator><name>xcnt</name></name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control>
+		<block>{<block_content>
+			<if_stmt><if>if <condition>(<expr><call><name>TransactionIdEquals</name><argument_list>(<argument><expr><name>xid</name></expr></argument>, <argument><expr><name><name>snapshot</name><operator>-&gt;</operator><name>xip</name><index>[<expr><name>i</name></expr>]</index></name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+				<return>return <expr><name>true</name></expr>;</return></block_content></block></if></if_stmt>
+		</block_content>}</block></for>
+	</block_content>}</block></if>
+	<else>else
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>int32</name></type>		<name>j</name></decl>;</decl_stmt>
+
+		<comment type="block">/*
+		 * In recovery we store all xids in the subxact array because it is by
+		 * far the bigger array, and we mostly don't know which xids are
+		 * top-level and which are subxacts. The xip array is empty.
+		 *
+		 * We start by searching subtrans, if we overflowed.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><name><name>snapshot</name><operator>-&gt;</operator><name>suboverflowed</name></name></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/*
+			 * Snapshot overflowed, so convert xid to top-level.  This is safe
+			 * because we eliminated too-old XIDs above.
+			 */</comment>
+			<expr_stmt><expr><name>xid</name> <operator>=</operator> <call><name>SubTransGetTopmostTransaction</name><argument_list>(<argument><expr><name>xid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+			<comment type="block">/*
+			 * If xid was indeed a subxact, we might now have an xid &lt; xmin,
+			 * so recheck to avoid an array scan.  No point in rechecking
+			 * xmax.
+			 */</comment>
+			<if_stmt><if>if <condition>(<expr><call><name>TransactionIdPrecedes</name><argument_list>(<argument><expr><name>xid</name></expr></argument>, <argument><expr><name><name>snapshot</name><operator>-&gt;</operator><name>xmin</name></name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+				<return>return <expr><name>false</name></expr>;</return></block_content></block></if></if_stmt>
+		</block_content>}</block></if></if_stmt>
+
+		<comment type="block">/*
+		 * We now have either a top-level xid higher than xmin or an
+		 * indeterminate xid. We don't know whether it's top level or subxact
+		 * but it doesn't matter. If it's present, the xid is visible.
+		 */</comment>
+		<for>for <control>(<init><expr><name>j</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>j</name> <operator>&lt;</operator> <name><name>snapshot</name><operator>-&gt;</operator><name>subxcnt</name></name></expr>;</condition> <incr><expr><name>j</name><operator>++</operator></expr></incr>)</control>
+		<block>{<block_content>
+			<if_stmt><if>if <condition>(<expr><call><name>TransactionIdEquals</name><argument_list>(<argument><expr><name>xid</name></expr></argument>, <argument><expr><name><name>snapshot</name><operator>-&gt;</operator><name>subxip</name><index>[<expr><name>j</name></expr>]</index></name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+				<return>return <expr><name>true</name></expr>;</return></block_content></block></if></if_stmt>
+		</block_content>}</block></for>
+	</block_content>}</block></else></if_stmt>
+
+	<return>return <expr><name>false</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Is the tuple really only locked?  That is, is it not updated?
+ *
+ * It's easy to check just infomask bits if the locker is not a multi; but
+ * otherwise we need to verify that the updating transaction has not aborted.
+ *
+ * This function is here because it follows the same time qualification rules
+ * laid out at the top of this file.
+ */</comment>
+<function><type><name>bool</name></type>
+<name>HeapTupleHeaderIsOnlyLocked</name><parameter_list>(<parameter><decl><type><name>HeapTupleHeader</name></type> <name>tuple</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>TransactionId</name></type> <name>xmax</name></decl>;</decl_stmt>
+
+	<comment type="block">/* if there's no valid Xmax, then there's obviously no update either */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>tuple</name><operator>-&gt;</operator><name>t_infomask</name></name> <operator>&amp;</operator> <name>HEAP_XMAX_INVALID</name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>true</name></expr>;</return></block_content></block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name><name>tuple</name><operator>-&gt;</operator><name>t_infomask</name></name> <operator>&amp;</operator> <name>HEAP_XMAX_LOCK_ONLY</name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>true</name></expr>;</return></block_content></block></if></if_stmt>
+
+	<comment type="block">/* invalid xmax means no update */</comment>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>TransactionIdIsValid</name><argument_list>(<argument><expr><call><name>HeapTupleHeaderGetRawXmax</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>true</name></expr>;</return></block_content></block></if></if_stmt>
+
+	<comment type="block">/*
+	 * if HEAP_XMAX_LOCK_ONLY is not set and not a multi, then this must
+	 * necessarily have been updated
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><operator>(</operator><name><name>tuple</name><operator>-&gt;</operator><name>t_infomask</name></name> <operator>&amp;</operator> <name>HEAP_XMAX_IS_MULTI</name><operator>)</operator></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>false</name></expr>;</return></block_content></block></if></if_stmt>
+
+	<comment type="block">/* ... but if it's a multi, then perhaps the updating Xid aborted. */</comment>
+	<expr_stmt><expr><name>xmax</name> <operator>=</operator> <call><name>HeapTupleGetUpdateXid</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* not LOCKED_ONLY, so it has to have an xmax */</comment>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>TransactionIdIsValid</name><argument_list>(<argument><expr><name>xmax</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><call><name>TransactionIdIsCurrentTransactionId</name><argument_list>(<argument><expr><name>xmax</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>false</name></expr>;</return></block_content></block></if></if_stmt>
+	<if_stmt><if>if <condition>(<expr><call><name>TransactionIdIsInProgress</name><argument_list>(<argument><expr><name>xmax</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>false</name></expr>;</return></block_content></block></if></if_stmt>
+	<if_stmt><if>if <condition>(<expr><call><name>TransactionIdDidCommit</name><argument_list>(<argument><expr><name>xmax</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>false</name></expr>;</return></block_content></block></if></if_stmt>
+
+	<comment type="block">/*
+	 * not current, not in progress, not committed -- must have aborted or
+	 * crashed
+	 */</comment>
+	<return>return <expr><name>true</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * check whether the transaction id 'xid' is in the pre-sorted array 'xip'.
+ */</comment>
+<function><type><specifier>static</specifier> <name>bool</name></type>
+<name>TransactionIdInArray</name><parameter_list>(<parameter><decl><type><name>TransactionId</name></type> <name>xid</name></decl></parameter>, <parameter><decl><type><name>TransactionId</name> <modifier>*</modifier></type><name>xip</name></decl></parameter>, <parameter><decl><type><name>Size</name></type> <name>num</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<return>return <expr><call><name>bsearch</name><argument_list>(<argument><expr><operator>&amp;</operator><name>xid</name></expr></argument>, <argument><expr><name>xip</name></expr></argument>, <argument><expr><name>num</name></expr></argument>,
+				   <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>TransactionId</name></expr></argument>)</argument_list></sizeof></expr></argument>, <argument><expr><name>xidComparator</name></expr></argument>)</argument_list></call> <operator>!=</operator> <name>NULL</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * See the comments for HeapTupleSatisfiesMVCC for the semantics this function
+ * obeys.
+ *
+ * Only usable on tuples from catalog tables!
+ *
+ * We don't need to support HEAP_MOVED_(IN|OFF) for now because we only support
+ * reading catalog pages which couldn't have been created in an older version.
+ *
+ * We don't set any hint bits in here as it seems unlikely to be beneficial as
+ * those should already be set by normal access and it seems to be too
+ * dangerous to do so as the semantics of doing so during timetravel are more
+ * complicated than when dealing "only" with the present.
+ */</comment>
+<function><type><name>bool</name></type>
+<name>HeapTupleSatisfiesHistoricMVCC</name><parameter_list>(<parameter><decl><type><name>HeapTuple</name></type> <name>htup</name></decl></parameter>, <parameter><decl><type><name>Snapshot</name></type> <name>snapshot</name></decl></parameter>,
+							   <parameter><decl><type><name>Buffer</name></type> <name>buffer</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>HeapTupleHeader</name></type> <name>tuple</name> <init>= <expr><name><name>htup</name><operator>-&gt;</operator><name>t_data</name></name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>TransactionId</name></type> <name>xmin</name> <init>= <expr><call><name>HeapTupleHeaderGetXmin</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>TransactionId</name></type> <name>xmax</name> <init>= <expr><call><name>HeapTupleHeaderGetRawXmax</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>ItemPointerIsValid</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>htup</name><operator>-&gt;</operator><name>t_self</name></name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>htup</name><operator>-&gt;</operator><name>t_tableOid</name></name> <operator>!=</operator> <name>InvalidOid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* inserting transaction aborted */</comment>
+	<if_stmt><if>if <condition>(<expr><call><name>HeapTupleHeaderXminInvalid</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><operator>!</operator><call><name>TransactionIdDidCommit</name><argument_list>(<argument><expr><name>xmin</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<return>return <expr><name>false</name></expr>;</return>
+	</block_content>}</block></if>
+	<comment type="block">/* check if it's one of our txids, toplevel is also in there */</comment>
+	<if type="elseif">else if <condition>(<expr><call><name>TransactionIdInArray</name><argument_list>(<argument><expr><name>xmin</name></expr></argument>, <argument><expr><name><name>snapshot</name><operator>-&gt;</operator><name>subxip</name></name></expr></argument>, <argument><expr><name><name>snapshot</name><operator>-&gt;</operator><name>subxcnt</name></name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>bool</name></type>		<name>resolved</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>CommandId</name></type>	<name>cmin</name> <init>= <expr><call><name>HeapTupleHeaderGetRawCommandId</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>CommandId</name></type>	<name>cmax</name> <init>= <expr><name>InvalidCommandId</name></expr></init></decl>;</decl_stmt>
+
+		<comment type="block">/*
+		 * another transaction might have (tried to) delete this tuple or
+		 * cmin/cmax was stored in a combocid. So we need to lookup the actual
+		 * values externally.
+		 */</comment>
+		<expr_stmt><expr><name>resolved</name> <operator>=</operator> <call><name>ResolveCminCmaxDuringDecoding</name><argument_list>(<argument><expr><call><name>HistoricSnapshotGetTupleCids</name><argument_list>()</argument_list></call></expr></argument>, <argument><expr><name>snapshot</name></expr></argument>,
+												 <argument><expr><name>htup</name></expr></argument>, <argument><expr><name>buffer</name></expr></argument>,
+												 <argument><expr><operator>&amp;</operator><name>cmin</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>cmax</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><name>resolved</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"could not resolve cmin/cmax of catalog tuple"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>cmin</name> <operator>!=</operator> <name>InvalidCommandId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name>cmin</name> <operator>&gt;=</operator> <name><name>snapshot</name><operator>-&gt;</operator><name>curcid</name></name></expr>)</condition><block type="pseudo"><block_content>
+			<return>return <expr><name>false</name></expr>;</return></block_content></block></if></if_stmt>		<comment type="block">/* inserted after scan started */</comment>
+		<comment type="block">/* fall through */</comment>
+	</block_content>}</block></if>
+	<comment type="block">/* committed before our xmin horizon. Do a normal visibility check. */</comment>
+	<if type="elseif">else if <condition>(<expr><call><name>TransactionIdPrecedes</name><argument_list>(<argument><expr><name>xmin</name></expr></argument>, <argument><expr><name><name>snapshot</name><operator>-&gt;</operator><name>xmin</name></name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><operator>!</operator><operator>(</operator><call><name>HeapTupleHeaderXminCommitted</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call> <operator>&amp;&amp;</operator>
+				 <operator>!</operator><call><name>TransactionIdDidCommit</name><argument_list>(<argument><expr><name>xmin</name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/* check for hint bit first, consult clog afterwards */</comment>
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>HeapTupleHeaderXminCommitted</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call> <operator>&amp;&amp;</operator>
+			<operator>!</operator><call><name>TransactionIdDidCommit</name><argument_list>(<argument><expr><name>xmin</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<return>return <expr><name>false</name></expr>;</return></block_content></block></if></if_stmt>
+		<comment type="block">/* fall through */</comment>
+	</block_content>}</block></if>
+	<comment type="block">/* beyond our xmax horizon, i.e. invisible */</comment>
+	<if type="elseif">else if <condition>(<expr><call><name>TransactionIdFollowsOrEquals</name><argument_list>(<argument><expr><name>xmin</name></expr></argument>, <argument><expr><name><name>snapshot</name><operator>-&gt;</operator><name>xmax</name></name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<return>return <expr><name>false</name></expr>;</return>
+	</block_content>}</block></if>
+	<comment type="block">/* check if it's a committed transaction in [xmin, xmax) */</comment>
+	<if type="elseif">else if <condition>(<expr><call><name>TransactionIdInArray</name><argument_list>(<argument><expr><name>xmin</name></expr></argument>, <argument><expr><name><name>snapshot</name><operator>-&gt;</operator><name>xip</name></name></expr></argument>, <argument><expr><name><name>snapshot</name><operator>-&gt;</operator><name>xcnt</name></name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* fall through */</comment>
+	</block_content>}</block></if>
+
+	<comment type="block">/*
+	 * none of the above, i.e. between [xmin, xmax) but hasn't committed. I.e.
+	 * invisible.
+	 */</comment>
+	<else>else
+	<block>{<block_content>
+		<return>return <expr><name>false</name></expr>;</return>
+	</block_content>}</block></else></if_stmt>
+
+	<comment type="block">/* at this point we know xmin is visible, go on to check xmax */</comment>
+
+	<comment type="block">/* xid invalid or aborted */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>tuple</name><operator>-&gt;</operator><name>t_infomask</name></name> <operator>&amp;</operator> <name>HEAP_XMAX_INVALID</name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>true</name></expr>;</return></block_content></block></if>
+	<comment type="block">/* locked tuples are always visible */</comment>
+	<if type="elseif">else if <condition>(<expr><call><name>HEAP_XMAX_IS_LOCKED_ONLY</name><argument_list>(<argument><expr><name><name>tuple</name><operator>-&gt;</operator><name>t_infomask</name></name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>true</name></expr>;</return></block_content></block></if>
+
+	<comment type="block">/*
+	 * We can see multis here if we're looking at user tables or if somebody
+	 * SELECT ... FOR SHARE/UPDATE a system table.
+	 */</comment>
+	<if type="elseif">else if <condition>(<expr><name><name>tuple</name><operator>-&gt;</operator><name>t_infomask</name></name> <operator>&amp;</operator> <name>HEAP_XMAX_IS_MULTI</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name>xmax</name> <operator>=</operator> <call><name>HeapTupleGetUpdateXid</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/* check if it's one of our txids, toplevel is also in there */</comment>
+	<if_stmt><if>if <condition>(<expr><call><name>TransactionIdInArray</name><argument_list>(<argument><expr><name>xmax</name></expr></argument>, <argument><expr><name><name>snapshot</name><operator>-&gt;</operator><name>subxip</name></name></expr></argument>, <argument><expr><name><name>snapshot</name><operator>-&gt;</operator><name>subxcnt</name></name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>bool</name></type>		<name>resolved</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>CommandId</name></type>	<name>cmin</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>CommandId</name></type>	<name>cmax</name> <init>= <expr><call><name>HeapTupleHeaderGetRawCommandId</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+		<comment type="block">/* Lookup actual cmin/cmax values */</comment>
+		<expr_stmt><expr><name>resolved</name> <operator>=</operator> <call><name>ResolveCminCmaxDuringDecoding</name><argument_list>(<argument><expr><call><name>HistoricSnapshotGetTupleCids</name><argument_list>()</argument_list></call></expr></argument>, <argument><expr><name>snapshot</name></expr></argument>,
+												 <argument><expr><name>htup</name></expr></argument>, <argument><expr><name>buffer</name></expr></argument>,
+												 <argument><expr><operator>&amp;</operator><name>cmin</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>cmax</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><name>resolved</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"could not resolve combocid to cmax"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>cmax</name> <operator>!=</operator> <name>InvalidCommandId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name>cmax</name> <operator>&gt;=</operator> <name><name>snapshot</name><operator>-&gt;</operator><name>curcid</name></name></expr>)</condition><block type="pseudo"><block_content>
+			<return>return <expr><name>true</name></expr>;</return></block_content></block></if>		<comment type="block">/* deleted after scan started */</comment>
+		<else>else<block type="pseudo"><block_content>
+			<return>return <expr><name>false</name></expr>;</return></block_content></block></else></if_stmt>		<comment type="block">/* deleted before scan started */</comment>
+	</block_content>}</block></if>
+	<comment type="block">/* below xmin horizon, normal transaction state is valid */</comment>
+	<if type="elseif">else if <condition>(<expr><call><name>TransactionIdPrecedes</name><argument_list>(<argument><expr><name>xmax</name></expr></argument>, <argument><expr><name><name>snapshot</name><operator>-&gt;</operator><name>xmin</name></name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><operator>!</operator><operator>(</operator><name><name>tuple</name><operator>-&gt;</operator><name>t_infomask</name></name> <operator>&amp;</operator> <name>HEAP_XMAX_COMMITTED</name> <operator>&amp;&amp;</operator>
+				 <operator>!</operator><call><name>TransactionIdDidCommit</name><argument_list>(<argument><expr><name>xmax</name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/* check hint bit first */</comment>
+		<if_stmt><if>if <condition>(<expr><name><name>tuple</name><operator>-&gt;</operator><name>t_infomask</name></name> <operator>&amp;</operator> <name>HEAP_XMAX_COMMITTED</name></expr>)</condition><block type="pseudo"><block_content>
+			<return>return <expr><name>false</name></expr>;</return></block_content></block></if></if_stmt>
+
+		<comment type="block">/* check clog */</comment>
+		<return>return <expr><operator>!</operator><call><name>TransactionIdDidCommit</name><argument_list>(<argument><expr><name>xmax</name></expr></argument>)</argument_list></call></expr>;</return>
+	</block_content>}</block></if>
+	<comment type="block">/* above xmax horizon, we cannot possibly see the deleting transaction */</comment>
+	<if type="elseif">else if <condition>(<expr><call><name>TransactionIdFollowsOrEquals</name><argument_list>(<argument><expr><name>xmax</name></expr></argument>, <argument><expr><name><name>snapshot</name><operator>-&gt;</operator><name>xmax</name></name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>true</name></expr>;</return></block_content></block></if>
+	<comment type="block">/* xmax is between [xmin, xmax), check known committed array */</comment>
+	<if type="elseif">else if <condition>(<expr><call><name>TransactionIdInArray</name><argument_list>(<argument><expr><name>xmax</name></expr></argument>, <argument><expr><name><name>snapshot</name><operator>-&gt;</operator><name>xip</name></name></expr></argument>, <argument><expr><name><name>snapshot</name><operator>-&gt;</operator><name>xcnt</name></name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>false</name></expr>;</return></block_content></block></if>
+	<comment type="block">/* xmax is between [xmin, xmax), but known not to have committed yet */</comment>
+	<else>else<block type="pseudo"><block_content>
+		<return>return <expr><name>true</name></expr>;</return></block_content></block></else></if_stmt>
+</block_content>}</block></function>
+</unit>

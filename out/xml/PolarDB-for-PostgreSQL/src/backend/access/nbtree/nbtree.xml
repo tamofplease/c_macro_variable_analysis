@@ -1,0 +1,1387 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<unit xmlns="http://www.srcML.org/srcML/src" xmlns:cpp="http://www.srcML.org/srcML/cpp" revision="1.0.0" language="C" filename="/cloned_projects/PolarDB-for-PostgreSQL/src/backend/access/nbtree/nbtree.c"><comment type="block">/*-------------------------------------------------------------------------
+ *
+ * nbtree.c
+ *	  Implementation of Lehman and Yao's btree management algorithm for
+ *	  Postgres.
+ *
+ * NOTES
+ *	  This file contains only the public interface routines.
+ *
+ *
+ * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1994, Regents of the University of California
+ *
+ * IDENTIFICATION
+ *	  src/backend/access/nbtree/nbtree.c
+ *
+ *-------------------------------------------------------------------------
+ */</comment>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"postgres.h"</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/nbtree.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/nbtxlog.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/relscan.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/xlog.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"commands/vacuum.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"miscadmin.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"nodes/execnodes.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"pgstat.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"postmaster/autovacuum.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/condition_variable.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/indexfsm.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/ipc.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/lmgr.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/smgr.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/builtins.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/index_selfuncs.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/memutils.h"</cpp:file></cpp:include>
+
+
+<comment type="block">/* Working state needed by btvacuumpage */</comment>
+<typedef>typedef <type><struct>struct
+<block>{
+	<decl_stmt><decl><type><name>IndexVacuumInfo</name> <modifier>*</modifier></type><name>info</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>IndexBulkDeleteResult</name> <modifier>*</modifier></type><name>stats</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>IndexBulkDeleteCallback</name></type> <name>callback</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>void</name>	   <modifier>*</modifier></type><name>callback_state</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>BTCycleId</name></type>	<name>cycleid</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>BlockNumber</name></type> <name>lastBlockVacuumed</name></decl>;</decl_stmt>	<comment type="block">/* highest blkno actually vacuumed */</comment>
+	<decl_stmt><decl><type><name>BlockNumber</name></type> <name>lastBlockLocked</name></decl>;</decl_stmt>	<comment type="block">/* highest blkno we've cleanup-locked */</comment>
+	<decl_stmt><decl><type><name>BlockNumber</name></type> <name>totFreePages</name></decl>;</decl_stmt>	<comment type="block">/* true total # of free pages */</comment>
+	<decl_stmt><decl><type><name>TransactionId</name></type> <name>oldestBtpoXact</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>MemoryContext</name></type> <name>pagedelcontext</name></decl>;</decl_stmt>
+}</block></struct></type> <name>BTVacState</name>;</typedef>
+
+<comment type="block">/*
+ * BTPARALLEL_NOT_INITIALIZED indicates that the scan has not started.
+ *
+ * BTPARALLEL_ADVANCING indicates that some process is advancing the scan to
+ * a new page; others must wait.
+ *
+ * BTPARALLEL_IDLE indicates that no backend is currently advancing the scan
+ * to a new page; some process can start doing that.
+ *
+ * BTPARALLEL_DONE indicates that the scan is complete (including error exit).
+ * We reach this state once for every distinct combination of array keys.
+ */</comment>
+<typedef>typedef <type><enum>enum
+<block>{
+	<decl><name>BTPARALLEL_NOT_INITIALIZED</name></decl>,
+	<decl><name>BTPARALLEL_ADVANCING</name></decl>,
+	<decl><name>BTPARALLEL_IDLE</name></decl>,
+	<decl><name>BTPARALLEL_DONE</name></decl>
+}</block></enum></type> <name>BTPS_State</name>;</typedef>
+
+<comment type="block">/*
+ * BTParallelScanDescData contains btree specific shared information required
+ * for parallel scan.
+ */</comment>
+<typedef>typedef <type><struct>struct <name>BTParallelScanDescData</name>
+<block>{
+	<decl_stmt><decl><type><name>BlockNumber</name></type> <name>btps_scanPage</name></decl>;</decl_stmt>	<comment type="block">/* latest or next page to be scanned */</comment>
+	<decl_stmt><decl><type><name>BTPS_State</name></type>	<name>btps_pageStatus</name></decl>;</decl_stmt>	<comment type="block">/* indicates whether next page is
+									 * available for scan. see above for
+									 * possible states of parallel scan. */</comment>
+	<decl_stmt><decl><type><name>int</name></type>			<name>btps_arrayKeyCount</name></decl>;</decl_stmt> <comment type="block">/* count indicating number of array scan
+									 * keys processed by parallel scan */</comment>
+	<decl_stmt><decl><type><name>slock_t</name></type>		<name>btps_mutex</name></decl>;</decl_stmt>		<comment type="block">/* protects above variables */</comment>
+	<decl_stmt><decl><type><name>ConditionVariable</name></type> <name>btps_cv</name></decl>;</decl_stmt>	<comment type="block">/* used to synchronize parallel scan */</comment>
+}</block></struct></type>			<name>BTParallelScanDescData</name>;</typedef>
+
+<typedef>typedef <type><name><name>struct</name> <name>BTParallelScanDescData</name></name> <modifier>*</modifier></type><name>BTParallelScanDesc</name>;</typedef>
+
+
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>btvacuumscan</name><parameter_list>(<parameter><decl><type><name>IndexVacuumInfo</name> <modifier>*</modifier></type><name>info</name></decl></parameter>, <parameter><decl><type><name>IndexBulkDeleteResult</name> <modifier>*</modifier></type><name>stats</name></decl></parameter>,
+			 <parameter><decl><type><name>IndexBulkDeleteCallback</name></type> <name>callback</name></decl></parameter>, <parameter><decl><type><name>void</name> <modifier>*</modifier></type><name>callback_state</name></decl></parameter>,
+			 <parameter><decl><type><name>BTCycleId</name></type> <name>cycleid</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>btvacuumpage</name><parameter_list>(<parameter><decl><type><name>BTVacState</name> <modifier>*</modifier></type><name>vstate</name></decl></parameter>, <parameter><decl><type><name>BlockNumber</name></type> <name>blkno</name></decl></parameter>,
+			 <parameter><decl><type><name>BlockNumber</name></type> <name>orig_blkno</name></decl></parameter>)</parameter_list>;</function_decl>
+
+
+<comment type="block">/*
+ * Btree handler function: return IndexAmRoutine with access method parameters
+ * and callbacks.
+ */</comment>
+<function><type><name>Datum</name></type>
+<name>bthandler</name><parameter_list>(<parameter><decl><type><name>PG_FUNCTION_ARGS</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>IndexAmRoutine</name> <modifier>*</modifier></type><name>amroutine</name> <init>= <expr><call><name>makeNode</name><argument_list>(<argument><expr><name>IndexAmRoutine</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name><name>amroutine</name><operator>-&gt;</operator><name>amstrategies</name></name> <operator>=</operator> <name>BTMaxStrategyNumber</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>amroutine</name><operator>-&gt;</operator><name>amsupport</name></name> <operator>=</operator> <name>BTNProcs</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>amroutine</name><operator>-&gt;</operator><name>amcanorder</name></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>amroutine</name><operator>-&gt;</operator><name>amcanorderbyop</name></name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>amroutine</name><operator>-&gt;</operator><name>amcanbackward</name></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>amroutine</name><operator>-&gt;</operator><name>amcanunique</name></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>amroutine</name><operator>-&gt;</operator><name>amcanmulticol</name></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>amroutine</name><operator>-&gt;</operator><name>amoptionalkey</name></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>amroutine</name><operator>-&gt;</operator><name>amsearcharray</name></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>amroutine</name><operator>-&gt;</operator><name>amsearchnulls</name></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>amroutine</name><operator>-&gt;</operator><name>amstorage</name></name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>amroutine</name><operator>-&gt;</operator><name>amclusterable</name></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>amroutine</name><operator>-&gt;</operator><name>ampredlocks</name></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>amroutine</name><operator>-&gt;</operator><name>amcanparallel</name></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>amroutine</name><operator>-&gt;</operator><name>amcaninclude</name></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>amroutine</name><operator>-&gt;</operator><name>amkeytype</name></name> <operator>=</operator> <name>InvalidOid</name></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name><name>amroutine</name><operator>-&gt;</operator><name>ambuild</name></name> <operator>=</operator> <name>btbuild</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>amroutine</name><operator>-&gt;</operator><name>ambuildempty</name></name> <operator>=</operator> <name>btbuildempty</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>amroutine</name><operator>-&gt;</operator><name>aminsert</name></name> <operator>=</operator> <name>btinsert</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>amroutine</name><operator>-&gt;</operator><name>ambulkdelete</name></name> <operator>=</operator> <name>btbulkdelete</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>amroutine</name><operator>-&gt;</operator><name>amvacuumcleanup</name></name> <operator>=</operator> <name>btvacuumcleanup</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>amroutine</name><operator>-&gt;</operator><name>amcanreturn</name></name> <operator>=</operator> <name>btcanreturn</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>amroutine</name><operator>-&gt;</operator><name>amcostestimate</name></name> <operator>=</operator> <name>btcostestimate</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>amroutine</name><operator>-&gt;</operator><name>amoptions</name></name> <operator>=</operator> <name>btoptions</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>amroutine</name><operator>-&gt;</operator><name>amproperty</name></name> <operator>=</operator> <name>btproperty</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>amroutine</name><operator>-&gt;</operator><name>amvalidate</name></name> <operator>=</operator> <name>btvalidate</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>amroutine</name><operator>-&gt;</operator><name>ambeginscan</name></name> <operator>=</operator> <name>btbeginscan</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>amroutine</name><operator>-&gt;</operator><name>amrescan</name></name> <operator>=</operator> <name>btrescan</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>amroutine</name><operator>-&gt;</operator><name>amgettuple</name></name> <operator>=</operator> <name>btgettuple</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>amroutine</name><operator>-&gt;</operator><name>amgetbitmap</name></name> <operator>=</operator> <name>btgetbitmap</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>amroutine</name><operator>-&gt;</operator><name>amendscan</name></name> <operator>=</operator> <name>btendscan</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>amroutine</name><operator>-&gt;</operator><name>ammarkpos</name></name> <operator>=</operator> <name>btmarkpos</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>amroutine</name><operator>-&gt;</operator><name>amrestrpos</name></name> <operator>=</operator> <name>btrestrpos</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>amroutine</name><operator>-&gt;</operator><name>amestimateparallelscan</name></name> <operator>=</operator> <name>btestimateparallelscan</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>amroutine</name><operator>-&gt;</operator><name>aminitparallelscan</name></name> <operator>=</operator> <name>btinitparallelscan</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>amroutine</name><operator>-&gt;</operator><name>amparallelrescan</name></name> <operator>=</operator> <name>btparallelrescan</name></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>PG_RETURN_POINTER</name><argument_list>(<argument><expr><name>amroutine</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ *	btbuildempty() -- build an empty btree index in the initialization fork
+ */</comment>
+<function><type><name>void</name></type>
+<name>btbuildempty</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>index</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>Page</name></type>		<name>metapage</name></decl>;</decl_stmt>
+
+	<comment type="block">/* Construct metapage. */</comment>
+	<expr_stmt><expr><name>metapage</name> <operator>=</operator> <operator>(</operator><name>Page</name><operator>)</operator> <call><name>palloc</name><argument_list>(<argument><expr><name>BLCKSZ</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>_bt_initmetapage</name><argument_list>(<argument><expr><name>metapage</name></expr></argument>, <argument><expr><name>P_NONE</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Write the page and log it.  It might seem that an immediate sync would
+	 * be sufficient to guarantee that the file exists on disk, but recovery
+	 * itself might remove it while replaying, for example, an
+	 * XLOG_DBASE_CREATE or XLOG_TBLSPC_CREATE record.  Therefore, we need
+	 * this even when wal_level=minimal.
+	 */</comment>
+	<expr_stmt><expr><call><name>PageEncryptInplace</name><argument_list>(<argument><expr><name>metapage</name></expr></argument>, <argument><expr><name>INIT_FORKNUM</name></expr></argument>, <argument><expr><name>BTREE_METAPAGE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>PageSetChecksumInplace</name><argument_list>(<argument><expr><name>metapage</name></expr></argument>, <argument><expr><name>BTREE_METAPAGE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>smgrwrite</name><argument_list>(<argument><expr><name><name>index</name><operator>-&gt;</operator><name>rd_smgr</name></name></expr></argument>, <argument><expr><name>INIT_FORKNUM</name></expr></argument>, <argument><expr><name>BTREE_METAPAGE</name></expr></argument>,
+			  <argument><expr><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <name>metapage</name></expr></argument>, <argument><expr><name>true</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>log_newpage</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>index</name><operator>-&gt;</operator><name>rd_smgr</name><operator>-&gt;</operator><name>smgr_rnode</name><operator>.</operator><name>node</name></name></expr></argument>, <argument><expr><name>INIT_FORKNUM</name></expr></argument>,
+				<argument><expr><name>BTREE_METAPAGE</name></expr></argument>, <argument><expr><name>metapage</name></expr></argument>, <argument><expr><name>true</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * An immediate sync is required even if we xlog'd the page, because the
+	 * write did not go through shared_buffers and therefore a concurrent
+	 * checkpoint may have moved the redo pointer past our xlog record.
+	 */</comment>
+	<expr_stmt><expr><call><name>smgrimmedsync</name><argument_list>(<argument><expr><name><name>index</name><operator>-&gt;</operator><name>rd_smgr</name></name></expr></argument>, <argument><expr><name>INIT_FORKNUM</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ *	btinsert() -- insert an index tuple into a btree.
+ *
+ *		Descend the tree recursively, find the appropriate location for our
+ *		new tuple, and put it there.
+ */</comment>
+<function><type><name>bool</name></type>
+<name>btinsert</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>rel</name></decl></parameter>, <parameter><decl><type><name>Datum</name> <modifier>*</modifier></type><name>values</name></decl></parameter>, <parameter><decl><type><name>bool</name> <modifier>*</modifier></type><name>isnull</name></decl></parameter>,
+		 <parameter><decl><type><name>ItemPointer</name></type> <name>ht_ctid</name></decl></parameter>, <parameter><decl><type><name>Relation</name></type> <name>heapRel</name></decl></parameter>,
+		 <parameter><decl><type><name>IndexUniqueCheck</name></type> <name>checkUnique</name></decl></parameter>,
+		 <parameter><decl><type><name>IndexInfo</name> <modifier>*</modifier></type><name>indexInfo</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>bool</name></type>		<name>result</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>IndexTuple</name></type>	<name>itup</name></decl>;</decl_stmt>
+
+	<comment type="block">/* generate an index tuple */</comment>
+	<expr_stmt><expr><name>itup</name> <operator>=</operator> <call><name>index_form_tuple</name><argument_list>(<argument><expr><call><name>RelationGetDescr</name><argument_list>(<argument><expr><name>rel</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>values</name></expr></argument>, <argument><expr><name>isnull</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>itup</name><operator>-&gt;</operator><name>t_tid</name></name> <operator>=</operator> <operator>*</operator><name>ht_ctid</name></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>result</name> <operator>=</operator> <call><name>_bt_doinsert</name><argument_list>(<argument><expr><name>rel</name></expr></argument>, <argument><expr><name>itup</name></expr></argument>, <argument><expr><name>checkUnique</name></expr></argument>, <argument><expr><name>heapRel</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>pfree</name><argument_list>(<argument><expr><name>itup</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<return>return <expr><name>result</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ *	btgettuple() -- Get the next tuple in the scan.
+ */</comment>
+<function><type><name>bool</name></type>
+<name>btgettuple</name><parameter_list>(<parameter><decl><type><name>IndexScanDesc</name></type> <name>scan</name></decl></parameter>, <parameter><decl><type><name>ScanDirection</name></type> <name>dir</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>BTScanOpaque</name></type> <name>so</name> <init>= <expr><operator>(</operator><name>BTScanOpaque</name><operator>)</operator> <name><name>scan</name><operator>-&gt;</operator><name>opaque</name></name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type>		<name>res</name></decl>;</decl_stmt>
+
+	<comment type="block">/* btree indexes are never lossy */</comment>
+	<expr_stmt><expr><name><name>scan</name><operator>-&gt;</operator><name>xs_recheck</name></name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * If we have any array keys, initialize them during first call for a
+	 * scan.  We can't do this in btrescan because we don't know the scan
+	 * direction at that time.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>so</name><operator>-&gt;</operator><name>numArrayKeys</name></name> <operator>&amp;&amp;</operator> <operator>!</operator><call><name>BTScanPosIsValid</name><argument_list>(<argument><expr><name><name>so</name><operator>-&gt;</operator><name>currPos</name></name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* punt if we have any unsatisfiable array keys */</comment>
+		<if_stmt><if>if <condition>(<expr><name><name>so</name><operator>-&gt;</operator><name>numArrayKeys</name></name> <operator>&lt;</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+			<return>return <expr><name>false</name></expr>;</return></block_content></block></if></if_stmt>
+
+		<expr_stmt><expr><call><name>_bt_start_array_keys</name><argument_list>(<argument><expr><name>scan</name></expr></argument>, <argument><expr><name>dir</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/* This loop handles advancing to the next array elements, if any */</comment>
+	<do>do
+	<block>{<block_content>
+		<comment type="block">/*
+		 * If we've already initialized this scan, we can just advance it in
+		 * the appropriate direction.  If we haven't done so yet, we call
+		 * _bt_first() to get the first item in the scan.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>BTScanPosIsValid</name><argument_list>(<argument><expr><name><name>so</name><operator>-&gt;</operator><name>currPos</name></name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><name>res</name> <operator>=</operator> <call><name>_bt_first</name><argument_list>(<argument><expr><name>scan</name></expr></argument>, <argument><expr><name>dir</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if>
+		<else>else
+		<block>{<block_content>
+			<comment type="block">/*
+			 * Check to see if we should kill the previously-fetched tuple.
+			 */</comment>
+			<if_stmt><if>if <condition>(<expr><name><name>scan</name><operator>-&gt;</operator><name>kill_prior_tuple</name></name></expr>)</condition>
+			<block>{<block_content>
+				<comment type="block">/*
+				 * Yes, remember it for later. (We'll deal with all such
+				 * tuples at once right before leaving the index page.)  The
+				 * test for numKilled overrun is not just paranoia: if the
+				 * caller reverses direction in the indexscan then the same
+				 * item might get entered multiple times. It's not worth
+				 * trying to optimize that, so we don't detect it, but instead
+				 * just forget any excess entries.
+				 */</comment>
+				<if_stmt><if>if <condition>(<expr><name><name>so</name><operator>-&gt;</operator><name>killedItems</name></name> <operator>==</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+					<expr_stmt><expr><name><name>so</name><operator>-&gt;</operator><name>killedItems</name></name> <operator>=</operator> <operator>(</operator><name>int</name> <operator>*</operator><operator>)</operator>
+						<call><name>palloc</name><argument_list>(<argument><expr><name>MaxIndexTuplesPerPage</name> <operator>*</operator> <sizeof>sizeof<argument_list>(<argument><expr><name>int</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+				<if_stmt><if>if <condition>(<expr><name><name>so</name><operator>-&gt;</operator><name>numKilled</name></name> <operator>&lt;</operator> <name>MaxIndexTuplesPerPage</name></expr>)</condition><block type="pseudo"><block_content>
+					<expr_stmt><expr><name><name>so</name><operator>-&gt;</operator><name>killedItems</name><index>[<expr><name><name>so</name><operator>-&gt;</operator><name>numKilled</name></name><operator>++</operator></expr>]</index></name> <operator>=</operator> <name><name>so</name><operator>-&gt;</operator><name>currPos</name><operator>.</operator><name>itemIndex</name></name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+			</block_content>}</block></if></if_stmt>
+
+			<comment type="block">/*
+			 * Now continue the scan.
+			 */</comment>
+			<expr_stmt><expr><name>res</name> <operator>=</operator> <call><name>_bt_next</name><argument_list>(<argument><expr><name>scan</name></expr></argument>, <argument><expr><name>dir</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></else></if_stmt>
+
+		<comment type="block">/* If we have a tuple, return it ... */</comment>
+		<if_stmt><if>if <condition>(<expr><name>res</name></expr>)</condition><block type="pseudo"><block_content>
+			<break>break;</break></block_content></block></if></if_stmt>
+		<comment type="block">/* ... otherwise see if we have more array keys to deal with */</comment>
+	</block_content>}</block> while <condition>(<expr><name><name>so</name><operator>-&gt;</operator><name>numArrayKeys</name></name> <operator>&amp;&amp;</operator> <call><name>_bt_advance_array_keys</name><argument_list>(<argument><expr><name>scan</name></expr></argument>, <argument><expr><name>dir</name></expr></argument>)</argument_list></call></expr>)</condition>;</do>
+
+	<return>return <expr><name>res</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * btgetbitmap() -- gets all matching tuples, and adds them to a bitmap
+ */</comment>
+<function><type><name>int64</name></type>
+<name>btgetbitmap</name><parameter_list>(<parameter><decl><type><name>IndexScanDesc</name></type> <name>scan</name></decl></parameter>, <parameter><decl><type><name>TIDBitmap</name> <modifier>*</modifier></type><name>tbm</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>BTScanOpaque</name></type> <name>so</name> <init>= <expr><operator>(</operator><name>BTScanOpaque</name><operator>)</operator> <name><name>scan</name><operator>-&gt;</operator><name>opaque</name></name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int64</name></type>		<name>ntids</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>ItemPointer</name></type> <name>heapTid</name></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * If we have any array keys, initialize them.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>so</name><operator>-&gt;</operator><name>numArrayKeys</name></name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* punt if we have any unsatisfiable array keys */</comment>
+		<if_stmt><if>if <condition>(<expr><name><name>so</name><operator>-&gt;</operator><name>numArrayKeys</name></name> <operator>&lt;</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+			<return>return <expr><name>ntids</name></expr>;</return></block_content></block></if></if_stmt>
+
+		<expr_stmt><expr><call><name>_bt_start_array_keys</name><argument_list>(<argument><expr><name>scan</name></expr></argument>, <argument><expr><name>ForwardScanDirection</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/* This loop handles advancing to the next array elements, if any */</comment>
+	<do>do
+	<block>{<block_content>
+		<comment type="block">/* Fetch the first page &amp; tuple */</comment>
+		<if_stmt><if>if <condition>(<expr><call><name>_bt_first</name><argument_list>(<argument><expr><name>scan</name></expr></argument>, <argument><expr><name>ForwardScanDirection</name></expr></argument>)</argument_list></call></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/* Save tuple ID, and continue scanning */</comment>
+			<expr_stmt><expr><name>heapTid</name> <operator>=</operator> <operator>&amp;</operator><name><name>scan</name><operator>-&gt;</operator><name>xs_ctup</name><operator>.</operator><name>t_self</name></name></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>tbm_add_tuples</name><argument_list>(<argument><expr><name>tbm</name></expr></argument>, <argument><expr><name>heapTid</name></expr></argument>, <argument><expr><literal type="number">1</literal></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><name>ntids</name><operator>++</operator></expr>;</expr_stmt>
+
+			<for>for <control>(<init>;</init><condition>;</condition><incr/>)</control>
+			<block>{<block_content>
+				<comment type="block">/*
+				 * Advance to next tuple within page.  This is the same as the
+				 * easy case in _bt_next().
+				 */</comment>
+				<if_stmt><if>if <condition>(<expr><operator>++</operator><name><name>so</name><operator>-&gt;</operator><name>currPos</name><operator>.</operator><name>itemIndex</name></name> <operator>&gt;</operator> <name><name>so</name><operator>-&gt;</operator><name>currPos</name><operator>.</operator><name>lastItem</name></name></expr>)</condition>
+				<block>{<block_content>
+					<comment type="block">/* let _bt_next do the heavy lifting */</comment>
+					<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>_bt_next</name><argument_list>(<argument><expr><name>scan</name></expr></argument>, <argument><expr><name>ForwardScanDirection</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+						<break>break;</break></block_content></block></if></if_stmt>
+				</block_content>}</block></if></if_stmt>
+
+				<comment type="block">/* Save tuple ID, and continue scanning */</comment>
+				<expr_stmt><expr><name>heapTid</name> <operator>=</operator> <operator>&amp;</operator><name><name>so</name><operator>-&gt;</operator><name>currPos</name><operator>.</operator><name>items</name><index>[<expr><name><name>so</name><operator>-&gt;</operator><name>currPos</name><operator>.</operator><name>itemIndex</name></name></expr>]</index></name><operator>.</operator><name>heapTid</name></expr>;</expr_stmt>
+				<expr_stmt><expr><call><name>tbm_add_tuples</name><argument_list>(<argument><expr><name>tbm</name></expr></argument>, <argument><expr><name>heapTid</name></expr></argument>, <argument><expr><literal type="number">1</literal></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<expr_stmt><expr><name>ntids</name><operator>++</operator></expr>;</expr_stmt>
+			</block_content>}</block></for>
+		</block_content>}</block></if></if_stmt>
+		<comment type="block">/* Now see if we have more array keys to deal with */</comment>
+	</block_content>}</block> while <condition>(<expr><name><name>so</name><operator>-&gt;</operator><name>numArrayKeys</name></name> <operator>&amp;&amp;</operator> <call><name>_bt_advance_array_keys</name><argument_list>(<argument><expr><name>scan</name></expr></argument>, <argument><expr><name>ForwardScanDirection</name></expr></argument>)</argument_list></call></expr>)</condition>;</do>
+
+	<return>return <expr><name>ntids</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ *	btbeginscan() -- start a scan on a btree index
+ */</comment>
+<function><type><name>IndexScanDesc</name></type>
+<name>btbeginscan</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>rel</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>nkeys</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>norderbys</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>IndexScanDesc</name></type> <name>scan</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>BTScanOpaque</name></type> <name>so</name></decl>;</decl_stmt>
+
+	<comment type="block">/* no order by operators allowed */</comment>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>norderbys</name> <operator>==</operator> <literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* get the scan */</comment>
+	<expr_stmt><expr><name>scan</name> <operator>=</operator> <call><name>RelationGetIndexScan</name><argument_list>(<argument><expr><name>rel</name></expr></argument>, <argument><expr><name>nkeys</name></expr></argument>, <argument><expr><name>norderbys</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* allocate private workspace */</comment>
+	<expr_stmt><expr><name>so</name> <operator>=</operator> <operator>(</operator><name>BTScanOpaque</name><operator>)</operator> <call><name>palloc</name><argument_list>(<argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>BTScanOpaqueData</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>BTScanPosInvalidate</name><argument_list>(<argument><expr><name><name>so</name><operator>-&gt;</operator><name>currPos</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>BTScanPosInvalidate</name><argument_list>(<argument><expr><name><name>so</name><operator>-&gt;</operator><name>markPos</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><name><name>scan</name><operator>-&gt;</operator><name>numberOfKeys</name></name> <operator>&gt;</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name><name>so</name><operator>-&gt;</operator><name>keyData</name></name> <operator>=</operator> <operator>(</operator><name>ScanKey</name><operator>)</operator> <call><name>palloc</name><argument_list>(<argument><expr><name><name>scan</name><operator>-&gt;</operator><name>numberOfKeys</name></name> <operator>*</operator> <sizeof>sizeof<argument_list>(<argument><expr><name>ScanKeyData</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if>
+	<else>else<block type="pseudo"><block_content>
+		<expr_stmt><expr><name><name>so</name><operator>-&gt;</operator><name>keyData</name></name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt></block_content></block></else></if_stmt>
+
+	<expr_stmt><expr><name><name>so</name><operator>-&gt;</operator><name>arrayKeyData</name></name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>	<comment type="block">/* assume no array keys for now */</comment>
+	<expr_stmt><expr><name><name>so</name><operator>-&gt;</operator><name>numArrayKeys</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>so</name><operator>-&gt;</operator><name>arrayKeys</name></name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>so</name><operator>-&gt;</operator><name>arrayContext</name></name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name><name>so</name><operator>-&gt;</operator><name>killedItems</name></name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>		<comment type="block">/* until needed */</comment>
+	<expr_stmt><expr><name><name>so</name><operator>-&gt;</operator><name>numKilled</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * We don't know yet whether the scan will be index-only, so we do not
+	 * allocate the tuple workspace arrays until btrescan.  However, we set up
+	 * scan-&gt;xs_itupdesc whether we'll need it or not, since that's so cheap.
+	 */</comment>
+	<expr_stmt><expr><name><name>so</name><operator>-&gt;</operator><name>currTuples</name></name> <operator>=</operator> <name><name>so</name><operator>-&gt;</operator><name>markTuples</name></name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name><name>scan</name><operator>-&gt;</operator><name>xs_itupdesc</name></name> <operator>=</operator> <call><name>RelationGetDescr</name><argument_list>(<argument><expr><name>rel</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name><name>scan</name><operator>-&gt;</operator><name>opaque</name></name> <operator>=</operator> <name>so</name></expr>;</expr_stmt>
+
+	<return>return <expr><name>scan</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ *	btrescan() -- rescan an index relation
+ */</comment>
+<function><type><name>void</name></type>
+<name>btrescan</name><parameter_list>(<parameter><decl><type><name>IndexScanDesc</name></type> <name>scan</name></decl></parameter>, <parameter><decl><type><name>ScanKey</name></type> <name>scankey</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>nscankeys</name></decl></parameter>,
+		 <parameter><decl><type><name>ScanKey</name></type> <name>orderbys</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>norderbys</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>BTScanOpaque</name></type> <name>so</name> <init>= <expr><operator>(</operator><name>BTScanOpaque</name><operator>)</operator> <name><name>scan</name><operator>-&gt;</operator><name>opaque</name></name></expr></init></decl>;</decl_stmt>
+
+	<comment type="block">/* we aren't holding any read locks, but gotta drop the pins */</comment>
+	<if_stmt><if>if <condition>(<expr><call><name>BTScanPosIsValid</name><argument_list>(<argument><expr><name><name>so</name><operator>-&gt;</operator><name>currPos</name></name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* Before leaving current page, deal with any killed items */</comment>
+		<if_stmt><if>if <condition>(<expr><name><name>so</name><operator>-&gt;</operator><name>numKilled</name></name> <operator>&gt;</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>_bt_killitems</name><argument_list>(<argument><expr><name>scan</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+		<expr_stmt><expr><call><name>BTScanPosUnpinIfPinned</name><argument_list>(<argument><expr><name><name>so</name><operator>-&gt;</operator><name>currPos</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>BTScanPosInvalidate</name><argument_list>(<argument><expr><name><name>so</name><operator>-&gt;</operator><name>currPos</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<expr_stmt><expr><name><name>so</name><operator>-&gt;</operator><name>markItemIndex</name></name> <operator>=</operator> <operator>-</operator><literal type="number">1</literal></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>so</name><operator>-&gt;</operator><name>arrayKeyCount</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>BTScanPosUnpinIfPinned</name><argument_list>(<argument><expr><name><name>so</name><operator>-&gt;</operator><name>markPos</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>BTScanPosInvalidate</name><argument_list>(<argument><expr><name><name>so</name><operator>-&gt;</operator><name>markPos</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Allocate tuple workspace arrays, if needed for an index-only scan and
+	 * not already done in a previous rescan call.  To save on palloc
+	 * overhead, both workspaces are allocated as one palloc block; only this
+	 * function and btendscan know that.
+	 *
+	 * NOTE: this data structure also makes it safe to return data from a
+	 * "name" column, even though btree name_ops uses an underlying storage
+	 * datatype of cstring.  The risk there is that "name" is supposed to be
+	 * padded to NAMEDATALEN, but the actual index tuple is probably shorter.
+	 * However, since we only return data out of tuples sitting in the
+	 * currTuples array, a fetch of NAMEDATALEN bytes can at worst pull some
+	 * data out of the markTuples array --- running off the end of memory for
+	 * a SIGSEGV is not possible.  Yeah, this is ugly as sin, but it beats
+	 * adding special-case treatment for name_ops elsewhere.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>scan</name><operator>-&gt;</operator><name>xs_want_itup</name></name> <operator>&amp;&amp;</operator> <name><name>so</name><operator>-&gt;</operator><name>currTuples</name></name> <operator>==</operator> <name>NULL</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name><name>so</name><operator>-&gt;</operator><name>currTuples</name></name> <operator>=</operator> <operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <call><name>palloc</name><argument_list>(<argument><expr><name>BLCKSZ</name> <operator>*</operator> <literal type="number">2</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>so</name><operator>-&gt;</operator><name>markTuples</name></name> <operator>=</operator> <name><name>so</name><operator>-&gt;</operator><name>currTuples</name></name> <operator>+</operator> <name>BLCKSZ</name></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/*
+	 * Reset the scan keys. Note that keys ordering stuff moved to _bt_first.
+	 * - vadim 05/05/97
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name>scankey</name> <operator>&amp;&amp;</operator> <name><name>scan</name><operator>-&gt;</operator><name>numberOfKeys</name></name> <operator>&gt;</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>memmove</name><argument_list>(<argument><expr><name><name>scan</name><operator>-&gt;</operator><name>keyData</name></name></expr></argument>,
+				<argument><expr><name>scankey</name></expr></argument>,
+				<argument><expr><name><name>scan</name><operator>-&gt;</operator><name>numberOfKeys</name></name> <operator>*</operator> <sizeof>sizeof<argument_list>(<argument><expr><name>ScanKeyData</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	<expr_stmt><expr><name><name>so</name><operator>-&gt;</operator><name>numberOfKeys</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>		<comment type="block">/* until _bt_preprocess_keys sets it */</comment>
+
+	<comment type="block">/* If any keys are SK_SEARCHARRAY type, set up array-key info */</comment>
+	<expr_stmt><expr><call><name>_bt_preprocess_array_keys</name><argument_list>(<argument><expr><name>scan</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ *	btendscan() -- close down a scan
+ */</comment>
+<function><type><name>void</name></type>
+<name>btendscan</name><parameter_list>(<parameter><decl><type><name>IndexScanDesc</name></type> <name>scan</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>BTScanOpaque</name></type> <name>so</name> <init>= <expr><operator>(</operator><name>BTScanOpaque</name><operator>)</operator> <name><name>scan</name><operator>-&gt;</operator><name>opaque</name></name></expr></init></decl>;</decl_stmt>
+
+	<comment type="block">/* we aren't holding any read locks, but gotta drop the pins */</comment>
+	<if_stmt><if>if <condition>(<expr><call><name>BTScanPosIsValid</name><argument_list>(<argument><expr><name><name>so</name><operator>-&gt;</operator><name>currPos</name></name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* Before leaving current page, deal with any killed items */</comment>
+		<if_stmt><if>if <condition>(<expr><name><name>so</name><operator>-&gt;</operator><name>numKilled</name></name> <operator>&gt;</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>_bt_killitems</name><argument_list>(<argument><expr><name>scan</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+		<expr_stmt><expr><call><name>BTScanPosUnpinIfPinned</name><argument_list>(<argument><expr><name><name>so</name><operator>-&gt;</operator><name>currPos</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<expr_stmt><expr><name><name>so</name><operator>-&gt;</operator><name>markItemIndex</name></name> <operator>=</operator> <operator>-</operator><literal type="number">1</literal></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>BTScanPosUnpinIfPinned</name><argument_list>(<argument><expr><name><name>so</name><operator>-&gt;</operator><name>markPos</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* No need to invalidate positions, the RAM is about to be freed. */</comment>
+
+	<comment type="block">/* Release storage */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>so</name><operator>-&gt;</operator><name>keyData</name></name> <operator>!=</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>pfree</name><argument_list>(<argument><expr><name><name>so</name><operator>-&gt;</operator><name>keyData</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	<comment type="block">/* so-&gt;arrayKeyData and so-&gt;arrayKeys are in arrayContext */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>so</name><operator>-&gt;</operator><name>arrayContext</name></name> <operator>!=</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>MemoryContextDelete</name><argument_list>(<argument><expr><name><name>so</name><operator>-&gt;</operator><name>arrayContext</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	<if_stmt><if>if <condition>(<expr><name><name>so</name><operator>-&gt;</operator><name>killedItems</name></name> <operator>!=</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>pfree</name><argument_list>(<argument><expr><name><name>so</name><operator>-&gt;</operator><name>killedItems</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	<if_stmt><if>if <condition>(<expr><name><name>so</name><operator>-&gt;</operator><name>currTuples</name></name> <operator>!=</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>pfree</name><argument_list>(<argument><expr><name><name>so</name><operator>-&gt;</operator><name>currTuples</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	<comment type="block">/* so-&gt;markTuples should not be pfree'd, see btrescan */</comment>
+	<expr_stmt><expr><call><name>pfree</name><argument_list>(<argument><expr><name>so</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ *	btmarkpos() -- save current scan position
+ */</comment>
+<function><type><name>void</name></type>
+<name>btmarkpos</name><parameter_list>(<parameter><decl><type><name>IndexScanDesc</name></type> <name>scan</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>BTScanOpaque</name></type> <name>so</name> <init>= <expr><operator>(</operator><name>BTScanOpaque</name><operator>)</operator> <name><name>scan</name><operator>-&gt;</operator><name>opaque</name></name></expr></init></decl>;</decl_stmt>
+
+	<comment type="block">/* There may be an old mark with a pin (but no lock). */</comment>
+	<expr_stmt><expr><call><name>BTScanPosUnpinIfPinned</name><argument_list>(<argument><expr><name><name>so</name><operator>-&gt;</operator><name>markPos</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Just record the current itemIndex.  If we later step to next page
+	 * before releasing the marked position, _bt_steppage makes a full copy of
+	 * the currPos struct in markPos.  If (as often happens) the mark is moved
+	 * before we leave the page, we don't have to do that work.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><call><name>BTScanPosIsValid</name><argument_list>(<argument><expr><name><name>so</name><operator>-&gt;</operator><name>currPos</name></name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name><name>so</name><operator>-&gt;</operator><name>markItemIndex</name></name> <operator>=</operator> <name><name>so</name><operator>-&gt;</operator><name>currPos</name><operator>.</operator><name>itemIndex</name></name></expr>;</expr_stmt></block_content></block></if>
+	<else>else
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>BTScanPosInvalidate</name><argument_list>(<argument><expr><name><name>so</name><operator>-&gt;</operator><name>markPos</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>so</name><operator>-&gt;</operator><name>markItemIndex</name></name> <operator>=</operator> <operator>-</operator><literal type="number">1</literal></expr>;</expr_stmt>
+	</block_content>}</block></else></if_stmt>
+
+	<comment type="block">/* Also record the current positions of any array keys */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>so</name><operator>-&gt;</operator><name>numArrayKeys</name></name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>_bt_mark_array_keys</name><argument_list>(<argument><expr><name>scan</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ *	btrestrpos() -- restore scan to last saved position
+ */</comment>
+<function><type><name>void</name></type>
+<name>btrestrpos</name><parameter_list>(<parameter><decl><type><name>IndexScanDesc</name></type> <name>scan</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>BTScanOpaque</name></type> <name>so</name> <init>= <expr><operator>(</operator><name>BTScanOpaque</name><operator>)</operator> <name><name>scan</name><operator>-&gt;</operator><name>opaque</name></name></expr></init></decl>;</decl_stmt>
+
+	<comment type="block">/* Restore the marked positions of any array keys */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>so</name><operator>-&gt;</operator><name>numArrayKeys</name></name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>_bt_restore_array_keys</name><argument_list>(<argument><expr><name>scan</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name><name>so</name><operator>-&gt;</operator><name>markItemIndex</name></name> <operator>&gt;=</operator> <literal type="number">0</literal></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/*
+		 * The scan has never moved to a new page since the last mark.  Just
+		 * restore the itemIndex.
+		 *
+		 * NB: In this case we can't count on anything in so-&gt;markPos to be
+		 * accurate.
+		 */</comment>
+		<expr_stmt><expr><name><name>so</name><operator>-&gt;</operator><name>currPos</name><operator>.</operator><name>itemIndex</name></name> <operator>=</operator> <name><name>so</name><operator>-&gt;</operator><name>markItemIndex</name></name></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<else>else
+	<block>{<block_content>
+		<comment type="block">/*
+		 * The scan moved to a new page after last mark or restore, and we are
+		 * now restoring to the marked page.  We aren't holding any read
+		 * locks, but if we're still holding the pin for the current position,
+		 * we must drop it.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><call><name>BTScanPosIsValid</name><argument_list>(<argument><expr><name><name>so</name><operator>-&gt;</operator><name>currPos</name></name></expr></argument>)</argument_list></call></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/* Before leaving current page, deal with any killed items */</comment>
+			<if_stmt><if>if <condition>(<expr><name><name>so</name><operator>-&gt;</operator><name>numKilled</name></name> <operator>&gt;</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><call><name>_bt_killitems</name><argument_list>(<argument><expr><name>scan</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+			<expr_stmt><expr><call><name>BTScanPosUnpinIfPinned</name><argument_list>(<argument><expr><name><name>so</name><operator>-&gt;</operator><name>currPos</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+
+		<if_stmt><if>if <condition>(<expr><call><name>BTScanPosIsValid</name><argument_list>(<argument><expr><name><name>so</name><operator>-&gt;</operator><name>markPos</name></name></expr></argument>)</argument_list></call></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/* bump pin on mark buffer for assignment to current buffer */</comment>
+			<if_stmt><if>if <condition>(<expr><call><name>BTScanPosIsPinned</name><argument_list>(<argument><expr><name><name>so</name><operator>-&gt;</operator><name>markPos</name></name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><call><name>IncrBufferRefCount</name><argument_list>(<argument><expr><name><name>so</name><operator>-&gt;</operator><name>markPos</name><operator>.</operator><name>buf</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+			<expr_stmt><expr><call><name>memcpy</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>so</name><operator>-&gt;</operator><name>currPos</name></name></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>so</name><operator>-&gt;</operator><name>markPos</name></name></expr></argument>,
+				   <argument><expr><call><name>offsetof</name><argument_list>(<argument><expr><name>BTScanPosData</name></expr></argument>, <argument><expr><name><name>items</name><index>[<expr><literal type="number">1</literal></expr>]</index></name></expr></argument>)</argument_list></call> <operator>+</operator>
+				   <name><name>so</name><operator>-&gt;</operator><name>markPos</name><operator>.</operator><name>lastItem</name></name> <operator>*</operator> <sizeof>sizeof<argument_list>(<argument><expr><name>BTScanPosItem</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<if_stmt><if>if <condition>(<expr><name><name>so</name><operator>-&gt;</operator><name>currTuples</name></name></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><call><name>memcpy</name><argument_list>(<argument><expr><name><name>so</name><operator>-&gt;</operator><name>currTuples</name></name></expr></argument>, <argument><expr><name><name>so</name><operator>-&gt;</operator><name>markTuples</name></name></expr></argument>,
+					   <argument><expr><name><name>so</name><operator>-&gt;</operator><name>markPos</name><operator>.</operator><name>nextTupleOffset</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+		</block_content>}</block></if>
+		<else>else<block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>BTScanPosInvalidate</name><argument_list>(<argument><expr><name><name>so</name><operator>-&gt;</operator><name>currPos</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></else></if_stmt>
+	</block_content>}</block></else></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * btestimateparallelscan -- estimate storage for BTParallelScanDescData
+ */</comment>
+<function><type><name>Size</name></type>
+<name>btestimateparallelscan</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<return>return <expr><sizeof>sizeof<argument_list>(<argument><expr><name>BTParallelScanDescData</name></expr></argument>)</argument_list></sizeof></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * btinitparallelscan -- initialize BTParallelScanDesc for parallel btree scan
+ */</comment>
+<function><type><name>void</name></type>
+<name>btinitparallelscan</name><parameter_list>(<parameter><decl><type><name>void</name> <modifier>*</modifier></type><name>target</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>BTParallelScanDesc</name></type> <name>bt_target</name> <init>= <expr><operator>(</operator><name>BTParallelScanDesc</name><operator>)</operator> <name>target</name></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>SpinLockInit</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>bt_target</name><operator>-&gt;</operator><name>btps_mutex</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>bt_target</name><operator>-&gt;</operator><name>btps_scanPage</name></name> <operator>=</operator> <name>InvalidBlockNumber</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>bt_target</name><operator>-&gt;</operator><name>btps_pageStatus</name></name> <operator>=</operator> <name>BTPARALLEL_NOT_INITIALIZED</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>bt_target</name><operator>-&gt;</operator><name>btps_arrayKeyCount</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>ConditionVariableInit</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>bt_target</name><operator>-&gt;</operator><name>btps_cv</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ *	btparallelrescan() -- reset parallel scan
+ */</comment>
+<function><type><name>void</name></type>
+<name>btparallelrescan</name><parameter_list>(<parameter><decl><type><name>IndexScanDesc</name></type> <name>scan</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>BTParallelScanDesc</name></type> <name>btscan</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>ParallelIndexScanDesc</name></type> <name>parallel_scan</name> <init>= <expr><name><name>scan</name><operator>-&gt;</operator><name>parallel_scan</name></name></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>parallel_scan</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>btscan</name> <operator>=</operator> <operator>(</operator><name>BTParallelScanDesc</name><operator>)</operator> <call><name>OffsetToPointer</name><argument_list>(<argument><expr><operator>(</operator><name>void</name> <operator>*</operator><operator>)</operator> <name>parallel_scan</name></expr></argument>,
+												  <argument><expr><name><name>parallel_scan</name><operator>-&gt;</operator><name>ps_offset</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * In theory, we don't need to acquire the spinlock here, because there
+	 * shouldn't be any other workers running at this point, but we do so for
+	 * consistency.
+	 */</comment>
+	<expr_stmt><expr><call><name>SpinLockAcquire</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>btscan</name><operator>-&gt;</operator><name>btps_mutex</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>btscan</name><operator>-&gt;</operator><name>btps_scanPage</name></name> <operator>=</operator> <name>InvalidBlockNumber</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>btscan</name><operator>-&gt;</operator><name>btps_pageStatus</name></name> <operator>=</operator> <name>BTPARALLEL_NOT_INITIALIZED</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>btscan</name><operator>-&gt;</operator><name>btps_arrayKeyCount</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>SpinLockRelease</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>btscan</name><operator>-&gt;</operator><name>btps_mutex</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * _bt_parallel_seize() -- Begin the process of advancing the scan to a new
+ *		page.  Other scans must wait until we call bt_parallel_release() or
+ *		bt_parallel_done().
+ *
+ * The return value is true if we successfully seized the scan and false
+ * if we did not.  The latter case occurs if no pages remain for the current
+ * set of scankeys.
+ *
+ * If the return value is true, *pageno returns the next or current page
+ * of the scan (depending on the scan direction).  An invalid block number
+ * means the scan hasn't yet started, and P_NONE means we've reached the end.
+ * The first time a participating process reaches the last page, it will return
+ * true and set *pageno to P_NONE; after that, further attempts to seize the
+ * scan will return false.
+ *
+ * Callers should ignore the value of pageno if the return value is false.
+ */</comment>
+<function><type><name>bool</name></type>
+<name>_bt_parallel_seize</name><parameter_list>(<parameter><decl><type><name>IndexScanDesc</name></type> <name>scan</name></decl></parameter>, <parameter><decl><type><name>BlockNumber</name> <modifier>*</modifier></type><name>pageno</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>BTScanOpaque</name></type> <name>so</name> <init>= <expr><operator>(</operator><name>BTScanOpaque</name><operator>)</operator> <name><name>scan</name><operator>-&gt;</operator><name>opaque</name></name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>BTPS_State</name></type>	<name>pageStatus</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type>		<name>exit_loop</name> <init>= <expr><name>false</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type>		<name>status</name> <init>= <expr><name>true</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>ParallelIndexScanDesc</name></type> <name>parallel_scan</name> <init>= <expr><name><name>scan</name><operator>-&gt;</operator><name>parallel_scan</name></name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>BTParallelScanDesc</name></type> <name>btscan</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><operator>*</operator><name>pageno</name> <operator>=</operator> <name>P_NONE</name></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>btscan</name> <operator>=</operator> <operator>(</operator><name>BTParallelScanDesc</name><operator>)</operator> <call><name>OffsetToPointer</name><argument_list>(<argument><expr><operator>(</operator><name>void</name> <operator>*</operator><operator>)</operator> <name>parallel_scan</name></expr></argument>,
+												  <argument><expr><name><name>parallel_scan</name><operator>-&gt;</operator><name>ps_offset</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<while>while <condition>(<expr><literal type="number">1</literal></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>SpinLockAcquire</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>btscan</name><operator>-&gt;</operator><name>btps_mutex</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name>pageStatus</name> <operator>=</operator> <name><name>btscan</name><operator>-&gt;</operator><name>btps_pageStatus</name></name></expr>;</expr_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name><name>so</name><operator>-&gt;</operator><name>arrayKeyCount</name></name> <operator>&lt;</operator> <name><name>btscan</name><operator>-&gt;</operator><name>btps_arrayKeyCount</name></name></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/* Parallel scan has already advanced to a new set of scankeys. */</comment>
+			<expr_stmt><expr><name>status</name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+		</block_content>}</block></if>
+		<if type="elseif">else if <condition>(<expr><name>pageStatus</name> <operator>==</operator> <name>BTPARALLEL_DONE</name></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/*
+			 * We're done with this set of scankeys.  This may be the end, or
+			 * there could be more sets to try.
+			 */</comment>
+			<expr_stmt><expr><name>status</name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+		</block_content>}</block></if>
+		<if type="elseif">else if <condition>(<expr><name>pageStatus</name> <operator>!=</operator> <name>BTPARALLEL_ADVANCING</name></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/*
+			 * We have successfully seized control of the scan for the purpose
+			 * of advancing it to a new page!
+			 */</comment>
+			<expr_stmt><expr><name><name>btscan</name><operator>-&gt;</operator><name>btps_pageStatus</name></name> <operator>=</operator> <name>BTPARALLEL_ADVANCING</name></expr>;</expr_stmt>
+			<expr_stmt><expr><operator>*</operator><name>pageno</name> <operator>=</operator> <name><name>btscan</name><operator>-&gt;</operator><name>btps_scanPage</name></name></expr>;</expr_stmt>
+			<expr_stmt><expr><name>exit_loop</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+		<expr_stmt><expr><call><name>SpinLockRelease</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>btscan</name><operator>-&gt;</operator><name>btps_mutex</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<if_stmt><if>if <condition>(<expr><name>exit_loop</name> <operator>||</operator> <operator>!</operator><name>status</name></expr>)</condition><block type="pseudo"><block_content>
+			<break>break;</break></block_content></block></if></if_stmt>
+		<expr_stmt><expr><call><name>ConditionVariableSleep</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>btscan</name><operator>-&gt;</operator><name>btps_cv</name></name></expr></argument>, <argument><expr><name>WAIT_EVENT_BTREE_PAGE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></while>
+	<expr_stmt><expr><call><name>ConditionVariableCancelSleep</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+	<return>return <expr><name>status</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * _bt_parallel_release() -- Complete the process of advancing the scan to a
+ *		new page.  We now have the new value btps_scanPage; some other backend
+ *		can now begin advancing the scan.
+ */</comment>
+<function><type><name>void</name></type>
+<name>_bt_parallel_release</name><parameter_list>(<parameter><decl><type><name>IndexScanDesc</name></type> <name>scan</name></decl></parameter>, <parameter><decl><type><name>BlockNumber</name></type> <name>scan_page</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>ParallelIndexScanDesc</name></type> <name>parallel_scan</name> <init>= <expr><name><name>scan</name><operator>-&gt;</operator><name>parallel_scan</name></name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>BTParallelScanDesc</name></type> <name>btscan</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name>btscan</name> <operator>=</operator> <operator>(</operator><name>BTParallelScanDesc</name><operator>)</operator> <call><name>OffsetToPointer</name><argument_list>(<argument><expr><operator>(</operator><name>void</name> <operator>*</operator><operator>)</operator> <name>parallel_scan</name></expr></argument>,
+												  <argument><expr><name><name>parallel_scan</name><operator>-&gt;</operator><name>ps_offset</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>SpinLockAcquire</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>btscan</name><operator>-&gt;</operator><name>btps_mutex</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>btscan</name><operator>-&gt;</operator><name>btps_scanPage</name></name> <operator>=</operator> <name>scan_page</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>btscan</name><operator>-&gt;</operator><name>btps_pageStatus</name></name> <operator>=</operator> <name>BTPARALLEL_IDLE</name></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>SpinLockRelease</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>btscan</name><operator>-&gt;</operator><name>btps_mutex</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>ConditionVariableSignal</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>btscan</name><operator>-&gt;</operator><name>btps_cv</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * _bt_parallel_done() -- Mark the parallel scan as complete.
+ *
+ * When there are no pages left to scan, this function should be called to
+ * notify other workers.  Otherwise, they might wait forever for the scan to
+ * advance to the next page.
+ */</comment>
+<function><type><name>void</name></type>
+<name>_bt_parallel_done</name><parameter_list>(<parameter><decl><type><name>IndexScanDesc</name></type> <name>scan</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>BTScanOpaque</name></type> <name>so</name> <init>= <expr><operator>(</operator><name>BTScanOpaque</name><operator>)</operator> <name><name>scan</name><operator>-&gt;</operator><name>opaque</name></name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>ParallelIndexScanDesc</name></type> <name>parallel_scan</name> <init>= <expr><name><name>scan</name><operator>-&gt;</operator><name>parallel_scan</name></name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>BTParallelScanDesc</name></type> <name>btscan</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type>		<name>status_changed</name> <init>= <expr><name>false</name></expr></init></decl>;</decl_stmt>
+
+	<comment type="block">/* Do nothing, for non-parallel scans */</comment>
+	<if_stmt><if>if <condition>(<expr><name>parallel_scan</name> <operator>==</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return;</return></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><name>btscan</name> <operator>=</operator> <operator>(</operator><name>BTParallelScanDesc</name><operator>)</operator> <call><name>OffsetToPointer</name><argument_list>(<argument><expr><operator>(</operator><name>void</name> <operator>*</operator><operator>)</operator> <name>parallel_scan</name></expr></argument>,
+												  <argument><expr><name><name>parallel_scan</name><operator>-&gt;</operator><name>ps_offset</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Mark the parallel scan as done for this combination of scan keys,
+	 * unless some other process already did so.  See also
+	 * _bt_advance_array_keys.
+	 */</comment>
+	<expr_stmt><expr><call><name>SpinLockAcquire</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>btscan</name><operator>-&gt;</operator><name>btps_mutex</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><name><name>so</name><operator>-&gt;</operator><name>arrayKeyCount</name></name> <operator>&gt;=</operator> <name><name>btscan</name><operator>-&gt;</operator><name>btps_arrayKeyCount</name></name> <operator>&amp;&amp;</operator>
+		<name><name>btscan</name><operator>-&gt;</operator><name>btps_pageStatus</name></name> <operator>!=</operator> <name>BTPARALLEL_DONE</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name><name>btscan</name><operator>-&gt;</operator><name>btps_pageStatus</name></name> <operator>=</operator> <name>BTPARALLEL_DONE</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name>status_changed</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+	<expr_stmt><expr><call><name>SpinLockRelease</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>btscan</name><operator>-&gt;</operator><name>btps_mutex</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* wake up all the workers associated with this parallel scan */</comment>
+	<if_stmt><if>if <condition>(<expr><name>status_changed</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ConditionVariableBroadcast</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>btscan</name><operator>-&gt;</operator><name>btps_cv</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * _bt_parallel_advance_array_keys() -- Advances the parallel scan for array
+ *			keys.
+ *
+ * Updates the count of array keys processed for both local and parallel
+ * scans.
+ */</comment>
+<function><type><name>void</name></type>
+<name>_bt_parallel_advance_array_keys</name><parameter_list>(<parameter><decl><type><name>IndexScanDesc</name></type> <name>scan</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>BTScanOpaque</name></type> <name>so</name> <init>= <expr><operator>(</operator><name>BTScanOpaque</name><operator>)</operator> <name><name>scan</name><operator>-&gt;</operator><name>opaque</name></name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>ParallelIndexScanDesc</name></type> <name>parallel_scan</name> <init>= <expr><name><name>scan</name><operator>-&gt;</operator><name>parallel_scan</name></name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>BTParallelScanDesc</name></type> <name>btscan</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name>btscan</name> <operator>=</operator> <operator>(</operator><name>BTParallelScanDesc</name><operator>)</operator> <call><name>OffsetToPointer</name><argument_list>(<argument><expr><operator>(</operator><name>void</name> <operator>*</operator><operator>)</operator> <name>parallel_scan</name></expr></argument>,
+												  <argument><expr><name><name>parallel_scan</name><operator>-&gt;</operator><name>ps_offset</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name><name>so</name><operator>-&gt;</operator><name>arrayKeyCount</name></name><operator>++</operator></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>SpinLockAcquire</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>btscan</name><operator>-&gt;</operator><name>btps_mutex</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><name><name>btscan</name><operator>-&gt;</operator><name>btps_pageStatus</name></name> <operator>==</operator> <name>BTPARALLEL_DONE</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name><name>btscan</name><operator>-&gt;</operator><name>btps_scanPage</name></name> <operator>=</operator> <name>InvalidBlockNumber</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>btscan</name><operator>-&gt;</operator><name>btps_pageStatus</name></name> <operator>=</operator> <name>BTPARALLEL_NOT_INITIALIZED</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>btscan</name><operator>-&gt;</operator><name>btps_arrayKeyCount</name></name><operator>++</operator></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+	<expr_stmt><expr><call><name>SpinLockRelease</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>btscan</name><operator>-&gt;</operator><name>btps_mutex</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * _bt_vacuum_needs_cleanup() -- Checks if index needs cleanup
+ *
+ * Called by btvacuumcleanup when btbulkdelete was never called because no
+ * tuples need to be deleted.
+ *
+ * When we return false, VACUUM can even skip the cleanup-only call to
+ * btvacuumscan (i.e. there will be no btvacuumscan call for this index at
+ * all).  Otherwise, a cleanup-only btvacuumscan call is required.
+ */</comment>
+<function><type><specifier>static</specifier> <name>bool</name></type>
+<name>_bt_vacuum_needs_cleanup</name><parameter_list>(<parameter><decl><type><name>IndexVacuumInfo</name> <modifier>*</modifier></type><name>info</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>Buffer</name></type>		<name>metabuf</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Page</name></type>		<name>metapg</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>BTMetaPageData</name> <modifier>*</modifier></type><name>metad</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type>		<name>result</name> <init>= <expr><name>false</name></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name>metabuf</name> <operator>=</operator> <call><name>_bt_getbuf</name><argument_list>(<argument><expr><name><name>info</name><operator>-&gt;</operator><name>index</name></name></expr></argument>, <argument><expr><name>BTREE_METAPAGE</name></expr></argument>, <argument><expr><name>BT_READ</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>metapg</name> <operator>=</operator> <call><name>BufferGetPage</name><argument_list>(<argument><expr><name>metabuf</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>metad</name> <operator>=</operator> <call><name>BTPageGetMeta</name><argument_list>(<argument><expr><name>metapg</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name><name>metad</name><operator>-&gt;</operator><name>btm_version</name></name> <operator>&lt;</operator> <name>BTREE_VERSION</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/*
+		 * Do cleanup if metapage needs upgrade, because we don't have
+		 * cleanup-related meta-information yet.
+		 */</comment>
+		<expr_stmt><expr><name>result</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<if type="elseif">else if <condition>(<expr><call><name>TransactionIdIsValid</name><argument_list>(<argument><expr><name><name>metad</name><operator>-&gt;</operator><name>btm_oldest_btpo_xact</name></name></expr></argument>)</argument_list></call> <operator>&amp;&amp;</operator>
+			 <call><name>TransactionIdPrecedes</name><argument_list>(<argument><expr><name><name>metad</name><operator>-&gt;</operator><name>btm_oldest_btpo_xact</name></name></expr></argument>,
+								   <argument><expr><name>RecentGlobalXmin</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/*
+		 * If any oldest btpo.xact from a previously deleted page in the index
+		 * is older than RecentGlobalXmin, then at least one deleted page can
+		 * be recycled -- don't skip cleanup.
+		 */</comment>
+		<expr_stmt><expr><name>result</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<else>else
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>StdRdOptions</name> <modifier>*</modifier></type><name>relopts</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>float8</name></type>		<name>cleanup_scale_factor</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>float8</name></type>		<name>prev_num_heap_tuples</name></decl>;</decl_stmt>
+
+		<comment type="block">/*
+		 * If table receives enough insertions and no cleanup was performed,
+		 * then index would appear have stale statistics.  If scale factor is
+		 * set, we avoid that by performing cleanup if the number of inserted
+		 * tuples exceeds vacuum_cleanup_index_scale_factor fraction of
+		 * original tuples count.
+		 */</comment>
+		<expr_stmt><expr><name>relopts</name> <operator>=</operator> <operator>(</operator><name>StdRdOptions</name> <operator>*</operator><operator>)</operator> <name><name>info</name><operator>-&gt;</operator><name>index</name><operator>-&gt;</operator><name>rd_options</name></name></expr>;</expr_stmt>
+		<expr_stmt><expr><name>cleanup_scale_factor</name> <operator>=</operator> <ternary><condition><expr><operator>(</operator><name>relopts</name> <operator>&amp;&amp;</operator>
+								<name><name>relopts</name><operator>-&gt;</operator><name>vacuum_cleanup_index_scale_factor</name></name> <operator>&gt;=</operator> <literal type="number">0</literal><operator>)</operator></expr>
+			?</condition><then> <expr><name><name>relopts</name><operator>-&gt;</operator><name>vacuum_cleanup_index_scale_factor</name></name></expr>
+			</then><else>: <expr><name>vacuum_cleanup_index_scale_factor</name></expr></else></ternary></expr>;</expr_stmt>
+		<expr_stmt><expr><name>prev_num_heap_tuples</name> <operator>=</operator> <name><name>metad</name><operator>-&gt;</operator><name>btm_last_cleanup_num_heap_tuples</name></name></expr>;</expr_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name>cleanup_scale_factor</name> <operator>&lt;=</operator> <literal type="number">0</literal> <operator>||</operator>
+			<name>prev_num_heap_tuples</name> <operator>&lt;=</operator> <literal type="number">0</literal> <operator>||</operator>
+			<operator>(</operator><name><name>info</name><operator>-&gt;</operator><name>num_heap_tuples</name></name> <operator>-</operator> <name>prev_num_heap_tuples</name><operator>)</operator> <operator>/</operator>
+			<name>prev_num_heap_tuples</name> <operator>&gt;=</operator> <name>cleanup_scale_factor</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><name>result</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	</block_content>}</block></else></if_stmt>
+
+	<expr_stmt><expr><call><name>_bt_relbuf</name><argument_list>(<argument><expr><name><name>info</name><operator>-&gt;</operator><name>index</name></name></expr></argument>, <argument><expr><name>metabuf</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<return>return <expr><name>result</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Bulk deletion of all index entries pointing to a set of heap tuples.
+ * The set of target tuples is specified via a callback routine that tells
+ * whether any given heap tuple (identified by ItemPointer) is being deleted.
+ *
+ * Result: a palloc'd struct containing statistical info for VACUUM displays.
+ */</comment>
+<function><type><name>IndexBulkDeleteResult</name> <modifier>*</modifier></type>
+<name>btbulkdelete</name><parameter_list>(<parameter><decl><type><name>IndexVacuumInfo</name> <modifier>*</modifier></type><name>info</name></decl></parameter>, <parameter><decl><type><name>IndexBulkDeleteResult</name> <modifier>*</modifier></type><name>stats</name></decl></parameter>,
+			 <parameter><decl><type><name>IndexBulkDeleteCallback</name></type> <name>callback</name></decl></parameter>, <parameter><decl><type><name>void</name> <modifier>*</modifier></type><name>callback_state</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>Relation</name></type>	<name>rel</name> <init>= <expr><name><name>info</name><operator>-&gt;</operator><name>index</name></name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>BTCycleId</name></type>	<name>cycleid</name></decl>;</decl_stmt>
+
+	<comment type="block">/* allocate stats if first time through, else re-use existing struct */</comment>
+	<if_stmt><if>if <condition>(<expr><name>stats</name> <operator>==</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name>stats</name> <operator>=</operator> <operator>(</operator><name>IndexBulkDeleteResult</name> <operator>*</operator><operator>)</operator> <call><name>palloc0</name><argument_list>(<argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>IndexBulkDeleteResult</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<comment type="block">/* Establish the vacuum cycle ID to use for this scan */</comment>
+	<comment type="block">/* The ENSURE stuff ensures we clean up shared memory on failure */</comment>
+	<expr_stmt><expr><call><name>PG_ENSURE_ERROR_CLEANUP</name><argument_list>(<argument><expr><name>_bt_end_vacuum_callback</name></expr></argument>, <argument><expr><call><name>PointerGetDatum</name><argument_list>(<argument><expr><name>rel</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<block>{<block_content>
+		<expr_stmt><expr><name>cycleid</name> <operator>=</operator> <call><name>_bt_start_vacuum</name><argument_list>(<argument><expr><name>rel</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><call><name>btvacuumscan</name><argument_list>(<argument><expr><name>info</name></expr></argument>, <argument><expr><name>stats</name></expr></argument>, <argument><expr><name>callback</name></expr></argument>, <argument><expr><name>callback_state</name></expr></argument>, <argument><expr><name>cycleid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block>
+	<expr_stmt><expr><call><name>PG_END_ENSURE_ERROR_CLEANUP</name><argument_list>(<argument><expr><name>_bt_end_vacuum_callback</name></expr></argument>, <argument><expr><call><name>PointerGetDatum</name><argument_list>(<argument><expr><name>rel</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>_bt_end_vacuum</name><argument_list>(<argument><expr><name>rel</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<return>return <expr><name>stats</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Post-VACUUM cleanup.
+ *
+ * Result: a palloc'd struct containing statistical info for VACUUM displays.
+ */</comment>
+<function><type><name>IndexBulkDeleteResult</name> <modifier>*</modifier></type>
+<name>btvacuumcleanup</name><parameter_list>(<parameter><decl><type><name>IndexVacuumInfo</name> <modifier>*</modifier></type><name>info</name></decl></parameter>, <parameter><decl><type><name>IndexBulkDeleteResult</name> <modifier>*</modifier></type><name>stats</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<comment type="block">/* No-op in ANALYZE ONLY mode */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>info</name><operator>-&gt;</operator><name>analyze_only</name></name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>stats</name></expr>;</return></block_content></block></if></if_stmt>
+
+	<comment type="block">/*
+	 * If btbulkdelete was called, we need not do anything, just return the
+	 * stats from the latest btbulkdelete call.  If it wasn't called, we might
+	 * still need to do a pass over the index, to recycle any newly-recyclable
+	 * pages or to obtain index statistics.  _bt_vacuum_needs_cleanup
+	 * determines if either are needed.
+	 *
+	 * Since we aren't going to actually delete any leaf items, there's no
+	 * need to go through all the vacuum-cycle-ID pushups.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name>stats</name> <operator>==</operator> <name>NULL</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* Check if we need a cleanup */</comment>
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>_bt_vacuum_needs_cleanup</name><argument_list>(<argument><expr><name>info</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<return>return <expr><name>NULL</name></expr>;</return></block_content></block></if></if_stmt>
+
+		<expr_stmt><expr><name>stats</name> <operator>=</operator> <operator>(</operator><name>IndexBulkDeleteResult</name> <operator>*</operator><operator>)</operator> <call><name>palloc0</name><argument_list>(<argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>IndexBulkDeleteResult</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>btvacuumscan</name><argument_list>(<argument><expr><name>info</name></expr></argument>, <argument><expr><name>stats</name></expr></argument>, <argument><expr><name>NULL</name></expr></argument>, <argument><expr><name>NULL</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/*
+	 * It's quite possible for us to be fooled by concurrent page splits into
+	 * double-counting some index tuples, so disbelieve any total that exceeds
+	 * the underlying heap's count ... if we know that accurately.  Otherwise
+	 * this might just make matters worse.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><name><name>info</name><operator>-&gt;</operator><name>estimated_count</name></name></expr>)</condition>
+	<block>{<block_content>
+		<if_stmt><if>if <condition>(<expr><name><name>stats</name><operator>-&gt;</operator><name>num_index_tuples</name></name> <operator>&gt;</operator> <name><name>info</name><operator>-&gt;</operator><name>num_heap_tuples</name></name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><name><name>stats</name><operator>-&gt;</operator><name>num_index_tuples</name></name> <operator>=</operator> <name><name>info</name><operator>-&gt;</operator><name>num_heap_tuples</name></name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<return>return <expr><name>stats</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * btvacuumscan --- scan the index for VACUUMing purposes
+ *
+ * This combines the functions of looking for leaf tuples that are deletable
+ * according to the vacuum callback, looking for empty pages that can be
+ * deleted, and looking for old deleted pages that can be recycled.  Both
+ * btbulkdelete and btvacuumcleanup invoke this (the latter only if no
+ * btbulkdelete call occurred and _bt_vacuum_needs_cleanup returned true).
+ * Note that this is also where the metadata used by _bt_vacuum_needs_cleanup
+ * is maintained.
+ *
+ * The caller is responsible for initially allocating/zeroing a stats struct
+ * and for obtaining a vacuum cycle ID if necessary.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>btvacuumscan</name><parameter_list>(<parameter><decl><type><name>IndexVacuumInfo</name> <modifier>*</modifier></type><name>info</name></decl></parameter>, <parameter><decl><type><name>IndexBulkDeleteResult</name> <modifier>*</modifier></type><name>stats</name></decl></parameter>,
+			 <parameter><decl><type><name>IndexBulkDeleteCallback</name></type> <name>callback</name></decl></parameter>, <parameter><decl><type><name>void</name> <modifier>*</modifier></type><name>callback_state</name></decl></parameter>,
+			 <parameter><decl><type><name>BTCycleId</name></type> <name>cycleid</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>Relation</name></type>	<name>rel</name> <init>= <expr><name><name>info</name><operator>-&gt;</operator><name>index</name></name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>BTVacState</name></type>	<name>vstate</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>BlockNumber</name></type> <name>num_pages</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>BlockNumber</name></type> <name>blkno</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type>		<name>needLock</name></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * Reset counts that will be incremented during the scan; needed in case
+	 * of multiple scans during a single VACUUM command
+	 */</comment>
+	<expr_stmt><expr><name><name>stats</name><operator>-&gt;</operator><name>estimated_count</name></name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>stats</name><operator>-&gt;</operator><name>num_index_tuples</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>stats</name><operator>-&gt;</operator><name>pages_deleted</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+
+	<comment type="block">/* Set up info to pass down to btvacuumpage */</comment>
+	<expr_stmt><expr><name><name>vstate</name><operator>.</operator><name>info</name></name> <operator>=</operator> <name>info</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>vstate</name><operator>.</operator><name>stats</name></name> <operator>=</operator> <name>stats</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>vstate</name><operator>.</operator><name>callback</name></name> <operator>=</operator> <name>callback</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>vstate</name><operator>.</operator><name>callback_state</name></name> <operator>=</operator> <name>callback_state</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>vstate</name><operator>.</operator><name>cycleid</name></name> <operator>=</operator> <name>cycleid</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>vstate</name><operator>.</operator><name>lastBlockVacuumed</name></name> <operator>=</operator> <name>BTREE_METAPAGE</name></expr>;</expr_stmt>	<comment type="block">/* Initialise at first block */</comment>
+	<expr_stmt><expr><name><name>vstate</name><operator>.</operator><name>lastBlockLocked</name></name> <operator>=</operator> <name>BTREE_METAPAGE</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>vstate</name><operator>.</operator><name>totFreePages</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>vstate</name><operator>.</operator><name>oldestBtpoXact</name></name> <operator>=</operator> <name>InvalidTransactionId</name></expr>;</expr_stmt>
+
+	<comment type="block">/* Create a temporary memory context to run _bt_pagedel in */</comment>
+	<expr_stmt><expr><name><name>vstate</name><operator>.</operator><name>pagedelcontext</name></name> <operator>=</operator> <call><name>AllocSetContextCreate</name><argument_list>(<argument><expr><name>CurrentMemoryContext</name></expr></argument>,
+												  <argument><expr><literal type="string">"_bt_pagedel"</literal></expr></argument>,
+												  <argument><expr><name>ALLOCSET_DEFAULT_SIZES</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * The outer loop iterates over all index pages except the metapage, in
+	 * physical order (we hope the kernel will cooperate in providing
+	 * read-ahead for speed).  It is critical that we visit all leaf pages,
+	 * including ones added after we start the scan, else we might fail to
+	 * delete some deletable tuples.  Hence, we must repeatedly check the
+	 * relation length.  We must acquire the relation-extension lock while
+	 * doing so to avoid a race condition: if someone else is extending the
+	 * relation, there is a window where bufmgr/smgr have created a new
+	 * all-zero page but it hasn't yet been write-locked by _bt_getbuf(). If
+	 * we manage to scan such a page here, we'll improperly assume it can be
+	 * recycled.  Taking the lock synchronizes things enough to prevent a
+	 * problem: either num_pages won't include the new page, or _bt_getbuf
+	 * already has write lock on the buffer and it will be fully initialized
+	 * before we can examine it.  (See also vacuumlazy.c, which has the same
+	 * issue.)	Also, we need not worry if a page is added immediately after
+	 * we look; the page splitting code already has write-lock on the left
+	 * page before it adds a right page, so we must already have processed any
+	 * tuples due to be moved into such a page.
+	 *
+	 * We can skip locking for new or temp relations, however, since no one
+	 * else could be accessing them.
+	 */</comment>
+	<expr_stmt><expr><name>needLock</name> <operator>=</operator> <operator>!</operator><call><name>RELATION_IS_LOCAL</name><argument_list>(<argument><expr><name>rel</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>blkno</name> <operator>=</operator> <name>BTREE_METAPAGE</name> <operator>+</operator> <literal type="number">1</literal></expr>;</expr_stmt>
+	<for>for <control>(<init>;</init><condition>;</condition><incr/>)</control>
+	<block>{<block_content>
+		<comment type="block">/* Get the current relation length */</comment>
+		<if_stmt><if>if <condition>(<expr><name>needLock</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>LockRelationForExtension</name><argument_list>(<argument><expr><name>rel</name></expr></argument>, <argument><expr><name>ExclusiveLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+		<expr_stmt><expr><name>num_pages</name> <operator>=</operator> <call><name>RelationGetNumberOfBlocks</name><argument_list>(<argument><expr><name>rel</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<if_stmt><if>if <condition>(<expr><name>needLock</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>UnlockRelationForExtension</name><argument_list>(<argument><expr><name>rel</name></expr></argument>, <argument><expr><name>ExclusiveLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+		<comment type="block">/* Quit if we've scanned the whole relation */</comment>
+		<if_stmt><if>if <condition>(<expr><name>blkno</name> <operator>&gt;=</operator> <name>num_pages</name></expr>)</condition><block type="pseudo"><block_content>
+			<break>break;</break></block_content></block></if></if_stmt>
+		<comment type="block">/* Iterate over pages, then loop back to recheck length */</comment>
+		<for>for <control>(<init>;</init> <condition><expr><name>blkno</name> <operator>&lt;</operator> <name>num_pages</name></expr>;</condition> <incr><expr><name>blkno</name><operator>++</operator></expr></incr>)</control>
+		<block>{<block_content>
+			<expr_stmt><expr><call><name>btvacuumpage</name><argument_list>(<argument><expr><operator>&amp;</operator><name>vstate</name></expr></argument>, <argument><expr><name>blkno</name></expr></argument>, <argument><expr><name>blkno</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></for>
+	</block_content>}</block></for>
+
+	<comment type="block">/*
+	 * Check to see if we need to issue one final WAL record for this index,
+	 * which may be needed for correctness on a hot standby node when non-MVCC
+	 * index scans could take place.
+	 *
+	 * If the WAL is replayed in hot standby, the replay process needs to get
+	 * cleanup locks on all index leaf pages, just as we've been doing here.
+	 * However, we won't issue any WAL records about pages that have no items
+	 * to be deleted.  For pages between pages we've vacuumed, the replay code
+	 * will take locks under the direction of the lastBlockVacuumed fields in
+	 * the XLOG_BTREE_VACUUM WAL records.  To cover pages after the last one
+	 * we vacuum, we need to issue a dummy XLOG_BTREE_VACUUM WAL record
+	 * against the last leaf page in the index, if that one wasn't vacuumed.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><call><name>XLogStandbyInfoActive</name><argument_list>()</argument_list></call> <operator>&amp;&amp;</operator>
+		<name><name>vstate</name><operator>.</operator><name>lastBlockVacuumed</name></name> <operator>&lt;</operator> <name><name>vstate</name><operator>.</operator><name>lastBlockLocked</name></name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>Buffer</name></type>		<name>buf</name></decl>;</decl_stmt>
+
+		<comment type="block">/*
+		 * The page should be valid, but we can't use _bt_getbuf() because we
+		 * want to use a nondefault buffer access strategy.  Since we aren't
+		 * going to delete any items, getting cleanup lock again is probably
+		 * overkill, but for consistency do that anyway.
+		 */</comment>
+		<expr_stmt><expr><name>buf</name> <operator>=</operator> <call><name>ReadBufferExtended</name><argument_list>(<argument><expr><name>rel</name></expr></argument>, <argument><expr><name>MAIN_FORKNUM</name></expr></argument>, <argument><expr><name><name>vstate</name><operator>.</operator><name>lastBlockLocked</name></name></expr></argument>,
+								 <argument><expr><name>RBM_NORMAL</name></expr></argument>, <argument><expr><name><name>info</name><operator>-&gt;</operator><name>strategy</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>LockBufferForCleanup</name><argument_list>(<argument><expr><name>buf</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>_bt_checkpage</name><argument_list>(<argument><expr><name>rel</name></expr></argument>, <argument><expr><name>buf</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>_bt_delitems_vacuum</name><argument_list>(<argument><expr><name>rel</name></expr></argument>, <argument><expr><name>buf</name></expr></argument>, <argument><expr><name>NULL</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><name><name>vstate</name><operator>.</operator><name>lastBlockVacuumed</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>_bt_relbuf</name><argument_list>(<argument><expr><name>rel</name></expr></argument>, <argument><expr><name>buf</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>MemoryContextDelete</name><argument_list>(<argument><expr><name><name>vstate</name><operator>.</operator><name>pagedelcontext</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * If we found any recyclable pages (and recorded them in the FSM), then
+	 * forcibly update the upper-level FSM pages to ensure that searchers can
+	 * find them.  It's possible that the pages were also found during
+	 * previous scans and so this is a waste of time, but it's cheap enough
+	 * relative to scanning the index that it shouldn't matter much, and
+	 * making sure that free pages are available sooner not later seems
+	 * worthwhile.
+	 *
+	 * Note that if no recyclable pages exist, we don't bother vacuuming the
+	 * FSM at all.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>vstate</name><operator>.</operator><name>totFreePages</name></name> <operator>&gt;</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>IndexFreeSpaceMapVacuum</name><argument_list>(<argument><expr><name>rel</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<comment type="block">/*
+	 * Maintain the oldest btpo.xact and a count of the current number of heap
+	 * tuples in the metapage (for the benefit of _bt_vacuum_needs_cleanup).
+	 *
+	 * The page with the oldest btpo.xact is typically a page deleted by this
+	 * VACUUM operation, since pages deleted by a previous VACUUM operation
+	 * tend to be placed in the FSM (by the current VACUUM operation) -- such
+	 * pages are not candidates to be the oldest btpo.xact.  (Note that pages
+	 * placed in the FSM are reported as deleted pages in the bulk delete
+	 * statistics, despite not counting as deleted pages for the purposes of
+	 * determining the oldest btpo.xact.)
+	 */</comment>
+	<expr_stmt><expr><call><name>_bt_update_meta_cleanup_info</name><argument_list>(<argument><expr><name>rel</name></expr></argument>, <argument><expr><name><name>vstate</name><operator>.</operator><name>oldestBtpoXact</name></name></expr></argument>,
+								 <argument><expr><name><name>info</name><operator>-&gt;</operator><name>num_heap_tuples</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* update statistics */</comment>
+	<expr_stmt><expr><name><name>stats</name><operator>-&gt;</operator><name>num_pages</name></name> <operator>=</operator> <name>num_pages</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>stats</name><operator>-&gt;</operator><name>pages_free</name></name> <operator>=</operator> <name><name>vstate</name><operator>.</operator><name>totFreePages</name></name></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * btvacuumpage --- VACUUM one page
+ *
+ * This processes a single page for btvacuumscan().  In some cases we
+ * must go back and re-examine previously-scanned pages; this routine
+ * recurses when necessary to handle that case.
+ *
+ * blkno is the page to process.  orig_blkno is the highest block number
+ * reached by the outer btvacuumscan loop (the same as blkno, unless we
+ * are recursing to re-examine a previous page).
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>btvacuumpage</name><parameter_list>(<parameter><decl><type><name>BTVacState</name> <modifier>*</modifier></type><name>vstate</name></decl></parameter>, <parameter><decl><type><name>BlockNumber</name></type> <name>blkno</name></decl></parameter>, <parameter><decl><type><name>BlockNumber</name></type> <name>orig_blkno</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>IndexVacuumInfo</name> <modifier>*</modifier></type><name>info</name> <init>= <expr><name><name>vstate</name><operator>-&gt;</operator><name>info</name></name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>IndexBulkDeleteResult</name> <modifier>*</modifier></type><name>stats</name> <init>= <expr><name><name>vstate</name><operator>-&gt;</operator><name>stats</name></name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>IndexBulkDeleteCallback</name></type> <name>callback</name> <init>= <expr><name><name>vstate</name><operator>-&gt;</operator><name>callback</name></name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>void</name>	   <modifier>*</modifier></type><name>callback_state</name> <init>= <expr><name><name>vstate</name><operator>-&gt;</operator><name>callback_state</name></name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Relation</name></type>	<name>rel</name> <init>= <expr><name><name>info</name><operator>-&gt;</operator><name>index</name></name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type>		<name>delete_now</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>BlockNumber</name></type> <name>recurse_to</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Buffer</name></type>		<name>buf</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Page</name></type>		<name>page</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>BTPageOpaque</name></type> <name>opaque</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+
+<label><name>restart</name>:</label>
+	<expr_stmt><expr><name>delete_now</name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name>recurse_to</name> <operator>=</operator> <name>P_NONE</name></expr>;</expr_stmt>
+
+	<comment type="block">/* call vacuum_delay_point while not holding any buffer lock */</comment>
+	<expr_stmt><expr><call><name>vacuum_delay_point</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * We can't use _bt_getbuf() here because it always applies
+	 * _bt_checkpage(), which will barf on an all-zero page. We want to
+	 * recycle all-zero pages, not fail.  Also, we want to use a nondefault
+	 * buffer access strategy.
+	 */</comment>
+	<expr_stmt><expr><name>buf</name> <operator>=</operator> <call><name>ReadBufferExtended</name><argument_list>(<argument><expr><name>rel</name></expr></argument>, <argument><expr><name>MAIN_FORKNUM</name></expr></argument>, <argument><expr><name>blkno</name></expr></argument>, <argument><expr><name>RBM_NORMAL</name></expr></argument>,
+							 <argument><expr><name><name>info</name><operator>-&gt;</operator><name>strategy</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>LockBuffer</name><argument_list>(<argument><expr><name>buf</name></expr></argument>, <argument><expr><name>BT_READ</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>page</name> <operator>=</operator> <call><name>BufferGetPage</name><argument_list>(<argument><expr><name>buf</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>PageIsNew</name><argument_list>(<argument><expr><name>page</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>_bt_checkpage</name><argument_list>(<argument><expr><name>rel</name></expr></argument>, <argument><expr><name>buf</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name>opaque</name> <operator>=</operator> <operator>(</operator><name>BTPageOpaque</name><operator>)</operator> <call><name>PageGetSpecialPointer</name><argument_list>(<argument><expr><name>page</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/*
+	 * If we are recursing, the only case we want to do anything with is a
+	 * live leaf page having the current vacuum cycle ID.  Any other state
+	 * implies we already saw the page (eg, deleted it as being empty).
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name>blkno</name> <operator>!=</operator> <name>orig_blkno</name></expr>)</condition>
+	<block>{<block_content>
+		<if_stmt><if>if <condition>(<expr><call><name>_bt_page_recyclable</name><argument_list>(<argument><expr><name>page</name></expr></argument>)</argument_list></call> <operator>||</operator>
+			<call><name>P_IGNORE</name><argument_list>(<argument><expr><name>opaque</name></expr></argument>)</argument_list></call> <operator>||</operator>
+			<operator>!</operator><call><name>P_ISLEAF</name><argument_list>(<argument><expr><name>opaque</name></expr></argument>)</argument_list></call> <operator>||</operator>
+			<name><name>opaque</name><operator>-&gt;</operator><name>btpo_cycleid</name></name> <operator>!=</operator> <name><name>vstate</name><operator>-&gt;</operator><name>cycleid</name></name></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><call><name>_bt_relbuf</name><argument_list>(<argument><expr><name>rel</name></expr></argument>, <argument><expr><name>buf</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<return>return;</return>
+		</block_content>}</block></if></if_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/* Page is valid, see what to do with it */</comment>
+	<if_stmt><if>if <condition>(<expr><call><name>_bt_page_recyclable</name><argument_list>(<argument><expr><name>page</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* Okay to recycle this page (which could be leaf or internal) */</comment>
+		<expr_stmt><expr><call><name>RecordFreeIndexPage</name><argument_list>(<argument><expr><name>rel</name></expr></argument>, <argument><expr><name>blkno</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>vstate</name><operator>-&gt;</operator><name>totFreePages</name></name><operator>++</operator></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>stats</name><operator>-&gt;</operator><name>pages_deleted</name></name><operator>++</operator></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<if type="elseif">else if <condition>(<expr><call><name>P_ISDELETED</name><argument_list>(<argument><expr><name>opaque</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/*
+		 * Already deleted page (which could be leaf or internal).  Can't
+		 * recycle yet.
+		 */</comment>
+		<expr_stmt><expr><name><name>stats</name><operator>-&gt;</operator><name>pages_deleted</name></name><operator>++</operator></expr>;</expr_stmt>
+
+		<comment type="block">/* Maintain the oldest btpo.xact */</comment>
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>TransactionIdIsValid</name><argument_list>(<argument><expr><name><name>vstate</name><operator>-&gt;</operator><name>oldestBtpoXact</name></name></expr></argument>)</argument_list></call> <operator>||</operator>
+			<call><name>TransactionIdPrecedes</name><argument_list>(<argument><expr><name><name>opaque</name><operator>-&gt;</operator><name>btpo</name><operator>.</operator><name>xact</name></name></expr></argument>, <argument><expr><name><name>vstate</name><operator>-&gt;</operator><name>oldestBtpoXact</name></name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><name><name>vstate</name><operator>-&gt;</operator><name>oldestBtpoXact</name></name> <operator>=</operator> <name><name>opaque</name><operator>-&gt;</operator><name>btpo</name><operator>.</operator><name>xact</name></name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	</block_content>}</block></if>
+	<if type="elseif">else if <condition>(<expr><call><name>P_ISHALFDEAD</name><argument_list>(<argument><expr><name>opaque</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/*
+		 * Half-dead leaf page.  Try to delete now.  Might update
+		 * oldestBtpoXact and pages_deleted below.
+		 */</comment>
+		<expr_stmt><expr><name>delete_now</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<if type="elseif">else if <condition>(<expr><call><name>P_ISLEAF</name><argument_list>(<argument><expr><name>opaque</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>OffsetNumber</name></type> <name><name>deletable</name><index>[<expr><name>MaxOffsetNumber</name></expr>]</index></name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>int</name></type>			<name>ndeletable</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>OffsetNumber</name></type> <name>offnum</name></decl>,
+					<decl><type ref="prev"/><name>minoff</name></decl>,
+					<decl><type ref="prev"/><name>maxoff</name></decl>;</decl_stmt>
+
+		<comment type="block">/*
+		 * Trade in the initial read lock for a super-exclusive write lock on
+		 * this page.  We must get such a lock on every leaf page over the
+		 * course of the vacuum scan, whether or not it actually contains any
+		 * deletable tuples --- see nbtree/README.
+		 */</comment>
+		<expr_stmt><expr><call><name>LockBuffer</name><argument_list>(<argument><expr><name>buf</name></expr></argument>, <argument><expr><name>BUFFER_LOCK_UNLOCK</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>LockBufferForCleanup</name><argument_list>(<argument><expr><name>buf</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/*
+		 * Remember highest leaf page number we've taken cleanup lock on; see
+		 * notes in btvacuumscan
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><name>blkno</name> <operator>&gt;</operator> <name><name>vstate</name><operator>-&gt;</operator><name>lastBlockLocked</name></name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><name><name>vstate</name><operator>-&gt;</operator><name>lastBlockLocked</name></name> <operator>=</operator> <name>blkno</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+		<comment type="block">/*
+		 * Check whether we need to recurse back to earlier pages.  What we
+		 * are concerned about is a page split that happened since we started
+		 * the vacuum scan.  If the split moved some tuples to a lower page
+		 * then we might have missed 'em.  If so, set up for tail recursion.
+		 * (Must do this before possibly clearing btpo_cycleid below!)
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><name><name>vstate</name><operator>-&gt;</operator><name>cycleid</name></name> <operator>!=</operator> <literal type="number">0</literal> <operator>&amp;&amp;</operator>
+			<name><name>opaque</name><operator>-&gt;</operator><name>btpo_cycleid</name></name> <operator>==</operator> <name><name>vstate</name><operator>-&gt;</operator><name>cycleid</name></name> <operator>&amp;&amp;</operator>
+			<operator>!</operator><operator>(</operator><name><name>opaque</name><operator>-&gt;</operator><name>btpo_flags</name></name> <operator>&amp;</operator> <name>BTP_SPLIT_END</name><operator>)</operator> <operator>&amp;&amp;</operator>
+			<operator>!</operator><call><name>P_RIGHTMOST</name><argument_list>(<argument><expr><name>opaque</name></expr></argument>)</argument_list></call> <operator>&amp;&amp;</operator>
+			<name><name>opaque</name><operator>-&gt;</operator><name>btpo_next</name></name> <operator>&lt;</operator> <name>orig_blkno</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><name>recurse_to</name> <operator>=</operator> <name><name>opaque</name><operator>-&gt;</operator><name>btpo_next</name></name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+		<comment type="block">/*
+		 * Scan over all items to see which ones need deleted according to the
+		 * callback function.
+		 */</comment>
+		<expr_stmt><expr><name>ndeletable</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+		<expr_stmt><expr><name>minoff</name> <operator>=</operator> <call><name>P_FIRSTDATAKEY</name><argument_list>(<argument><expr><name>opaque</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name>maxoff</name> <operator>=</operator> <call><name>PageGetMaxOffsetNumber</name><argument_list>(<argument><expr><name>page</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<if_stmt><if>if <condition>(<expr><name>callback</name></expr>)</condition>
+		<block>{<block_content>
+			<for>for <control>(<init><expr><name>offnum</name> <operator>=</operator> <name>minoff</name></expr>;</init>
+				 <condition><expr><name>offnum</name> <operator>&lt;=</operator> <name>maxoff</name></expr>;</condition>
+				 <incr><expr><name>offnum</name> <operator>=</operator> <call><name>OffsetNumberNext</name><argument_list>(<argument><expr><name>offnum</name></expr></argument>)</argument_list></call></expr></incr>)</control>
+			<block>{<block_content>
+				<decl_stmt><decl><type><name>IndexTuple</name></type>	<name>itup</name></decl>;</decl_stmt>
+				<decl_stmt><decl><type><name>ItemPointer</name></type> <name>htup</name></decl>;</decl_stmt>
+
+				<expr_stmt><expr><name>itup</name> <operator>=</operator> <operator>(</operator><name>IndexTuple</name><operator>)</operator> <call><name>PageGetItem</name><argument_list>(<argument><expr><name>page</name></expr></argument>,
+												<argument><expr><call><name>PageGetItemId</name><argument_list>(<argument><expr><name>page</name></expr></argument>, <argument><expr><name>offnum</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<expr_stmt><expr><name>htup</name> <operator>=</operator> <operator>&amp;</operator><operator>(</operator><name><name>itup</name><operator>-&gt;</operator><name>t_tid</name></name><operator>)</operator></expr>;</expr_stmt>
+
+				<comment type="block">/*
+				 * During Hot Standby we currently assume that
+				 * XLOG_BTREE_VACUUM records do not produce conflicts. That is
+				 * only true as long as the callback function depends only
+				 * upon whether the index tuple refers to heap tuples removed
+				 * in the initial heap scan. When vacuum starts it derives a
+				 * value of OldestXmin. Backends taking later snapshots could
+				 * have a RecentGlobalXmin with a later xid than the vacuum's
+				 * OldestXmin, so it is possible that row versions deleted
+				 * after OldestXmin could be marked as killed by other
+				 * backends. The callback function *could* look at the index
+				 * tuple state in isolation and decide to delete the index
+				 * tuple, though currently it does not. If it ever did, we
+				 * would need to reconsider whether XLOG_BTREE_VACUUM records
+				 * should cause conflicts. If they did cause conflicts they
+				 * would be fairly harsh conflicts, since we haven't yet
+				 * worked out a way to pass a useful value for
+				 * latestRemovedXid on the XLOG_BTREE_VACUUM records. This
+				 * applies to *any* type of index that marks index tuples as
+				 * killed.
+				 */</comment>
+				<if_stmt><if>if <condition>(<expr><call><name>callback</name><argument_list>(<argument><expr><name>htup</name></expr></argument>, <argument><expr><name>callback_state</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+					<expr_stmt><expr><name><name>deletable</name><index>[<expr><name>ndeletable</name><operator>++</operator></expr>]</index></name> <operator>=</operator> <name>offnum</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+			</block_content>}</block></for>
+		</block_content>}</block></if></if_stmt>
+
+		<comment type="block">/*
+		 * Apply any needed deletes.  We issue just one _bt_delitems_vacuum()
+		 * call per page, so as to minimize WAL traffic.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><name>ndeletable</name> <operator>&gt;</operator> <literal type="number">0</literal></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/*
+			 * Notice that the issued XLOG_BTREE_VACUUM WAL record includes
+			 * all information to the replay code to allow it to get a cleanup
+			 * lock on all pages between the previous lastBlockVacuumed and
+			 * this page. This ensures that WAL replay locks all leaf pages at
+			 * some point, which is important should non-MVCC scans be
+			 * requested. This is currently unused on standby, but we record
+			 * it anyway, so that the WAL contains the required information.
+			 *
+			 * Since we can visit leaf pages out-of-order when recursing,
+			 * replay might end up locking such pages an extra time, but it
+			 * doesn't seem worth the amount of bookkeeping it'd take to avoid
+			 * that.
+			 */</comment>
+			<expr_stmt><expr><call><name>_bt_delitems_vacuum</name><argument_list>(<argument><expr><name>rel</name></expr></argument>, <argument><expr><name>buf</name></expr></argument>, <argument><expr><name>deletable</name></expr></argument>, <argument><expr><name>ndeletable</name></expr></argument>,
+								<argument><expr><name><name>vstate</name><operator>-&gt;</operator><name>lastBlockVacuumed</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+			<comment type="block">/*
+			 * Remember highest leaf page number we've issued a
+			 * XLOG_BTREE_VACUUM WAL record for.
+			 */</comment>
+			<if_stmt><if>if <condition>(<expr><name>blkno</name> <operator>&gt;</operator> <name><name>vstate</name><operator>-&gt;</operator><name>lastBlockVacuumed</name></name></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><name><name>vstate</name><operator>-&gt;</operator><name>lastBlockVacuumed</name></name> <operator>=</operator> <name>blkno</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+			<expr_stmt><expr><name><name>stats</name><operator>-&gt;</operator><name>tuples_removed</name></name> <operator>+=</operator> <name>ndeletable</name></expr>;</expr_stmt>
+			<comment type="block">/* must recompute maxoff */</comment>
+			<expr_stmt><expr><name>maxoff</name> <operator>=</operator> <call><name>PageGetMaxOffsetNumber</name><argument_list>(<argument><expr><name>page</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></if>
+		<else>else
+		<block>{<block_content>
+			<comment type="block">/*
+			 * If the leaf page has been split during this vacuum cycle, it
+			 * seems worth expending a write to clear btpo_cycleid even if we
+			 * don't have any deletions to do.  (If we do, _bt_delitems_vacuum
+			 * takes care of this.)  This ensures we won't process the page
+			 * again.
+			 *
+			 * We treat this like a hint-bit update because there's no need to
+			 * WAL-log it.
+			 */</comment>
+			<if_stmt><if>if <condition>(<expr><name><name>vstate</name><operator>-&gt;</operator><name>cycleid</name></name> <operator>!=</operator> <literal type="number">0</literal> <operator>&amp;&amp;</operator>
+				<name><name>opaque</name><operator>-&gt;</operator><name>btpo_cycleid</name></name> <operator>==</operator> <name><name>vstate</name><operator>-&gt;</operator><name>cycleid</name></name></expr>)</condition>
+			<block>{<block_content>
+				<expr_stmt><expr><name><name>opaque</name><operator>-&gt;</operator><name>btpo_cycleid</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+				<expr_stmt><expr><call><name>MarkBufferDirtyHint</name><argument_list>(<argument><expr><name>buf</name></expr></argument>, <argument><expr><name>true</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			</block_content>}</block></if></if_stmt>
+		</block_content>}</block></else></if_stmt>
+
+		<comment type="block">/*
+		 * If the leaf page is now empty, try to delete it; else count the
+		 * live tuples.  We don't delete when recursing, though, to avoid
+		 * putting entries into freePages out-of-order (doesn't seem worth any
+		 * extra code to handle the case).
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><name>minoff</name> <operator>&gt;</operator> <name>maxoff</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><name>delete_now</name> <operator>=</operator> <operator>(</operator><name>blkno</name> <operator>==</operator> <name>orig_blkno</name><operator>)</operator></expr>;</expr_stmt></block_content></block></if>
+		<else>else<block type="pseudo"><block_content>
+			<expr_stmt><expr><name><name>stats</name><operator>-&gt;</operator><name>num_index_tuples</name></name> <operator>+=</operator> <name>maxoff</name> <operator>-</operator> <name>minoff</name> <operator>+</operator> <literal type="number">1</literal></expr>;</expr_stmt></block_content></block></else></if_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>delete_now</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>MemoryContext</name></type> <name>oldcontext</name></decl>;</decl_stmt>
+
+		<comment type="block">/* Run pagedel in a temp context to avoid memory leakage */</comment>
+		<expr_stmt><expr><call><name>MemoryContextReset</name><argument_list>(<argument><expr><name><name>vstate</name><operator>-&gt;</operator><name>pagedelcontext</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name>oldcontext</name> <operator>=</operator> <call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name><name>vstate</name><operator>-&gt;</operator><name>pagedelcontext</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/*
+		 * We trust the _bt_pagedel return value because it does not include
+		 * any page that a future call here from btvacuumscan is expected to
+		 * count.  There will be no double-counting.
+		 */</comment>
+		<expr_stmt><expr><name><name>stats</name><operator>-&gt;</operator><name>pages_deleted</name></name> <operator>+=</operator> <call><name>_bt_pagedel</name><argument_list>(<argument><expr><name>rel</name></expr></argument>, <argument><expr><name>buf</name></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>vstate</name><operator>-&gt;</operator><name>oldestBtpoXact</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>oldcontext</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<comment type="block">/* pagedel released buffer, so we shouldn't */</comment>
+	</block_content>}</block></if>
+	<else>else<block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>_bt_relbuf</name><argument_list>(<argument><expr><name>rel</name></expr></argument>, <argument><expr><name>buf</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></else></if_stmt>
+
+	<comment type="block">/*
+	 * This is really tail recursion, but if the compiler is too stupid to
+	 * optimize it as such, we'd eat an uncomfortably large amount of stack
+	 * space per recursion level (due to the deletable[] array). A failure is
+	 * improbable since the number of levels isn't likely to be large ... but
+	 * just in case, let's hand-optimize into a loop.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name>recurse_to</name> <operator>!=</operator> <name>P_NONE</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name>blkno</name> <operator>=</operator> <name>recurse_to</name></expr>;</expr_stmt>
+		<goto>goto <name>restart</name>;</goto>
+	</block_content>}</block></if></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ *	btcanreturn() -- Check whether btree indexes support index-only scans.
+ *
+ * btrees always do, so this is trivial.
+ */</comment>
+<function><type><name>bool</name></type>
+<name>btcanreturn</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>index</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>attno</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<return>return <expr><name>true</name></expr>;</return>
+</block_content>}</block></function>
+</unit>

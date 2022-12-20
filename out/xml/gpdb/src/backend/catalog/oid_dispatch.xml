@@ -1,0 +1,1567 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<unit xmlns="http://www.srcML.org/srcML/src" xmlns:cpp="http://www.srcML.org/srcML/cpp" revision="1.0.0" language="C" filename="/cloned_projects/gpdb/src/backend/catalog/oid_dispatch.c"><comment type="block">/*-------------------------------------------------------------------------
+ *
+ * oid_dispatch.c
+ *		Functions to ensure that QD and QEs use same OIDs for catalog objects.
+ *
+ *
+ * In Greenplum, it's important that most objects, like relations, functions,
+ * operators, have the same OIDs in the master and all QE nodes.  Otherwise
+ * query plans generated in the master will not work on the QE nodes, because
+ * they use the master's OIDs to refer to objects.
+ *
+ * Whenever a CREATE statement, or any other command that creates new objects,
+ * is dispatched, the master also needs to tell the QE servers which OIDs to
+ * use for the new objects.  Before GPDB 5.0, that was done by modifying all
+ * the structs representing DDL statements, like DefineStmt,
+ * CreateOpClassStmt, and so forth, by adding a new OID field to them.
+ * However, that was annoying when merging with the upstream, because it
+ * required scattered changes to all the structs, and the accompanying
+ * routines to copy and serialize them.  Moreover, for more complicated object
+ * types, like a table, a single OID was not enough, as CREATE TABLE not only
+ * creates the entry in pg_class, it also creates a composite type, an array
+ * type for the composite type, and possibly the same for the associated toast
+ * table.
+ *
+ * Starting with GPDB 5.0, we take a different tack.  Whenever a new OID is
+ * needed for an object in PostgreSQL, the GetNewOidWithIndex() is used.
+ * In GPDB, all the upstream calls to GetNewOidWithIndex() function have been
+ * replaced with calls to the GetNewOidFor* functions in this file.  All the
+ * GetNewOidFor*() functions are actually just wrappers for the
+ * GetNewOrPreassignedOid() function, and only differ in the key arguments
+ * for each object type.  GetNewOrPreassignedOid() does the heavy
+ * lifting.  It behaves differently in the QD and the QEs:
+ *
+ * In the QD, GetNewOrPreassignedOid() generates a new OID by calling through
+ * to the upstream GetNewOidWithIndex() function.  But it also records the
+ * the generated OID in private memory, in the 'dispatch_oids' list, along
+ * with the key for that object.  For example, when a new type is created,
+ * the GetNewOrPreassignedOid() function generates a new OID, and records it
+ * it along with the type's namespace and name in the 'dispatch_oids' list.
+ * When the command is dispatched to the QE servers, all the recorded OIDs
+ * are included in the dispatched request, and the QE processes in turn stash
+ * the list into backend-private memory.  This is the 'preassigned_oids' list.
+ *
+ * In a QE node, when we reach the same code as in the QD to create a new
+ * object, the GetNewOrPreassignedOid() function is called again.  The
+ * function looks into the 'preassigned_oids' list to see if we had received
+ * an OID for to use for the named object from the master. Under normal
+ * circumstances, we should have pre-assigned OIDs for all objects created in
+ * QEs, and the GetNewOrPreassignedOid() function will throw an error if we
+ * don't.
+ *
+ * All in all, this provides a generic mechanism for DDL commands, to record
+ * OIDs that are assigned for new objects in the master, transfer them to QE
+ * nodes when the DDL command is dispatched, and for the QE nodes to use the
+ * same, pre-assigned, OIDs for the objects.
+ *
+ * This same mechanism is used to preserve OIDs when upgrading a GPDB cluster
+ * using pg_upgrade. pg_upgrade in PostgreSQL is using a set of global vars to
+ * communicate the next OID for an object during upgrade, a strategy GPDB
+ * doesn't employ due to the need for multiple OIDs for auxiliary objects.
+ * pg_upgrade records the OIDs from the old cluster and inserts them into the
+ * same 'preassigned_oids' list to restore them, that we use to assign specific
+ * OIDs in a QE node at dispatch. Additionally, to ensure that object creation
+ * that isn't bound by preassigned OIDs isn't consuming an OID that will later
+ * in the restore process be preassigned, a separate list of all such OIDs is
+ * maintained and queried before assigning a new non-preassigned OID.
+ *
+ * Portions Copyright 2016-Present VMware, Inc. or its affiliates.
+ * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1994, Regents of the University of California
+ *
+ *
+ * IDENTIFICATION
+ *	  src/backend/catalog/oid_dispatch.c
+ *
+ *-------------------------------------------------------------------------
+ */</comment>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"postgres.h"</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/catalog.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/indexing.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/pg_am.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/pg_amop.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/pg_amproc.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/pg_attrdef.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/pg_authid.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/pg_cast.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/pg_collation.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/pg_constraint.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/pg_conversion.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/pg_database.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/pg_default_acl.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/pg_enum.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/pg_extension.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/pg_extprotocol.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/pg_event_trigger.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/pg_foreign_data_wrapper.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/pg_foreign_server.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/pg_language.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/pg_largeobject_metadata.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/pg_namespace.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/pg_opclass.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/pg_operator.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/pg_opfamily.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/pg_policy.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/pg_proc.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/pg_publication.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/pg_publication_rel.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/pg_resqueue.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/pg_resqueuecapability.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/pg_resgroup.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/pg_resgroupcapability.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/pg_rewrite.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/pg_subscription.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/pg_tablespace.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/pg_transform.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/pg_trigger.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/pg_ts_config.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/pg_ts_dict.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/pg_ts_parser.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/pg_ts_template.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/pg_type.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/pg_user_mapping.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/oid_dispatch.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"cdb/cdbvars.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"executor/execdesc.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"lib/rbtree.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"miscadmin.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"nodes/pg_list.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/memutils.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/rel.h"</cpp:file></cpp:include>
+
+<comment type="block">/* #define OID_DISPATCH_DEBUG */</comment>
+
+<comment type="block">/*
+ * These were received from the QD, and should be consumed by the current
+ * statement.
+ */</comment>
+<decl_stmt><decl><type><specifier>static</specifier> <name>List</name> <modifier>*</modifier></type><name>preassigned_oids</name> <init>= <expr><name>NIL</name></expr></init></decl>;</decl_stmt>
+
+<comment type="block">/*
+ * These will be sent to the QEs on next CdbDispatchUtilityStatement call.
+ */</comment>
+<decl_stmt><decl><type><specifier>static</specifier> <name>List</name> <modifier>*</modifier></type><name>dispatch_oids</name> <init>= <expr><name>NIL</name></expr></init></decl>;</decl_stmt>
+
+<decl_stmt><decl><type><specifier>static</specifier> <name>MemoryContext</name></type> <name>oids_context</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+
+<decl_stmt><decl><type><specifier>static</specifier> <name>bool</name></type> <name>preserve_oids_on_commit</name> <init>= <expr><name>false</name></expr></init></decl>;</decl_stmt>
+
+<comment type="block">/*
+ * These will be used by the schema restoration process during binary upgrade,
+ * so any new object must not use any Oid in this structure or else there will
+ * be collisions.
+ */</comment>
+<typedef>typedef <type><struct>struct
+<block>{
+	<decl_stmt><decl><type><name>RBTNode</name></type>		<name>rbnode</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Oid</name></type>			<name>oid</name></decl>;</decl_stmt>
+}</block></struct></type> <name>OidPreassignment</name>;</typedef>
+
+<decl_stmt><decl><type><specifier>static</specifier> <name>RBTree</name> <modifier>*</modifier></type><name>binary_upgrade_preassigned_oids</name></decl>;</decl_stmt>
+
+<function><type><specifier>static</specifier> <name>MemoryContext</name></type>
+<name>get_oids_context</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><name>oids_context</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name>oids_context</name> <operator>=</operator> <call><name>AllocSetContextCreate</name><argument_list>(<argument><expr><name>TopMemoryContext</name></expr></argument>,
+											 <argument><expr><literal type="string">"Oid dispatch context"</literal></expr></argument>,
+											 <argument><expr><name>ALLOCSET_SMALL_SIZES</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<return>return <expr><name>oids_context</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Some commands, like VACUUM, start transactions of their own. Normally,
+ * the list of assigned OIDs is reset at transaction commit, and warnings
+ * are printed for any assignments that haven't been dispatched to the
+ * segments. Calling PreserveOidAssignmentsOnCommit() changes that, so
+ * that the list of assigned OIDs is preserved across commits, until you
+ * call ClearOidAssignmentsOnCommit() to reset the flag. Abort always
+ * clears the list and resets the flag.
+ */</comment>
+<function><type><name>void</name></type>
+<name>PreserveOidAssignmentsOnCommit</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><name>preserve_oids_on_commit</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<function><type><name>void</name></type>
+<name>ClearOidAssignmentsOnCommit</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><name>preserve_oids_on_commit</name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Comments for SaveOidAssignments and RestoreOidAssignments
+ * The two functions should come together, before some procedures
+ * that do not want to touch the global vars (dispatch_oids or preassigned_oids),
+ * we need to first save the oid assignments, and then do the job, finally
+ * restore oid assignments. A typical usage should be as below:
+ *    List *l = SaveOidAssignments();
+ *    do_the_job();
+ *    RestoreOidAssignments(l);
+ *
+ * The global var dispatch_oids is only used on QD, and the global
+ * var preassigned_oids is only used on QEs. They are both Lists,
+ * in a specific memorycontext, normally the memorycontext will be
+ * reset at the end of transaction.
+ *
+ * Greenplum's MPP architecture need to make some OIDs consistent
+ * among coordinator and segments (like table OIDs). The oid assignments
+ * are generated on QD and then dispatched to QEs. A single SQL might
+ * involve sever dispatch events, for example, there are some functions
+ * involving SQLs and these functions are evaluated during planning stage
+ * before we dispatch the final Utility plan. We do not want to the dispatches
+ * during plannign stage to touch oid assignments.
+ *
+ * Another subtle case that the pair of functions are useful is that
+ * subtransaction abort will lead to reset  of the oid assignments memory context.
+ * Subtransaction abort might happen for UDF with exception handling and nothing
+ * to do with the main statement needed to dispatch. That is why we deep copy
+ * the content to CurrentMemoryContext and reset oid assignment context during
+ * SaveOidAssignments and bring everything back during RestoreOidAssignments.
+ *
+ * Note: these two functions only do memory related operations when the gloabl
+ * vars are not empty.
+ */</comment>
+<function><type><name>List</name> <modifier>*</modifier></type>
+<name>SaveOidAssignments</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>List</name>     <modifier>*</modifier></type><name>l</name>   <init>= <expr><name>NIL</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>List</name>     <modifier>*</modifier></type><name>src</name> <init>= <expr><name>NIL</name></expr></init></decl>;</decl_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>Gp_role</name> <operator>==</operator> <name>GP_ROLE_DISPATCH</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name>src</name> <operator>=</operator> <name>dispatch_oids</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name>dispatch_oids</name> <operator>=</operator> <name>NIL</name></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<if type="elseif">else if <condition>(<expr><name>Gp_role</name> <operator>==</operator> <name>GP_ROLE_EXECUTE</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name>src</name> <operator>=</operator> <name>preassigned_oids</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name>preassigned_oids</name> <operator>=</operator> <name>NIL</name></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<else>else<block type="pseudo"><block_content>
+		<return>return <expr><name>NIL</name></expr>;</return></block_content></block></else></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>src</name> <operator>==</operator> <name>NIL</name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>NIL</name></expr>;</return></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>CurrentMemoryContext</name> <operator>!=</operator> <call><name>get_oids_context</name><argument_list>()</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>l</name> <operator>=</operator> <call><name>copyObject</name><argument_list>(<argument><expr><name>src</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>MemoryContextReset</name><argument_list>(<argument><expr><call><name>get_oids_context</name><argument_list>()</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<return>return <expr><name>l</name></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><name>void</name></type>
+<name>RestoreOidAssignments</name><parameter_list>(<parameter><decl><type><name>List</name> <modifier>*</modifier></type><name>oid_assignments</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>MemoryContext</name></type>   <name>old</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>List</name>          <modifier>*</modifier><modifier>*</modifier></type><name>target</name></decl>;</decl_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>oid_assignments</name> <operator>==</operator> <name>NIL</name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return;</return></block_content></block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>Gp_role</name> <operator>==</operator> <name>GP_ROLE_DISPATCH</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name>target</name> <operator>=</operator> <operator>&amp;</operator><name>dispatch_oids</name></expr>;</expr_stmt></block_content></block></if>
+	<if type="elseif">else if <condition>(<expr><name>Gp_role</name> <operator>==</operator> <name>GP_ROLE_EXECUTE</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name>target</name> <operator>=</operator> <operator>&amp;</operator><name>preassigned_oids</name></expr>;</expr_stmt></block_content></block></if>
+	<else>else<block type="pseudo"><block_content>
+		<return>return;</return></block_content></block></else></if_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>CurrentMemoryContext</name> <operator>!=</operator> <call><name>get_oids_context</name><argument_list>()</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>old</name> <operator>=</operator> <call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><call><name>get_oids_context</name><argument_list>()</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><operator>*</operator><name>target</name> <operator>=</operator> <call><name>copyObject</name><argument_list>(<argument><expr><name>oid_assignments</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>old</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>list_free_deep</name><argument_list>(<argument><expr><name>oid_assignments</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/* ----------------------------------------------------------------
+ * Functions for use in QE.
+ * ----------------------------------------------------------------
+ */</comment>
+
+<comment type="block">/*
+ * Remember a list of pre-assigned OIDs, to be consumed later in the
+ * transaction, when those system objects are created.
+ */</comment>
+<function><type><name>void</name></type>
+<name>AddPreassignedOids</name><parameter_list>(<parameter><decl><type><name>List</name> <modifier>*</modifier></type><name>l</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>ListCell</name> <modifier>*</modifier></type><name>lc</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>MemoryContext</name></type> <name>old_context</name></decl>;</decl_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>IsBinaryUpgrade</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"AddPreassignedOids called during binary upgrade"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<comment type="block">/*
+	 * In the master, the OID-assignment-list is usually included in the next
+	 * command that is dispatched, after an OID was assigned. In almost all
+	 * cases, the dispatched command is the same CREATE command for which the
+	 * oid was assigned. But I'm not sure if that's true for *all* commands,
+	 * and so we don't require it. It is OK if an OID assignment is included
+	 * in one dispatched command, but the command that needs the OID is only
+	 * dispatched later in the same transaction. Therefore, don't reset the
+	 * 'preassigned_oids' list, when it's dispatched.
+	 */</comment>
+	<expr_stmt><expr><name>old_context</name> <operator>=</operator> <call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><call><name>get_oids_context</name><argument_list>()</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<macro><name>foreach</name><argument_list>(<argument>lc</argument>, <argument>l</argument>)</argument_list></macro>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>OidAssignment</name> <modifier>*</modifier></type><name>p</name> <init>= <expr><operator>(</operator><name>OidAssignment</name> <operator>*</operator><operator>)</operator> <call><name>lfirst</name><argument_list>(<argument><expr><name>lc</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+		<expr_stmt><expr><name>p</name> <operator>=</operator> <call><name>copyObject</name><argument_list>(<argument><expr><name>p</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name>preassigned_oids</name> <operator>=</operator> <call><name>lappend</name><argument_list>(<argument><expr><name>preassigned_oids</name></expr></argument>, <argument><expr><name>p</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>OID_DISPATCH_DEBUG</name></cpp:ifdef>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>NOTICE</name></expr></argument>, <argument><expr><literal type="string">"received OID assignment: catalog %u, namespace: %u, name: \"%s\": %u"</literal></expr></argument>,
+			 <argument><expr><name><name>p</name><operator>-&gt;</operator><name>catalog</name></name></expr></argument>, <argument><expr><name><name>p</name><operator>-&gt;</operator><name>namespaceOid</name></name></expr></argument>, <argument><expr><ternary><condition><expr><name><name>p</name><operator>-&gt;</operator><name>objname</name></name></expr> ?</condition><then> <expr><name><name>p</name><operator>-&gt;</operator><name>objname</name></name></expr> </then><else>: <expr><literal type="string">""</literal></expr></else></ternary></expr></argument>, <argument><expr><name><name>p</name><operator>-&gt;</operator><name>oid</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+	</block_content>}</block>
+	<expr_stmt><expr><call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>old_context</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * For pg_upgrade_support functions, created during a binary upgrade, use OIDs
+ * from a special reserved block of OIDs. We cannot use "normal" OIDs for these,
+ * as they may collide with actual user objects restored later in the upgrade
+ * process.
+ */</comment>
+<decl_stmt><decl><type><specifier>static</specifier> <name>Oid</name></type> <name>BinaryUpgradeSchemaReservedOid</name> <init>= <expr><name>FirstBinaryUpgradeReservedObjectId</name></expr></init></decl>;</decl_stmt>
+<decl_stmt><decl><type><specifier>static</specifier> <name>Oid</name></type> <name>NextBinaryUpgradeReservedOid</name> <init>= <expr><name>FirstBinaryUpgradeReservedObjectId</name> <operator>+</operator> <literal type="number">1</literal></expr></init></decl>;</decl_stmt>
+
+<function><type><specifier>static</specifier> <name>Oid</name></type>
+<name>AssignBinaryUpgradeReservedOid</name><parameter_list>()</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>Oid</name></type>		<name>result</name> <init>= <expr><name>NextBinaryUpgradeReservedOid</name></expr></init></decl>;</decl_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>result</name> <operator>&gt;</operator> <name>LastBinaryUpgradeReservedObjectId</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"out of OIDs reserved for binary-upgrade"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><name>NextBinaryUpgradeReservedOid</name><operator>++</operator></expr>;</expr_stmt>
+
+	<return>return <expr><name>result</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Helper routine for GetPreassignedOidFor*() functions. Finds an entry in the
+ * 'preassigned_oids' list with the given search key.
+ *
+ * If found, removes the entry from the list, and returns the OID. If not
+ * found, returns InvalidOid.
+ */</comment>
+<function><type><specifier>static</specifier> <name>Oid</name></type>
+<name>GetPreassignedOid</name><parameter_list>(<parameter><decl><type><name>OidAssignment</name> <modifier>*</modifier></type><name>searchkey</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>ListCell</name>   <modifier>*</modifier></type><name>cur_item</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>ListCell</name>   <modifier>*</modifier></type><name>prev_item</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Oid</name></type>			<name>oid</name></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * For binary_upgrade schema, and any functions in it, use OIDs
+	 * from the reserved block.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name>IsBinaryUpgrade</name></expr>)</condition>
+	<block>{<block_content>
+		<if_stmt><if>if <condition>(<expr><name><name>searchkey</name><operator>-&gt;</operator><name>catalog</name></name> <operator>==</operator> <name>NamespaceRelationId</name> <operator>&amp;&amp;</operator>
+			<call><name>strcmp</name><argument_list>(<argument><expr><name><name>searchkey</name><operator>-&gt;</operator><name>objname</name></name></expr></argument>, <argument><expr><literal type="string">"binary_upgrade"</literal></expr></argument>)</argument_list></call> <operator>==</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+			<return>return <expr><name>BinaryUpgradeSchemaReservedOid</name></expr>;</return></block_content></block></if></if_stmt>
+		<if_stmt><if>if <condition>(<expr><name><name>searchkey</name><operator>-&gt;</operator><name>catalog</name></name> <operator>==</operator> <name>ProcedureRelationId</name> <operator>&amp;&amp;</operator>
+			<name><name>searchkey</name><operator>-&gt;</operator><name>namespaceOid</name></name> <operator>==</operator> <name>BinaryUpgradeSchemaReservedOid</name></expr>)</condition><block type="pseudo"><block_content>
+			<return>return <expr><call><name>AssignBinaryUpgradeReservedOid</name><argument_list>()</argument_list></call></expr>;</return></block_content></block></if></if_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<expr_stmt><expr><name>prev_item</name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name>cur_item</name> <operator>=</operator> <call><name>list_head</name><argument_list>(<argument><expr><name>preassigned_oids</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<while>while <condition>(<expr><name>cur_item</name> <operator>!=</operator> <name>NULL</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>OidAssignment</name> <modifier>*</modifier></type><name>p</name> <init>= <expr><operator>(</operator><name>OidAssignment</name> <operator>*</operator><operator>)</operator> <call><name>lfirst</name><argument_list>(<argument><expr><name>cur_item</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name><name>searchkey</name><operator>-&gt;</operator><name>catalog</name></name> <operator>==</operator> <name><name>p</name><operator>-&gt;</operator><name>catalog</name></name> <operator>&amp;&amp;</operator>
+			<operator>(</operator><name><name>searchkey</name><operator>-&gt;</operator><name>objname</name></name> <operator>==</operator> <name>NULL</name> <operator>||</operator>
+			 <operator>(</operator><name><name>p</name><operator>-&gt;</operator><name>objname</name></name> <operator>!=</operator> <name>NULL</name> <operator>&amp;&amp;</operator> <call><name>strcmp</name><argument_list>(<argument><expr><name><name>searchkey</name><operator>-&gt;</operator><name>objname</name></name></expr></argument>, <argument><expr><name><name>p</name><operator>-&gt;</operator><name>objname</name></name></expr></argument>)</argument_list></call> <operator>==</operator> <literal type="number">0</literal><operator>)</operator><operator>)</operator> <operator>&amp;&amp;</operator>
+			<name><name>searchkey</name><operator>-&gt;</operator><name>namespaceOid</name></name> <operator>==</operator> <name><name>p</name><operator>-&gt;</operator><name>namespaceOid</name></name> <operator>&amp;&amp;</operator>
+			<name><name>searchkey</name><operator>-&gt;</operator><name>keyOid1</name></name> <operator>==</operator> <name><name>p</name><operator>-&gt;</operator><name>keyOid1</name></name> <operator>&amp;&amp;</operator>
+			<name><name>searchkey</name><operator>-&gt;</operator><name>keyOid2</name></name> <operator>==</operator> <name><name>p</name><operator>-&gt;</operator><name>keyOid2</name></name></expr>)</condition>
+		<block>{<block_content>
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>OID_DISPATCH_DEBUG</name></cpp:ifdef>
+			<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>NOTICE</name></expr></argument>, <argument><expr><literal type="string">"using OID assignment: catalog %u, namespace: %u, name: \"%s\": %u"</literal></expr></argument>,
+				 <argument><expr><name><name>p</name><operator>-&gt;</operator><name>catalog</name></name></expr></argument>, <argument><expr><name><name>p</name><operator>-&gt;</operator><name>namespaceOid</name></name></expr></argument>, <argument><expr><ternary><condition><expr><name><name>p</name><operator>-&gt;</operator><name>objname</name></name></expr> ?</condition><then> <expr><name><name>p</name><operator>-&gt;</operator><name>objname</name></name></expr> </then><else>: <expr><literal type="string">""</literal></expr></else></ternary></expr></argument>, <argument><expr><name><name>p</name><operator>-&gt;</operator><name>oid</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+			<expr_stmt><expr><name>oid</name> <operator>=</operator> <name><name>p</name><operator>-&gt;</operator><name>oid</name></name></expr>;</expr_stmt>
+			<expr_stmt><expr><name>preassigned_oids</name> <operator>=</operator> <call><name>list_delete_cell</name><argument_list>(<argument><expr><name>preassigned_oids</name></expr></argument>, <argument><expr><name>cur_item</name></expr></argument>, <argument><expr><name>prev_item</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>pfree</name><argument_list>(<argument><expr><name>p</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<return>return <expr><name>oid</name></expr>;</return>
+		</block_content>}</block></if></if_stmt>
+		<expr_stmt><expr><name>prev_item</name> <operator>=</operator> <name>cur_item</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name>cur_item</name> <operator>=</operator> <call><name>lnext</name><argument_list>(<argument><expr><name>cur_item</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></while>
+
+	<return>return <expr><name>InvalidOid</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/* ----------------------------------------------------------------
+ * Wrapper functions over upstream GetNewOidWithIndex(), that
+ * memorize the OID for dispatch in the QD, and looks up the
+ * pre-assigned OID in QE.
+ *
+ * When adding a function for a new catalog table, look at indexing.h
+ * to see what the unique key columns for the table are.
+ * ----------------------------------------------------------------
+ */</comment>
+<function><type><specifier>static</specifier> <name>Oid</name></type>
+<name>GetNewOrPreassignedOid</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>relation</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>indexId</name></decl></parameter>, <parameter><decl><type><name>AttrNumber</name></type> <name>oidcolumn</name></decl></parameter>,
+					   <parameter><decl><type><name>OidAssignment</name> <modifier>*</modifier></type><name>searchkey</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>Oid</name></type>			<name>oid</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name><name>searchkey</name><operator>-&gt;</operator><name>catalog</name></name> <operator>=</operator> <call><name>RelationGetRelid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>Gp_role</name> <operator>==</operator> <name>GP_ROLE_EXECUTE</name> <operator>||</operator> <name>IsBinaryUpgrade</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name>oid</name> <operator>=</operator> <call><name>GetPreassignedOid</name><argument_list>(<argument><expr><name>searchkey</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/*
+		 * During normal operation, all OIDs are preassigned unless the object
+		 * type is exempt (in which case we should never reach here). During
+		 * upgrades we do however allow objects to be created with new OIDs
+		 * since objects may be created in new cluster which didn't exist in
+		 * the old cluster.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><name>oid</name> <operator>==</operator> <name>InvalidOid</name></expr>)</condition>
+		<block>{<block_content>
+			<if_stmt><if>if <condition>(<expr><call><name>IS_QUERY_DISPATCHER</name><argument_list>()</argument_list></call> <operator>&amp;&amp;</operator> <name>IsBinaryUpgrade</name> <operator>&amp;&amp;</operator> <name>Gp_role</name> <operator>==</operator> <name>GP_ROLE_UTILITY</name></expr>)</condition><block type="pseudo"><block_content>
+				<comment type="block">/*
+				 * If it hits here on the QD, it must be (IsBinaryUpgrade &amp;&amp;
+				 * Gp_role == GP_ROLE_UTILITY) already, however, check those
+				 * too in case we have new GP roles in the future, and for
+				 * better code readability.
+				 */</comment>
+				<expr_stmt><expr><name>oid</name> <operator>=</operator> <call><name>GetNewOidWithIndex</name><argument_list>(<argument><expr><name>relation</name></expr></argument>, <argument><expr><name>indexId</name></expr></argument>, <argument><expr><name>oidcolumn</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if>
+			<else>else<block type="pseudo"><block_content>
+				<comment type="block">/*
+				 * On QE, Greenplum requires a pre-assigned OID to keep QD and
+				 * QEs synchronized, whether in binary upgrade or not.
+				 */</comment>
+				<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"no pre-assigned OID for %s tuple \"%s\" (namespace:%u keyOid1:%u keyOid2:%u)"</literal></expr></argument>,
+					 <argument><expr><call><name>RelationGetRelationName</name><argument_list>(<argument><expr><name>relation</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><ternary><condition><expr><name><name>searchkey</name><operator>-&gt;</operator><name>objname</name></name></expr> ?</condition><then> <expr><name><name>searchkey</name><operator>-&gt;</operator><name>objname</name></name></expr> </then><else>: <expr><literal type="string">""</literal></expr></else></ternary></expr></argument>,
+					 <argument><expr><name><name>searchkey</name><operator>-&gt;</operator><name>namespaceOid</name></name></expr></argument>, <argument><expr><name><name>searchkey</name><operator>-&gt;</operator><name>keyOid1</name></name></expr></argument>, <argument><expr><name><name>searchkey</name><operator>-&gt;</operator><name>keyOid2</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></else></if_stmt>
+		</block_content>}</block></if></if_stmt>
+	</block_content>}</block></if>
+	<if type="elseif">else if <condition>(<expr><name>Gp_role</name> <operator>==</operator> <name>GP_ROLE_DISPATCH</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>MemoryContext</name></type> <name>oldcontext</name></decl>;</decl_stmt>
+
+		<comment type="block">/* Assign a new oid, and memorize it in the list of OIDs to dispatch */</comment>
+		<expr_stmt><expr><name>oid</name> <operator>=</operator> <call><name>GetNewOidWithIndex</name><argument_list>(<argument><expr><name>relation</name></expr></argument>, <argument><expr><name>indexId</name></expr></argument>, <argument><expr><name>oidcolumn</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><name>oldcontext</name> <operator>=</operator> <call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><call><name>get_oids_context</name><argument_list>()</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>searchkey</name><operator>-&gt;</operator><name>oid</name></name> <operator>=</operator> <name>oid</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name>dispatch_oids</name> <operator>=</operator> <call><name>lappend</name><argument_list>(<argument><expr><name>dispatch_oids</name></expr></argument>, <argument><expr><call><name>copyObject</name><argument_list>(<argument><expr><name>searchkey</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>oldcontext</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>OID_DISPATCH_DEBUG</name></cpp:ifdef>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>NOTICE</name></expr></argument>, <argument><expr><literal type="string">"adding OID assignment: catalog \"%s\", namespace: %u, name: \"%s\": %u"</literal></expr></argument>,
+			 <argument><expr><call><name>RelationGetRelationName</name><argument_list>(<argument><expr><name>relation</name></expr></argument>)</argument_list></call></expr></argument>,
+			 <argument><expr><name><name>searchkey</name><operator>-&gt;</operator><name>namespaceOid</name></name></expr></argument>,
+			 <argument><expr><ternary><condition><expr><name><name>searchkey</name><operator>-&gt;</operator><name>objname</name></name></expr> ?</condition><then> <expr><name><name>searchkey</name><operator>-&gt;</operator><name>objname</name></name></expr> </then><else>: <expr><literal type="string">""</literal></expr></else></ternary></expr></argument>,
+			 <argument><expr><name><name>searchkey</name><operator>-&gt;</operator><name>oid</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+	</block_content>}</block></if>
+	<else>else
+	<block>{<block_content>
+		<expr_stmt><expr><name>oid</name> <operator>=</operator> <call><name>GetNewOidWithIndex</name><argument_list>(<argument><expr><name>relation</name></expr></argument>, <argument><expr><name>indexId</name></expr></argument>, <argument><expr><name>oidcolumn</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></else></if_stmt>
+
+	<return>return <expr><name>oid</name></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><name>Oid</name></type>
+<name>GetNewOidForAccessMethod</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>relation</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>indexId</name></decl></parameter>, <parameter><decl><type><name>AttrNumber</name></type> <name>oidcolumn</name></decl></parameter>,
+						 <parameter><decl><type><name>char</name> <modifier>*</modifier></type><name>amname</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>OidAssignment</name></type> <name>key</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>RelationGetRelid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>)</argument_list></call> <operator>==</operator> <name>AccessMethodRelationId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>indexId</name> <operator>==</operator> <name>AmOidIndexId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>oidcolumn</name> <operator>==</operator> <name>Anum_pg_am_oid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><operator>&amp;</operator><name>key</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>OidAssignment</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>type</name></name> <operator>=</operator> <name>T_OidAssignment</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>catalog</name></name> <operator>=</operator> <call><name>RelationGetRelid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>objname</name></name> <operator>=</operator> <name>amname</name></expr>;</expr_stmt>
+	<return>return <expr><call><name>GetNewOrPreassignedOid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>, <argument><expr><name>indexId</name></expr></argument>, <argument><expr><name>oidcolumn</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>key</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><name>Oid</name></type>
+<name>GetNewOidForAccessMethodOperator</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>relation</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>indexId</name></decl></parameter>, <parameter><decl><type><name>AttrNumber</name></type> <name>oidcolumn</name></decl></parameter>,
+								 <parameter><decl><type><name>Oid</name></type> <name>amopfamily</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>amoplefttype</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>amoprighttype</name></decl></parameter>,
+								 <parameter><decl><type><name>Oid</name></type> <name>amopstrategy</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>OidAssignment</name></type> <name>key</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>RelationGetRelid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>)</argument_list></call> <operator>==</operator> <name>AccessMethodOperatorRelationId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>indexId</name> <operator>==</operator> <name>AccessMethodOperatorOidIndexId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>oidcolumn</name> <operator>==</operator> <name>Anum_pg_amop_oid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><operator>&amp;</operator><name>key</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>OidAssignment</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>type</name></name> <operator>=</operator> <name>T_OidAssignment</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>keyOid1</name></name> <operator>=</operator> <name>amopfamily</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>keyOid2</name></name> <operator>=</operator> <name>amoplefttype</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>keyOid3</name></name> <operator>=</operator> <name>amoprighttype</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>keyOid4</name></name> <operator>=</operator> <name>amopstrategy</name></expr>;</expr_stmt>
+	<return>return <expr><call><name>GetNewOrPreassignedOid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>, <argument><expr><name>indexId</name></expr></argument>, <argument><expr><name>oidcolumn</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>key</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><name>Oid</name></type>
+<name>GetNewOidForAccessMethodProcedure</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>relation</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>indexId</name></decl></parameter>, <parameter><decl><type><name>AttrNumber</name></type> <name>oidcolumn</name></decl></parameter>,
+								  <parameter><decl><type><name>Oid</name></type> <name>amprocfamily</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>amproclefttype</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>amprocrighttype</name></decl></parameter>,
+								  <parameter><decl><type><name>Oid</name></type> <name>amproc</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>OidAssignment</name></type> <name>key</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>RelationGetRelid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>)</argument_list></call> <operator>==</operator> <name>AccessMethodProcedureRelationId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>indexId</name> <operator>==</operator> <name>AccessMethodProcedureOidIndexId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>oidcolumn</name> <operator>==</operator> <name>Anum_pg_amproc_oid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><operator>&amp;</operator><name>key</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>OidAssignment</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>type</name></name> <operator>=</operator> <name>T_OidAssignment</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>keyOid1</name></name> <operator>=</operator> <name>amprocfamily</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>keyOid2</name></name> <operator>=</operator> <name>amproclefttype</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>keyOid3</name></name> <operator>=</operator> <name>amprocrighttype</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>keyOid4</name></name> <operator>=</operator> <name>amproc</name></expr>;</expr_stmt>
+	<return>return <expr><call><name>GetNewOrPreassignedOid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>, <argument><expr><name>indexId</name></expr></argument>, <argument><expr><name>oidcolumn</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>key</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><name>Oid</name></type>
+<name>GetNewOidForAttrDefault</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>relation</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>indexId</name></decl></parameter>, <parameter><decl><type><name>AttrNumber</name></type> <name>oidcolumn</name></decl></parameter>,
+						<parameter><decl><type><name>Oid</name></type> <name>adrelid</name></decl></parameter>, <parameter><decl><type><name>int16</name></type> <name>adnum</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>OidAssignment</name></type> <name>key</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>RelationGetRelid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>)</argument_list></call> <operator>==</operator> <name>AttrDefaultRelationId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>indexId</name> <operator>==</operator> <name>AttrDefaultOidIndexId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>oidcolumn</name> <operator>==</operator> <name>Anum_pg_attrdef_oid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><operator>&amp;</operator><name>key</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>OidAssignment</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>type</name></name> <operator>=</operator> <name>T_OidAssignment</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>keyOid1</name></name> <operator>=</operator> <name>adrelid</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>keyOid2</name></name> <operator>=</operator> <operator>(</operator><name>Oid</name><operator>)</operator> <name>adnum</name></expr>;</expr_stmt>
+	<return>return <expr><call><name>GetNewOrPreassignedOid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>, <argument><expr><name>indexId</name></expr></argument>, <argument><expr><name>oidcolumn</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>key</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><name>Oid</name></type>
+<name>GetNewOidForAuthId</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>relation</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>indexId</name></decl></parameter>, <parameter><decl><type><name>AttrNumber</name></type> <name>oidcolumn</name></decl></parameter>,
+				   <parameter><decl><type><name>char</name> <modifier>*</modifier></type><name>rolname</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>OidAssignment</name></type> <name>key</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>RelationGetRelid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>)</argument_list></call> <operator>==</operator> <name>AuthIdRelationId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>indexId</name> <operator>==</operator> <name>AuthIdOidIndexId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>oidcolumn</name> <operator>==</operator> <name>Anum_pg_authid_oid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><operator>&amp;</operator><name>key</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>OidAssignment</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>type</name></name> <operator>=</operator> <name>T_OidAssignment</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>objname</name></name> <operator>=</operator> <name>rolname</name></expr>;</expr_stmt>
+	<return>return <expr><call><name>GetNewOrPreassignedOid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>, <argument><expr><name>indexId</name></expr></argument>, <argument><expr><name>oidcolumn</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>key</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><name>Oid</name></type>
+<name>GetNewOidForCast</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>relation</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>indexId</name></decl></parameter>, <parameter><decl><type><name>AttrNumber</name></type> <name>oidcolumn</name></decl></parameter>,
+				 <parameter><decl><type><name>Oid</name></type> <name>castsource</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>casttarget</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>OidAssignment</name></type> <name>key</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>RelationGetRelid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>)</argument_list></call> <operator>==</operator> <name>CastRelationId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>indexId</name> <operator>==</operator> <name>CastOidIndexId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>oidcolumn</name> <operator>==</operator> <name>Anum_pg_cast_oid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><operator>&amp;</operator><name>key</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>OidAssignment</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>type</name></name> <operator>=</operator> <name>T_OidAssignment</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>keyOid1</name></name> <operator>=</operator> <name>castsource</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>keyOid2</name></name> <operator>=</operator> <name>casttarget</name></expr>;</expr_stmt>
+	<return>return <expr><call><name>GetNewOrPreassignedOid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>, <argument><expr><name>indexId</name></expr></argument>, <argument><expr><name>oidcolumn</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>key</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><name>Oid</name></type>
+<name>GetNewOidForCollation</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>relation</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>indexId</name></decl></parameter>, <parameter><decl><type><name>AttrNumber</name></type> <name>oidcolumn</name></decl></parameter>,
+					  <parameter><decl><type><name>Oid</name></type> <name>collnamespace</name></decl></parameter>, <parameter><decl><type><name>char</name> <modifier>*</modifier></type><name>collname</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>OidAssignment</name></type> <name>key</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>RelationGetRelid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>)</argument_list></call> <operator>==</operator> <name>CollationRelationId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>indexId</name> <operator>==</operator> <name>CollationOidIndexId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>oidcolumn</name> <operator>==</operator> <name>Anum_pg_collation_oid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><operator>&amp;</operator><name>key</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>OidAssignment</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>type</name></name> <operator>=</operator> <name>T_OidAssignment</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>namespaceOid</name></name> <operator>=</operator> <name>collnamespace</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>objname</name></name> <operator>=</operator> <name>collname</name></expr>;</expr_stmt>
+	<return>return <expr><call><name>GetNewOrPreassignedOid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>, <argument><expr><name>indexId</name></expr></argument>, <argument><expr><name>oidcolumn</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>key</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><name>Oid</name></type>
+<name>GetNewOidForConstraint</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>relation</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>indexId</name></decl></parameter>, <parameter><decl><type><name>AttrNumber</name></type> <name>oidcolumn</name></decl></parameter>,
+					   <parameter><decl><type><name>Oid</name></type> <name>conrelid</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>contypid</name></decl></parameter>, <parameter><decl><type><name>char</name> <modifier>*</modifier></type><name>conname</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>OidAssignment</name></type> <name>key</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>RelationGetRelid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>)</argument_list></call> <operator>==</operator> <name>ConstraintRelationId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>indexId</name> <operator>==</operator> <name>ConstraintOidIndexId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>oidcolumn</name> <operator>==</operator> <name>Anum_pg_constraint_oid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><operator>&amp;</operator><name>key</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>OidAssignment</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>type</name></name> <operator>=</operator> <name>T_OidAssignment</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>objname</name></name> <operator>=</operator> <name>conname</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>keyOid1</name></name> <operator>=</operator> <name>conrelid</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>keyOid2</name></name> <operator>=</operator> <name>contypid</name></expr>;</expr_stmt>
+	<return>return <expr><call><name>GetNewOrPreassignedOid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>, <argument><expr><name>indexId</name></expr></argument>, <argument><expr><name>oidcolumn</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>key</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><name>Oid</name></type>
+<name>GetNewOidForConversion</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>relation</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>indexId</name></decl></parameter>, <parameter><decl><type><name>AttrNumber</name></type> <name>oidcolumn</name></decl></parameter>,
+					   <parameter><decl><type><name>Oid</name></type> <name>connamespace</name></decl></parameter>, <parameter><decl><type><name>char</name> <modifier>*</modifier></type><name>conname</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>OidAssignment</name></type> <name>key</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>RelationGetRelid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>)</argument_list></call> <operator>==</operator> <name>ConversionRelationId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>indexId</name> <operator>==</operator> <name>ConversionOidIndexId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>oidcolumn</name> <operator>==</operator> <name>Anum_pg_conversion_oid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><operator>&amp;</operator><name>key</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>OidAssignment</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>type</name></name> <operator>=</operator> <name>T_OidAssignment</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>namespaceOid</name></name> <operator>=</operator> <name>connamespace</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>objname</name></name> <operator>=</operator> <name>conname</name></expr>;</expr_stmt>
+	<return>return <expr><call><name>GetNewOrPreassignedOid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>, <argument><expr><name>indexId</name></expr></argument>, <argument><expr><name>oidcolumn</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>key</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * Databases are assigned slightly differently, because the QD
+ * needs to do some extra checking on the Oid to check if it's suitable.
+ * In the QD, call GetNewOidWithIndex like usual, and when you
+ * find an OID that can be used, call RememberAssignedOidForDatabase()
+ * to have it dispatched. In the QE, call GetPreassignedOidForDatabase().
+ */</comment>
+<function><type><name>Oid</name></type>
+<name>GetPreassignedOidForDatabase</name><parameter_list>(<parameter><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>datname</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>OidAssignment</name></type> <name>searchkey</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Oid</name></type>			<name>oid</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><operator>&amp;</operator><name>searchkey</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>OidAssignment</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>searchkey</name><operator>.</operator><name>type</name></name> <operator>=</operator> <name>T_OidAssignment</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>searchkey</name><operator>.</operator><name>catalog</name></name> <operator>=</operator> <name>DatabaseRelationId</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>searchkey</name><operator>.</operator><name>objname</name></name> <operator>=</operator> <operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <name>datname</name></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><operator>(</operator><name>oid</name> <operator>=</operator> <call><name>GetPreassignedOid</name><argument_list>(<argument><expr><operator>&amp;</operator><name>searchkey</name></expr></argument>)</argument_list></call><operator>)</operator> <operator>==</operator> <name>InvalidOid</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"no pre-assigned OID for database \"%s\""</literal></expr></argument>, <argument><expr><name>datname</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	<return>return <expr><name>oid</name></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><name>void</name></type>
+<name>RememberAssignedOidForDatabase</name><parameter_list>(<parameter><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>datname</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>oid</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>MemoryContext</name></type> <name>oldcontext</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>OidAssignment</name> <modifier>*</modifier></type><name>key</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name>oldcontext</name> <operator>=</operator> <call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><call><name>get_oids_context</name><argument_list>()</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>key</name> <operator>=</operator> <call><name>makeNode</name><argument_list>(<argument><expr><name>OidAssignment</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>-&gt;</operator><name>catalog</name></name> <operator>=</operator> <name>DatabaseRelationId</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>-&gt;</operator><name>objname</name></name> <operator>=</operator> <operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <call><name>pstrdup</name><argument_list>(<argument><expr><name>datname</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>-&gt;</operator><name>oid</name></name> <operator>=</operator> <name>oid</name></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>dispatch_oids</name> <operator>=</operator> <call><name>lappend</name><argument_list>(<argument><expr><name>dispatch_oids</name></expr></argument>, <argument><expr><name>key</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>oldcontext</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Return the preassigned OID if it exists, but doesn't allocate or
+ * complain if it doesn't.
+ */</comment>
+<function><type><name>Oid</name></type>
+<name>GetPreassignedOidForRelation</name><parameter_list>(<parameter><decl><type><name>Oid</name></type> <name>namespaceOid</name></decl></parameter>, <parameter><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>relname</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>OidAssignment</name></type> <name>searchkey</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><operator>&amp;</operator><name>searchkey</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>OidAssignment</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>searchkey</name><operator>.</operator><name>catalog</name></name> <operator>=</operator> <name>RelationRelationId</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>searchkey</name><operator>.</operator><name>namespaceOid</name></name> <operator>=</operator> <name>namespaceOid</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>searchkey</name><operator>.</operator><name>objname</name></name> <operator>=</operator> <operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <name>relname</name></expr>;</expr_stmt>
+
+	<return>return <expr><call><name>GetPreassignedOid</name><argument_list>(<argument><expr><operator>&amp;</operator><name>searchkey</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Return the preassigned OID if it exists, but doens't allocate or
+ * complain if it doesn't.
+ */</comment>
+<function><type><name>Oid</name></type>
+<name>GetPreassignedOidForType</name><parameter_list>(<parameter><decl><type><name>Oid</name></type> <name>namespaceOid</name></decl></parameter>, <parameter><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>typname</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>OidAssignment</name></type> <name>searchkey</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><operator>&amp;</operator><name>searchkey</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>OidAssignment</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>searchkey</name><operator>.</operator><name>catalog</name></name> <operator>=</operator> <name>TypeRelationId</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>searchkey</name><operator>.</operator><name>namespaceOid</name></name> <operator>=</operator> <name>namespaceOid</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>searchkey</name><operator>.</operator><name>objname</name></name> <operator>=</operator> <operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <name>typname</name></expr>;</expr_stmt>
+
+	<return>return <expr><call><name>GetPreassignedOid</name><argument_list>(<argument><expr><operator>&amp;</operator><name>searchkey</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/* Enums values have similar issues as databases */</comment>
+
+<function><type><name>Oid</name></type>
+<name>GetPreassignedOidForEnum</name><parameter_list>(<parameter><decl><type><name>Oid</name></type> <name>enumtypid</name></decl></parameter>, <parameter><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>enumlabel</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>OidAssignment</name></type> <name>searchkey</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Oid</name></type>			<name>oid</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><operator>&amp;</operator><name>searchkey</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>OidAssignment</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>searchkey</name><operator>.</operator><name>type</name></name> <operator>=</operator> <name>T_OidAssignment</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>searchkey</name><operator>.</operator><name>catalog</name></name> <operator>=</operator> <name>EnumRelationId</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>searchkey</name><operator>.</operator><name>keyOid1</name></name> <operator>=</operator> <name>enumtypid</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>searchkey</name><operator>.</operator><name>objname</name></name> <operator>=</operator> <operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <name>enumlabel</name></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><operator>(</operator><name>oid</name> <operator>=</operator> <call><name>GetPreassignedOid</name><argument_list>(<argument><expr><operator>&amp;</operator><name>searchkey</name></expr></argument>)</argument_list></call><operator>)</operator> <operator>==</operator> <name>InvalidOid</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"no pre-assigned OID for enum label \"%s\" of %u"</literal></expr></argument>, <argument><expr><name>enumlabel</name></expr></argument>, <argument><expr><name>enumtypid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	<return>return <expr><name>oid</name></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><name>void</name></type>
+<name>RememberAssignedOidForEnum</name><parameter_list>(<parameter><decl><type><name>Oid</name></type> <name>enumtypid</name></decl></parameter>, <parameter><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>enumlabel</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>oid</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>MemoryContext</name></type> <name>oldcontext</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>OidAssignment</name> <modifier>*</modifier></type><name>key</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name>oldcontext</name> <operator>=</operator> <call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><call><name>get_oids_context</name><argument_list>()</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>key</name> <operator>=</operator> <call><name>makeNode</name><argument_list>(<argument><expr><name>OidAssignment</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>-&gt;</operator><name>catalog</name></name> <operator>=</operator> <name>EnumRelationId</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>-&gt;</operator><name>keyOid1</name></name> <operator>=</operator> <name>enumtypid</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>-&gt;</operator><name>objname</name></name> <operator>=</operator> <operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <call><name>pstrdup</name><argument_list>(<argument><expr><name>enumlabel</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>-&gt;</operator><name>oid</name></name> <operator>=</operator> <name>oid</name></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>dispatch_oids</name> <operator>=</operator> <call><name>lappend</name><argument_list>(<argument><expr><name>dispatch_oids</name></expr></argument>, <argument><expr><name>key</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>oldcontext</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<function><type><name>Oid</name></type>
+<name>GetNewOidForDefaultAcl</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>relation</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>indexId</name></decl></parameter>, <parameter><decl><type><name>AttrNumber</name></type> <name>oidcolumn</name></decl></parameter>,
+					   <parameter><decl><type><name>Oid</name></type> <name>defaclrole</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>defaclnamespace</name></decl></parameter>, <parameter><decl><type><name>char</name></type> <name>defaclobjtype</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>OidAssignment</name></type> <name>key</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>RelationGetRelid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>)</argument_list></call> <operator>==</operator> <name>DefaultAclRelationId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>indexId</name> <operator>==</operator> <name>DefaultAclOidIndexId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>oidcolumn</name> <operator>==</operator> <name>Anum_pg_default_acl_oid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><operator>&amp;</operator><name>key</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>OidAssignment</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>type</name></name> <operator>=</operator> <name>T_OidAssignment</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>keyOid1</name></name> <operator>=</operator> <name>defaclrole</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>namespaceOid</name></name> <operator>=</operator> <name>defaclnamespace</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>keyOid2</name></name> <operator>=</operator> <operator>(</operator><name>Oid</name><operator>)</operator> <name>defaclobjtype</name></expr>;</expr_stmt>
+	<return>return <expr><call><name>GetNewOrPreassignedOid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>, <argument><expr><name>indexId</name></expr></argument>, <argument><expr><name>oidcolumn</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>key</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><name>Oid</name></type>
+<name>GetNewOidForExtension</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>relation</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>indexId</name></decl></parameter>, <parameter><decl><type><name>AttrNumber</name></type> <name>oidcolumn</name></decl></parameter>,
+					  <parameter><decl><type><name>char</name> <modifier>*</modifier></type><name>extname</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>OidAssignment</name></type> <name>key</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>RelationGetRelid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>)</argument_list></call> <operator>==</operator> <name>ExtensionRelationId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>indexId</name> <operator>==</operator> <name>ExtensionOidIndexId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>oidcolumn</name> <operator>==</operator> <name>Anum_pg_extension_oid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Note that unlike most catalogs with a "namespace" column,
+	 * extnamespace is not meant to imply that the extension
+	 * belongs to that schema.
+	 */</comment>
+	<expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><operator>&amp;</operator><name>key</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>OidAssignment</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>type</name></name> <operator>=</operator> <name>T_OidAssignment</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>objname</name></name> <operator>=</operator> <name>extname</name></expr>;</expr_stmt>
+	<return>return <expr><call><name>GetNewOrPreassignedOid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>, <argument><expr><name>indexId</name></expr></argument>, <argument><expr><name>oidcolumn</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>key</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><name>Oid</name></type>
+<name>GetNewOidForExtprotocol</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>relation</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>indexId</name></decl></parameter>, <parameter><decl><type><name>AttrNumber</name></type> <name>oidcolumn</name></decl></parameter>,
+						<parameter><decl><type><name>char</name> <modifier>*</modifier></type><name>ptcname</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>OidAssignment</name></type> <name>key</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>RelationGetRelid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>)</argument_list></call> <operator>==</operator> <name>ExtprotocolRelationId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>indexId</name> <operator>==</operator> <name>ExtprotocolOidIndexId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>oidcolumn</name> <operator>==</operator> <name>Anum_pg_extprotocol_oid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><operator>&amp;</operator><name>key</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>OidAssignment</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>type</name></name> <operator>=</operator> <name>T_OidAssignment</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>objname</name></name> <operator>=</operator> <name>ptcname</name></expr>;</expr_stmt>
+	<return>return <expr><call><name>GetNewOrPreassignedOid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>, <argument><expr><name>indexId</name></expr></argument>, <argument><expr><name>oidcolumn</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>key</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><name>Oid</name></type>
+<name>GetNewOidForForeignDataWrapper</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>relation</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>indexId</name></decl></parameter>, <parameter><decl><type><name>AttrNumber</name></type> <name>oidcolumn</name></decl></parameter>,
+							   <parameter><decl><type><name>char</name> <modifier>*</modifier></type><name>fdwname</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>OidAssignment</name></type> <name>key</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>RelationGetRelid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>)</argument_list></call> <operator>==</operator> <name>ForeignDataWrapperRelationId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>indexId</name> <operator>==</operator> <name>ForeignDataWrapperOidIndexId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>oidcolumn</name> <operator>==</operator> <name>Anum_pg_foreign_data_wrapper_oid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><operator>&amp;</operator><name>key</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>OidAssignment</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>type</name></name> <operator>=</operator> <name>T_OidAssignment</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>objname</name></name> <operator>=</operator> <name>fdwname</name></expr>;</expr_stmt>
+	<return>return <expr><call><name>GetNewOrPreassignedOid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>, <argument><expr><name>indexId</name></expr></argument>, <argument><expr><name>oidcolumn</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>key</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><name>Oid</name></type>
+<name>GetNewOidForForeignServer</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>relation</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>indexId</name></decl></parameter>, <parameter><decl><type><name>AttrNumber</name></type> <name>oidcolumn</name></decl></parameter>,
+						  <parameter><decl><type><name>char</name> <modifier>*</modifier></type><name>srvname</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>OidAssignment</name></type> <name>key</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>RelationGetRelid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>)</argument_list></call> <operator>==</operator> <name>ForeignServerRelationId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>indexId</name> <operator>==</operator> <name>ForeignServerOidIndexId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>oidcolumn</name> <operator>==</operator> <name>Anum_pg_foreign_server_oid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><operator>&amp;</operator><name>key</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>OidAssignment</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>type</name></name> <operator>=</operator> <name>T_OidAssignment</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>objname</name></name> <operator>=</operator> <name>srvname</name></expr>;</expr_stmt>
+	<return>return <expr><call><name>GetNewOrPreassignedOid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>, <argument><expr><name>indexId</name></expr></argument>, <argument><expr><name>oidcolumn</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>key</name></expr></argument>)</argument_list></call></expr>;</return>
+
+</block_content>}</block></function>
+
+<function><type><name>Oid</name></type>
+<name>GetNewOidForLanguage</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>relation</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>indexId</name></decl></parameter>, <parameter><decl><type><name>AttrNumber</name></type> <name>oidcolumn</name></decl></parameter>,
+					 <parameter><decl><type><name>char</name> <modifier>*</modifier></type><name>lanname</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>OidAssignment</name></type> <name>key</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>RelationGetRelid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>)</argument_list></call> <operator>==</operator> <name>LanguageRelationId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>indexId</name> <operator>==</operator> <name>LanguageOidIndexId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>oidcolumn</name> <operator>==</operator> <name>Anum_pg_language_oid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><operator>&amp;</operator><name>key</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>OidAssignment</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>type</name></name> <operator>=</operator> <name>T_OidAssignment</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>objname</name></name> <operator>=</operator> <name>lanname</name></expr>;</expr_stmt>
+	<return>return <expr><call><name>GetNewOrPreassignedOid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>, <argument><expr><name>indexId</name></expr></argument>, <argument><expr><name>oidcolumn</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>key</name></expr></argument>)</argument_list></call></expr>;</return>
+
+</block_content>}</block></function>
+<function><type><name>Oid</name></type>
+<name>GetNewOidForNamespace</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>relation</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>indexId</name></decl></parameter>, <parameter><decl><type><name>AttrNumber</name></type> <name>oidcolumn</name></decl></parameter>,
+					  <parameter><decl><type><name>char</name> <modifier>*</modifier></type><name>nspname</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>OidAssignment</name></type> <name>key</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>RelationGetRelid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>)</argument_list></call> <operator>==</operator> <name>NamespaceRelationId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>indexId</name> <operator>==</operator> <name>NamespaceOidIndexId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>oidcolumn</name> <operator>==</operator> <name>Anum_pg_namespace_oid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><operator>&amp;</operator><name>key</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>OidAssignment</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>type</name></name> <operator>=</operator> <name>T_OidAssignment</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>objname</name></name> <operator>=</operator> <name>nspname</name></expr>;</expr_stmt>
+	<return>return <expr><call><name>GetNewOrPreassignedOid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>, <argument><expr><name>indexId</name></expr></argument>, <argument><expr><name>oidcolumn</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>key</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><name>Oid</name></type>
+<name>GetNewOidForOperator</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>relation</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>indexId</name></decl></parameter>, <parameter><decl><type><name>AttrNumber</name></type> <name>oidcolumn</name></decl></parameter>,
+					 <parameter><decl><type><name>char</name> <modifier>*</modifier></type><name>oprname</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>oprleft</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>oprright</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>oprnamespace</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>OidAssignment</name></type> <name>key</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>RelationGetRelid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>)</argument_list></call> <operator>==</operator> <name>OperatorRelationId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>indexId</name> <operator>==</operator> <name>OperatorOidIndexId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>oidcolumn</name> <operator>==</operator> <name>Anum_pg_operator_oid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><operator>&amp;</operator><name>key</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>OidAssignment</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>type</name></name> <operator>=</operator> <name>T_OidAssignment</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>objname</name></name> <operator>=</operator> <name>oprname</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>keyOid1</name></name> <operator>=</operator> <name>oprleft</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>keyOid2</name></name> <operator>=</operator> <name>oprright</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>namespaceOid</name></name> <operator>=</operator> <name>oprnamespace</name></expr>;</expr_stmt>
+	<return>return <expr><call><name>GetNewOrPreassignedOid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>, <argument><expr><name>indexId</name></expr></argument>, <argument><expr><name>oidcolumn</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>key</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><name>Oid</name></type>
+<name>GetNewOidForOperatorClass</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>relation</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>indexId</name></decl></parameter>, <parameter><decl><type><name>AttrNumber</name></type> <name>oidcolumn</name></decl></parameter>,
+						  <parameter><decl><type><name>Oid</name></type> <name>opcmethod</name></decl></parameter>, <parameter><decl><type><name>char</name> <modifier>*</modifier></type><name>opcname</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>opcnamespace</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>OidAssignment</name></type> <name>key</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>RelationGetRelid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>)</argument_list></call> <operator>==</operator> <name>OperatorClassRelationId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>indexId</name> <operator>==</operator> <name>OpclassOidIndexId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>oidcolumn</name> <operator>==</operator> <name>Anum_pg_opclass_oid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><operator>&amp;</operator><name>key</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>OidAssignment</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>type</name></name> <operator>=</operator> <name>T_OidAssignment</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>keyOid1</name></name> <operator>=</operator> <name>opcmethod</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>objname</name></name> <operator>=</operator> <name>opcname</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>namespaceOid</name></name> <operator>=</operator> <name>opcnamespace</name></expr>;</expr_stmt>
+	<return>return <expr><call><name>GetNewOrPreassignedOid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>, <argument><expr><name>indexId</name></expr></argument>, <argument><expr><name>oidcolumn</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>key</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><name>Oid</name></type>
+<name>GetNewOidForOperatorFamily</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>relation</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>indexId</name></decl></parameter>, <parameter><decl><type><name>AttrNumber</name></type> <name>oidcolumn</name></decl></parameter>,
+						   <parameter><decl><type><name>Oid</name></type> <name>opfmethod</name></decl></parameter>, <parameter><decl><type><name>char</name> <modifier>*</modifier></type><name>opfname</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>opfnamespace</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>OidAssignment</name></type> <name>key</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>RelationGetRelid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>)</argument_list></call> <operator>==</operator> <name>OperatorFamilyRelationId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>indexId</name> <operator>==</operator> <name>OpfamilyOidIndexId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>oidcolumn</name> <operator>==</operator> <name>Anum_pg_opfamily_oid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><operator>&amp;</operator><name>key</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>OidAssignment</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>type</name></name> <operator>=</operator> <name>T_OidAssignment</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>keyOid1</name></name> <operator>=</operator> <name>opfmethod</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>objname</name></name> <operator>=</operator> <name>opfname</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>namespaceOid</name></name> <operator>=</operator> <name>opfnamespace</name></expr>;</expr_stmt>
+	<return>return <expr><call><name>GetNewOrPreassignedOid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>, <argument><expr><name>indexId</name></expr></argument>, <argument><expr><name>oidcolumn</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>key</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><name>Oid</name></type>
+<name>GetNewOidForPolicy</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>relation</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>indexId</name></decl></parameter>, <parameter><decl><type><name>AttrNumber</name></type> <name>oidcolumn</name></decl></parameter>,
+				   <parameter><decl><type><name>Oid</name></type> <name>polrelid</name></decl></parameter>, <parameter><decl><type><name>char</name> <modifier>*</modifier></type><name>polname</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>OidAssignment</name></type> <name>key</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>RelationGetRelid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>)</argument_list></call> <operator>==</operator> <name>PolicyRelationId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>indexId</name> <operator>==</operator> <name>PolicyOidIndexId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>oidcolumn</name> <operator>==</operator> <name>Anum_pg_policy_oid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><operator>&amp;</operator><name>key</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>OidAssignment</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>type</name></name> <operator>=</operator> <name>T_OidAssignment</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>keyOid1</name></name> <operator>=</operator> <name>polrelid</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>objname</name></name> <operator>=</operator> <name>polname</name></expr>;</expr_stmt>
+	<return>return <expr><call><name>GetNewOrPreassignedOid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>, <argument><expr><name>indexId</name></expr></argument>, <argument><expr><name>oidcolumn</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>key</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><name>Oid</name></type>
+<name>GetNewOidForProcedure</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>relation</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>indexId</name></decl></parameter>, <parameter><decl><type><name>AttrNumber</name></type> <name>oidcolumn</name></decl></parameter>,
+					  <parameter><decl><type><name>char</name> <modifier>*</modifier></type><name>proname</name></decl></parameter>, <parameter><decl><type><name>oidvector</name> <modifier>*</modifier></type><name>proargtypes</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>pronamespace</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>OidAssignment</name></type> <name>key</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>RelationGetRelid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>)</argument_list></call> <operator>==</operator> <name>ProcedureRelationId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>indexId</name> <operator>==</operator> <name>ProcedureOidIndexId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>oidcolumn</name> <operator>==</operator> <name>Anum_pg_proc_oid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><operator>&amp;</operator><name>key</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>OidAssignment</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>type</name></name> <operator>=</operator> <name>T_OidAssignment</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>objname</name></name> <operator>=</operator> <name>proname</name></expr>;</expr_stmt>
+	<comment type="block">/*
+	 * GPDB_12_MERGE_FIXME: we have nowhere to put 'proargtypes' in the OidAssignment
+	 * struct currently. That's harmless, as long as we never try to dispatch the
+	 * creation of two overloaded in one go. Isn't it a problem for binary upgrade,
+	 * though?
+	 */</comment>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>namespaceOid</name></name> <operator>=</operator> <name>pronamespace</name></expr>;</expr_stmt>
+	<return>return <expr><call><name>GetNewOrPreassignedOid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>, <argument><expr><name>indexId</name></expr></argument>, <argument><expr><name>oidcolumn</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>key</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><name>Oid</name></type>
+<name>GetNewOidForRelation</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>relation</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>indexId</name></decl></parameter>, <parameter><decl><type><name>AttrNumber</name></type> <name>oidcolumn</name></decl></parameter>,
+					 <parameter><decl><type><name>char</name> <modifier>*</modifier></type><name>relname</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>relnamespace</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>OidAssignment</name></type> <name>key</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>RelationGetRelid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>)</argument_list></call> <operator>==</operator> <name>RelationRelationId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>indexId</name> <operator>==</operator> <name>ClassOidIndexId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>oidcolumn</name> <operator>==</operator> <name>Anum_pg_class_oid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><operator>&amp;</operator><name>key</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>OidAssignment</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>type</name></name> <operator>=</operator> <name>T_OidAssignment</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>objname</name></name> <operator>=</operator> <name>relname</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>namespaceOid</name></name> <operator>=</operator> <name>relnamespace</name></expr>;</expr_stmt>
+	<return>return <expr><call><name>GetNewOrPreassignedOid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>, <argument><expr><name>indexId</name></expr></argument>, <argument><expr><name>oidcolumn</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>key</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><name>Oid</name></type>
+<name>GetNewOidForResQueue</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>relation</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>indexId</name></decl></parameter>, <parameter><decl><type><name>AttrNumber</name></type> <name>oidcolumn</name></decl></parameter>,
+					 <parameter><decl><type><name>char</name> <modifier>*</modifier></type><name>rsqname</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>OidAssignment</name></type> <name>key</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>RelationGetRelid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>)</argument_list></call> <operator>==</operator> <name>ResQueueRelationId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>indexId</name> <operator>==</operator> <name>ResQueueOidIndexId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>oidcolumn</name> <operator>==</operator> <name>Anum_pg_resqueue_oid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><operator>&amp;</operator><name>key</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>OidAssignment</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>type</name></name> <operator>=</operator> <name>T_OidAssignment</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>objname</name></name> <operator>=</operator> <name>rsqname</name></expr>;</expr_stmt>
+	<return>return <expr><call><name>GetNewOrPreassignedOid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>, <argument><expr><name>indexId</name></expr></argument>, <argument><expr><name>oidcolumn</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>key</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><name>Oid</name></type>
+<name>GetNewOidForRewrite</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>relation</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>indexId</name></decl></parameter>, <parameter><decl><type><name>AttrNumber</name></type> <name>oidcolumn</name></decl></parameter>,
+					<parameter><decl><type><name>Oid</name></type> <name>ev_class</name></decl></parameter>, <parameter><decl><type><name>char</name> <modifier>*</modifier></type><name>rulename</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>OidAssignment</name></type> <name>key</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>RelationGetRelid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>)</argument_list></call> <operator>==</operator> <name>RewriteRelationId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>indexId</name> <operator>==</operator> <name>RewriteOidIndexId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>oidcolumn</name> <operator>==</operator> <name>Anum_pg_rewrite_oid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><operator>&amp;</operator><name>key</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>OidAssignment</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>type</name></name> <operator>=</operator> <name>T_OidAssignment</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>keyOid1</name></name> <operator>=</operator> <name>ev_class</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>objname</name></name> <operator>=</operator> <name>rulename</name></expr>;</expr_stmt>
+	<return>return <expr><call><name>GetNewOrPreassignedOid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>, <argument><expr><name>indexId</name></expr></argument>, <argument><expr><name>oidcolumn</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>key</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><name>Oid</name></type>
+<name>GetNewOidForSubscription</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>relation</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>indexId</name></decl></parameter>, <parameter><decl><type><name>AttrNumber</name></type> <name>oidcolumn</name></decl></parameter>,
+						 <parameter><decl><type><name>Oid</name></type> <name>subdbid</name></decl></parameter>, <parameter><decl><type><name>char</name> <modifier>*</modifier></type><name>subname</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>OidAssignment</name></type> <name>key</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>RelationGetRelid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>)</argument_list></call> <operator>==</operator> <name>SubscriptionRelationId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>indexId</name> <operator>==</operator> <name>SubscriptionObjectIndexId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>oidcolumn</name> <operator>==</operator> <name>Anum_pg_subscription_oid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><operator>&amp;</operator><name>key</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>OidAssignment</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>type</name></name> <operator>=</operator> <name>T_OidAssignment</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>keyOid1</name></name> <operator>=</operator> <name>subdbid</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>objname</name></name> <operator>=</operator> <name>subname</name></expr>;</expr_stmt>
+	<return>return <expr><call><name>GetNewOrPreassignedOid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>, <argument><expr><name>indexId</name></expr></argument>, <argument><expr><name>oidcolumn</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>key</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><name>Oid</name></type>
+<name>GetNewOidForTableSpace</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>relation</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>indexId</name></decl></parameter>, <parameter><decl><type><name>AttrNumber</name></type> <name>oidcolumn</name></decl></parameter>,
+					   <parameter><decl><type><name>char</name> <modifier>*</modifier></type><name>spcname</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>OidAssignment</name></type> <name>key</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>RelationGetRelid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>)</argument_list></call> <operator>==</operator> <name>TableSpaceRelationId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>indexId</name> <operator>==</operator> <name>TablespaceOidIndexId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>oidcolumn</name> <operator>==</operator> <name>Anum_pg_tablespace_oid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><operator>&amp;</operator><name>key</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>OidAssignment</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>type</name></name> <operator>=</operator> <name>T_OidAssignment</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>objname</name></name> <operator>=</operator> <name>spcname</name></expr>;</expr_stmt>
+	<return>return <expr><call><name>GetNewOrPreassignedOid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>, <argument><expr><name>indexId</name></expr></argument>, <argument><expr><name>oidcolumn</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>key</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><name>Oid</name></type>
+<name>GetNewOidForTransform</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>relation</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>indexId</name></decl></parameter>, <parameter><decl><type><name>AttrNumber</name></type> <name>oidcolumn</name></decl></parameter>,
+					  <parameter><decl><type><name>Oid</name></type> <name>trftype</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>trflang</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>OidAssignment</name></type> <name>key</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>RelationGetRelid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>)</argument_list></call> <operator>==</operator> <name>TransformRelationId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>indexId</name> <operator>==</operator> <name>TransformOidIndexId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>oidcolumn</name> <operator>==</operator> <name>Anum_pg_transform_oid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><operator>&amp;</operator><name>key</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>OidAssignment</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>type</name></name> <operator>=</operator> <name>T_OidAssignment</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>keyOid1</name></name> <operator>=</operator> <name>trftype</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>keyOid2</name></name> <operator>=</operator> <name>trflang</name></expr>;</expr_stmt>
+	<return>return <expr><call><name>GetNewOrPreassignedOid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>, <argument><expr><name>indexId</name></expr></argument>, <argument><expr><name>oidcolumn</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>key</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><name>Oid</name></type>
+<name>GetNewOidForTrigger</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>relation</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>indexId</name></decl></parameter>, <parameter><decl><type><name>AttrNumber</name></type> <name>oidcolumn</name></decl></parameter>,
+					<parameter><decl><type><name>Oid</name></type> <name>tgrelid</name></decl></parameter>, <parameter><decl><type><name>char</name> <modifier>*</modifier></type><name>tgname</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>tgconstraint</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>tgfid</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>OidAssignment</name></type> <name>key</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>RelationGetRelid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>)</argument_list></call> <operator>==</operator> <name>TriggerRelationId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>indexId</name> <operator>==</operator> <name>TriggerOidIndexId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>oidcolumn</name> <operator>==</operator> <name>Anum_pg_trigger_oid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><operator>&amp;</operator><name>key</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>OidAssignment</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>type</name></name> <operator>=</operator> <name>T_OidAssignment</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>keyOid1</name></name> <operator>=</operator> <name>tgrelid</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>objname</name></name> <operator>=</operator> <name>tgname</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>keyOid2</name></name> <operator>=</operator> <name>tgconstraint</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>keyOid3</name></name> <operator>=</operator> <name>tgfid</name></expr>;</expr_stmt>
+	<return>return <expr><call><name>GetNewOrPreassignedOid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>, <argument><expr><name>indexId</name></expr></argument>, <argument><expr><name>oidcolumn</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>key</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><name>Oid</name></type>
+<name>GetNewOidForTSParser</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>relation</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>indexId</name></decl></parameter>, <parameter><decl><type><name>AttrNumber</name></type> <name>oidcolumn</name></decl></parameter>,
+					 <parameter><decl><type><name>char</name> <modifier>*</modifier></type><name>prsname</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>prsnamespace</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>OidAssignment</name></type> <name>key</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>RelationGetRelid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>)</argument_list></call> <operator>==</operator> <name>TSParserRelationId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>indexId</name> <operator>==</operator> <name>TSParserOidIndexId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>oidcolumn</name> <operator>==</operator> <name>Anum_pg_ts_parser_oid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><operator>&amp;</operator><name>key</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>OidAssignment</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>type</name></name> <operator>=</operator> <name>T_OidAssignment</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>objname</name></name> <operator>=</operator> <name>prsname</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>namespaceOid</name></name> <operator>=</operator> <name>prsnamespace</name></expr>;</expr_stmt>
+	<return>return <expr><call><name>GetNewOrPreassignedOid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>, <argument><expr><name>indexId</name></expr></argument>, <argument><expr><name>oidcolumn</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>key</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><name>Oid</name></type>
+<name>GetNewOidForTSDictionary</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>relation</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>indexId</name></decl></parameter>, <parameter><decl><type><name>AttrNumber</name></type> <name>oidcolumn</name></decl></parameter>,
+						 <parameter><decl><type><name>char</name> <modifier>*</modifier></type><name>dictname</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>dictnamespace</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>OidAssignment</name></type> <name>key</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>RelationGetRelid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>)</argument_list></call> <operator>==</operator> <name>TSDictionaryRelationId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>indexId</name> <operator>==</operator> <name>TSDictionaryOidIndexId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>oidcolumn</name> <operator>==</operator> <name>Anum_pg_ts_dict_oid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><operator>&amp;</operator><name>key</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>OidAssignment</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>type</name></name> <operator>=</operator> <name>T_OidAssignment</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>objname</name></name> <operator>=</operator> <name>dictname</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>namespaceOid</name></name> <operator>=</operator> <name>dictnamespace</name></expr>;</expr_stmt>
+	<return>return <expr><call><name>GetNewOrPreassignedOid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>, <argument><expr><name>indexId</name></expr></argument>, <argument><expr><name>oidcolumn</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>key</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><name>Oid</name></type>
+<name>GetNewOidForTSTemplate</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>relation</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>indexId</name></decl></parameter>, <parameter><decl><type><name>AttrNumber</name></type> <name>oidcolumn</name></decl></parameter>,
+					   <parameter><decl><type><name>char</name> <modifier>*</modifier></type><name>tmplname</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>tmplnamespace</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>OidAssignment</name></type> <name>key</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>RelationGetRelid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>)</argument_list></call> <operator>==</operator> <name>TSTemplateRelationId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>indexId</name> <operator>==</operator> <name>TSTemplateOidIndexId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>oidcolumn</name> <operator>==</operator> <name>Anum_pg_ts_template_oid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><operator>&amp;</operator><name>key</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>OidAssignment</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>type</name></name> <operator>=</operator> <name>T_OidAssignment</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>namespaceOid</name></name> <operator>=</operator> <name>tmplnamespace</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>objname</name></name> <operator>=</operator> <name>tmplname</name></expr>;</expr_stmt>
+	<return>return <expr><call><name>GetNewOrPreassignedOid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>, <argument><expr><name>indexId</name></expr></argument>, <argument><expr><name>oidcolumn</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>key</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><name>Oid</name></type>
+<name>GetNewOidForTSConfig</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>relation</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>indexId</name></decl></parameter>, <parameter><decl><type><name>AttrNumber</name></type> <name>oidcolumn</name></decl></parameter>,
+					 <parameter><decl><type><name>char</name> <modifier>*</modifier></type><name>cfgname</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>cfgnamespace</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>OidAssignment</name></type> <name>key</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>RelationGetRelid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>)</argument_list></call> <operator>==</operator> <name>TSConfigRelationId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>indexId</name> <operator>==</operator> <name>TSConfigOidIndexId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>oidcolumn</name> <operator>==</operator> <name>Anum_pg_ts_config_oid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><operator>&amp;</operator><name>key</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>OidAssignment</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>type</name></name> <operator>=</operator> <name>T_OidAssignment</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>objname</name></name> <operator>=</operator> <name>cfgname</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>namespaceOid</name></name> <operator>=</operator> <name>cfgnamespace</name></expr>;</expr_stmt>
+	<return>return <expr><call><name>GetNewOrPreassignedOid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>, <argument><expr><name>indexId</name></expr></argument>, <argument><expr><name>oidcolumn</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>key</name></expr></argument>)</argument_list></call></expr>;</return>
+
+</block_content>}</block></function>
+
+<function><type><name>Oid</name></type>
+<name>GetNewOidForType</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>relation</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>indexId</name></decl></parameter>, <parameter><decl><type><name>AttrNumber</name></type> <name>oidcolumn</name></decl></parameter>,
+				 <parameter><decl><type><name>char</name> <modifier>*</modifier></type><name>typname</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>typnamespace</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>OidAssignment</name></type> <name>key</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>RelationGetRelid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>)</argument_list></call> <operator>==</operator> <name>TypeRelationId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>indexId</name> <operator>==</operator> <name>TypeOidIndexId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>oidcolumn</name> <operator>==</operator> <name>Anum_pg_type_oid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><operator>&amp;</operator><name>key</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>OidAssignment</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>type</name></name> <operator>=</operator> <name>T_OidAssignment</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>objname</name></name> <operator>=</operator> <name>typname</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>namespaceOid</name></name> <operator>=</operator> <name>typnamespace</name></expr>;</expr_stmt>
+	<return>return <expr><call><name>GetNewOrPreassignedOid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>, <argument><expr><name>indexId</name></expr></argument>, <argument><expr><name>oidcolumn</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>key</name></expr></argument>)</argument_list></call></expr>;</return>
+
+</block_content>}</block></function>
+
+<function><type><name>Oid</name></type>
+<name>GetNewOidForResGroup</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>relation</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>indexId</name></decl></parameter>, <parameter><decl><type><name>AttrNumber</name></type> <name>oidcolumn</name></decl></parameter>,
+					 <parameter><decl><type><name>char</name> <modifier>*</modifier></type><name>rsgname</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>OidAssignment</name></type> <name>key</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>RelationGetRelid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>)</argument_list></call> <operator>==</operator> <name>ResGroupRelationId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>indexId</name> <operator>==</operator> <name>ResGroupOidIndexId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>oidcolumn</name> <operator>==</operator> <name>Anum_pg_resgroup_oid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><operator>&amp;</operator><name>key</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>OidAssignment</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>type</name></name> <operator>=</operator> <name>T_OidAssignment</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>objname</name></name> <operator>=</operator> <name>rsgname</name></expr>;</expr_stmt>
+	<return>return <expr><call><name>GetNewOrPreassignedOid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>, <argument><expr><name>indexId</name></expr></argument>, <argument><expr><name>oidcolumn</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>key</name></expr></argument>)</argument_list></call></expr>;</return>
+
+</block_content>}</block></function>
+<function><type><name>Oid</name></type>
+<name>GetNewOidForUserMapping</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>relation</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>indexId</name></decl></parameter>, <parameter><decl><type><name>AttrNumber</name></type> <name>oidcolumn</name></decl></parameter>,
+						<parameter><decl><type><name>Oid</name></type> <name>umuser</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>umserver</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>OidAssignment</name></type> <name>key</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>RelationGetRelid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>)</argument_list></call> <operator>==</operator> <name>UserMappingRelationId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>indexId</name> <operator>==</operator> <name>UserMappingOidIndexId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>oidcolumn</name> <operator>==</operator> <name>Anum_pg_user_mapping_oid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><operator>&amp;</operator><name>key</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>OidAssignment</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>type</name></name> <operator>=</operator> <name>T_OidAssignment</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>keyOid1</name></name> <operator>=</operator> <name>umuser</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>keyOid2</name></name> <operator>=</operator> <name>umserver</name></expr>;</expr_stmt>
+	<return>return <expr><call><name>GetNewOrPreassignedOid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>, <argument><expr><name>indexId</name></expr></argument>, <argument><expr><name>oidcolumn</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>key</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><name>Oid</name></type>
+<name>GetNewOidForPublication</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>relation</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>indexId</name></decl></parameter>, <parameter><decl><type><name>AttrNumber</name></type> <name>oidcolumn</name></decl></parameter>,
+						<parameter><decl><type><name>char</name> <modifier>*</modifier></type><name>pubname</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>OidAssignment</name></type> <name>key</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>RelationGetRelid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>)</argument_list></call> <operator>==</operator> <name>PublicationRelationId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>indexId</name> <operator>==</operator> <name>PublicationObjectIndexId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>oidcolumn</name> <operator>==</operator> <name>Anum_pg_publication_oid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><operator>&amp;</operator><name>key</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>OidAssignment</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>type</name></name> <operator>=</operator> <name>T_OidAssignment</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>objname</name></name> <operator>=</operator> <name>pubname</name></expr>;</expr_stmt>
+	<return>return <expr><call><name>GetNewOrPreassignedOid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>, <argument><expr><name>indexId</name></expr></argument>, <argument><expr><name>oidcolumn</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>key</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><name>Oid</name></type>
+<name>GetNewOidForPublicationRel</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>relation</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>indexId</name></decl></parameter>, <parameter><decl><type><name>AttrNumber</name></type> <name>oidcolumn</name></decl></parameter>,
+						   <parameter><decl><type><name>Oid</name></type> <name>prrelid</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>prpubid</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>OidAssignment</name></type> <name>key</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>RelationGetRelid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>)</argument_list></call> <operator>==</operator> <name>PublicationRelRelationId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>indexId</name> <operator>==</operator> <name>PublicationRelObjectIndexId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>oidcolumn</name> <operator>==</operator> <name>Anum_pg_publication_rel_oid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><operator>&amp;</operator><name>key</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>OidAssignment</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>type</name></name> <operator>=</operator> <name>T_OidAssignment</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>keyOid1</name></name> <operator>=</operator> <name>prrelid</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>.</operator><name>keyOid2</name></name> <operator>=</operator> <name>prpubid</name></expr>;</expr_stmt>
+	<return>return <expr><call><name>GetNewOrPreassignedOid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>, <argument><expr><name>indexId</name></expr></argument>, <argument><expr><name>oidcolumn</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>key</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * We also use the oid assignment list to remember the index names chosen for
+ * partitioned indexes. This is slightly different from the normal use to
+ * dispatch OIDs. The key is the parent index OID + child table OID, and
+ * the thing we remember/dispatch is the index name chosen (compare with
+ * the normal use, where the key is typically an object name, and we
+ * remember/dispatch the OID of that object).
+ */</comment>
+<function><type><name>char</name> <modifier>*</modifier></type>
+<name>GetPreassignedIndexNameForChildIndex</name><parameter_list>(<parameter><decl><type><name>Oid</name></type> <name>parentIdxOid</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>childRelId</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>ListCell</name>   <modifier>*</modifier></type><name>cur_item</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>ListCell</name>   <modifier>*</modifier></type><name>prev_item</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>result</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name>prev_item</name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name>cur_item</name> <operator>=</operator> <call><name>list_head</name><argument_list>(<argument><expr><name>preassigned_oids</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<while>while <condition>(<expr><name>cur_item</name> <operator>!=</operator> <name>NULL</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>OidAssignment</name> <modifier>*</modifier></type><name>p</name> <init>= <expr><operator>(</operator><name>OidAssignment</name> <operator>*</operator><operator>)</operator> <call><name>lfirst</name><argument_list>(<argument><expr><name>cur_item</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name><name>p</name><operator>-&gt;</operator><name>catalog</name></name> <operator>==</operator> <name>INDEX_NAME_ASSIGNMENT</name> <operator>&amp;&amp;</operator>
+			<name><name>p</name><operator>-&gt;</operator><name>keyOid1</name></name> <operator>==</operator> <name>parentIdxOid</name> <operator>&amp;&amp;</operator>
+			<name><name>p</name><operator>-&gt;</operator><name>keyOid2</name></name> <operator>==</operator> <name>childRelId</name></expr>)</condition>
+		<block>{<block_content>
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>OID_DISPATCH_DEBUG</name></cpp:ifdef>
+			<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>NOTICE</name></expr></argument>, <argument><expr><literal type="string">"using index name assignment: parentIdxOid: %u childRelId: %u: %s"</literal></expr></argument>,
+				 <argument><expr><name><name>p</name><operator>-&gt;</operator><name>keyOid1</name></name></expr></argument>, <argument><expr><name><name>p</name><operator>-&gt;</operator><name>keyOid2</name></name></expr></argument>, <argument><expr><name><name>p</name><operator>-&gt;</operator><name>objname</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+			<expr_stmt><expr><name>result</name> <operator>=</operator> <call><name>pstrdup</name><argument_list>(<argument><expr><name><name>p</name><operator>-&gt;</operator><name>objname</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><name>preassigned_oids</name> <operator>=</operator> <call><name>list_delete_cell</name><argument_list>(<argument><expr><name>preassigned_oids</name></expr></argument>, <argument><expr><name>cur_item</name></expr></argument>, <argument><expr><name>prev_item</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>pfree</name><argument_list>(<argument><expr><name>p</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<return>return <expr><name>result</name></expr>;</return>
+		</block_content>}</block></if></if_stmt>
+		<expr_stmt><expr><name>prev_item</name> <operator>=</operator> <name>cur_item</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name>cur_item</name> <operator>=</operator> <call><name>lnext</name><argument_list>(<argument><expr><name>cur_item</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></while>
+
+	<if_stmt><if>if <condition>(<expr><name>result</name> <operator>==</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"no pre-assigned index name for parent index %u, child %u"</literal></expr></argument>,
+			 <argument><expr><name>parentIdxOid</name></expr></argument>, <argument><expr><name>childRelId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	<return>return <expr><name>result</name></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><name>void</name></type>
+<name>RememberPreassignedIndexNameForChildIndex</name><parameter_list>(<parameter><decl><type><name>Oid</name></type> <name>parentIdxOid</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>childRelId</name></decl></parameter>, <parameter><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>idxname</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>MemoryContext</name></type> <name>oldcontext</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>OidAssignment</name> <modifier>*</modifier></type><name>key</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name>oldcontext</name> <operator>=</operator> <call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><call><name>get_oids_context</name><argument_list>()</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>key</name> <operator>=</operator> <call><name>makeNode</name><argument_list>(<argument><expr><name>OidAssignment</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>-&gt;</operator><name>catalog</name></name> <operator>=</operator> <name>INDEX_NAME_ASSIGNMENT</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>-&gt;</operator><name>keyOid1</name></name> <operator>=</operator> <name>parentIdxOid</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>-&gt;</operator><name>keyOid2</name></name> <operator>=</operator> <name>childRelId</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>key</name><operator>-&gt;</operator><name>objname</name></name> <operator>=</operator> <operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <call><name>pstrdup</name><argument_list>(<argument><expr><name>idxname</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>dispatch_oids</name> <operator>=</operator> <call><name>lappend</name><argument_list>(<argument><expr><name>dispatch_oids</name></expr></argument>, <argument><expr><name>key</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>oldcontext</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/* ----------------------------------------------------------------
+ * Functions for use in binary-upgrade mode
+ * ----------------------------------------------------------------
+ */</comment>
+
+<comment type="block">/*
+ * Support functions for the Red-Black Tree which is used to keep the Oid
+ * preassignments from the schema restore process during binary upgrade.
+ */</comment>
+<function><type><specifier>static</specifier> <name>int</name></type>
+<name>rbtree_cmp</name><parameter_list>(<parameter><decl><type><specifier>const</specifier> <name>RBTNode</name> <modifier>*</modifier></type><name>a</name></decl></parameter>, <parameter><decl><type><specifier>const</specifier> <name>RBTNode</name> <modifier>*</modifier></type><name>b</name></decl></parameter>, <parameter><decl><type><name>void</name> <modifier>*</modifier></type><name>arg</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><specifier>const</specifier> <name>OidPreassignment</name> <modifier>*</modifier></type><name>prea</name> <init>= <expr><operator>(</operator><specifier>const</specifier> <name>OidPreassignment</name> <operator>*</operator><operator>)</operator> <name>a</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><specifier>const</specifier> <name>OidPreassignment</name> <modifier>*</modifier></type><name>preb</name> <init>= <expr><operator>(</operator><specifier>const</specifier> <name>OidPreassignment</name> <operator>*</operator><operator>)</operator> <name>b</name></expr></init></decl>;</decl_stmt>
+
+	<return>return <expr><name><name>prea</name><operator>-&gt;</operator><name>oid</name></name> <operator>-</operator> <name><name>preb</name><operator>-&gt;</operator><name>oid</name></name></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><specifier>static</specifier> <name>RBTNode</name> <modifier>*</modifier></type>
+<name>rbtree_alloc</name><parameter_list>(<parameter><decl><type><name>void</name> <modifier>*</modifier></type><name>arg</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<return>return <expr><operator>(</operator><name>RBTNode</name> <operator>*</operator><operator>)</operator> <call><name>palloc</name><argument_list>(<argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>OidPreassignment</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>rbtree_free</name><parameter_list>(<parameter><decl><type><name>RBTNode</name> <modifier>*</modifier></type><name>node</name></decl></parameter>, <parameter><decl><type><name>void</name> <modifier>*</modifier></type><name>arg</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>pfree</name><argument_list>(<argument><expr><name>node</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * The RB Tree combiner function will be called when a new node has the same
+ * key as an existing node (when rbtree_alloc() returns zero). For this
+ * particular usecase the only value we have is the key, so make it a no-op.
+ */</comment>
+<decl_stmt><decl><type><specifier>static</specifier> <name>void</name></type>
+<name>rbtree_combine</name><argument_list>(<argument><expr><name>RBTNode</name> <operator>*</operator><name>existing</name> <call><name>pg_attribute_unused</name><argument_list>()</argument_list></call></expr></argument>, <argument><expr><specifier>const</specifier> <name>RBTNode</name> <operator>*</operator><name>new</name> <call><name>pg_attribute_unused</name><argument_list>()</argument_list></call></expr></argument>, <argument><expr><name>void</name> <operator>*</operator><name>arg</name></expr></argument>)</argument_list>
+<block>{<block_content>
+	<return>return;</return>
+</block_content>}</block></decl></decl_stmt>
+
+<comment type="block">/*
+ * Remember an Oid which will be used in schema restoration during binary
+ * upgrade, such that we can prohibit any new object to consume Oids which
+ * will lead to collision.
+ */</comment>
+<function><type><name>void</name></type>
+<name>MarkOidPreassignedFromBinaryUpgrade</name><parameter_list>(<parameter><decl><type><name>Oid</name></type> <name>oid</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>MemoryContext</name></type>		<name>oldcontext</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>OidPreassignment</name></type>	<name>node</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type>				<name>isnew</name></decl>;</decl_stmt>
+
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><name>IsBinaryUpgrade</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"MarkOidPreassignedFromBinaryUpgrade called, but not in binary upgrade mode"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>oid</name> <operator>==</operator> <name>InvalidOid</name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return;</return></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><name>oldcontext</name> <operator>=</operator> <call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>TopMemoryContext</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><name>binary_upgrade_preassigned_oids</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name>binary_upgrade_preassigned_oids</name> <operator>=</operator> <call><name>rbt_create</name><argument_list>(<argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>OidPreassignment</name></expr></argument>)</argument_list></sizeof></expr></argument>,
+													 <argument><expr><name>rbtree_cmp</name></expr></argument>,
+													 <argument><expr><name>rbtree_combine</name></expr></argument>,
+													 <argument><expr><name>rbtree_alloc</name></expr></argument>,
+													 <argument><expr><name>rbtree_free</name></expr></argument>,
+													 <argument><expr><name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<expr_stmt><expr><name><name>node</name><operator>.</operator><name>oid</name></name> <operator>=</operator> <name>oid</name></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>rbt_insert</name><argument_list>(<argument><expr><name>binary_upgrade_preassigned_oids</name></expr></argument>, <argument><expr><operator>(</operator><name>RBTNode</name> <operator>*</operator><operator>)</operator> <operator>&amp;</operator><name>node</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>isnew</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>oldcontext</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * Remember an OID which is set from loading a database dump performed
+ * using the binary-upgrade flag.
+ */</comment>
+<function><type><name>void</name></type>
+<name>AddPreassignedOidFromBinaryUpgrade</name><parameter_list>(<parameter><decl><type><name>Oid</name></type> <name>oid</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>catalog</name></decl></parameter>, <parameter><decl><type><name>char</name> <modifier>*</modifier></type><name>objname</name></decl></parameter>,
+								   <parameter><decl><type><name>Oid</name></type> <name>namespaceOid</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>keyOid1</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>keyOid2</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>OidAssignment</name></type> <name>assignment</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>MemoryContext</name></type> <name>oldcontext</name></decl>;</decl_stmt>
+
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><name>IsBinaryUpgrade</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"AddPreassignedOidFromBinaryUpgrade called, but not in binary upgrade mode"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>catalog</name> <operator>==</operator> <name>InvalidOid</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"AddPreassignedOidFromBinaryUpgrade called with Invalid catalog relation Oid"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>Gp_role</name> <operator>!=</operator> <name>GP_ROLE_UTILITY</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* Perhaps we should error out and shut down here? */</comment>
+		<return>return;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><operator>&amp;</operator><name>assignment</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>OidAssignment</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>assignment</name><operator>.</operator><name>type</name></name> <operator>=</operator> <name>T_OidAssignment</name></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * This is essentially mimicking CreateKeyFromCatalogTuple except we set
+	 * the members directly from the binary_upgrade function
+	 */</comment>
+	<expr_stmt><expr><name><name>assignment</name><operator>.</operator><name>oid</name></name> <operator>=</operator> <name>oid</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>assignment</name><operator>.</operator><name>catalog</name></name> <operator>=</operator> <name>catalog</name></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><name>objname</name> <operator>!=</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name><name>assignment</name><operator>.</operator><name>objname</name></name> <operator>=</operator> <name>objname</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	<if_stmt><if>if <condition>(<expr><name>namespaceOid</name> <operator>!=</operator> <name>InvalidOid</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name><name>assignment</name><operator>.</operator><name>namespaceOid</name></name> <operator>=</operator> <name>namespaceOid</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	<if_stmt><if>if <condition>(<expr><name>keyOid1</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name><name>assignment</name><operator>.</operator><name>keyOid1</name></name> <operator>=</operator> <name>keyOid1</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	<if_stmt><if>if <condition>(<expr><name>keyOid2</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name><name>assignment</name><operator>.</operator><name>keyOid2</name></name> <operator>=</operator> <name>keyOid2</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<comment type="block">/*
+	 * Note that in binary-upgrade mode, the OID pre-assign calls are not done in
+	 * the same transactions as the DDL commands that consume the OIDs. Hence they
+	 * need to survive end-of-xact.
+	 */</comment>
+	<expr_stmt><expr><name>oldcontext</name> <operator>=</operator> <call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>TopMemoryContext</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>preassigned_oids</name> <operator>=</operator> <call><name>lappend</name><argument_list>(<argument><expr><name>preassigned_oids</name></expr></argument>, <argument><expr><call><name>copyObject</name><argument_list>(<argument><expr><operator>&amp;</operator><name>assignment</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>oldcontext</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>OID_DISPATCH_DEBUG</name></cpp:ifdef>
+	<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>WARNING</name></expr></argument>, <argument><expr><literal type="string">"adding OID assignment: catalog \"%u\", namespace: %u, name: \"%s\": %u"</literal></expr></argument>,
+		 <argument><expr><name><name>assignment</name><operator>.</operator><name>catalog</name></name></expr></argument>,
+		 <argument><expr><name><name>assignment</name><operator>.</operator><name>namespaceOid</name></name></expr></argument>,
+		 <argument><expr><ternary><condition><expr><name><name>assignment</name><operator>.</operator><name>objname</name></name></expr> ?</condition><then> <expr><name><name>assignment</name><operator>.</operator><name>objname</name></name></expr> </then><else>: <expr><literal type="string">""</literal></expr></else></ternary></expr></argument>,
+		 <argument><expr><name><name>assignment</name><operator>.</operator><name>oid</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+</block_content>}</block></function>
+
+<comment type="block">/* ----------------------------------------------------------------
+ * Functions for use in the master node.
+ * ----------------------------------------------------------------
+ */</comment>
+
+<comment type="block">/*
+ * Get list of OIDs assigned in this transaction, since the last call.
+ */</comment>
+<function><type><name>List</name> <modifier>*</modifier></type>
+<name>GetAssignedOidsForDispatch</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>List</name>	   <modifier>*</modifier></type><name>l</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name>l</name> <operator>=</operator> <name>dispatch_oids</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name>dispatch_oids</name> <operator>=</operator> <name>NIL</name></expr>;</expr_stmt>
+	<return>return <expr><name>l</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Called at end-of-transaction. There is normally nothing to do,
+ * but we perform some sanity checks.
+ */</comment>
+<function><type><name>void</name></type>
+<name>AtEOXact_DispatchOids</name><parameter_list>(<parameter><decl><type><name>bool</name></type> <name>isCommit</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<if_stmt><if>if <condition>(<expr><name>preserve_oids_on_commit</name></expr>)</condition>
+	<block>{<block_content>
+		<if_stmt><if>if <condition>(<expr><name>isCommit</name></expr>)</condition><block type="pseudo"><block_content>
+			<return>return;</return></block_content></block></if></if_stmt>
+		<expr_stmt><expr><name>preserve_oids_on_commit</name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/*
+	 * Reset the list of to-be-dispatched OIDs. (in QD)
+	 *
+	 * All the OID assignments should've been dispatched before end of
+	 * transaction. Unless we're aborting.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name>isCommit</name> <operator>&amp;&amp;</operator> <name>dispatch_oids</name></expr>)</condition>
+	<block>{<block_content>
+		<while>while <condition>(<expr><name>dispatch_oids</name></expr>)</condition>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>OidAssignment</name> <modifier>*</modifier></type><name>p</name> <init>= <expr><operator>(</operator><name>OidAssignment</name> <operator>*</operator><operator>)</operator> <call><name>linitial</name><argument_list>(<argument><expr><name>dispatch_oids</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+			<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>WARNING</name></expr></argument>, <argument><expr><literal type="string">"OID assignment not dispatched: catalog %u, namespace: %u, name: \"%s\""</literal></expr></argument>,
+				 <argument><expr><name><name>p</name><operator>-&gt;</operator><name>catalog</name></name></expr></argument>, <argument><expr><name><name>p</name><operator>-&gt;</operator><name>namespaceOid</name></name></expr></argument>, <argument><expr><ternary><condition><expr><name><name>p</name><operator>-&gt;</operator><name>objname</name></name></expr> ?</condition><then> <expr><name><name>p</name><operator>-&gt;</operator><name>objname</name></name></expr> </then><else>: <expr><literal type="string">""</literal></expr></else></ternary></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><name>dispatch_oids</name> <operator>=</operator> <call><name>list_delete_first</name><argument_list>(<argument><expr><name>dispatch_oids</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></while>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"oids were assigned, but not dispatched to QEs"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<else>else
+	<block>{<block_content>
+		<comment type="block">/* The list will be free'd with the memory context. */</comment>
+		<expr_stmt><expr><name>dispatch_oids</name> <operator>=</operator> <name>NIL</name></expr>;</expr_stmt>
+	</block_content>}</block></else></if_stmt>
+
+	<comment type="block">/*
+	 * Reset the list of pre-assigned OIDs (in QE).
+	 *
+	 * Normally, at commit, all the pre-assigned OIDs should be consumed
+	 * already. But there are some corner cases where they're not. For
+	 * example, when running a CREATE TABLE AS SELECT query, the command
+	 * might be dispatched to multiple slices, but only the QE writer
+	 * processes create the table. In the other processes, the OIDs will
+	 * go unused.
+	 *
+	 * In binary-upgrade mode, however, the OID pre-assign calls are not
+	 * done in the same transactions as the DDL commands that consume
+	 * the OIDs. Hence they need to survive end-of-xact.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><name>IsBinaryUpgrade</name></expr>)</condition>
+	<block>{<block_content>
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>OID_DISPATCH_DEBUG</name></cpp:ifdef>
+		<while>while <condition>(<expr><name>preassigned_oids</name></expr>)</condition>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>OidAssignment</name> <modifier>*</modifier></type><name>p</name> <init>= <expr><operator>(</operator><name>OidAssignment</name> <operator>*</operator><operator>)</operator> <call><name>linitial</name><argument_list>(<argument><expr><name>preassigned_oids</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+			<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>NOTICE</name></expr></argument>, <argument><expr><literal type="string">"unused pre-assigned OID: catalog %u, namespace: %u, name: \"%s\""</literal></expr></argument>,
+				 <argument><expr><name><name>p</name><operator>-&gt;</operator><name>catalog</name></name></expr></argument>, <argument><expr><name><name>p</name><operator>-&gt;</operator><name>namespaceOid</name></name></expr></argument>, <argument><expr><name><name>p</name><operator>-&gt;</operator><name>objname</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><name>preassigned_oids</name> <operator>=</operator> <call><name>list_delete_first</name><argument_list>(<argument><expr><name>preassigned_oids</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></while>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+		<expr_stmt><expr><name>preassigned_oids</name> <operator>=</operator> <name>NIL</name></expr>;</expr_stmt>
+
+		<expr_stmt><expr><call><name>MemoryContextReset</name><argument_list>(<argument><expr><call><name>get_oids_context</name><argument_list>()</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * Is the given OID reserved for some other object?
+ *
+ * This is mainly of concern during binary upgrade, where we preassign
+ * all the OIDs at the beginning of a restore. During normal operation,
+ * there should be no clashes anyway.
+ */</comment>
+<function><type><name>bool</name></type>
+<name>IsOidAcceptable</name><parameter_list>(<parameter><decl><type><name>Oid</name></type> <name>oid</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>ListCell</name> <modifier>*</modifier></type><name>lc</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>OidPreassignment</name></type> <name>pre</name></decl>;</decl_stmt>
+
+	<macro><name>foreach</name><argument_list>(<argument>lc</argument>, <argument>preassigned_oids</argument>)</argument_list></macro>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>OidAssignment</name> <modifier>*</modifier></type><name>p</name> <init>= <expr><operator>(</operator><name>OidAssignment</name> <operator>*</operator><operator>)</operator> <call><name>lfirst</name><argument_list>(<argument><expr><name>lc</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name><name>p</name><operator>-&gt;</operator><name>oid</name></name> <operator>==</operator> <name>oid</name></expr>)</condition><block type="pseudo"><block_content>
+			<return>return <expr><name>false</name></expr>;</return></block_content></block></if></if_stmt>
+	</block_content>}</block>
+
+	<if_stmt><if>if <condition>(<expr><name>binary_upgrade_preassigned_oids</name> <operator>==</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>true</name></expr>;</return></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><name><name>pre</name><operator>.</operator><name>oid</name></name> <operator>=</operator> <name>oid</name></expr>;</expr_stmt>
+	<return>return <expr><operator>(</operator><call><name>rbt_find</name><argument_list>(<argument><expr><name>binary_upgrade_preassigned_oids</name></expr></argument>, <argument><expr><operator>(</operator><name>RBTNode</name> <operator>*</operator><operator>)</operator> <operator>&amp;</operator><name>pre</name></expr></argument>)</argument_list></call> <operator>==</operator> <name>NULL</name><operator>)</operator></expr>;</return>
+</block_content>}</block></function>
+</unit>

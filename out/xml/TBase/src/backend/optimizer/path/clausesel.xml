@@ -1,0 +1,975 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<unit xmlns="http://www.srcML.org/srcML/src" xmlns:cpp="http://www.srcML.org/srcML/cpp" revision="1.0.0" language="C" filename="/cloned_projects/TBase/src/backend/optimizer/path/clausesel.c"><comment type="block">/*-------------------------------------------------------------------------
+ *
+ * clausesel.c
+ *      Routines to compute clause selectivities
+ *
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1994, Regents of the University of California
+ *
+ *
+ * IDENTIFICATION
+ *      src/backend/optimizer/path/clausesel.c
+ *
+ *-------------------------------------------------------------------------
+ */</comment>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"postgres.h"</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"nodes/makefuncs.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"optimizer/clauses.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"optimizer/cost.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"optimizer/pathnode.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"optimizer/plancat.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/fmgroids.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/lsyscache.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/selfuncs.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"statistics/statistics.h"</cpp:file></cpp:include>
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>__TBASE__</name></cpp:ifdef>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/htup_details.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/pg_operator.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/syscache.h"</cpp:file></cpp:include>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+
+<comment type="block">/*
+ * Data structure for accumulating info about possible range-query
+ * clause pairs in clauselist_selectivity.
+ */</comment>
+<typedef>typedef <type><struct>struct <name>RangeQueryClause</name>
+<block>{
+    <decl_stmt><decl><type><name><name>struct</name> <name>RangeQueryClause</name></name> <modifier>*</modifier></type><name>next</name></decl>;</decl_stmt>    <comment type="block">/* next in linked list */</comment>
+    <decl_stmt><decl><type><name>Node</name>       <modifier>*</modifier></type><name>var</name></decl>;</decl_stmt>            <comment type="block">/* The common variable of the clauses */</comment>
+    <decl_stmt><decl><type><name>bool</name></type>        <name>have_lobound</name></decl>;</decl_stmt>    <comment type="block">/* found a low-bound clause yet? */</comment>
+    <decl_stmt><decl><type><name>bool</name></type>        <name>have_hibound</name></decl>;</decl_stmt>    <comment type="block">/* found a high-bound clause yet? */</comment>
+    <decl_stmt><decl><type><name>Selectivity</name></type> <name>lobound</name></decl>;</decl_stmt>        <comment type="block">/* Selectivity of a var &gt; something clause */</comment>
+    <decl_stmt><decl><type><name>Selectivity</name></type> <name>hibound</name></decl>;</decl_stmt>        <comment type="block">/* Selectivity of a var &lt; something clause */</comment>
+}</block></struct></type> <name>RangeQueryClause</name>;</typedef>
+
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>addRangeClause</name><parameter_list>(<parameter><decl><type><name>RangeQueryClause</name> <modifier>*</modifier><modifier>*</modifier></type><name>rqlist</name></decl></parameter>, <parameter><decl><type><name>Node</name> <modifier>*</modifier></type><name>clause</name></decl></parameter>,
+               <parameter><decl><type><name>bool</name></type> <name>varonleft</name></decl></parameter>, <parameter><decl><type><name>bool</name></type> <name>isLTsel</name></decl></parameter>, <parameter><decl><type><name>Selectivity</name></type> <name>s2</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>RelOptInfo</name> <modifier>*</modifier></type><name>find_single_rel_for_clauses</name><parameter_list>(<parameter><decl><type><name>PlannerInfo</name> <modifier>*</modifier></type><name>root</name></decl></parameter>,
+                            <parameter><decl><type><name>List</name> <modifier>*</modifier></type><name>clauses</name></decl></parameter>)</parameter_list>;</function_decl>
+
+<comment type="block" format="doxygen">/****************************************************************************
+ *        ROUTINES TO COMPUTE SELECTIVITIES
+ ****************************************************************************/</comment>
+
+<comment type="block">/*
+ * clauselist_selectivity -
+ *      Compute the selectivity of an implicitly-ANDed list of boolean
+ *      expression clauses.  The list can be empty, in which case 1.0
+ *      must be returned.  List elements may be either RestrictInfos
+ *      or bare expression clauses --- the former is preferred since
+ *      it allows caching of results.
+ *
+ * See clause_selectivity() for the meaning of the additional parameters.
+ *
+ * Our basic approach is to take the product of the selectivities of the
+ * subclauses.  However, that's only right if the subclauses have independent
+ * probabilities, and in reality they are often NOT independent.  So,
+ * we want to be smarter where we can.
+ *
+ * If the clauses taken together refer to just one relation, we'll try to
+ * apply selectivity estimates using any extended statistics for that rel.
+ * Currently we only have (soft) functional dependencies, so apply these in as
+ * many cases as possible, and fall back on normal estimates for remaining
+ * clauses.
+ *
+ * We also recognize "range queries", such as "x &gt; 34 AND x &lt; 42".  Clauses
+ * are recognized as possible range query components if they are restriction
+ * opclauses whose operators have scalarltsel() or scalargtsel() as their
+ * restriction selectivity estimator.  We pair up clauses of this form that
+ * refer to the same variable.  An unpairable clause of this kind is simply
+ * multiplied into the selectivity product in the normal way.  But when we
+ * find a pair, we know that the selectivities represent the relative
+ * positions of the low and high bounds within the column's range, so instead
+ * of figuring the selectivity as hisel * losel, we can figure it as hisel +
+ * losel - 1.  (To visualize this, see that hisel is the fraction of the range
+ * below the high bound, while losel is the fraction above the low bound; so
+ * hisel can be interpreted directly as a 0..1 value but we need to convert
+ * losel to 1-losel before interpreting it as a value.  Then the available
+ * range is 1-losel to hisel.  However, this calculation double-excludes
+ * nulls, so really we need hisel + losel + null_frac - 1.)
+ *
+ * If either selectivity is exactly DEFAULT_INEQ_SEL, we forget this equation
+ * and instead use DEFAULT_RANGE_INEQ_SEL.  The same applies if the equation
+ * yields an impossible (negative) result.
+ *
+ * A free side-effect is that we can recognize redundant inequalities such
+ * as "x &lt; 4 AND x &lt; 5"; only the tighter constraint will be counted.
+ *
+ * Of course this is all very dependent on the behavior of
+ * scalarltsel/scalargtsel; perhaps some day we can generalize the approach.
+ */</comment>
+<function><type><name>Selectivity</name></type>
+<name>clauselist_selectivity</name><parameter_list>(<parameter><decl><type><name>PlannerInfo</name> <modifier>*</modifier></type><name>root</name></decl></parameter>,
+					   <parameter><decl><type><name>List</name> <modifier>*</modifier></type><name>clauses</name></decl></parameter>,
+					   <parameter><decl><type><name>int</name></type> <name>varRelid</name></decl></parameter>,
+					   <parameter><decl><type><name>JoinType</name></type> <name>jointype</name></decl></parameter>,
+					   <parameter><decl><type><name>SpecialJoinInfo</name> <modifier>*</modifier></type><name>sjinfo</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>Selectivity</name></type> <name>s1</name> <init>= <expr><literal type="number">1.0</literal></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>RelOptInfo</name> <modifier>*</modifier></type><name>rel</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Bitmapset</name>  <modifier>*</modifier></type><name>estimatedclauses</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>RangeQueryClause</name> <modifier>*</modifier></type><name>rqlist</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>ListCell</name>   <modifier>*</modifier></type><name>l</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>listidx</name></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * If there's exactly one clause, just go directly to
+	 * clause_selectivity(). None of what we might do below is relevant.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><call><name>list_length</name><argument_list>(<argument><expr><name>clauses</name></expr></argument>)</argument_list></call> <operator>==</operator> <literal type="number">1</literal></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><call><name>clause_selectivity</name><argument_list>(<argument><expr><name>root</name></expr></argument>, <argument><expr><operator>(</operator><name>Node</name> <operator>*</operator><operator>)</operator> <call><name>linitial</name><argument_list>(<argument><expr><name>clauses</name></expr></argument>)</argument_list></call></expr></argument>,
+								  <argument><expr><name>varRelid</name></expr></argument>, <argument><expr><name>jointype</name></expr></argument>, <argument><expr><name>sjinfo</name></expr></argument>)</argument_list></call></expr>;</return></block_content></block></if></if_stmt>
+
+	<comment type="block">/*
+	 * Determine if these clauses reference a single relation.  If so, and if
+	 * it has extended statistics, try to apply those.
+	 */</comment>
+	<expr_stmt><expr><name>rel</name> <operator>=</operator> <call><name>find_single_rel_for_clauses</name><argument_list>(<argument><expr><name>root</name></expr></argument>, <argument><expr><name>clauses</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><name>rel</name> <operator>&amp;&amp;</operator> <name><name>rel</name><operator>-&gt;</operator><name>rtekind</name></name> <operator>==</operator> <name>RTE_RELATION</name> <operator>&amp;&amp;</operator> <name><name>rel</name><operator>-&gt;</operator><name>statlist</name></name> <operator>!=</operator> <name>NIL</name></expr>)</condition>
+	<block>{<block_content>
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>__TBASE__</name></cpp:ifdef>
+		<comment type="block">/*
+		 * Perform subset eliminations on any clauses found applicable by
+		 * subset_clauselist_selectivity. Subset dependencies got higher
+		 * priority over statistic-based dependencies. 'estimatedclauses'
+		 * will be filled with the 0-based list positions of clauses used
+		 * that way, so that we can ignore them below in both dependencies
+		 * selectivity calculation and independent basic selectivity
+		 * calculation.
+		 */</comment>
+		<expr_stmt><expr><name>s1</name> <operator>*=</operator> <call><name>subset_clauselist_selectivity</name><argument_list>(<argument><expr><name>root</name></expr></argument>, <argument><expr><name>clauses</name></expr></argument>, <argument><expr><name>varRelid</name></expr></argument>, <argument><expr><name>jointype</name></expr></argument>,
+											<argument><expr><name>sjinfo</name></expr></argument>, <argument><expr><name>rel</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>estimatedclauses</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+		<comment type="block">/*
+		 * Perform selectivity estimations on any clauses found applicable by
+		 * dependencies_clauselist_selectivity.  'estimatedclauses' will be
+		 * filled with the 0-based list positions of clauses used that way, so
+		 * that we can ignore them below.
+		 */</comment>
+		<expr_stmt><expr><name>s1</name> <operator>*=</operator> <call><name>dependencies_clauselist_selectivity</name><argument_list>(<argument><expr><name>root</name></expr></argument>, <argument><expr><name>clauses</name></expr></argument>, <argument><expr><name>varRelid</name></expr></argument>,
+												  <argument><expr><name>jointype</name></expr></argument>, <argument><expr><name>sjinfo</name></expr></argument>, <argument><expr><name>rel</name></expr></argument>,
+												  <argument><expr><operator>&amp;</operator><name>estimatedclauses</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/*
+		 * This would be the place to apply any other types of extended
+		 * statistics selectivity estimations for remaining clauses.
+		 */</comment>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/*
+	 * Apply normal selectivity estimates for remaining clauses. We'll be
+	 * careful to skip any clauses which were already estimated above.
+	 *
+	 * Anything that doesn't look like a potential rangequery clause gets
+	 * multiplied into s1 and forgotten. Anything that does gets inserted into
+	 * an rqlist entry.
+	 */</comment>
+	<expr_stmt><expr><name>listidx</name> <operator>=</operator> <operator>-</operator><literal type="number">1</literal></expr>;</expr_stmt>
+	<macro><name>foreach</name><argument_list>(<argument>l</argument>, <argument>clauses</argument>)</argument_list></macro>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>Node</name>	   <modifier>*</modifier></type><name>clause</name> <init>= <expr><operator>(</operator><name>Node</name> <operator>*</operator><operator>)</operator> <call><name>lfirst</name><argument_list>(<argument><expr><name>l</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>RestrictInfo</name> <modifier>*</modifier></type><name>rinfo</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>Selectivity</name></type> <name>s2</name></decl>;</decl_stmt>
+
+		<expr_stmt><expr><name>listidx</name><operator>++</operator></expr>;</expr_stmt>
+
+		<comment type="block">/*
+		 * Skip this clause if it's already been estimated by some other
+		 * statistics above.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><call><name>bms_is_member</name><argument_list>(<argument><expr><name>listidx</name></expr></argument>, <argument><expr><name>estimatedclauses</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<continue>continue;</continue></block_content></block></if></if_stmt>
+
+		<comment type="block">/* Always compute the selectivity using clause_selectivity */</comment>
+		<expr_stmt><expr><name>s2</name> <operator>=</operator> <call><name>clause_selectivity</name><argument_list>(<argument><expr><name>root</name></expr></argument>, <argument><expr><name>clause</name></expr></argument>, <argument><expr><name>varRelid</name></expr></argument>, <argument><expr><name>jointype</name></expr></argument>, <argument><expr><name>sjinfo</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/*
+		 * Check for being passed a RestrictInfo.
+		 *
+		 * If it's a pseudoconstant RestrictInfo, then s2 is either 1.0 or
+		 * 0.0; just use that rather than looking for range pairs.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><call><name>IsA</name><argument_list>(<argument><expr><name>clause</name></expr></argument>, <argument><expr><name>RestrictInfo</name></expr></argument>)</argument_list></call></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><name>rinfo</name> <operator>=</operator> <operator>(</operator><name>RestrictInfo</name> <operator>*</operator><operator>)</operator> <name>clause</name></expr>;</expr_stmt>
+			<if_stmt><if>if <condition>(<expr><name><name>rinfo</name><operator>-&gt;</operator><name>pseudoconstant</name></name></expr>)</condition>
+			<block>{<block_content>
+				<expr_stmt><expr><name>s1</name> <operator>=</operator> <name>s1</name> <operator>*</operator> <name>s2</name></expr>;</expr_stmt>
+				<continue>continue;</continue>
+			</block_content>}</block></if></if_stmt>
+			<expr_stmt><expr><name>clause</name> <operator>=</operator> <operator>(</operator><name>Node</name> <operator>*</operator><operator>)</operator> <name><name>rinfo</name><operator>-&gt;</operator><name>clause</name></name></expr>;</expr_stmt>
+		</block_content>}</block></if>
+		<else>else<block type="pseudo"><block_content>
+			<expr_stmt><expr><name>rinfo</name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt></block_content></block></else></if_stmt>
+
+		<comment type="block">/*
+		 * See if it looks like a restriction clause with a pseudoconstant on
+		 * one side.  (Anything more complicated than that might not behave in
+		 * the simple way we are expecting.)  Most of the tests here can be
+		 * done more efficiently with rinfo than without.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><call><name>is_opclause</name><argument_list>(<argument><expr><name>clause</name></expr></argument>)</argument_list></call> <operator>&amp;&amp;</operator> <call><name>list_length</name><argument_list>(<argument><expr><operator>(</operator><operator>(</operator><name>OpExpr</name> <operator>*</operator><operator>)</operator> <name>clause</name><operator>)</operator><operator>-&gt;</operator><name>args</name></expr></argument>)</argument_list></call> <operator>==</operator> <literal type="number">2</literal></expr>)</condition>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>OpExpr</name>	   <modifier>*</modifier></type><name>expr</name> <init>= <expr><operator>(</operator><name>OpExpr</name> <operator>*</operator><operator>)</operator> <name>clause</name></expr></init></decl>;</decl_stmt>
+			<decl_stmt><decl><type><name>bool</name></type>		<name>varonleft</name> <init>= <expr><name>true</name></expr></init></decl>;</decl_stmt>
+			<decl_stmt><decl><type><name>bool</name></type>		<name>ok</name></decl>;</decl_stmt>
+
+			<if_stmt><if>if <condition>(<expr><name>rinfo</name></expr>)</condition>
+			<block>{<block_content>
+				<expr_stmt><expr><name>ok</name> <operator>=</operator> <operator>(</operator><call><name>bms_membership</name><argument_list>(<argument><expr><name><name>rinfo</name><operator>-&gt;</operator><name>clause_relids</name></name></expr></argument>)</argument_list></call> <operator>==</operator> <name>BMS_SINGLETON</name><operator>)</operator> <operator>&amp;&amp;</operator>
+					<operator>(</operator><call><name>is_pseudo_constant_clause_relids</name><argument_list>(<argument><expr><call><name>lsecond</name><argument_list>(<argument><expr><name><name>expr</name><operator>-&gt;</operator><name>args</name></name></expr></argument>)</argument_list></call></expr></argument>,
+													  <argument><expr><name><name>rinfo</name><operator>-&gt;</operator><name>right_relids</name></name></expr></argument>)</argument_list></call> <operator>||</operator>
+					 <operator>(</operator><name>varonleft</name> <operator>=</operator> <name>false</name><operator>,</operator>
+					  <call><name>is_pseudo_constant_clause_relids</name><argument_list>(<argument><expr><call><name>linitial</name><argument_list>(<argument><expr><name><name>expr</name><operator>-&gt;</operator><name>args</name></name></expr></argument>)</argument_list></call></expr></argument>,
+													   <argument><expr><name><name>rinfo</name><operator>-&gt;</operator><name>left_relids</name></name></expr></argument>)</argument_list></call><operator>)</operator><operator>)</operator></expr>;</expr_stmt>
+			</block_content>}</block></if>
+			<else>else
+			<block>{<block_content>
+				<expr_stmt><expr><name>ok</name> <operator>=</operator> <operator>(</operator><call><name>NumRelids</name><argument_list>(<argument><expr><name>clause</name></expr></argument>)</argument_list></call> <operator>==</operator> <literal type="number">1</literal><operator>)</operator> <operator>&amp;&amp;</operator>
+					<operator>(</operator><call><name>is_pseudo_constant_clause</name><argument_list>(<argument><expr><call><name>lsecond</name><argument_list>(<argument><expr><name><name>expr</name><operator>-&gt;</operator><name>args</name></name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call> <operator>||</operator>
+					 <operator>(</operator><name>varonleft</name> <operator>=</operator> <name>false</name><operator>,</operator>
+					  <call><name>is_pseudo_constant_clause</name><argument_list>(<argument><expr><call><name>linitial</name><argument_list>(<argument><expr><name><name>expr</name><operator>-&gt;</operator><name>args</name></name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call><operator>)</operator><operator>)</operator></expr>;</expr_stmt>
+			</block_content>}</block></else></if_stmt>
+
+			<if_stmt><if>if <condition>(<expr><name>ok</name></expr>)</condition>
+			<block>{<block_content>
+				<comment type="block">/*
+				 * If it's not a "&lt;" or "&gt;" operator, just merge the
+				 * selectivity in generically.  But if it's the right oprrest,
+				 * add the clause to rqlist for later processing.
+				 */</comment>
+				<switch>switch <condition>(<expr><call><name>get_oprrest</name><argument_list>(<argument><expr><name><name>expr</name><operator>-&gt;</operator><name>opno</name></name></expr></argument>)</argument_list></call></expr>)</condition>
+				<block>{<block_content>
+					<case>case <expr><name>F_SCALARLTSEL</name></expr>:</case>
+						<expr_stmt><expr><call><name>addRangeClause</name><argument_list>(<argument><expr><operator>&amp;</operator><name>rqlist</name></expr></argument>, <argument><expr><name>clause</name></expr></argument>,
+									   <argument><expr><name>varonleft</name></expr></argument>, <argument><expr><name>true</name></expr></argument>, <argument><expr><name>s2</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+						<break>break;</break>
+					<case>case <expr><name>F_SCALARGTSEL</name></expr>:</case>
+						<expr_stmt><expr><call><name>addRangeClause</name><argument_list>(<argument><expr><operator>&amp;</operator><name>rqlist</name></expr></argument>, <argument><expr><name>clause</name></expr></argument>,
+									   <argument><expr><name>varonleft</name></expr></argument>, <argument><expr><name>false</name></expr></argument>, <argument><expr><name>s2</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+						<break>break;</break>
+					<default>default:</default>
+						<comment type="block">/* Just merge the selectivity in generically */</comment>
+						<expr_stmt><expr><name>s1</name> <operator>=</operator> <name>s1</name> <operator>*</operator> <name>s2</name></expr>;</expr_stmt>
+						<break>break;</break>
+				</block_content>}</block></switch>
+				<continue>continue;</continue>		<comment type="block">/* drop to loop bottom */</comment>
+			</block_content>}</block></if></if_stmt>
+		</block_content>}</block></if></if_stmt>
+
+		<comment type="block">/* Not the right form, so treat it generically. */</comment>
+		<expr_stmt><expr><name>s1</name> <operator>=</operator> <name>s1</name> <operator>*</operator> <name>s2</name></expr>;</expr_stmt>
+	</block_content>}</block>
+
+	<comment type="block">/*
+	 * Now scan the rangequery pair list.
+	 */</comment>
+	<while>while <condition>(<expr><name>rqlist</name> <operator>!=</operator> <name>NULL</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>RangeQueryClause</name> <modifier>*</modifier></type><name>rqnext</name></decl>;</decl_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name><name>rqlist</name><operator>-&gt;</operator><name>have_lobound</name></name> <operator>&amp;&amp;</operator> <name><name>rqlist</name><operator>-&gt;</operator><name>have_hibound</name></name></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/* Successfully matched a pair of range clauses */</comment>
+			<decl_stmt><decl><type><name>Selectivity</name></type> <name>s2</name></decl>;</decl_stmt>
+
+			<comment type="block">/*
+			 * Exact equality to the default value probably means the
+			 * selectivity function punted.  This is not airtight but should
+			 * be good enough.
+			 */</comment>
+			<if_stmt><if>if <condition>(<expr><name><name>rqlist</name><operator>-&gt;</operator><name>hibound</name></name> <operator>==</operator> <name>DEFAULT_INEQ_SEL</name> <operator>||</operator>
+				<name><name>rqlist</name><operator>-&gt;</operator><name>lobound</name></name> <operator>==</operator> <name>DEFAULT_INEQ_SEL</name></expr>)</condition>
+			<block>{<block_content>
+				<expr_stmt><expr><name>s2</name> <operator>=</operator> <name>DEFAULT_RANGE_INEQ_SEL</name></expr>;</expr_stmt>
+			</block_content>}</block></if>
+			<else>else
+			<block>{<block_content>
+				<expr_stmt><expr><name>s2</name> <operator>=</operator> <name><name>rqlist</name><operator>-&gt;</operator><name>hibound</name></name> <operator>+</operator> <name><name>rqlist</name><operator>-&gt;</operator><name>lobound</name></name> <operator>-</operator> <literal type="number">1.0</literal></expr>;</expr_stmt>
+
+				<comment type="block">/* Adjust for double-exclusion of NULLs */</comment>
+				<expr_stmt><expr><name>s2</name> <operator>+=</operator> <call><name>nulltestsel</name><argument_list>(<argument><expr><name>root</name></expr></argument>, <argument><expr><name>IS_NULL</name></expr></argument>, <argument><expr><name><name>rqlist</name><operator>-&gt;</operator><name>var</name></name></expr></argument>,
+								  <argument><expr><name>varRelid</name></expr></argument>, <argument><expr><name>jointype</name></expr></argument>, <argument><expr><name>sjinfo</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+				<comment type="block">/*
+				 * A zero or slightly negative s2 should be converted into a
+				 * small positive value; we probably are dealing with a very
+				 * tight range and got a bogus result due to roundoff errors.
+				 * However, if s2 is very negative, then we probably have
+				 * default selectivity estimates on one or both sides of the
+				 * range that we failed to recognize above for some reason.
+				 */</comment>
+				<if_stmt><if>if <condition>(<expr><name>s2</name> <operator>&lt;=</operator> <literal type="number">0.0</literal></expr>)</condition>
+				<block>{<block_content>
+					<if_stmt><if>if <condition>(<expr><name>s2</name> <operator>&lt;</operator> <operator>-</operator><literal type="number">0.01</literal></expr>)</condition>
+					<block>{<block_content>
+						<comment type="block">/*
+						 * No data available --- use a default estimate that
+						 * is small, but not real small.
+						 */</comment>
+						<expr_stmt><expr><name>s2</name> <operator>=</operator> <name>DEFAULT_RANGE_INEQ_SEL</name></expr>;</expr_stmt>
+					</block_content>}</block></if>
+					<else>else
+					<block>{<block_content>
+						<comment type="block">/*
+						 * It's just roundoff error; use a small positive
+						 * value
+						 */</comment>
+						<expr_stmt><expr><name>s2</name> <operator>=</operator> <literal type="number">1.0e-10</literal></expr>;</expr_stmt>
+					</block_content>}</block></else></if_stmt>
+				</block_content>}</block></if></if_stmt>
+			</block_content>}</block></else></if_stmt>
+			<comment type="block">/* Merge in the selectivity of the pair of clauses */</comment>
+			<expr_stmt><expr><name>s1</name> <operator>*=</operator> <name>s2</name></expr>;</expr_stmt>
+		</block_content>}</block></if>
+		<else>else
+		<block>{<block_content>
+			<comment type="block">/* Only found one of a pair, merge it in generically */</comment>
+			<if_stmt><if>if <condition>(<expr><name><name>rqlist</name><operator>-&gt;</operator><name>have_lobound</name></name></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><name>s1</name> <operator>*=</operator> <name><name>rqlist</name><operator>-&gt;</operator><name>lobound</name></name></expr>;</expr_stmt></block_content></block></if>
+			<else>else<block type="pseudo"><block_content>
+				<expr_stmt><expr><name>s1</name> <operator>*=</operator> <name><name>rqlist</name><operator>-&gt;</operator><name>hibound</name></name></expr>;</expr_stmt></block_content></block></else></if_stmt>
+		</block_content>}</block></else></if_stmt>
+		<comment type="block">/* release storage and advance */</comment>
+		<expr_stmt><expr><name>rqnext</name> <operator>=</operator> <name><name>rqlist</name><operator>-&gt;</operator><name>next</name></name></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>pfree</name><argument_list>(<argument><expr><name>rqlist</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name>rqlist</name> <operator>=</operator> <name>rqnext</name></expr>;</expr_stmt>
+	</block_content>}</block></while>
+
+	<return>return <expr><name>s1</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * addRangeClause --- add a new range clause for clauselist_selectivity
+ *
+ * Here is where we try to match up pairs of range-query clauses
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>addRangeClause</name><parameter_list>(<parameter><decl><type><name>RangeQueryClause</name> <modifier>*</modifier><modifier>*</modifier></type><name>rqlist</name></decl></parameter>, <parameter><decl><type><name>Node</name> <modifier>*</modifier></type><name>clause</name></decl></parameter>,
+               <parameter><decl><type><name>bool</name></type> <name>varonleft</name></decl></parameter>, <parameter><decl><type><name>bool</name></type> <name>isLTsel</name></decl></parameter>, <parameter><decl><type><name>Selectivity</name></type> <name>s2</name></decl></parameter>)</parameter_list>
+<block>{<block_content><comment type="line">// #lizard forgives</comment>
+    <decl_stmt><decl><type><name>RangeQueryClause</name> <modifier>*</modifier></type><name>rqelem</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>Node</name>       <modifier>*</modifier></type><name>var</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>bool</name></type>        <name>is_lobound</name></decl>;</decl_stmt>
+
+    <if_stmt><if>if <condition>(<expr><name>varonleft</name></expr>)</condition>
+    <block>{<block_content>
+        <expr_stmt><expr><name>var</name> <operator>=</operator> <call><name>get_leftop</name><argument_list>(<argument><expr><operator>(</operator><name>Expr</name> <operator>*</operator><operator>)</operator> <name>clause</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <expr_stmt><expr><name>is_lobound</name> <operator>=</operator> <operator>!</operator><name>isLTsel</name></expr>;</expr_stmt>    <comment type="block">/* x &lt; something is high bound */</comment>
+    </block_content>}</block></if>
+    <else>else
+    <block>{<block_content>
+        <expr_stmt><expr><name>var</name> <operator>=</operator> <call><name>get_rightop</name><argument_list>(<argument><expr><operator>(</operator><name>Expr</name> <operator>*</operator><operator>)</operator> <name>clause</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <expr_stmt><expr><name>is_lobound</name> <operator>=</operator> <name>isLTsel</name></expr>;</expr_stmt>    <comment type="block">/* something &lt; x is low bound */</comment>
+    </block_content>}</block></else></if_stmt>
+
+    <for>for <control>(<init><expr><name>rqelem</name> <operator>=</operator> <operator>*</operator><name>rqlist</name></expr>;</init> <condition><expr><name>rqelem</name></expr>;</condition> <incr><expr><name>rqelem</name> <operator>=</operator> <name><name>rqelem</name><operator>-&gt;</operator><name>next</name></name></expr></incr>)</control>
+    <block>{<block_content>
+        <comment type="block">/*
+         * We use full equal() here because the "var" might be a function of
+         * one or more attributes of the same relation...
+         */</comment>
+        <if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>equal</name><argument_list>(<argument><expr><name>var</name></expr></argument>, <argument><expr><name><name>rqelem</name><operator>-&gt;</operator><name>var</name></name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+            <continue>continue;</continue></block_content></block></if></if_stmt>
+        <comment type="block">/* Found the right group to put this clause in */</comment>
+        <if_stmt><if>if <condition>(<expr><name>is_lobound</name></expr>)</condition>
+        <block>{<block_content>
+            <if_stmt><if>if <condition>(<expr><operator>!</operator><name><name>rqelem</name><operator>-&gt;</operator><name>have_lobound</name></name></expr>)</condition>
+            <block>{<block_content>
+                <expr_stmt><expr><name><name>rqelem</name><operator>-&gt;</operator><name>have_lobound</name></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+                <expr_stmt><expr><name><name>rqelem</name><operator>-&gt;</operator><name>lobound</name></name> <operator>=</operator> <name>s2</name></expr>;</expr_stmt>
+            </block_content>}</block></if>
+            <else>else
+            <block>{<block_content>
+
+                <comment type="block">/*------
+                 * We have found two similar clauses, such as
+                 * x &lt; y AND x &lt; z.
+                 * Keep only the more restrictive one.
+                 *------
+                 */</comment>
+                <if_stmt><if>if <condition>(<expr><name><name>rqelem</name><operator>-&gt;</operator><name>lobound</name></name> <operator>&gt;</operator> <name>s2</name></expr>)</condition><block type="pseudo"><block_content>
+                    <expr_stmt><expr><name><name>rqelem</name><operator>-&gt;</operator><name>lobound</name></name> <operator>=</operator> <name>s2</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+            </block_content>}</block></else></if_stmt>
+        </block_content>}</block></if>
+        <else>else
+        <block>{<block_content>
+            <if_stmt><if>if <condition>(<expr><operator>!</operator><name><name>rqelem</name><operator>-&gt;</operator><name>have_hibound</name></name></expr>)</condition>
+            <block>{<block_content>
+                <expr_stmt><expr><name><name>rqelem</name><operator>-&gt;</operator><name>have_hibound</name></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+                <expr_stmt><expr><name><name>rqelem</name><operator>-&gt;</operator><name>hibound</name></name> <operator>=</operator> <name>s2</name></expr>;</expr_stmt>
+            </block_content>}</block></if>
+            <else>else
+            <block>{<block_content>
+
+                <comment type="block">/*------
+                 * We have found two similar clauses, such as
+                 * x &gt; y AND x &gt; z.
+                 * Keep only the more restrictive one.
+                 *------
+                 */</comment>
+                <if_stmt><if>if <condition>(<expr><name><name>rqelem</name><operator>-&gt;</operator><name>hibound</name></name> <operator>&gt;</operator> <name>s2</name></expr>)</condition><block type="pseudo"><block_content>
+                    <expr_stmt><expr><name><name>rqelem</name><operator>-&gt;</operator><name>hibound</name></name> <operator>=</operator> <name>s2</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+            </block_content>}</block></else></if_stmt>
+        </block_content>}</block></else></if_stmt>
+        <return>return;</return>
+    </block_content>}</block></for>
+
+    <comment type="block">/* No matching var found, so make a new clause-pair data structure */</comment>
+    <expr_stmt><expr><name>rqelem</name> <operator>=</operator> <operator>(</operator><name>RangeQueryClause</name> <operator>*</operator><operator>)</operator> <call><name>palloc</name><argument_list>(<argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>RangeQueryClause</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>rqelem</name><operator>-&gt;</operator><name>var</name></name> <operator>=</operator> <name>var</name></expr>;</expr_stmt>
+    <if_stmt><if>if <condition>(<expr><name>is_lobound</name></expr>)</condition>
+    <block>{<block_content>
+        <expr_stmt><expr><name><name>rqelem</name><operator>-&gt;</operator><name>have_lobound</name></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+        <expr_stmt><expr><name><name>rqelem</name><operator>-&gt;</operator><name>have_hibound</name></name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+        <expr_stmt><expr><name><name>rqelem</name><operator>-&gt;</operator><name>lobound</name></name> <operator>=</operator> <name>s2</name></expr>;</expr_stmt>
+    </block_content>}</block></if>
+    <else>else
+    <block>{<block_content>
+        <expr_stmt><expr><name><name>rqelem</name><operator>-&gt;</operator><name>have_lobound</name></name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+        <expr_stmt><expr><name><name>rqelem</name><operator>-&gt;</operator><name>have_hibound</name></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+        <expr_stmt><expr><name><name>rqelem</name><operator>-&gt;</operator><name>hibound</name></name> <operator>=</operator> <name>s2</name></expr>;</expr_stmt>
+    </block_content>}</block></else></if_stmt>
+    <expr_stmt><expr><name><name>rqelem</name><operator>-&gt;</operator><name>next</name></name> <operator>=</operator> <operator>*</operator><name>rqlist</name></expr>;</expr_stmt>
+    <expr_stmt><expr><operator>*</operator><name>rqlist</name> <operator>=</operator> <name>rqelem</name></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * find_single_rel_for_clauses
+ *        Examine each clause in 'clauses' and determine if all clauses
+ *        reference only a single relation.  If so return that relation,
+ *        otherwise return NULL.
+ */</comment>
+<function><type><specifier>static</specifier> <name>RelOptInfo</name> <modifier>*</modifier></type>
+<name>find_single_rel_for_clauses</name><parameter_list>(<parameter><decl><type><name>PlannerInfo</name> <modifier>*</modifier></type><name>root</name></decl></parameter>, <parameter><decl><type><name>List</name> <modifier>*</modifier></type><name>clauses</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <decl_stmt><decl><type><name>int</name></type>            <name>lastrelid</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>ListCell</name>   <modifier>*</modifier></type><name>l</name></decl>;</decl_stmt>
+
+    <macro><name>foreach</name><argument_list>(<argument>l</argument>, <argument>clauses</argument>)</argument_list></macro>
+    <block>{<block_content>
+        <decl_stmt><decl><type><name>RestrictInfo</name> <modifier>*</modifier></type><name>rinfo</name> <init>= <expr><operator>(</operator><name>RestrictInfo</name> <operator>*</operator><operator>)</operator> <call><name>lfirst</name><argument_list>(<argument><expr><name>l</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+        <decl_stmt><decl><type><name>int</name></type>            <name>relid</name></decl>;</decl_stmt>
+
+        <comment type="block">/*
+         * If we have a list of bare clauses rather than RestrictInfos, we
+         * could pull out their relids the hard way with pull_varnos().
+         * However, currently the extended-stats machinery won't do anything
+         * with non-RestrictInfo clauses anyway, so there's no point in
+         * spending extra cycles; just fail if that's what we have.
+         */</comment>
+        <if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>IsA</name><argument_list>(<argument><expr><name>rinfo</name></expr></argument>, <argument><expr><name>RestrictInfo</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+            <return>return <expr><name>NULL</name></expr>;</return></block_content></block></if></if_stmt>
+
+        <if_stmt><if>if <condition>(<expr><call><name>bms_is_empty</name><argument_list>(<argument><expr><name><name>rinfo</name><operator>-&gt;</operator><name>clause_relids</name></name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+            <continue>continue;</continue></block_content></block></if></if_stmt>            <comment type="block">/* we can ignore variable-free clauses */</comment>
+        <if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>bms_get_singleton_member</name><argument_list>(<argument><expr><name><name>rinfo</name><operator>-&gt;</operator><name>clause_relids</name></name></expr></argument>, <argument><expr><operator>&amp;</operator><name>relid</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+            <return>return <expr><name>NULL</name></expr>;</return></block_content></block></if></if_stmt>        <comment type="block">/* multiple relations in this clause */</comment>
+        <if_stmt><if>if <condition>(<expr><name>lastrelid</name> <operator>==</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+            <expr_stmt><expr><name>lastrelid</name> <operator>=</operator> <name>relid</name></expr>;</expr_stmt></block_content></block></if>    <comment type="block">/* first clause referencing a relation */</comment>
+        <if type="elseif">else if <condition>(<expr><name>relid</name> <operator>!=</operator> <name>lastrelid</name></expr>)</condition><block type="pseudo"><block_content>
+            <return>return <expr><name>NULL</name></expr>;</return></block_content></block></if></if_stmt>        <comment type="block">/* relation not same as last one */</comment>
+    </block_content>}</block>
+
+    <if_stmt><if>if <condition>(<expr><name>lastrelid</name> <operator>!=</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+        <return>return <expr><call><name>find_base_rel</name><argument_list>(<argument><expr><name>root</name></expr></argument>, <argument><expr><name>lastrelid</name></expr></argument>)</argument_list></call></expr>;</return></block_content></block></if></if_stmt>
+
+    <return>return <expr><name>NULL</name></expr>;</return>                <comment type="block">/* no clauses */</comment>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * bms_is_subset_singleton
+ *
+ * Same result as bms_is_subset(s, bms_make_singleton(x)),
+ * but a little faster and doesn't leak memory.
+ *
+ * Is this of use anywhere else?  If so move to bitmapset.c ...
+ */</comment>
+<function><type><specifier>static</specifier> <name>bool</name></type>
+<name>bms_is_subset_singleton</name><parameter_list>(<parameter><decl><type><specifier>const</specifier> <name>Bitmapset</name> <modifier>*</modifier></type><name>s</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>x</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <switch>switch <condition>(<expr><call><name>bms_membership</name><argument_list>(<argument><expr><name>s</name></expr></argument>)</argument_list></call></expr>)</condition>
+    <block>{<block_content>
+        <case>case <expr><name>BMS_EMPTY_SET</name></expr>:</case>
+            <return>return <expr><name>true</name></expr>;</return>
+        <case>case <expr><name>BMS_SINGLETON</name></expr>:</case>
+            <return>return <expr><call><name>bms_is_member</name><argument_list>(<argument><expr><name>x</name></expr></argument>, <argument><expr><name>s</name></expr></argument>)</argument_list></call></expr>;</return>
+        <case>case <expr><name>BMS_MULTIPLE</name></expr>:</case>
+            <return>return <expr><name>false</name></expr>;</return>
+    </block_content>}</block></switch>
+    <comment type="block">/* can't get here... */</comment>
+    <return>return <expr><name>false</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * treat_as_join_clause -
+ *      Decide whether an operator clause is to be handled by the
+ *      restriction or join estimator.  Subroutine for clause_selectivity().
+ */</comment>
+<function><type><specifier>static</specifier> <specifier>inline</specifier> <name>bool</name></type>
+<name>treat_as_join_clause</name><parameter_list>(<parameter><decl><type><name>Node</name> <modifier>*</modifier></type><name>clause</name></decl></parameter>, <parameter><decl><type><name>RestrictInfo</name> <modifier>*</modifier></type><name>rinfo</name></decl></parameter>,
+                     <parameter><decl><type><name>int</name></type> <name>varRelid</name></decl></parameter>, <parameter><decl><type><name>SpecialJoinInfo</name> <modifier>*</modifier></type><name>sjinfo</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <if_stmt><if>if <condition>(<expr><name>varRelid</name> <operator>!=</operator> <literal type="number">0</literal></expr>)</condition>
+    <block>{<block_content>
+        <comment type="block">/*
+         * Caller is forcing restriction mode (eg, because we are examining an
+         * inner indexscan qual).
+         */</comment>
+        <return>return <expr><name>false</name></expr>;</return>
+    </block_content>}</block></if>
+    <if type="elseif">else if <condition>(<expr><name>sjinfo</name> <operator>==</operator> <name>NULL</name></expr>)</condition>
+    <block>{<block_content>
+        <comment type="block">/*
+         * It must be a restriction clause, since it's being evaluated at a
+         * scan node.
+         */</comment>
+        <return>return <expr><name>false</name></expr>;</return>
+    </block_content>}</block></if>
+    <else>else
+    <block>{<block_content>
+        <comment type="block">/*
+         * Otherwise, it's a join if there's more than one relation used. We
+         * can optimize this calculation if an rinfo was passed.
+         *
+         * XXX    Since we know the clause is being evaluated at a join, the
+         * only way it could be single-relation is if it was delayed by outer
+         * joins.  Although we can make use of the restriction qual estimators
+         * anyway, it seems likely that we ought to account for the
+         * probability of injected nulls somehow.
+         */</comment>
+        <if_stmt><if>if <condition>(<expr><name>rinfo</name></expr>)</condition><block type="pseudo"><block_content>
+            <return>return <expr><operator>(</operator><call><name>bms_membership</name><argument_list>(<argument><expr><name><name>rinfo</name><operator>-&gt;</operator><name>clause_relids</name></name></expr></argument>)</argument_list></call> <operator>==</operator> <name>BMS_MULTIPLE</name><operator>)</operator></expr>;</return></block_content></block></if>
+        <else>else<block type="pseudo"><block_content>
+            <return>return <expr><operator>(</operator><call><name>NumRelids</name><argument_list>(<argument><expr><name>clause</name></expr></argument>)</argument_list></call> <operator>&gt;</operator> <literal type="number">1</literal><operator>)</operator></expr>;</return></block_content></block></else></if_stmt>
+    </block_content>}</block></else></if_stmt>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * clause_selectivity -
+ *      Compute the selectivity of a general boolean expression clause.
+ *
+ * The clause can be either a RestrictInfo or a plain expression.  If it's
+ * a RestrictInfo, we try to cache the selectivity for possible re-use,
+ * so passing RestrictInfos is preferred.
+ *
+ * varRelid is either 0 or a rangetable index.
+ *
+ * When varRelid is not 0, only variables belonging to that relation are
+ * considered in computing selectivity; other vars are treated as constants
+ * of unknown values.  This is appropriate for estimating the selectivity of
+ * a join clause that is being used as a restriction clause in a scan of a
+ * nestloop join's inner relation --- varRelid should then be the ID of the
+ * inner relation.
+ *
+ * When varRelid is 0, all variables are treated as variables.  This
+ * is appropriate for ordinary join clauses and restriction clauses.
+ *
+ * jointype is the join type, if the clause is a join clause.  Pass JOIN_INNER
+ * if the clause isn't a join clause.
+ *
+ * sjinfo is NULL for a non-join clause, otherwise it provides additional
+ * context information about the join being performed.  There are some
+ * special cases:
+ *    1. For a special (not INNER) join, sjinfo is always a member of
+ *       root-&gt;join_info_list.
+ *    2. For an INNER join, sjinfo is just a transient struct, and only the
+ *       relids and jointype fields in it can be trusted.
+ * It is possible for jointype to be different from sjinfo-&gt;jointype.
+ * This indicates we are considering a variant join: either with
+ * the LHS and RHS switched, or with one input unique-ified.
+ *
+ * Note: when passing nonzero varRelid, it's normally appropriate to set
+ * jointype == JOIN_INNER, sjinfo == NULL, even if the clause is really a
+ * join clause; because we aren't treating it as a join clause.
+ */</comment>
+<function><type><name>Selectivity</name></type>
+<name>clause_selectivity</name><parameter_list>(<parameter><decl><type><name>PlannerInfo</name> <modifier>*</modifier></type><name>root</name></decl></parameter>,
+                   <parameter><decl><type><name>Node</name> <modifier>*</modifier></type><name>clause</name></decl></parameter>,
+                   <parameter><decl><type><name>int</name></type> <name>varRelid</name></decl></parameter>,
+                   <parameter><decl><type><name>JoinType</name></type> <name>jointype</name></decl></parameter>,
+                   <parameter><decl><type><name>SpecialJoinInfo</name> <modifier>*</modifier></type><name>sjinfo</name></decl></parameter>)</parameter_list>
+<block>{<block_content><comment type="line">// #lizard forgives</comment>
+    <decl_stmt><decl><type><name>Selectivity</name></type> <name>s1</name> <init>= <expr><literal type="number">0.5</literal></expr></init></decl>;</decl_stmt>        <comment type="block">/* default for any unhandled clause type */</comment>
+    <decl_stmt><decl><type><name>RestrictInfo</name> <modifier>*</modifier></type><name>rinfo</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>bool</name></type>        <name>cacheable</name> <init>= <expr><name>false</name></expr></init></decl>;</decl_stmt>
+
+    <if_stmt><if>if <condition>(<expr><name>clause</name> <operator>==</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>            <comment type="block">/* can this still happen? */</comment>
+        <return>return <expr><name>s1</name></expr>;</return></block_content></block></if></if_stmt>
+
+    <if_stmt><if>if <condition>(<expr><call><name>IsA</name><argument_list>(<argument><expr><name>clause</name></expr></argument>, <argument><expr><name>RestrictInfo</name></expr></argument>)</argument_list></call></expr>)</condition>
+    <block>{<block_content>
+        <expr_stmt><expr><name>rinfo</name> <operator>=</operator> <operator>(</operator><name>RestrictInfo</name> <operator>*</operator><operator>)</operator> <name>clause</name></expr>;</expr_stmt>
+
+        <comment type="block">/*
+         * If the clause is marked pseudoconstant, then it will be used as a
+         * gating qual and should not affect selectivity estimates; hence
+         * return 1.0.  The only exception is that a constant FALSE may be
+         * taken as having selectivity 0.0, since it will surely mean no rows
+         * out of the plan.  This case is simple enough that we need not
+         * bother caching the result.
+         */</comment>
+        <if_stmt><if>if <condition>(<expr><name><name>rinfo</name><operator>-&gt;</operator><name>pseudoconstant</name></name></expr>)</condition>
+        <block>{<block_content>
+            <if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>IsA</name><argument_list>(<argument><expr><name><name>rinfo</name><operator>-&gt;</operator><name>clause</name></name></expr></argument>, <argument><expr><name>Const</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+                <return>return <expr><operator>(</operator><name>Selectivity</name><operator>)</operator> <literal type="number">1.0</literal></expr>;</return></block_content></block></if></if_stmt>
+        </block_content>}</block></if></if_stmt>
+
+        <comment type="block">/*
+         * If the clause is marked redundant, always return 1.0.
+         */</comment>
+        <if_stmt><if>if <condition>(<expr><name><name>rinfo</name><operator>-&gt;</operator><name>norm_selec</name></name> <operator>&gt;</operator> <literal type="number">1</literal></expr>)</condition><block type="pseudo"><block_content>
+            <return>return <expr><operator>(</operator><name>Selectivity</name><operator>)</operator> <literal type="number">1.0</literal></expr>;</return></block_content></block></if></if_stmt>
+
+        <comment type="block">/*
+         * If possible, cache the result of the selectivity calculation for
+         * the clause.  We can cache if varRelid is zero or the clause
+         * contains only vars of that relid --- otherwise varRelid will affect
+         * the result, so mustn't cache.  Outer join quals might be examined
+         * with either their join's actual jointype or JOIN_INNER, so we need
+         * two cache variables to remember both cases.  Note: we assume the
+         * result won't change if we are switching the input relations or
+         * considering a unique-ified case, so we only need one cache variable
+         * for all non-JOIN_INNER cases.
+         */</comment>
+        <if_stmt><if>if <condition>(<expr><name>varRelid</name> <operator>==</operator> <literal type="number">0</literal> <operator>||</operator>
+            <call><name>bms_is_subset_singleton</name><argument_list>(<argument><expr><name><name>rinfo</name><operator>-&gt;</operator><name>clause_relids</name></name></expr></argument>, <argument><expr><name>varRelid</name></expr></argument>)</argument_list></call></expr>)</condition>
+        <block>{<block_content>
+            <comment type="block">/* Cacheable --- do we already have the result? */</comment>
+            <if_stmt><if>if <condition>(<expr><name>jointype</name> <operator>==</operator> <name>JOIN_INNER</name></expr>)</condition>
+            <block>{<block_content>
+                <if_stmt><if>if <condition>(<expr><name><name>rinfo</name><operator>-&gt;</operator><name>norm_selec</name></name> <operator>&gt;=</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+                    <return>return <expr><name><name>rinfo</name><operator>-&gt;</operator><name>norm_selec</name></name></expr>;</return></block_content></block></if></if_stmt>
+            </block_content>}</block></if>
+            <else>else
+            <block>{<block_content>
+                <if_stmt><if>if <condition>(<expr><name><name>rinfo</name><operator>-&gt;</operator><name>outer_selec</name></name> <operator>&gt;=</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+                    <return>return <expr><name><name>rinfo</name><operator>-&gt;</operator><name>outer_selec</name></name></expr>;</return></block_content></block></if></if_stmt>
+            </block_content>}</block></else></if_stmt>
+            <expr_stmt><expr><name>cacheable</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+        </block_content>}</block></if></if_stmt>
+
+        <comment type="block">/*
+         * Proceed with examination of contained clause.  If the clause is an
+         * OR-clause, we want to look at the variant with sub-RestrictInfos,
+         * so that per-subclause selectivities can be cached.
+         */</comment>
+        <if_stmt><if>if <condition>(<expr><name><name>rinfo</name><operator>-&gt;</operator><name>orclause</name></name></expr>)</condition><block type="pseudo"><block_content>
+            <expr_stmt><expr><name>clause</name> <operator>=</operator> <operator>(</operator><name>Node</name> <operator>*</operator><operator>)</operator> <name><name>rinfo</name><operator>-&gt;</operator><name>orclause</name></name></expr>;</expr_stmt></block_content></block></if>
+        <else>else<block type="pseudo"><block_content>
+            <expr_stmt><expr><name>clause</name> <operator>=</operator> <operator>(</operator><name>Node</name> <operator>*</operator><operator>)</operator> <name><name>rinfo</name><operator>-&gt;</operator><name>clause</name></name></expr>;</expr_stmt></block_content></block></else></if_stmt>
+    </block_content>}</block></if></if_stmt>
+
+    <if_stmt><if>if <condition>(<expr><call><name>IsA</name><argument_list>(<argument><expr><name>clause</name></expr></argument>, <argument><expr><name>Var</name></expr></argument>)</argument_list></call></expr>)</condition>
+    <block>{<block_content>
+        <decl_stmt><decl><type><name>Var</name>           <modifier>*</modifier></type><name>var</name> <init>= <expr><operator>(</operator><name>Var</name> <operator>*</operator><operator>)</operator> <name>clause</name></expr></init></decl>;</decl_stmt>
+
+        <comment type="block">/*
+         * We probably shouldn't ever see an uplevel Var here, but if we do,
+         * return the default selectivity...
+         */</comment>
+        <if_stmt><if>if <condition>(<expr><name><name>var</name><operator>-&gt;</operator><name>varlevelsup</name></name> <operator>==</operator> <literal type="number">0</literal> <operator>&amp;&amp;</operator>
+            <operator>(</operator><name>varRelid</name> <operator>==</operator> <literal type="number">0</literal> <operator>||</operator> <name>varRelid</name> <operator>==</operator> <operator>(</operator><name>int</name><operator>)</operator> <name><name>var</name><operator>-&gt;</operator><name>varno</name></name><operator>)</operator></expr>)</condition>
+        <block>{<block_content>
+            <comment type="block">/* Use the restriction selectivity function for a bool Var */</comment>
+            <expr_stmt><expr><name>s1</name> <operator>=</operator> <call><name>boolvarsel</name><argument_list>(<argument><expr><name>root</name></expr></argument>, <argument><expr><operator>(</operator><name>Node</name> <operator>*</operator><operator>)</operator> <name>var</name></expr></argument>, <argument><expr><name>varRelid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        </block_content>}</block></if></if_stmt>
+    </block_content>}</block></if>
+    <if type="elseif">else if <condition>(<expr><call><name>IsA</name><argument_list>(<argument><expr><name>clause</name></expr></argument>, <argument><expr><name>Const</name></expr></argument>)</argument_list></call></expr>)</condition>
+    <block>{<block_content>
+        <comment type="block">/* bool constant is pretty easy... */</comment>
+        <decl_stmt><decl><type><name>Const</name>       <modifier>*</modifier></type><name>con</name> <init>= <expr><operator>(</operator><name>Const</name> <operator>*</operator><operator>)</operator> <name>clause</name></expr></init></decl>;</decl_stmt>
+
+        <expr_stmt><expr><name>s1</name> <operator>=</operator> <ternary><condition><expr><name><name>con</name><operator>-&gt;</operator><name>constisnull</name></name></expr> ?</condition><then> <expr><literal type="number">0.0</literal></expr> </then><else>:
+            <expr><ternary><condition><expr><call><name>DatumGetBool</name><argument_list>(<argument><expr><name><name>con</name><operator>-&gt;</operator><name>constvalue</name></name></expr></argument>)</argument_list></call></expr> ?</condition><then> <expr><literal type="number">1.0</literal></expr> </then><else>: <expr><literal type="number">0.0</literal></expr></else></ternary></expr></else></ternary></expr>;</expr_stmt>
+    </block_content>}</block></if>
+    <if type="elseif">else if <condition>(<expr><call><name>IsA</name><argument_list>(<argument><expr><name>clause</name></expr></argument>, <argument><expr><name>Param</name></expr></argument>)</argument_list></call></expr>)</condition>
+    <block>{<block_content>
+        <comment type="block">/* see if we can replace the Param */</comment>
+        <decl_stmt><decl><type><name>Node</name>       <modifier>*</modifier></type><name>subst</name> <init>= <expr><call><name>estimate_expression_value</name><argument_list>(<argument><expr><name>root</name></expr></argument>, <argument><expr><name>clause</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+        <if_stmt><if>if <condition>(<expr><call><name>IsA</name><argument_list>(<argument><expr><name>subst</name></expr></argument>, <argument><expr><name>Const</name></expr></argument>)</argument_list></call></expr>)</condition>
+        <block>{<block_content>
+            <comment type="block">/* bool constant is pretty easy... */</comment>
+            <decl_stmt><decl><type><name>Const</name>       <modifier>*</modifier></type><name>con</name> <init>= <expr><operator>(</operator><name>Const</name> <operator>*</operator><operator>)</operator> <name>subst</name></expr></init></decl>;</decl_stmt>
+
+            <expr_stmt><expr><name>s1</name> <operator>=</operator> <ternary><condition><expr><name><name>con</name><operator>-&gt;</operator><name>constisnull</name></name></expr> ?</condition><then> <expr><literal type="number">0.0</literal></expr> </then><else>:
+                <expr><ternary><condition><expr><call><name>DatumGetBool</name><argument_list>(<argument><expr><name><name>con</name><operator>-&gt;</operator><name>constvalue</name></name></expr></argument>)</argument_list></call></expr> ?</condition><then> <expr><literal type="number">1.0</literal></expr> </then><else>: <expr><literal type="number">0.0</literal></expr></else></ternary></expr></else></ternary></expr>;</expr_stmt>
+        </block_content>}</block></if>
+        <else>else
+        <block>{<block_content>
+            <comment type="block">/* XXX any way to do better than default? */</comment>
+        </block_content>}</block></else></if_stmt>
+    </block_content>}</block></if>
+    <if type="elseif">else if <condition>(<expr><call><name>not_clause</name><argument_list>(<argument><expr><name>clause</name></expr></argument>)</argument_list></call></expr>)</condition>
+    <block>{<block_content>
+        <comment type="block">/* inverse of the selectivity of the underlying clause */</comment>
+        <expr_stmt><expr><name>s1</name> <operator>=</operator> <literal type="number">1.0</literal> <operator>-</operator> <call><name>clause_selectivity</name><argument_list>(<argument><expr><name>root</name></expr></argument>,
+                                      <argument><expr><operator>(</operator><name>Node</name> <operator>*</operator><operator>)</operator> <call><name>get_notclausearg</name><argument_list>(<argument><expr><operator>(</operator><name>Expr</name> <operator>*</operator><operator>)</operator> <name>clause</name></expr></argument>)</argument_list></call></expr></argument>,
+                                      <argument><expr><name>varRelid</name></expr></argument>,
+                                      <argument><expr><name>jointype</name></expr></argument>,
+                                      <argument><expr><name>sjinfo</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    </block_content>}</block></if>
+    <if type="elseif">else if <condition>(<expr><call><name>and_clause</name><argument_list>(<argument><expr><name>clause</name></expr></argument>)</argument_list></call></expr>)</condition>
+    <block>{<block_content>
+        <comment type="block">/* share code with clauselist_selectivity() */</comment>
+        <expr_stmt><expr><name>s1</name> <operator>=</operator> <call><name>clauselist_selectivity</name><argument_list>(<argument><expr><name>root</name></expr></argument>,
+                                    <argument><expr><operator>(</operator><operator>(</operator><name>BoolExpr</name> <operator>*</operator><operator>)</operator> <name>clause</name><operator>)</operator><operator>-&gt;</operator><name>args</name></expr></argument>,
+                                    <argument><expr><name>varRelid</name></expr></argument>,
+                                    <argument><expr><name>jointype</name></expr></argument>,
+                                    <argument><expr><name>sjinfo</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    </block_content>}</block></if>
+    <if type="elseif">else if <condition>(<expr><call><name>or_clause</name><argument_list>(<argument><expr><name>clause</name></expr></argument>)</argument_list></call></expr>)</condition>
+    <block>{<block_content>
+        <comment type="block">/*
+         * Selectivities for an OR clause are computed as s1+s2 - s1*s2 to
+         * account for the probable overlap of selected tuple sets.
+         *
+         * XXX is this too conservative?
+         */</comment>
+        <decl_stmt><decl><type><name>ListCell</name>   <modifier>*</modifier></type><name>arg</name></decl>;</decl_stmt>
+
+        <expr_stmt><expr><name>s1</name> <operator>=</operator> <literal type="number">0.0</literal></expr>;</expr_stmt>
+        <macro><name>foreach</name><argument_list>(<argument>arg</argument>, <argument>((BoolExpr *) clause)-&gt;args</argument>)</argument_list></macro>
+        <block>{<block_content>
+            <decl_stmt><decl><type><name>Selectivity</name></type> <name>s2</name> <init>= <expr><call><name>clause_selectivity</name><argument_list>(<argument><expr><name>root</name></expr></argument>,
+                                                <argument><expr><operator>(</operator><name>Node</name> <operator>*</operator><operator>)</operator> <call><name>lfirst</name><argument_list>(<argument><expr><name>arg</name></expr></argument>)</argument_list></call></expr></argument>,
+                                                <argument><expr><name>varRelid</name></expr></argument>,
+                                                <argument><expr><name>jointype</name></expr></argument>,
+                                                <argument><expr><name>sjinfo</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+            <expr_stmt><expr><name>s1</name> <operator>=</operator> <name>s1</name> <operator>+</operator> <name>s2</name> <operator>-</operator> <name>s1</name> <operator>*</operator> <name>s2</name></expr>;</expr_stmt>
+        </block_content>}</block>
+    </block_content>}</block></if>
+    <if type="elseif">else if <condition>(<expr><call><name>is_opclause</name><argument_list>(<argument><expr><name>clause</name></expr></argument>)</argument_list></call> <operator>||</operator> <call><name>IsA</name><argument_list>(<argument><expr><name>clause</name></expr></argument>, <argument><expr><name>DistinctExpr</name></expr></argument>)</argument_list></call></expr>)</condition>
+    <block>{<block_content>
+        <decl_stmt><decl><type><name>OpExpr</name>       <modifier>*</modifier></type><name>opclause</name> <init>= <expr><operator>(</operator><name>OpExpr</name> <operator>*</operator><operator>)</operator> <name>clause</name></expr></init></decl>;</decl_stmt>
+        <decl_stmt><decl><type><name>Oid</name></type>            <name>opno</name> <init>= <expr><name><name>opclause</name><operator>-&gt;</operator><name>opno</name></name></expr></init></decl>;</decl_stmt>
+
+        <if_stmt><if>if <condition>(<expr><call><name>treat_as_join_clause</name><argument_list>(<argument><expr><name>clause</name></expr></argument>, <argument><expr><name>rinfo</name></expr></argument>, <argument><expr><name>varRelid</name></expr></argument>, <argument><expr><name>sjinfo</name></expr></argument>)</argument_list></call></expr>)</condition>
+        <block>{<block_content>
+            <comment type="block">/* Estimate selectivity for a join clause. */</comment>
+            <expr_stmt><expr><name>s1</name> <operator>=</operator> <call><name>join_selectivity</name><argument_list>(<argument><expr><name>root</name></expr></argument>, <argument><expr><name>opno</name></expr></argument>,
+                                  <argument><expr><name><name>opclause</name><operator>-&gt;</operator><name>args</name></name></expr></argument>,
+                                  <argument><expr><name><name>opclause</name><operator>-&gt;</operator><name>inputcollid</name></name></expr></argument>,
+                                  <argument><expr><name>jointype</name></expr></argument>,
+                                  <argument><expr><name>sjinfo</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        </block_content>}</block></if>
+        <else>else
+        <block>{<block_content>
+            <comment type="block">/* Estimate selectivity for a restriction clause. */</comment>
+            <expr_stmt><expr><name>s1</name> <operator>=</operator> <call><name>restriction_selectivity</name><argument_list>(<argument><expr><name>root</name></expr></argument>, <argument><expr><name>opno</name></expr></argument>,
+                                         <argument><expr><name><name>opclause</name><operator>-&gt;</operator><name>args</name></name></expr></argument>,
+                                         <argument><expr><name><name>opclause</name><operator>-&gt;</operator><name>inputcollid</name></name></expr></argument>,
+                                         <argument><expr><name>varRelid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        </block_content>}</block></else></if_stmt>
+
+        <comment type="block">/*
+         * DistinctExpr has the same representation as OpExpr, but the
+         * contained operator is "=" not "&lt;&gt;", so we must negate the result.
+         * This estimation method doesn't give the right behavior for nulls,
+         * but it's better than doing nothing.
+         */</comment>
+        <if_stmt><if>if <condition>(<expr><call><name>IsA</name><argument_list>(<argument><expr><name>clause</name></expr></argument>, <argument><expr><name>DistinctExpr</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+            <expr_stmt><expr><name>s1</name> <operator>=</operator> <literal type="number">1.0</literal> <operator>-</operator> <name>s1</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+    </block_content>}</block></if>
+    <if type="elseif">else if <condition>(<expr><call><name>IsA</name><argument_list>(<argument><expr><name>clause</name></expr></argument>, <argument><expr><name>ScalarArrayOpExpr</name></expr></argument>)</argument_list></call></expr>)</condition>
+    <block>{<block_content>
+        <comment type="block">/* Use node specific selectivity calculation function */</comment>
+        <expr_stmt><expr><name>s1</name> <operator>=</operator> <call><name>scalararraysel</name><argument_list>(<argument><expr><name>root</name></expr></argument>,
+                            <argument><expr><operator>(</operator><name>ScalarArrayOpExpr</name> <operator>*</operator><operator>)</operator> <name>clause</name></expr></argument>,
+                            <argument><expr><call><name>treat_as_join_clause</name><argument_list>(<argument><expr><name>clause</name></expr></argument>, <argument><expr><name>rinfo</name></expr></argument>,
+                                                 <argument><expr><name>varRelid</name></expr></argument>, <argument><expr><name>sjinfo</name></expr></argument>)</argument_list></call></expr></argument>,
+                            <argument><expr><name>varRelid</name></expr></argument>,
+                            <argument><expr><name>jointype</name></expr></argument>,
+                            <argument><expr><name>sjinfo</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    </block_content>}</block></if>
+    <if type="elseif">else if <condition>(<expr><call><name>IsA</name><argument_list>(<argument><expr><name>clause</name></expr></argument>, <argument><expr><name>RowCompareExpr</name></expr></argument>)</argument_list></call></expr>)</condition>
+    <block>{<block_content>
+        <comment type="block">/* Use node specific selectivity calculation function */</comment>
+        <expr_stmt><expr><name>s1</name> <operator>=</operator> <call><name>rowcomparesel</name><argument_list>(<argument><expr><name>root</name></expr></argument>,
+                           <argument><expr><operator>(</operator><name>RowCompareExpr</name> <operator>*</operator><operator>)</operator> <name>clause</name></expr></argument>,
+                           <argument><expr><name>varRelid</name></expr></argument>,
+                           <argument><expr><name>jointype</name></expr></argument>,
+                           <argument><expr><name>sjinfo</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    </block_content>}</block></if>
+    <if type="elseif">else if <condition>(<expr><call><name>IsA</name><argument_list>(<argument><expr><name>clause</name></expr></argument>, <argument><expr><name>NullTest</name></expr></argument>)</argument_list></call></expr>)</condition>
+    <block>{<block_content>
+        <comment type="block">/* Use node specific selectivity calculation function */</comment>
+        <expr_stmt><expr><name>s1</name> <operator>=</operator> <call><name>nulltestsel</name><argument_list>(<argument><expr><name>root</name></expr></argument>,
+                         <argument><expr><operator>(</operator><operator>(</operator><name>NullTest</name> <operator>*</operator><operator>)</operator> <name>clause</name><operator>)</operator><operator>-&gt;</operator><name>nulltesttype</name></expr></argument>,
+                         <argument><expr><operator>(</operator><name>Node</name> <operator>*</operator><operator>)</operator> <operator>(</operator><operator>(</operator><name>NullTest</name> <operator>*</operator><operator>)</operator> <name>clause</name><operator>)</operator><operator>-&gt;</operator><name>arg</name></expr></argument>,
+                         <argument><expr><name>varRelid</name></expr></argument>,
+                         <argument><expr><name>jointype</name></expr></argument>,
+                         <argument><expr><name>sjinfo</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    </block_content>}</block></if>
+    <if type="elseif">else if <condition>(<expr><call><name>IsA</name><argument_list>(<argument><expr><name>clause</name></expr></argument>, <argument><expr><name>BooleanTest</name></expr></argument>)</argument_list></call></expr>)</condition>
+    <block>{<block_content>
+        <comment type="block">/* Use node specific selectivity calculation function */</comment>
+        <expr_stmt><expr><name>s1</name> <operator>=</operator> <call><name>booltestsel</name><argument_list>(<argument><expr><name>root</name></expr></argument>,
+                         <argument><expr><operator>(</operator><operator>(</operator><name>BooleanTest</name> <operator>*</operator><operator>)</operator> <name>clause</name><operator>)</operator><operator>-&gt;</operator><name>booltesttype</name></expr></argument>,
+                         <argument><expr><operator>(</operator><name>Node</name> <operator>*</operator><operator>)</operator> <operator>(</operator><operator>(</operator><name>BooleanTest</name> <operator>*</operator><operator>)</operator> <name>clause</name><operator>)</operator><operator>-&gt;</operator><name>arg</name></expr></argument>,
+                         <argument><expr><name>varRelid</name></expr></argument>,
+                         <argument><expr><name>jointype</name></expr></argument>,
+                         <argument><expr><name>sjinfo</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    </block_content>}</block></if>
+    <if type="elseif">else if <condition>(<expr><call><name>IsA</name><argument_list>(<argument><expr><name>clause</name></expr></argument>, <argument><expr><name>CurrentOfExpr</name></expr></argument>)</argument_list></call></expr>)</condition>
+    <block>{<block_content>
+        <comment type="block">/* CURRENT OF selects at most one row of its table */</comment>
+        <decl_stmt><decl><type><name>CurrentOfExpr</name> <modifier>*</modifier></type><name>cexpr</name> <init>= <expr><operator>(</operator><name>CurrentOfExpr</name> <operator>*</operator><operator>)</operator> <name>clause</name></expr></init></decl>;</decl_stmt>
+        <decl_stmt><decl><type><name>RelOptInfo</name> <modifier>*</modifier></type><name>crel</name> <init>= <expr><call><name>find_base_rel</name><argument_list>(<argument><expr><name>root</name></expr></argument>, <argument><expr><name><name>cexpr</name><operator>-&gt;</operator><name>cvarno</name></name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+        <if_stmt><if>if <condition>(<expr><name><name>crel</name><operator>-&gt;</operator><name>tuples</name></name> <operator>&gt;</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+            <expr_stmt><expr><name>s1</name> <operator>=</operator> <literal type="number">1.0</literal> <operator>/</operator> <name><name>crel</name><operator>-&gt;</operator><name>tuples</name></name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+    </block_content>}</block></if>
+    <if type="elseif">else if <condition>(<expr><call><name>IsA</name><argument_list>(<argument><expr><name>clause</name></expr></argument>, <argument><expr><name>RelabelType</name></expr></argument>)</argument_list></call></expr>)</condition>
+    <block>{<block_content>
+        <comment type="block">/* Not sure this case is needed, but it can't hurt */</comment>
+        <expr_stmt><expr><name>s1</name> <operator>=</operator> <call><name>clause_selectivity</name><argument_list>(<argument><expr><name>root</name></expr></argument>,
+                                <argument><expr><operator>(</operator><name>Node</name> <operator>*</operator><operator>)</operator> <operator>(</operator><operator>(</operator><name>RelabelType</name> <operator>*</operator><operator>)</operator> <name>clause</name><operator>)</operator><operator>-&gt;</operator><name>arg</name></expr></argument>,
+                                <argument><expr><name>varRelid</name></expr></argument>,
+                                <argument><expr><name>jointype</name></expr></argument>,
+                                <argument><expr><name>sjinfo</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    </block_content>}</block></if>
+    <if type="elseif">else if <condition>(<expr><call><name>IsA</name><argument_list>(<argument><expr><name>clause</name></expr></argument>, <argument><expr><name>CoerceToDomain</name></expr></argument>)</argument_list></call></expr>)</condition>
+    <block>{<block_content>
+        <comment type="block">/* Not sure this case is needed, but it can't hurt */</comment>
+        <expr_stmt><expr><name>s1</name> <operator>=</operator> <call><name>clause_selectivity</name><argument_list>(<argument><expr><name>root</name></expr></argument>,
+                                <argument><expr><operator>(</operator><name>Node</name> <operator>*</operator><operator>)</operator> <operator>(</operator><operator>(</operator><name>CoerceToDomain</name> <operator>*</operator><operator>)</operator> <name>clause</name><operator>)</operator><operator>-&gt;</operator><name>arg</name></expr></argument>,
+                                <argument><expr><name>varRelid</name></expr></argument>,
+                                <argument><expr><name>jointype</name></expr></argument>,
+                                <argument><expr><name>sjinfo</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    </block_content>}</block></if>
+    <else>else
+    <block>{<block_content>
+        <comment type="block">/*
+         * For anything else, see if we can consider it as a boolean variable.
+         * This only works if it's an immutable expression in Vars of a single
+         * relation; but there's no point in us checking that here because
+         * boolvarsel() will do it internally, and return a suitable default
+         * selectivity if not.
+         */</comment>
+        <expr_stmt><expr><name>s1</name> <operator>=</operator> <call><name>boolvarsel</name><argument_list>(<argument><expr><name>root</name></expr></argument>, <argument><expr><name>clause</name></expr></argument>, <argument><expr><name>varRelid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    </block_content>}</block></else></if_stmt>
+
+    <comment type="block">/* Cache the result if possible */</comment>
+    <if_stmt><if>if <condition>(<expr><name>cacheable</name></expr>)</condition>
+    <block>{<block_content>
+        <if_stmt><if>if <condition>(<expr><name>jointype</name> <operator>==</operator> <name>JOIN_INNER</name></expr>)</condition><block type="pseudo"><block_content>
+            <expr_stmt><expr><name><name>rinfo</name><operator>-&gt;</operator><name>norm_selec</name></name> <operator>=</operator> <name>s1</name></expr>;</expr_stmt></block_content></block></if>
+        <else>else<block type="pseudo"><block_content>
+            <expr_stmt><expr><name><name>rinfo</name><operator>-&gt;</operator><name>outer_selec</name></name> <operator>=</operator> <name>s1</name></expr>;</expr_stmt></block_content></block></else></if_stmt>
+    </block_content>}</block></if></if_stmt>
+
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>SELECTIVITY_DEBUG</name></cpp:ifdef>
+    <expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>DEBUG4</name></expr></argument>, <argument><expr><literal type="string">"clause_selectivity: s1 %f"</literal></expr></argument>, <argument><expr><name>s1</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>                            <comment type="block">/* SELECTIVITY_DEBUG */</comment>
+
+    <return>return <expr><name>s1</name></expr>;</return>
+</block_content>}</block></function>
+
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>__TBASE__</name></cpp:ifdef>
+<comment type="block">/*
+ * clause_selectivity_could_under_estimated
+ *	  Check whether BaseRelOpt of the path might got under estimated rows.
+ *
+ * In real user scenarios, multiple columns could have correlation. It needs
+ * more statistic hints for the optimizer to know the data model
+ * characteristics. Since the extended mutli-column statistic calculation only
+ * supports '=' operation, we introduced this function to check if the
+ * selectivity of input path is under estimated.
+ */</comment>
+<function><type><name>bool</name></type>
+<name>clause_selectivity_could_under_estimated</name><parameter_list>(<parameter><decl><type><name>PlannerInfo</name> <modifier>*</modifier></type><name>root</name></decl></parameter>, <parameter><decl><type><name>Path</name> <modifier>*</modifier></type><name>path</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>RelOptInfo</name> <modifier>*</modifier></type><name>rel</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+
+	<comment type="block">/* We only support 1-depth nestloop outer path for now. */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>path</name><operator>-&gt;</operator><name>pathtype</name></name> <operator>==</operator> <name>T_SeqScan</name> <operator>||</operator>
+		<name><name>path</name><operator>-&gt;</operator><name>pathtype</name></name> <operator>==</operator> <name>T_IndexScan</name> <operator>||</operator>
+		<name><name>path</name><operator>-&gt;</operator><name>pathtype</name></name> <operator>==</operator> <name>T_IndexOnlyScan</name> <operator>||</operator>
+		<name><name>path</name><operator>-&gt;</operator><name>pathtype</name></name> <operator>==</operator> <name>T_BitmapIndexScan</name> <operator>||</operator>
+		<name><name>path</name><operator>-&gt;</operator><name>pathtype</name></name> <operator>==</operator> <name>T_BitmapHeapScan</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name>rel</name> <operator>=</operator> <name><name>path</name><operator>-&gt;</operator><name>parent</name></name></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<else>else
+	<block>{<block_content>
+		<return>return <expr><name>false</name></expr>;</return>
+	</block_content>}</block></else></if_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>rel</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * The correlation problem only happens when there are multiple
+	 * restrictions.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><call><name>list_length</name><argument_list>(<argument><expr><name><name>rel</name><operator>-&gt;</operator><name>baserestrictinfo</name></name></expr></argument>)</argument_list></call> <operator>&gt;</operator> <literal type="number">1</literal></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>ListCell</name> 	<modifier>*</modifier></type><name>lc</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>Node</name> 		<modifier>*</modifier></type><name>clause</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>int</name></type> 		<name>count</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+
+		<comment type="block">/* Walk through all restrictions */</comment>
+		<macro><name>foreach</name> <argument_list>(<argument>lc</argument>, <argument>rel-&gt;baserestrictinfo</argument>)</argument_list></macro>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>RestrictInfo</name> <modifier>*</modifier></type><name>ri</name> <init>= <expr><operator>(</operator><name>RestrictInfo</name> <operator>*</operator><operator>)</operator> <call><name>lfirst</name><argument_list>(<argument><expr><name>lc</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+			<comment type="block">/*
+			 * Proceed with examination of contained clause.  If the clause is
+			 * an OR-clause.
+			 */</comment>
+			<if_stmt><if>if <condition>(<expr><name><name>ri</name><operator>-&gt;</operator><name>orclause</name></name></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><name>clause</name> <operator>=</operator> <operator>(</operator><name>Node</name> <operator>*</operator><operator>)</operator> <name><name>ri</name><operator>-&gt;</operator><name>orclause</name></name></expr>;</expr_stmt></block_content></block></if>
+			<else>else<block type="pseudo"><block_content>
+				<expr_stmt><expr><name>clause</name> <operator>=</operator> <operator>(</operator><name>Node</name> <operator>*</operator><operator>)</operator> <name><name>ri</name><operator>-&gt;</operator><name>clause</name></name></expr>;</expr_stmt></block_content></block></else></if_stmt>
+
+			<comment type="block">/*
+			 * The multi-column statistic only supports '=' operator based on
+			 * single column histograms. Thus we count all unsupported cases
+			 * here. is_opclause() covers the NULL check for 'clause'
+			 *
+			 * TODO(Tbase): Be more precise on other type of clauses.
+			 */</comment>
+			<if_stmt><if>if <condition>(<expr><call><name>is_opclause</name><argument_list>(<argument><expr><name>clause</name></expr></argument>)</argument_list></call></expr>)</condition>
+			<block>{<block_content>
+				<decl_stmt><decl><type><name>OpExpr</name>	   		   <modifier>*</modifier></type><name>opclause</name> <init>= <expr><operator>(</operator><name>OpExpr</name> <operator>*</operator><operator>)</operator> <name>clause</name></expr></init></decl>;</decl_stmt>
+				<decl_stmt><decl><type><name>char</name>		 	   <modifier>*</modifier></type><name>oprname</name>  <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+				<decl_stmt><decl><type><name>Oid</name></type>					<name>opno</name> <init>= <expr><name><name>opclause</name><operator>-&gt;</operator><name>opno</name></name></expr></init></decl>;</decl_stmt>
+				<decl_stmt><decl><type><name>HeapTuple</name></type> 			<name>opTuple</name></decl>;</decl_stmt>
+				<decl_stmt><decl><type><name>Form_pg_operator</name></type> 	<name>operform</name></decl>;</decl_stmt>
+
+				<expr_stmt><expr><name>opTuple</name> <operator>=</operator> <call><name>SearchSysCache1</name><argument_list>(<argument><expr><name>OPEROID</name></expr></argument>, <argument><expr><call><name>ObjectIdGetDatum</name><argument_list>(<argument><expr><name>opno</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<if_stmt><if>if <condition>(<expr><call><name>HeapTupleIsValid</name><argument_list>(<argument><expr><name>opTuple</name></expr></argument>)</argument_list></call></expr>)</condition>
+				<block>{<block_content>
+					<expr_stmt><expr><name>operform</name> <operator>=</operator> <operator>(</operator><name>Form_pg_operator</name><operator>)</operator><call><name>GETSTRUCT</name><argument_list>(<argument><expr><name>opTuple</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+					<expr_stmt><expr><name>oprname</name> <operator>=</operator> <call><name>NameStr</name><argument_list>(<argument><expr><name><name>operform</name><operator>-&gt;</operator><name>oprname</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				</block_content>}</block></if></if_stmt>
+				<expr_stmt><expr><call><name>ReleaseSysCache</name><argument_list>(<argument><expr><name>opTuple</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+				<comment type="block">/* Supported case, skip the count. */</comment>
+				<if_stmt><if>if <condition>(<expr><name>oprname</name> <operator>&amp;&amp;</operator> <call><name>strcmp</name><argument_list>(<argument><expr><name>oprname</name></expr></argument>, <argument><expr><literal type="string">"="</literal></expr></argument>)</argument_list></call> <operator>==</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+					<continue>continue;</continue></block_content></block></if></if_stmt>
+			</block_content>}</block></if></if_stmt>
+
+			<comment type="block">/* Unsupported case */</comment>
+			<expr_stmt><expr><name>count</name><operator>++</operator></expr>;</expr_stmt>
+		</block_content>}</block>
+
+		<comment type="block">/*
+		 * The path got some restrictions which could lead to selectivity
+		 * under estimation.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><name>count</name> <operator>&gt;</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+			<return>return <expr><name>true</name></expr>;</return></block_content></block></if></if_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<return>return <expr><name>false</name></expr>;</return>
+</block_content>}</block></function>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+</unit>

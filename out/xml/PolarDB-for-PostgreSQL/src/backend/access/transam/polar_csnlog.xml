@@ -1,0 +1,1285 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<unit xmlns="http://www.srcML.org/srcML/src" xmlns:cpp="http://www.srcML.org/srcML/cpp" revision="1.0.0" language="C" filename="/cloned_projects/PolarDB-for-PostgreSQL/src/backend/access/transam/polar_csnlog.c"><comment type="block">/*-------------------------------------------------------------------------
+ *
+ * polar_csnlog.c
+ *		Tracking Commit-Sequence-Numbers and in-progress subtransactions
+ *
+ * The polar_csnlog manager is a pg_clog-like manager that stores the commit
+ * sequence number, or parent transaction Id, for each transaction.  It is
+ * a fundamental part of MVCC.
+ *
+ * The csnlog serves two purposes:
+ *
+ * 1. While a transaction is in progress, it stores the parent transaction
+ * Id for each in-progress subtransaction. A main transaction has a parent
+ * of InvalidTransactionId, and each subtransaction has its immediate
+ * parent. The tree can easily be walked from child to parent, but not in
+ * the opposite direction.
+ *
+ * 2. After a transaction has committed, it stores the Commit Sequence
+ * Number of the commit.
+ *
+ * We can use the same structure for both, because we don't care about the
+ * parent-child relationships subtransaction after commit.
+ *
+ * This code is based on clog.c, but the robustness requirements
+ * are completely different from pg_clog, because we only need to remember
+ * csn information for currently-open and recently committed
+ * transactions.  Thus, there is no need to preserve data over a crash and
+ * restart.
+ *
+ * There are no XLOG interactions since we do not care about preserving
+ * data across crashes.  During database startup, we simply force the
+ * currently-active page of CSNLOG to zeroes.
+ *
+ * Portions Copyright (c) 2021, Alibaba Group Holding Limited
+ * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1994, Regents of the University of California
+ *
+ * IDENTIFICATION
+ *
+ * src/backend/access/transam/polar_csnlog.c
+ *
+ *-------------------------------------------------------------------------
+ */</comment>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;sys/stat.h&gt;</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;unistd.h&gt;</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/polar_csnlog.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/polar_csn_mvcc_vars.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/slru.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/transam.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/xlog.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/xloginsert.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/xlogutils.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/pg_control.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/fd.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/lwlock.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/shmem.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/proc.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/snapmgr.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"miscadmin.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"pg_trace.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"port/atomics.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/guc.h"</cpp:file></cpp:include>
+
+<comment type="block">/*
+ * Defines for CSNLOG page sizes.  A page is the same BLCKSZ as is used
+ * everywhere else in Postgres.
+ *
+ * Note: because TransactionIds are 32 bits and wrap around at 0xFFFFFFFF,
+ * CSNLOG page numbering also wraps around at 0xFFFFFFFF/CSNLOG_XACTS_PER_PAGE,
+ * and CSNLOG segment numbering at
+ * 0xFFFFFFFF/CLOG_XACTS_PER_PAGE/SLRU_PAGES_PER_SEGMENT.  We need take no
+ * explicit notice of that fact in this module, except when comparing segment
+ * and page numbers in polar_csnlog_truncate (see CSNLOGPagePrecedes).
+ */</comment>
+
+<comment type="block">/* We store the commit LSN for each xid */</comment>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>CSNLOG_XACTS_PER_PAGE</name></cpp:macro> <cpp:value>(BLCKSZ / sizeof(CommitSeqNo))</cpp:value></cpp:define>
+
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>CSNLOG_XACTS_PER_LSN_GROUP</name></cpp:macro>	<cpp:value>32</cpp:value></cpp:define>	<comment type="block">/* keep this a power of 2 */</comment>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>CSNLOG_LSNS_PER_PAGE</name></cpp:macro>	<cpp:value>(CSNLOG_XACTS_PER_PAGE / CSNLOG_XACTS_PER_LSN_GROUP)</cpp:value></cpp:define>
+
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>CSNLOG_XACTS_PER_UB_GROUP</name></cpp:macro> <cpp:value>CSNLOG_XACTS_PER_PAGE</cpp:value></cpp:define> 
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>CSNLOG_UB_GROUPS</name></cpp:macro> <cpp:value>((MaxTransactionId + CSNLOG_XACTS_PER_UB_GROUP - 1) / \
+		CSNLOG_XACTS_PER_UB_GROUP)</cpp:value></cpp:define>
+
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>GetLSNIndex</name><parameter_list>(<parameter><type><name>slotno</name></type></parameter>, <parameter><type><name>xid</name></type></parameter>)</parameter_list></cpp:macro>	<cpp:value>((slotno) * CSNLOG_LSNS_PER_PAGE + \
+	((xid) % (TransactionId) CSNLOG_XACTS_PER_PAGE) / CSNLOG_XACTS_PER_LSN_GROUP)</cpp:value></cpp:define>
+
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>TransactionIdToPageNo</name><parameter_list>(<parameter><type><name>xid</name></type></parameter>)</parameter_list></cpp:macro>	<cpp:value>((xid) / (TransactionId) CSNLOG_XACTS_PER_PAGE)</cpp:value></cpp:define>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>TransactionIdToItemNo</name><parameter_list>(<parameter><type><name>xid</name></type></parameter>)</parameter_list></cpp:macro>  <cpp:value>((xid) % (TransactionId) CSNLOG_XACTS_PER_PAGE)</cpp:value></cpp:define>
+
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>TransactionIdToUBSlotNo</name><parameter_list>(<parameter><type><name>xid</name></type></parameter>)</parameter_list></cpp:macro>	<cpp:value>((xid) / (TransactionId) CSNLOG_XACTS_PER_UB_GROUP)</cpp:value></cpp:define>
+
+<comment type="block">/* We allocate new log pages in batches */</comment>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>BATCH_SIZE</name></cpp:macro> <cpp:value>128</cpp:value></cpp:define>
+
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>CSNLOG_DIR</name></cpp:macro>                   <cpp:value>"pg_csnlog"</cpp:value></cpp:define>
+
+<comment type="block">/* POLAR: Check whether csnlog local file cache is enabled */</comment>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>POLAR_ENABLE_CSNLOG_LOCAL_CACHE</name><parameter_list>()</parameter_list></cpp:macro> <cpp:value>(polar_csnlog_max_local_cache_segments &gt; 0 &amp;&amp; polar_enable_shared_storage_mode)</cpp:value></cpp:define>
+
+<comment type="block">/*
+ * Link to shared-memory data structures for csnlog control
+ */</comment>
+<decl_stmt><decl><type><specifier>static</specifier> <name>SlruCtlData</name></type> <name>polar_csnlog_ctl</name></decl>;</decl_stmt>
+
+<comment type="block">/*
+ * Link to shared-memory for csn upperbound cache
+ */</comment>
+<decl_stmt><decl><type><specifier>static</specifier> <name>char</name> <modifier>*</modifier></type><name>polar_upperbound_csn_ptr</name></decl>;</decl_stmt>
+
+<function_decl><type><specifier>static</specifier> <name>bool</name></type> <name>polar_csnlog_page_precedes</name><parameter_list>(<parameter><decl><type><name>int</name></type> <name>page1</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>page2</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>int</name></type>	<name>polar_csnlog_zero_page</name><parameter_list>(<parameter><decl><type><name>int</name></type> <name>pageno</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>polar_csnlog_set_csn_by_page</name><parameter_list>(<parameter><decl><type><name>TransactionId</name></type> <name>xid</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>nsubxids</name></decl></parameter>, 
+										 <parameter><decl><type><name>TransactionId</name> <modifier>*</modifier></type><name>subxids</name></decl></parameter>, <parameter><decl><type><name>CommitSeqNo</name></type> <name>csn</name></decl></parameter>, 
+										 <parameter><decl><type><name>XLogRecPtr</name></type> <name>lsn</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>pageno</name></decl></parameter>)</parameter_list>;</function_decl> 
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>polar_csnlog_set_csn_by_itemno</name><parameter_list>(<parameter><decl><type><name>TransactionId</name></type> <name>xid</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>slotno</name></decl></parameter>, 
+										 	<parameter><decl><type><name>int</name></type> <name>offset</name></decl></parameter>, <parameter><decl><type><name>CommitSeqNo</name></type> <name>csn</name></decl></parameter>, 
+										 	<parameter><decl><type><name>XLogRecPtr</name></type> <name>lsn</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>CommitSeqNo</name></type> <name>polar_csnlog_get_csn_by_itemno</name><parameter_list>(<parameter><decl><type><name>TransactionId</name></type> <name>xid</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>slotno</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>itemno</name></decl></parameter>)</parameter_list>;</function_decl>
+
+<function_decl><type><specifier>static</specifier> <name>CommitSeqNo</name></type> <name>polar_csnlog_get_csn_internal</name><parameter_list>(<parameter><decl><type><name>TransactionId</name></type> <name>xid</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>CommitSeqNo</name></type> <name>polar_csnlog_get_csn_recursive</name><parameter_list>(<parameter><decl><type><name>TransactionId</name></type> <name>xid</name></decl></parameter>)</parameter_list>;</function_decl>
+
+<function_decl><type><specifier>static</specifier> <specifier>inline</specifier> <name>void</name></type> <name>polar_csnlog_set_upperbound_csn</name><parameter_list>(<parameter><decl><type><name>TransactionId</name></type> <name>xid</name></decl></parameter>, <parameter><decl><type><name>CommitSeqNo</name></type> <name>csn</name></decl></parameter>)</parameter_list>;</function_decl>
+
+<function><type><specifier>static</specifier> <specifier>inline</specifier> <name>SlruCtl</name></type>
+<name>polar_csnlog_get_ctl</name><parameter_list>()</parameter_list>
+<block>{<block_content>
+	<return>return <expr><operator>&amp;</operator><name>polar_csnlog_ctl</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * polar_csnlog_set_csn
+ *
+ * Record CSN of transaction entries in the csn log for a
+ * transaction and its subtransaction tree. Take care to ensure this is
+ * efficient, and as atomic as possible.
+ *
+ * xid is a single xid to set CSN for. This will typically be the
+ * top level transactionid for a top level commit or abort. It can
+ * also be a subtransaction when we record transaction aborts.
+ *
+ * subxids is an array of xids of length nsubxids, representing subtransactions
+ * in the tree of xid. In various cases nsubxids may be zero.
+ *
+ * csn is the commit sequence number of the transaction. It should be
+ * InvalidCommitSeqNo for abort cases.
+ *
+ * Note: This doesn't guarantee atomicity. The caller can use the
+ * POLAR_CSN_COMMITTING special value for that.
+ */</comment>
+<function><type><name>void</name></type>
+<name>polar_csnlog_set_csn</name><parameter_list>(<parameter><decl><type><name>TransactionId</name></type> <name>xid</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>sub_xid_num</name></decl></parameter>,
+					 <parameter><decl><type><name>TransactionId</name> <modifier>*</modifier></type><name>sub_xids</name></decl></parameter>, <parameter><decl><type><name>CommitSeqNo</name></type> <name>csn</name></decl></parameter>, <parameter><decl><type><name>XLogRecPtr</name></type> <name>lsn</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>int</name></type>			<name>sub_xid_idx</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>top_pageno</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>TransactionId</name></type> <name>top_xid</name></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * param check
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><call><name>IsBootstrapProcessingMode</name><argument_list>()</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name>csn</name> <operator>=</operator> <name>POLAR_CSN_FROZEN</name></expr>;</expr_stmt></block_content></block></if>
+	<else>else
+	<block>{<block_content>
+		<comment type="block">/*no cover begin*/</comment>
+		<if_stmt><if>if <condition>(<expr><name>csn</name> <operator>==</operator> <name>InvalidCommitSeqNo</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"cannot mark transaction committed without CSN"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+		<comment type="block">/*no cover end*/</comment>
+	</block_content>}</block></else></if_stmt>
+
+	<comment type="block">/*
+	 * We set the status of child transaction before the status of parent
+	 * transactions, so that another process can correctly determine the
+	 * resulting status of a child transaction. See
+	 * polar_csnlog_get_csn_recursive().
+	 */</comment>
+	<expr_stmt><expr><name>top_xid</name> <operator>=</operator> <name>InvalidTransactionId</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name>top_pageno</name> <operator>=</operator> <call><name>TransactionIdToPageNo</name><argument_list>(<argument><expr><name>xid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>sub_xid_idx</name> <operator>=</operator> <name>sub_xid_num</name> <operator>-</operator> <literal type="number">1</literal></expr>;</expr_stmt>
+	<do>do
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>int</name></type>			<name>current_pageno</name> <init>= <expr><name>top_pageno</name></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>int</name></type>			<name>sub_xid_num_on_page</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+
+		<comment type="block">/* Collect sub xids on same page */</comment>
+		<for>for <control>(<init>;</init> <condition><expr><name>sub_xid_idx</name> <operator>&gt;=</operator> <literal type="number">0</literal></expr>;</condition> <incr><expr><name>sub_xid_idx</name><operator>--</operator></expr></incr>)</control>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>int</name></type>			<name>sub_xid_pageno</name> <init>= <expr><call><name>TransactionIdToPageNo</name><argument_list>(<argument><expr><name><name>sub_xids</name><index>[<expr><name>sub_xid_idx</name></expr>]</index></name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+			<if_stmt><if>if <condition>(<expr><name>sub_xid_num_on_page</name> <operator>==</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><name>current_pageno</name> <operator>=</operator> <name>sub_xid_pageno</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+			<if_stmt><if>if <condition>(<expr><name>current_pageno</name> <operator>!=</operator> <name>sub_xid_pageno</name></expr>)</condition><block type="pseudo"><block_content>
+				<break>break;</break></block_content></block></if></if_stmt>
+
+			<expr_stmt><expr><name>sub_xid_num_on_page</name><operator>++</operator></expr>;</expr_stmt>
+		</block_content>}</block></for>
+
+		<comment type="block">/* top_xid can be invalid when main xid is not on current page */</comment>
+		<if_stmt><if>if <condition>(<expr><name>current_pageno</name> <operator>==</operator> <name>top_pageno</name></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>top_xid</name> <operator>==</operator> <name>InvalidTransactionId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><name>top_xid</name> <operator>=</operator> <name>xid</name></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+
+		<expr_stmt><expr><call><name>polar_csnlog_set_csn_by_page</name><argument_list>(<argument><expr><name>top_xid</name></expr></argument>, <argument><expr><name>sub_xid_num_on_page</name></expr></argument>, <argument><expr><name>sub_xids</name> <operator>+</operator> <name>sub_xid_idx</name> <operator>+</operator> <literal type="number">1</literal></expr></argument>,
+									 <argument><expr><name>csn</name></expr></argument>, <argument><expr><name>lsn</name></expr></argument>, <argument><expr><name>current_pageno</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block>
+	while <condition>(<expr><name>sub_xid_idx</name> <operator>&gt;=</operator> <literal type="number">0</literal></expr>)</condition>;</do>
+
+	<if_stmt><if>if <condition>(<expr><name>top_xid</name> <operator>==</operator> <name>InvalidTransactionId</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/*
+		 * No subxids were on the same page as the main xid; we have to update
+		 * it separately
+		 */</comment>
+		<expr_stmt><expr><call><name>polar_csnlog_set_csn_by_page</name><argument_list>(<argument><expr><name>xid</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><name>NULL</name></expr></argument>, <argument><expr><name>csn</name></expr></argument>, <argument><expr><name>lsn</name></expr></argument>, <argument><expr><name>top_pageno</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Record the final state of transaction entries in the csn log for
+ * all entries on a single page.  Atomic only on this page.
+ *
+ * xid maybe invalid
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>polar_csnlog_set_csn_by_page</name><parameter_list>(<parameter><decl><type><name>TransactionId</name></type> <name>xid</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>nsubxids</name></decl></parameter>,
+							 <parameter><decl><type><name>TransactionId</name> <modifier>*</modifier></type><name>subxids</name></decl></parameter>, <parameter><decl><type><name>CommitSeqNo</name></type> <name>csn</name></decl></parameter>,
+							 <parameter><decl><type><name>XLogRecPtr</name></type> <name>lsn</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>pageno</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>SlruCtl</name></type>		<name>csnlog_ctl</name> <init>= <expr><call><name>polar_csnlog_get_ctl</name><argument_list>()</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>slotno</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>i</name></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * We use share lock for high performance, but it depend on 64 bit atomic
+	 * ops. We have only 8 bytes for csn, so we can not use 64 bit simulation
+	 * mode
+	 */</comment>
+<cpp:if>#<cpp:directive>if</cpp:directive> <expr><operator>!</operator><call><name>defined</name><argument_list>(<argument><expr><name>PG_HAVE_ATOMIC_U64_SIMULATION</name></expr></argument>)</argument_list></call></expr></cpp:if>
+	<expr_stmt><expr><call><name>LWLockAcquire</name><argument_list>(<argument><expr><name>CSNLogControlLock</name></expr></argument>, <argument><expr><name>LW_SHARED</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>slotno</name> <operator>=</operator> <call><name>SimpleLruReadPage_ReadOnly_Locked</name><argument_list>(<argument><expr><name>csnlog_ctl</name></expr></argument>, <argument><expr><name>pageno</name></expr></argument>, <argument><expr><name>xid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+<cpp:else>#<cpp:directive>else</cpp:directive></cpp:else>
+	<expr_stmt><expr><call><name>LWLockAcquire</name><argument_list>(<argument><expr><name>CSNLogControlLock</name></expr></argument>, <argument><expr><name>LW_EXCLUSIVE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>slotno</name> <operator>=</operator> <call><name>SimpleLruReadPage</name><argument_list>(<argument><expr><name>csnlog_ctl</name></expr></argument>, <argument><expr><name>pageno</name></expr></argument>, <argument><expr><name>true</name></expr></argument>, <argument><expr><name>xid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+	<comment type="block">/*
+	 * We set the status of child transaction before the status of parent
+	 * transactions, so that another process can correctly determine the
+	 * resulting status of a child transaction. See
+	 * polar_csnlog_get_csn_recursive().
+	 */</comment>
+	<for>for <control>(<init><expr><name>i</name> <operator>=</operator> <name>nsubxids</name> <operator>-</operator> <literal type="number">1</literal></expr>;</init> <condition><expr><name>i</name> <operator>&gt;=</operator> <literal type="number">0</literal></expr>;</condition> <incr><expr><name>i</name><operator>--</operator></expr></incr>)</control>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>csnlog_ctl</name><operator>-&gt;</operator><name>shared</name><operator>-&gt;</operator><name>page_number</name><index>[<expr><name>slotno</name></expr>]</index></name> <operator>==</operator> <call><name>TransactionIdToPageNo</name><argument_list>(<argument><expr><name><name>subxids</name><index>[<expr><name>i</name></expr>]</index></name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>polar_csnlog_set_upperbound_csn</name><argument_list>(<argument><expr><name><name>subxids</name><index>[<expr><name>i</name></expr>]</index></name></expr></argument>, <argument><expr><name>csn</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>pg_write_barrier</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>polar_csnlog_set_csn_by_itemno</name><argument_list>(<argument><expr><name><name>subxids</name><index>[<expr><name>i</name></expr>]</index></name></expr></argument>, <argument><expr><name>slotno</name></expr></argument>, <argument><expr><call><name>TransactionIdToItemNo</name><argument_list>(<argument><expr><name><name>subxids</name><index>[<expr><name>i</name></expr>]</index></name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>csn</name></expr></argument>, <argument><expr><name>lsn</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>pg_write_barrier</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></for>
+
+	<if_stmt><if>if <condition>(<expr><call><name>TransactionIdIsValid</name><argument_list>(<argument><expr><name>xid</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>polar_csnlog_set_upperbound_csn</name><argument_list>(<argument><expr><name>xid</name></expr></argument>, <argument><expr><name>csn</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>pg_write_barrier</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>polar_csnlog_set_csn_by_itemno</name><argument_list>(<argument><expr><name>xid</name></expr></argument>, <argument><expr><name>slotno</name></expr></argument>, <argument><expr><call><name>TransactionIdToItemNo</name><argument_list>(<argument><expr><name>xid</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>csn</name></expr></argument>, <argument><expr><name>lsn</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<expr_stmt><expr><name><name>csnlog_ctl</name><operator>-&gt;</operator><name>shared</name><operator>-&gt;</operator><name>page_dirty</name><index>[<expr><name>slotno</name></expr>]</index></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><name>CSNLogControlLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+
+
+<comment type="block">/*
+ * Record the parent of a subtransaction in CSN log.
+ *
+ * In some cases we may need to overwrite an existing value.
+ *
+ * Logic is almost same with SubTransSetParent,
+ * but we try to get shared lock on CSNLogControlLock
+ */</comment>
+<function><type><name>void</name></type>
+<name>polar_csnlog_set_parent</name><parameter_list>(<parameter><decl><type><name>TransactionId</name></type> <name>xid</name></decl></parameter>, <parameter><decl><type><name>TransactionId</name></type> <name>parent</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>SlruCtl</name></type>		<name>csnlog_ctl</name> <init>= <expr><call><name>polar_csnlog_get_ctl</name><argument_list>()</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>pageno</name> <init>= <expr><call><name>TransactionIdToPageNo</name><argument_list>(<argument><expr><name>xid</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>itemno</name> <init>= <expr><call><name>TransactionIdToItemNo</name><argument_list>(<argument><expr><name>xid</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>slotno</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>CommitSeqNo</name></type> <name>old_csn</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>CommitSeqNo</name></type> <name>new_csn</name></decl>;</decl_stmt>
+
+	<comment type="block">/* Called in bootstrap mode is impossible */</comment>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>TransactionIdIsNormal</name><argument_list>(<argument><expr><name>xid</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>TransactionIdIsNormal</name><argument_list>(<argument><expr><name>parent</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>TransactionIdFollows</name><argument_list>(<argument><expr><name>xid</name></expr></argument>, <argument><expr><name>parent</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>new_csn</name> <operator>=</operator> <name>POLAR_CSN_SUBTRANS_BIT</name> <operator>|</operator> <operator>(</operator><name>uint64</name><operator>)</operator> <name>parent</name></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * CSNLogControlLock is acquired by SimpleLruReadPage_ReadOnly.
+	 *
+	 * Shared page access is enough to set the subtransaction parent. It is
+	 * set when the subtransaction is assigned an xid, and can be read only
+	 * later after the subtransaction have modified some tuples.
+	 */</comment>
+	<expr_stmt><expr><name>slotno</name> <operator>=</operator> <call><name>SimpleLruReadPage_ReadOnly</name><argument_list>(<argument><expr><name>csnlog_ctl</name></expr></argument>, <argument><expr><name>pageno</name></expr></argument>, <argument><expr><name>xid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * It's possible we'll try to set the parent xid multiple times.
+	 * And in 2pc or standby, we may be changing the xid from direct xid to 
+	 * top xid
+	 * 
+	 * In RW, the order must be: 
+	 * 1. set subtrans parent from assign txid call
+	 * 2. abort subtrans      
+	 * 3. commit/abort parent trans
+	 * these order lead to subtrans csnlog status transition as such:
+	 * in progress -&gt; aborted
+	 * 
+	 * In RO, the order may be:
+	 * 1. redo abort subtrans (subtrans abort write abort wal in RW)
+	 * 2. redo set subtrans parent from assignment wal (subtrans abort does not remove xid from assignment in RW)
+	 * 3. redo commit/abort parent trans (parent commit/abort does not have aborted subtrans in wal in RW)
+	 * these order lead to subtrans csnlog status transition as such:
+	 * in progress -&gt; aborted -&gt; subtrans 
+	 * We should not permit aborted/committed/committing status transfer to subtrans.
+	 * When this happens, just ignore
+	 */</comment>
+	<expr_stmt><expr><name>old_csn</name> <operator>=</operator> <call><name>polar_csnlog_get_csn_by_itemno</name><argument_list>(<argument><expr><name>xid</name></expr></argument>, <argument><expr><name>slotno</name></expr></argument>, <argument><expr><name>itemno</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><call><name>POLAR_CSN_IS_INPROGRESS</name><argument_list>(<argument><expr><name>old_csn</name></expr></argument>)</argument_list></call> <operator>||</operator>
+		<operator>(</operator><call><name>POLAR_CSN_IS_SUBTRANS</name><argument_list>(<argument><expr><name>old_csn</name></expr></argument>)</argument_list></call> <operator>&amp;&amp;</operator> <name>old_csn</name> <operator>!=</operator> <name>new_csn</name><operator>)</operator></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>polar_csnlog_set_csn_by_itemno</name><argument_list>(<argument><expr><name>xid</name></expr></argument>, <argument><expr><name>slotno</name></expr></argument>, <argument><expr><name>itemno</name></expr></argument>, <argument><expr><name>new_csn</name></expr></argument>, <argument><expr><name>InvalidXLogRecPtr</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>csnlog_ctl</name><operator>-&gt;</operator><name>shared</name><operator>-&gt;</operator><name>page_dirty</name><index>[<expr><name>slotno</name></expr>]</index></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><name>CSNLogControlLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Interrogate the parent of a transaction in the csnlog.
+ */</comment>
+<function><type><name>TransactionId</name></type>
+<name>polar_csnlog_get_parent</name><parameter_list>(<parameter><decl><type><name>TransactionId</name></type> <name>xid</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>CommitSeqNo</name></type> <name>csn</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>LWLockAcquire</name><argument_list>(<argument><expr><name>CSNLogControlLock</name></expr></argument>, <argument><expr><name>LW_SHARED</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>csn</name> <operator>=</operator> <call><name>polar_csnlog_get_csn_internal</name><argument_list>(<argument><expr><name>xid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><name>CSNLogControlLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><call><name>POLAR_CSN_IS_SUBTRANS</name><argument_list>(<argument><expr><name>csn</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><operator>(</operator><name>TransactionId</name><operator>)</operator> <operator>(</operator><name>csn</name> <operator>&amp;</operator> <literal type="number">0xFFFFFFFF</literal><operator>)</operator></expr>;</return></block_content></block></if>
+	<else>else<block type="pseudo"><block_content>
+		<return>return <expr><name>InvalidTransactionId</name></expr>;</return></block_content></block></else></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * polar_csnlog_get_top
+ *
+ * Returns the topmost transaction of the given transaction id.
+ *
+ * Because we cannot look back further than TransactionXmin, it is possible
+ * that this function will lie and return an intermediate subtransaction ID
+ * instead of the true topmost parent ID.  This is OK, because in practice
+ * we only care about detecting whether the topmost parent is still running
+ * or is part of a current snapshot's list of still-running transactions.
+ * Therefore, any XID before TransactionXmin is as good as any other.
+ *
+ * Logic is same with SubTransGetTopmostTransaction
+ */</comment>
+<function><type><name>TransactionId</name></type>
+<name>polar_csnlog_get_top</name><parameter_list>(<parameter><decl><type><name>TransactionId</name></type> <name>xid</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>TransactionId</name></type> <name>parentXid</name> <init>= <expr><name>xid</name></expr></init></decl>,
+				<decl><type ref="prev"/><name>previousXid</name> <init>= <expr><name>xid</name></expr></init></decl>;</decl_stmt>
+
+	<comment type="block">/* Can't ask about stuff that might not be around anymore */</comment>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>TransactionIdFollowsOrEquals</name><argument_list>(<argument><expr><name>xid</name></expr></argument>, <argument><expr><name>TransactionXmin</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<while>while <condition>(<expr><call><name>TransactionIdIsValid</name><argument_list>(<argument><expr><name>parentXid</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name>previousXid</name> <operator>=</operator> <name>parentXid</name></expr>;</expr_stmt>
+		<if_stmt><if>if <condition>(<expr><call><name>TransactionIdPrecedes</name><argument_list>(<argument><expr><name>parentXid</name></expr></argument>, <argument><expr><name>TransactionXmin</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<break>break;</break></block_content></block></if></if_stmt>
+		<expr_stmt><expr><name>parentXid</name> <operator>=</operator> <call><name>polar_csnlog_get_parent</name><argument_list>(<argument><expr><name>parentXid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/*
+		 * By convention the parent xid gets allocated first, so should always
+		 * precede the child xid. Anything else points to a corrupted data
+		 * structure that could lead to an infinite loop, so exit.
+		 */</comment>
+		<comment type="block">/*no cover begin*/</comment>
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>TransactionIdPrecedes</name><argument_list>(<argument><expr><name>parentXid</name></expr></argument>, <argument><expr><name>previousXid</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"pg_csnlog contains invalid entry: xid %u points to parent xid %u"</literal></expr></argument>,
+				 <argument><expr><name>previousXid</name></expr></argument>, <argument><expr><name>parentXid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+		<comment type="block">/*no cover end*/</comment>
+	</block_content>}</block></while>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>TransactionIdIsValid</name><argument_list>(<argument><expr><name>previousXid</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<return>return <expr><name>previousXid</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Set status or csn of a single transaction atomically.
+ *
+ * For performance, we only share lock CSNLogControlLock
+ * when we support 64 bit atomic ops:
+ * 1. one write/multi read csn concurrency may be happen, we should make sure
+ *    write or read csn is atomic
+ * 2. write/write csn concurrency is impossible
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>polar_csnlog_set_csn_by_itemno</name><parameter_list>(<parameter><decl><type><name>TransactionId</name></type> <name>xid</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>slotno</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>itemno</name></decl></parameter>,
+							   <parameter><decl><type><name>CommitSeqNo</name></type> <name>new_csn</name></decl></parameter>, <parameter><decl><type><name>XLogRecPtr</name></type> <name>lsn</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>SlruCtl</name></type>		<name>csnlog_ctl</name> <init>= <expr><call><name>polar_csnlog_get_ctl</name><argument_list>()</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><specifier>volatile</specifier>	<name>CommitSeqNo</name> <modifier>*</modifier></type><name>csn_ptr</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name>csn_ptr</name> <operator>=</operator> <operator>(</operator><name>CommitSeqNo</name> <operator>*</operator><operator>)</operator> <name><name>csnlog_ctl</name><operator>-&gt;</operator><name>shared</name><operator>-&gt;</operator><name>page_buffer</name><index>[<expr><name>slotno</name></expr>]</index></name></expr>;</expr_stmt>
+	<expr_stmt><expr><name>csn_ptr</name> <operator>+=</operator> <name>itemno</name></expr>;</expr_stmt>
+
+<cpp:if>#<cpp:directive>if</cpp:directive> <expr><operator>!</operator><call><name>defined</name><argument_list>(<argument><expr><name>PG_HAVE_ATOMIC_U64_SIMULATION</name></expr></argument>)</argument_list></call></expr></cpp:if>
+	<expr_stmt><expr><call><name>pg_atomic_write_u64</name><argument_list>(<argument><expr><operator>(</operator><specifier>volatile</specifier> <name>pg_atomic_uint64</name> <operator>*</operator><operator>)</operator> <name>csn_ptr</name></expr></argument>, <argument><expr><name>new_csn</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+<cpp:else>#<cpp:directive>else</cpp:directive></cpp:else>
+	<expr_stmt><expr><operator>*</operator><name>csn_ptr</name> <operator>=</operator> <name>new_csn</name></expr>;</expr_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+	<comment type="block">/*
+	 * Update the group LSN if the transaction completion LSN is higher.
+	 *
+	 * Note: lsn will be invalid when supplied during InRecovery processing,
+	 * so we don't need to do anything special to avoid LSN updates during
+	 * recovery. After recovery completes the next clog change will set the
+	 * LSN correctly.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>XLogRecPtrIsInvalid</name><argument_list>(<argument><expr><name>lsn</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>int</name></type>			<name>lsnindex</name> <init>= <expr><call><name>GetLSNIndex</name><argument_list>(<argument><expr><name>slotno</name></expr></argument>, <argument><expr><name>xid</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+<cpp:if>#<cpp:directive>if</cpp:directive> <expr><operator>!</operator><call><name>defined</name><argument_list>(<argument><expr><name>PG_HAVE_ATOMIC_U64_SIMULATION</name></expr></argument>)</argument_list></call></expr></cpp:if>
+		<decl_stmt><decl><type><name>pg_atomic_uint64</name> <modifier>*</modifier></type><name>lsn_ptr</name> <init>= <expr><operator>(</operator><name>pg_atomic_uint64</name> <operator>*</operator><operator>)</operator>
+		<operator>&amp;</operator><name><name>csnlog_ctl</name><operator>-&gt;</operator><name>shared</name><operator>-&gt;</operator><name>group_lsn</name><index>[<expr><name>lsnindex</name></expr>]</index></name></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>XLogRecPtr</name></type>	<name>old_lsn</name> <init>= <expr><call><name>pg_atomic_read_u64</name><argument_list>(<argument><expr><name>lsn_ptr</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+		<while>while <condition>(<expr><name>old_lsn</name> <operator>&lt;</operator> <name>lsn</name></expr>)</condition>
+		<block>{<block_content>
+			<if_stmt><if>if <condition>(<expr><call><name>pg_atomic_compare_exchange_u64</name><argument_list>(<argument><expr><name>lsn_ptr</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>old_lsn</name></expr></argument>, <argument><expr><name>lsn</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+				<break>break;</break></block_content></block></if></if_stmt>
+		</block_content>}</block></while>
+<cpp:else>#<cpp:directive>else</cpp:directive></cpp:else>
+		<if_stmt><if>if <condition>(<expr><name><name>csnlog_ctl</name><operator>-&gt;</operator><name>shared</name><operator>-&gt;</operator><name>group_lsn</name><index>[<expr><name>lsnindex</name></expr>]</index></name> <operator>&lt;</operator> <name>lsn</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><name><name>csnlog_ctl</name><operator>-&gt;</operator><name>shared</name><operator>-&gt;</operator><name>group_lsn</name><index>[<expr><name>lsnindex</name></expr>]</index></name> <operator>=</operator> <name>lsn</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+	</block_content>}</block></if></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Get status or csn of a single transaction atomically.
+ *
+ * For performance, we may hold share CSNLogControlLock
+ * when we support 64 bit atomic ops.
+ * Use atomic ops to access in that case.
+ */</comment>
+<function><type><specifier>static</specifier> <name>CommitSeqNo</name></type>
+<name>polar_csnlog_get_csn_by_itemno</name><parameter_list>(<parameter><decl><type><name>TransactionId</name></type> <name>xid</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>slotno</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>itemno</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>SlruCtl</name></type>		<name>csnlog_ctl</name> <init>= <expr><call><name>polar_csnlog_get_ctl</name><argument_list>()</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>CommitSeqNo</name> <modifier>*</modifier></type><name>csn_ptr</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name>csn_ptr</name> <operator>=</operator> <operator>(</operator><name>CommitSeqNo</name> <operator>*</operator><operator>)</operator> <name><name>csnlog_ctl</name><operator>-&gt;</operator><name>shared</name><operator>-&gt;</operator><name>page_buffer</name><index>[<expr><name>slotno</name></expr>]</index></name></expr>;</expr_stmt>
+	<expr_stmt><expr><name>csn_ptr</name> <operator>+=</operator> <name>itemno</name></expr>;</expr_stmt>
+
+<cpp:if>#<cpp:directive>if</cpp:directive> <expr><operator>!</operator><call><name>defined</name><argument_list>(<argument><expr><name>PG_HAVE_ATOMIC_U64_SIMULATION</name></expr></argument>)</argument_list></call></expr></cpp:if>
+	<return>return <expr><call><name>pg_atomic_read_u64</name><argument_list>(<argument><expr><operator>(</operator><specifier>volatile</specifier> <name>pg_atomic_uint64</name> <operator>*</operator><operator>)</operator> <name>csn_ptr</name></expr></argument>)</argument_list></call></expr>;</return>
+<cpp:else>#<cpp:directive>else</cpp:directive></cpp:else>
+	<return>return <expr><operator>*</operator><name>csn_ptr</name></expr>;</return>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Interrogate the state of a transaction in the csn log.
+ *
+ * NB: this is a low-level routine and is NOT the preferred entry point
+ * for most uses; TransactionIdGetCommitSeqNo() in transam.c is the intended caller.
+ */</comment>
+<function><type><name>CommitSeqNo</name></type>
+<name>polar_csnlog_get_csn</name><parameter_list>(<parameter><decl><type><name>TransactionId</name></type> <name>xid</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>CommitSeqNo</name></type> <name>csn</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>LWLockAcquire</name><argument_list>(<argument><expr><name>CSNLogControlLock</name></expr></argument>, <argument><expr><name>LW_SHARED</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>csn</name> <operator>=</operator> <call><name>polar_csnlog_get_csn_recursive</name><argument_list>(<argument><expr><name>xid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><name>CSNLogControlLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<return>return <expr><name>csn</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Determine the CSN of a transaction, walking the subtransaction tree if needed.
+ *
+ * Hold shared CSNLogControlLock.
+ */</comment>
+<function><type><specifier>static</specifier> <name>CommitSeqNo</name></type>
+<name>polar_csnlog_get_csn_recursive</name><parameter_list>(<parameter><decl><type><name>TransactionId</name></type> <name>xid</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>CommitSeqNo</name></type> <name>csn</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>LWLockHeldByMeInMode</name><argument_list>(<argument><expr><name>CSNLogControlLock</name></expr></argument>, <argument><expr><name>LW_SHARED</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>csn</name> <operator>=</operator> <call><name>polar_csnlog_get_csn_internal</name><argument_list>(<argument><expr><name>xid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><call><name>POLAR_CSN_IS_SUBTRANS</name><argument_list>(<argument><expr><name>csn</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>TransactionId</name></type> <name>parent_xid</name> <init>= <expr><name>csn</name> <operator>&amp;</operator> <operator>~</operator><name>POLAR_CSN_SUBTRANS_BIT</name></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>CommitSeqNo</name></type> <name>parent_csn</name> <init>= <expr><call><name>polar_csnlog_get_csn_recursive</name><argument_list>(<argument><expr><name>parent_xid</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><operator>!</operator><call><name>POLAR_CSN_IS_SUBTRANS</name><argument_list>(<argument><expr><name>parent_csn</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/*
+		 * The parent and child transaction status update is not atomic. We
+		 * must take care not to use the updated parent status with the old
+		 * child status, or else we can wrongly see a committed subtransaction
+		 * as aborted. This happens when the parent is already marked as
+		 * committed and the child is not yet marked.
+		 */</comment>
+		<expr_stmt><expr><call><name>pg_read_barrier</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name>csn</name> <operator>=</operator> <call><name>polar_csnlog_get_csn_internal</name><argument_list>(<argument><expr><name>xid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<if_stmt><if>if <condition>(<expr><call><name>POLAR_CSN_IS_SUBTRANS</name><argument_list>(<argument><expr><name>csn</name></expr></argument>)</argument_list></call></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/*
+			 * We set status or csn in xid descend order(POLAR_CSN_COMMITTING
+			 * is only set on main xid). If child is still subtrans, then
+			 * parent_csn found before must be POLAR_CSN_COMMITTING or
+			 * POLAR_CSN_INPROGRESS. So as child csn.
+			 */</comment>
+			<if_stmt><if>if <condition>(<expr><call><name>POLAR_CSN_IS_INPROGRESS</name><argument_list>(<argument><expr><name>parent_csn</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><name>csn</name> <operator>=</operator> <name>POLAR_CSN_INPROGRESS</name></expr>;</expr_stmt></block_content></block></if>
+			<if type="elseif">else if <condition>(<expr><call><name>POLAR_CSN_IS_COMMITTING</name><argument_list>(<argument><expr><name>parent_csn</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><name>csn</name> <operator>=</operator> <name>POLAR_CSN_COMMITTING</name></expr>;</expr_stmt></block_content></block></if>
+			<else>else
+			<block>{<block_content>
+				<comment type="block">/*no cover begin*/</comment>
+				<if_stmt><if>if <condition>(<expr><name>polar_csn_elog_panic_enable</name></expr>)</condition><block type="pseudo"><block_content>
+					<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>PANIC</name></expr></argument>, <argument><expr><literal type="string">"Wrong csn state, xid: %u, parent_xid: %u, csn: "</literal><name>UINT64_FORMAT</name></expr></argument>, <argument><expr><name>xid</name></expr></argument>, <argument><expr><name>parent_xid</name></expr></argument>, <argument><expr><name>parent_csn</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if>
+				<else>else<block type="pseudo"><block_content>
+					<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>LOG</name></expr></argument>, <argument><expr><literal type="string">"Wrong csn state, xid: %u, parent_xid: %u, csn: "</literal><name>UINT64_FORMAT</name></expr></argument>, <argument><expr><name>xid</name></expr></argument>, <argument><expr><name>parent_xid</name></expr></argument>, <argument><expr><name>parent_csn</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></else></if_stmt>
+				<comment type="block">/*no cover end*/</comment>
+			</block_content>}</block></else></if_stmt>
+		</block_content>}</block></if></if_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<return>return <expr><name>csn</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Get the raw CSN value.
+ *
+ * Logic is almost same with SubTransGetParent,
+ * but we have two differences:
+ * 1. we return CommitSeqNo not TransactionId
+ * 2. we hold share CSNLogControlLock when called in
+ *    and we try best to hold share CSNLogControlLock
+ *    when exit
+ */</comment>
+<function><type><specifier>static</specifier> <name>CommitSeqNo</name></type>
+<name>polar_csnlog_get_csn_internal</name><parameter_list>(<parameter><decl><type><name>TransactionId</name></type> <name>xid</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>SlruCtl</name></type>		<name>csnlog_ctl</name> <init>= <expr><call><name>polar_csnlog_get_ctl</name><argument_list>()</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>pageno</name> <init>= <expr><call><name>TransactionIdToPageNo</name><argument_list>(<argument><expr><name>xid</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>itemno</name> <init>= <expr><call><name>TransactionIdToItemNo</name><argument_list>(<argument><expr><name>xid</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>slotno</name></decl>;</decl_stmt>
+
+	<comment type="block">/* Can't ask about stuff that might not be around anymore */</comment>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>TransactionIdFollowsOrEquals</name><argument_list>(<argument><expr><name>xid</name></expr></argument>, <argument><expr><name>TransactionXmin</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>TransactionIdIsNormal</name><argument_list>(<argument><expr><name>xid</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<if_stmt><if>if <condition>(<expr><name>xid</name> <operator>==</operator> <name>InvalidTransactionId</name></expr>)</condition><block type="pseudo"><block_content>
+			<return>return <expr><name>POLAR_CSN_ABORTED</name></expr>;</return></block_content></block></if></if_stmt>
+		<if_stmt><if>if <condition>(<expr><name>xid</name> <operator>==</operator> <name>FrozenTransactionId</name> <operator>||</operator> <name>xid</name> <operator>==</operator> <name>BootstrapTransactionId</name></expr>)</condition><block type="pseudo"><block_content>
+			<return>return <expr><name>POLAR_CSN_FROZEN</name></expr>;</return></block_content></block></if></if_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<expr_stmt><expr><name>slotno</name> <operator>=</operator> <call><name>SimpleLruReadPage_ReadOnly_Locked</name><argument_list>(<argument><expr><name>csnlog_ctl</name></expr></argument>, <argument><expr><name>pageno</name></expr></argument>, <argument><expr><name>xid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<return>return <expr><call><name>polar_csnlog_get_csn_by_itemno</name><argument_list>(<argument><expr><name>xid</name></expr></argument>, <argument><expr><name>slotno</name></expr></argument>, <argument><expr><name>itemno</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Find the next xid that is in progress.
+ * We do not care about the subtransactions, they are accounted for
+ * by their respective top-level transactions.
+ */</comment>
+<function><type><name>TransactionId</name></type>
+<name>polar_csnlog_get_next_active_xid</name><parameter_list>(<parameter><decl><type><name>TransactionId</name></type> <name>xid</name></decl></parameter>,
+								 <parameter><decl><type><name>TransactionId</name></type> <name>end</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>SlruCtl</name></type>		<name>csnlog_ctl</name> <init>= <expr><call><name>polar_csnlog_get_ctl</name><argument_list>()</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>TransactionIdIsValid</name><argument_list>(<argument><expr><name>TransactionXmin</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>LWLockAcquire</name><argument_list>(<argument><expr><name>CSNLogControlLock</name></expr></argument>, <argument><expr><name>LW_SHARED</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<for>for <control>(<init>;</init><condition>;</condition><incr/>)</control>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>int</name></type>			<name>pageno</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>int</name></type>			<name>slotno</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>int</name></type>			<name>itemno</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>CommitSeqNo</name> <modifier>*</modifier></type><name>csn_ptr</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>CommitSeqNo</name></type> <name>csn</name></decl>;</decl_stmt>
+
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>TransactionIdPrecedes</name><argument_list>(<argument><expr><name>xid</name></expr></argument>, <argument><expr><name>end</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<goto>goto <name>end</name>;</goto></block_content></block></if></if_stmt>
+
+		<expr_stmt><expr><name>pageno</name> <operator>=</operator> <call><name>TransactionIdToPageNo</name><argument_list>(<argument><expr><name>xid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name>itemno</name> <operator>=</operator> <call><name>TransactionIdToItemNo</name><argument_list>(<argument><expr><name>xid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name>slotno</name> <operator>=</operator> <call><name>SimpleLruReadPage_ReadOnly_Locked</name><argument_list>(<argument><expr><name>csnlog_ctl</name></expr></argument>, <argument><expr><name>pageno</name></expr></argument>, <argument><expr><name>xid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><name>csn_ptr</name> <operator>=</operator> <operator>(</operator><name>CommitSeqNo</name> <operator>*</operator><operator>)</operator> <name><name>csnlog_ctl</name><operator>-&gt;</operator><name>shared</name><operator>-&gt;</operator><name>page_buffer</name><index>[<expr><name>slotno</name></expr>]</index></name></expr>;</expr_stmt>
+		<expr_stmt><expr><name>csn_ptr</name> <operator>+=</operator> <name>itemno</name></expr>;</expr_stmt>
+
+		<comment type="block">/* make sure csn unchanged */</comment>
+<cpp:if>#<cpp:directive>if</cpp:directive> <expr><operator>!</operator><call><name>defined</name><argument_list>(<argument><expr><name>PG_HAVE_ATOMIC_U64_SIMULATION</name></expr></argument>)</argument_list></call></expr></cpp:if>
+		<expr_stmt><expr><name>csn</name> <operator>=</operator> <call><name>pg_atomic_read_u64</name><argument_list>(<argument><expr><operator>(</operator><specifier>volatile</specifier> <name>pg_atomic_uint64</name> <operator>*</operator><operator>)</operator> <name>csn_ptr</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+<cpp:else>#<cpp:directive>else</cpp:directive></cpp:else>
+		<expr_stmt><expr><name>csn</name> <operator>=</operator> <operator>*</operator><name>csn_ptr</name></expr>;</expr_stmt> 
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+		<if_stmt><if>if <condition>(<expr><call><name>POLAR_CSN_IS_INPROGRESS</name><argument_list>(<argument><expr><name>csn</name></expr></argument>)</argument_list></call>
+			<operator>||</operator> <call><name>POLAR_CSN_IS_COMMITTING</name><argument_list>(<argument><expr><name>csn</name></expr></argument>)</argument_list></call></expr>)</condition>
+		<block>{<block_content>
+			<goto>goto <name>end</name>;</goto>
+		</block_content>}</block></if></if_stmt>
+
+		<expr_stmt><expr><call><name>TransactionIdAdvance</name><argument_list>(<argument><expr><name>xid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></for>
+
+<label><name>end</name>:</label>
+	<expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><name>CSNLogControlLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<return>return <expr><name>xid</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Report shared-memory space needed by CSN upperbound stat.
+ */</comment>
+<function><type><specifier>static</specifier> <specifier>inline</specifier> <name>Size</name></type>
+<name>polar_csnlog_upperbound_csn_shmem_size</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<return>return <expr><sizeof>sizeof<argument_list>(<argument><expr><name>CommitSeqNo</name></expr></argument>)</argument_list></sizeof> <operator>*</operator> <name>CSNLOG_UB_GROUPS</name> <operator>+</operator> <sizeof>sizeof<argument_list>(<argument><expr><name>polar_csnlog_ub_stat</name></expr></argument>)</argument_list></sizeof></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><specifier>static</specifier> <specifier>inline</specifier> <name>CommitSeqNo</name><modifier>*</modifier></type>
+<name>polar_csnlog_get_upperbound_csn_ptr</name><parameter_list>(<parameter><decl><type><name>int</name></type> <name>slotno</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<return>return <expr><operator>(</operator><name>CommitSeqNo</name> <operator>*</operator><operator>)</operator><operator>(</operator><name>polar_upperbound_csn_ptr</name> <operator>+</operator> <sizeof>sizeof<argument_list>(<argument><expr><name>CommitSeqNo</name></expr></argument>)</argument_list></sizeof> <operator>*</operator> <name>slotno</name><operator>)</operator></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><name>polar_csnlog_ub_stat</name><modifier>*</modifier></type> 
+<name>polar_csnlog_get_upperbound_stat_ptr</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<return>return <expr><operator>(</operator><name>polar_csnlog_ub_stat</name><operator>*</operator><operator>)</operator><operator>(</operator><name>polar_upperbound_csn_ptr</name> <operator>+</operator> 
+										<sizeof>sizeof<argument_list>(<argument><expr><name>CommitSeqNo</name></expr></argument>)</argument_list></sizeof> <operator>*</operator> <name>CSNLOG_UB_GROUPS</name><operator>)</operator></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><specifier>static</specifier> <specifier>inline</specifier> <name>void</name></type> 
+<name>polar_csnlog_upperbound_csn_init</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>int</name></type>	<name>slotno</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>CommitSeqNo</name>	<modifier>*</modifier></type><name>csn_ptr</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>polar_csnlog_ub_stat</name> <modifier>*</modifier></type><name>ub_stat</name></decl>;</decl_stmt>
+	<for>for<control>(<init><expr><name>slotno</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>slotno</name> <operator>&lt;</operator> <name>CSNLOG_UB_GROUPS</name></expr>;</condition> <incr><expr><name>slotno</name><operator>++</operator></expr></incr>)</control>
+	<block>{<block_content>
+		<expr_stmt><expr><name>csn_ptr</name> <operator>=</operator> <call><name>polar_csnlog_get_upperbound_csn_ptr</name><argument_list>(<argument><expr><name>slotno</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><operator>*</operator><name>csn_ptr</name> <operator>=</operator> <name>POLAR_CSN_FROZEN</name></expr>;</expr_stmt> 
+	</block_content>}</block></for>
+	<expr_stmt><expr><name>ub_stat</name> <operator>=</operator> <call><name>polar_csnlog_get_upperbound_stat_ptr</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><name>ub_stat</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>polar_csnlog_ub_stat</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<function><type><specifier>static</specifier> <specifier>inline</specifier> <name>void</name></type> 
+<name>polar_csnlog_set_upperbound_csn</name><parameter_list>(<parameter><decl><type><name>TransactionId</name></type> <name>xid</name></decl></parameter>, <parameter><decl><type><name>CommitSeqNo</name></type> <name>csn</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+<cpp:if>#<cpp:directive>if</cpp:directive> <expr><operator>!</operator><call><name>defined</name><argument_list>(<argument><expr><name>PG_HAVE_ATOMIC_U64_SIMULATION</name></expr></argument>)</argument_list></call></expr></cpp:if>
+	<if_stmt><if>if <condition>(<expr><name>polar_csnlog_upperbound_enable</name> <operator>&amp;&amp;</operator> <call><name>POLAR_CSN_IS_COMMITTED</name><argument_list>(<argument><expr><name>csn</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>int</name></type> <name>slotno</name> <init>=<expr><call><name>TransactionIdToUBSlotNo</name><argument_list>(<argument><expr><name>xid</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>pg_atomic_uint64</name> <modifier>*</modifier></type><name>csn_ptr</name> <init>= <expr><operator>(</operator><name>pg_atomic_uint64</name> <operator>*</operator><operator>)</operator>
+							<call><name>polar_csnlog_get_upperbound_csn_ptr</name><argument_list>(<argument><expr><name>slotno</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>CommitSeqNo</name></type> <name>old_csn</name> <init>= <expr><call><name>pg_atomic_read_u64</name><argument_list>(<argument><expr><name>csn_ptr</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+		<while>while <condition>(<expr><name>old_csn</name> <operator>&lt;</operator> <name>csn</name></expr>)</condition>
+		<block>{<block_content>
+			<if_stmt><if>if <condition>(<expr><call><name>pg_atomic_compare_exchange_u64</name><argument_list>(<argument><expr><name>csn_ptr</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>old_csn</name></expr></argument>, <argument><expr><name>csn</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+				<break>break;</break></block_content></block></if></if_stmt>
+		</block_content>}</block></while>
+	</block_content>}</block></if></if_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+</block_content>}</block></function>
+
+<comment type="block">/*no cover begin*/</comment>
+<function><type><name>CommitSeqNo</name></type> 
+<name>polar_csnlog_get_upperbound_csn</name><parameter_list>(<parameter><decl><type><name>TransactionId</name></type> <name>xid</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+<cpp:if>#<cpp:directive>if</cpp:directive> <expr><operator>!</operator><call><name>defined</name><argument_list>(<argument><expr><name>PG_HAVE_ATOMIC_U64_SIMULATION</name></expr></argument>)</argument_list></call></expr></cpp:if>
+	<decl_stmt><decl><type><name>int</name></type> <name>slotno</name> <init>=<expr><call><name>TransactionIdToUBSlotNo</name><argument_list>(<argument><expr><name>xid</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>pg_atomic_uint64</name> <modifier>*</modifier></type><name>csn_ptr</name> <init>= <expr><operator>(</operator><name>pg_atomic_uint64</name> <operator>*</operator><operator>)</operator>
+							<call><name>polar_csnlog_get_upperbound_csn_ptr</name><argument_list>(<argument><expr><name>slotno</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<return>return <expr><call><name>pg_atomic_read_u64</name><argument_list>(<argument><expr><name>csn_ptr</name></expr></argument>)</argument_list></call></expr>;</return>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+	<return>return <expr><name>POLAR_CSN_MAX_NORMAL</name></expr>;</return> 
+</block_content>}</block></function>
+
+<function><type><name>void</name></type>
+<name>polar_csnlog_count_upperbound_fetch</name><parameter_list>(<parameter><decl><type><name>int</name></type> <name>t_all_fetches</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>t_ub_fetches</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>t_ub_hits</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>polar_csnlog_ub_stat</name> <modifier>*</modifier></type><name>ub_stat</name> <init>= <expr><call><name>polar_csnlog_get_upperbound_stat_ptr</name><argument_list>()</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>pg_atomic_fetch_add_u64</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>ub_stat</name><operator>-&gt;</operator><name>t_all_fetches</name></name></expr></argument>, <argument><expr><name>t_all_fetches</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><name>t_ub_fetches</name> <operator>&gt;</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>pg_atomic_fetch_add_u64</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>ub_stat</name><operator>-&gt;</operator><name>t_ub_fetches</name></name></expr></argument>, <argument><expr><name>t_ub_fetches</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	<if_stmt><if>if <condition>(<expr><name>t_ub_hits</name> <operator>&gt;</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>pg_atomic_fetch_add_u64</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>ub_stat</name><operator>-&gt;</operator><name>t_ub_hits</name></name></expr></argument>, <argument><expr><name>t_ub_hits</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+</block_content>}</block></function>
+<comment type="block">/*no cover end*/</comment>
+
+<comment type="block">/*
+ *	Search xids from start(inclusive) to end(exclusive),
+ *	add running xids(in_progress or committing or committed csn &gt;= csn arg)
+ *  to xid array. If array overflowed, set overflow flag
+ */</comment>
+<function><type><name>void</name></type> <name>polar_csnlog_get_running_xids</name><parameter_list>(<parameter><decl><type><name>TransactionId</name></type> <name>start</name></decl></parameter>, <parameter><decl><type><name>TransactionId</name></type> <name>end</name></decl></parameter>, <parameter><decl><type><name>CommitSeqNo</name></type> <name>snapshot_csn</name></decl></parameter>,
+                                   <parameter><decl><type><name>int</name></type> <name>max_xids</name></decl></parameter>, <parameter><decl><type><name>int</name> <modifier>*</modifier></type><name>nxids</name></decl></parameter>, <parameter><decl><type><name>TransactionId</name> <modifier>*</modifier></type><name>xids</name></decl></parameter>, <parameter><decl><type><name>bool</name> <modifier>*</modifier></type><name>overflowed</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>SlruCtl</name></type>		<name>csnlog_ctl</name> <init>= <expr><call><name>polar_csnlog_get_ctl</name><argument_list>()</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>TransactionIdPrecedes</name><argument_list>(<argument><expr><name>start</name></expr></argument>, <argument><expr><name>end</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>LWLockAcquire</name><argument_list>(<argument><expr><name>CSNLogControlLock</name></expr></argument>, <argument><expr><name>LW_SHARED</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><operator>*</operator><name>nxids</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+	<expr_stmt><expr><operator>*</operator><name>overflowed</name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+	<for>for <control>(<init>;</init><condition>;</condition><incr/>)</control>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>int</name></type>			<name>pageno</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>int</name></type>			<name>slotno</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>int</name></type>			<name>itemno</name></decl>;</decl_stmt>
+
+		<expr_stmt><expr><name>pageno</name> <operator>=</operator> <call><name>TransactionIdToPageNo</name><argument_list>(<argument><expr><name>start</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name>slotno</name> <operator>=</operator> <call><name>SimpleLruReadPage_ReadOnly_Locked</name><argument_list>(<argument><expr><name>csnlog_ctl</name></expr></argument>, <argument><expr><name>pageno</name></expr></argument>, <argument><expr><name>start</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name>itemno</name> <operator>=</operator> <call><name>TransactionIdToItemNo</name><argument_list>(<argument><expr><name>start</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<for>for <control>(<init>;</init> <condition><expr><name>itemno</name> <operator>&lt;</operator> <name>CSNLOG_XACTS_PER_PAGE</name></expr>;</condition> <incr><expr><name>itemno</name><operator>++</operator></expr></incr>)</control>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>CommitSeqNo</name> <modifier>*</modifier></type><name>csn_ptr</name></decl>;</decl_stmt>
+			<decl_stmt><decl><type><name>CommitSeqNo</name></type> <name>csn</name></decl>;</decl_stmt>
+
+			<expr_stmt><expr><name>csn_ptr</name> <operator>=</operator> <operator>(</operator><name>CommitSeqNo</name> <operator>*</operator><operator>)</operator> <name><name>csnlog_ctl</name><operator>-&gt;</operator><name>shared</name><operator>-&gt;</operator><name>page_buffer</name><index>[<expr><name>slotno</name></expr>]</index></name></expr>;</expr_stmt>
+			<expr_stmt><expr><name>csn_ptr</name> <operator>+=</operator> <name>itemno</name></expr>;</expr_stmt>
+
+			<comment type="block">/* make sure csn unchanged */</comment>
+<cpp:if>#<cpp:directive>if</cpp:directive> <expr><operator>!</operator><call><name>defined</name><argument_list>(<argument><expr><name>PG_HAVE_ATOMIC_U64_SIMULATION</name></expr></argument>)</argument_list></call></expr></cpp:if>
+			<expr_stmt><expr><name>csn</name> <operator>=</operator> <call><name>pg_atomic_read_u64</name><argument_list>(<argument><expr><operator>(</operator><specifier>volatile</specifier> <name>pg_atomic_uint64</name> <operator>*</operator><operator>)</operator> <name>csn_ptr</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+<cpp:else>#<cpp:directive>else</cpp:directive></cpp:else>
+			<expr_stmt><expr><name>csn</name> <operator>=</operator> <operator>*</operator><name>csn_ptr</name></expr>;</expr_stmt> 
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+			<comment type="block">/* 
+			 * In in_progress and committing status, csn must &gt;= ours,
+			 * see these as running also.
+			 */</comment>
+			<if_stmt><if>if <condition>(<expr><call><name>POLAR_CSN_IS_INPROGRESS</name><argument_list>(<argument><expr><name>csn</name></expr></argument>)</argument_list></call> <operator>||</operator> 
+				<call><name>POLAR_CSN_IS_COMMITTING</name><argument_list>(<argument><expr><name>csn</name></expr></argument>)</argument_list></call> <operator>||</operator>
+				<operator>(</operator><call><name>POLAR_CSN_IS_COMMITTED</name><argument_list>(<argument><expr><name>csn</name></expr></argument>)</argument_list></call> <operator>&amp;&amp;</operator> <name>csn</name> <operator>&gt;=</operator> <name>snapshot_csn</name><operator>)</operator></expr>)</condition>
+			<block>{<block_content>
+				<comment type="block">/* We are overflowed */</comment>
+				<if_stmt><if>if <condition>(<expr><operator>*</operator><name>nxids</name> <operator>==</operator> <name>max_xids</name></expr>)</condition>
+				<block>{<block_content>
+					<expr_stmt><expr><operator>*</operator><name>overflowed</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+
+					<expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><name>CSNLogControlLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+					<comment type="block">/* It is not a common case, log it */</comment>
+					<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>LOG</name></expr></argument>, <argument><expr><literal type="string">"xid snapshot overflowed in tx %d"</literal></expr></argument>, <argument><expr><name><name>MyPgXact</name><operator>-&gt;</operator><name>xid</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+					<return>return;</return>
+				</block_content>}</block></if></if_stmt>
+					
+				<expr_stmt><expr><name><name>xids</name><index>[<expr><operator>*</operator><name>nxids</name></expr>]</index></name> <operator>=</operator> <name>start</name></expr>;</expr_stmt>
+				<expr_stmt><expr><operator>*</operator><name>nxids</name> <operator>=</operator> <operator>*</operator><name>nxids</name> <operator>+</operator> <literal type="number">1</literal></expr>;</expr_stmt>
+			</block_content>}</block></if></if_stmt>
+
+			<expr_stmt><expr><call><name>TransactionIdAdvance</name><argument_list>(<argument><expr><name>start</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			
+			<comment type="block">/* Reach end */</comment>
+			<if_stmt><if>if <condition>(<expr><call><name>TransactionIdEquals</name><argument_list>(<argument><expr><name>start</name></expr></argument>, <argument><expr><name>end</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+				<goto>goto <name>end</name>;</goto></block_content></block></if></if_stmt>
+
+			<comment type="block">/* Need swich page */</comment>
+			<if_stmt><if>if <condition>(<expr><name>pageno</name> <operator>!=</operator> <call><name>TransactionIdToPageNo</name><argument_list>(<argument><expr><name>start</name></expr></argument>)</argument_list></call></expr>)</condition>
+			<block>{<block_content>
+				<break>break;</break>
+			</block_content>}</block></if></if_stmt>
+		</block_content>}</block></for>
+	</block_content>}</block></for>
+
+<label><name>end</name>:</label>
+	<expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><name>CSNLogControlLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Number of shared CSNLOG buffers.
+ */</comment>
+<function><type><name>Size</name></type>
+<name>polar_csnlog_shmem_buffers</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<return>return <expr><call><name>Max</name><argument_list>(<argument><expr><name>polar_csnlog_slot_size</name></expr></argument>, <argument><expr><name>BATCH_SIZE</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Initialization of shared memory for CSNLOG
+ */</comment>
+<function><type><name>Size</name></type>
+<name>polar_csnlog_shmem_size</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>Size</name></type> <name>size</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name>size</name> <operator>=</operator> <call><name>SimpleLruShmemSize</name><argument_list>(<argument><expr><call><name>polar_csnlog_shmem_buffers</name><argument_list>()</argument_list></call></expr></argument>, <argument><expr><name>CSNLOG_LSNS_PER_PAGE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>polar_csnlog_upperbound_enable</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name>size</name> <operator>=</operator> <call><name>add_size</name><argument_list>(<argument><expr><call><name>MAXALIGN</name><argument_list>(<argument><expr><name>size</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><call><name>polar_csnlog_upperbound_csn_shmem_size</name><argument_list>()</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<comment type="block">/* Add size for local cache segments */</comment>
+	<if_stmt><if>if <condition>(<expr><call><name>POLAR_ENABLE_CSNLOG_LOCAL_CACHE</name><argument_list>()</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name>size</name> <operator>=</operator> <call><name>add_size</name><argument_list>(<argument><expr><call><name>MAXALIGN</name><argument_list>(<argument><expr><name>size</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><call><name>polar_local_cache_shmem_size</name><argument_list>(<argument><expr><name>polar_csnlog_max_local_cache_segments</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<return>return <expr><name>size</name></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><name>void</name></type>
+<name>polar_csnlog_shmem_init</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>SlruCtl</name></type>	<name>csnlog_ctl</name> <init>= <expr><call><name>polar_csnlog_get_ctl</name><argument_list>()</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>polar_csnlog_upperbound_enable</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>bool</name></type>	<name>found</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>Size</name></type>	<name>size</name> <init>= <expr><call><name>polar_csnlog_upperbound_csn_shmem_size</name><argument_list>()</argument_list></call></expr></init></decl>;</decl_stmt>
+
+		<expr_stmt><expr><name>polar_upperbound_csn_ptr</name> <operator>=</operator> <call><name>ShmemInitStruct</name><argument_list>(<argument><expr><literal type="string">"CSN upperbound shared"</literal></expr></argument>, <argument><expr><name>size</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>found</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><name>found</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>polar_csnlog_upperbound_csn_init</name><argument_list>()</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<expr_stmt><expr><name><name>csnlog_ctl</name><operator>-&gt;</operator><name>PagePrecedes</name></name> <operator>=</operator> <name>polar_csnlog_page_precedes</name></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>SimpleLruInit</name><argument_list>(<argument><expr><name>csnlog_ctl</name></expr></argument>, <argument><expr><literal type="string">"csnlog"</literal></expr></argument>, <argument><expr><call><name>polar_csnlog_shmem_buffers</name><argument_list>()</argument_list></call></expr></argument>, <argument><expr><name>CSNLOG_LSNS_PER_PAGE</name></expr></argument>,
+				  <argument><expr><name>CSNLogControlLock</name></expr></argument>, <argument><expr><name>CSNLOG_DIR</name></expr></argument>, <argument><expr><name>LWTRANCHE_CSNLOG_BUFFERS</name></expr></argument>, 
+				  <argument><expr><call><name>polar_slru_file_in_shared_storage</name><argument_list>(<argument><expr><name>true</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Create local segment file cache manager */</comment>
+	<if_stmt><if>if <condition>(<expr><call><name>POLAR_ENABLE_CSNLOG_LOCAL_CACHE</name><argument_list>()</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>uint32</name></type> <name>io_permission</name> <init>= <expr><name>POLAR_CACHE_LOCAL_FILE_READ</name> <operator>|</operator> <name>POLAR_CACHE_LOCAL_FILE_WRITE</name></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>polar_local_cache</name></type> <name>cache</name></decl>;</decl_stmt>
+
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>polar_in_replica_mode</name><argument_list>()</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><name>io_permission</name> <operator>|=</operator> <operator>(</operator><name>POLAR_CACHE_SHARED_FILE_READ</name> <operator>|</operator> <name>POLAR_CACHE_SHARED_FILE_WRITE</name><operator>)</operator></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+		<expr_stmt><expr><name>cache</name> <operator>=</operator> <call><name>polar_create_local_cache</name><argument_list>(<argument><expr><literal type="string">"csnlog"</literal></expr></argument>, <argument><expr><literal type="string">"pg_csnlog"</literal></expr></argument>,
+			<argument><expr><name>polar_csnlog_max_local_cache_segments</name></expr></argument>, <argument><expr><operator>(</operator><name>SLRU_PAGES_PER_SEGMENT</name> <operator>*</operator> <name>BLCKSZ</name><operator>)</operator></expr></argument>, <argument><expr><name>LWTRANCHE_POLAR_CSNLOG_LOCAL_CACHE</name></expr></argument>,
+			<argument><expr><name>io_permission</name></expr></argument>, <argument><expr><name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><call><name>polar_slru_reg_local_cache</name><argument_list>(<argument><expr><call><name>polar_csnlog_get_ctl</name><argument_list>()</argument_list></call></expr></argument>, <argument><expr><name>cache</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Verify whether pg_csnlog exist. If not exist, recreate it.
+ */</comment>
+<function><type><name>void</name></type>
+<name>polar_csnlog_validate_dir</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name><name>struct</name> <name>stat</name></name></type> <name>stat_buf</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>char</name></type>		<name><name>path</name><index>[<expr><name>MAXPGPATH</name></expr>]</index></name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>snprintf</name><argument_list>(<argument><expr><operator>(</operator><name>path</name><operator>)</operator></expr></argument>, <argument><expr><name>MAXPGPATH</name></expr></argument>, <argument><expr><literal type="string">"%s/%s"</literal></expr></argument>, <argument><expr><ternary><condition><expr><call><name>POLAR_FILE_IN_SHARED_STORAGE</name><argument_list>()</argument_list></call></expr> ?</condition><then> 
+																<expr><name>polar_datadir</name></expr> </then><else>: <expr><name>DataDir</name></expr></else></ternary></expr></argument>, <argument><expr><name>CSNLOG_DIR</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>polar_enable_shared_storage_mode</name> <operator>&amp;&amp;</operator> <name>polar_mount_pfs_readonly_mode</name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return ;</return></block_content></block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><call><name>polar_stat</name><argument_list>(<argument><expr><name>path</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>stat_buf</name></expr></argument>)</argument_list></call> <operator>==</operator> <literal type="number">0</literal></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/*no cover begin*/</comment>
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>S_ISDIR</name><argument_list>(<argument><expr><name><name>stat_buf</name><operator>.</operator><name>st_mode</name></name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>FATAL</name></expr></argument>,
+					<argument><expr><operator>(</operator><call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"required csnlog directory \"%s\" is not a directory"</literal></expr></argument>, <argument><expr><name>path</name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+		<comment type="block">/*no cover end*/</comment>
+	</block_content>}</block></if>
+	<else>else
+	<block>{<block_content>
+		<comment type="block">/*no cover begin*/</comment>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>LOG</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"creating missing csnlog directory \"%s\""</literal></expr></argument>,
+						<argument><expr><name>path</name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		
+		<if_stmt><if>if <condition>(<expr><call><name>polar_make_pg_directory</name><argument_list>(<argument><expr><name>path</name></expr></argument>)</argument_list></call> <operator>&lt;</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>FATAL</name></expr></argument>,
+					<argument><expr><operator>(</operator><call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"could not create csnlog directory \"%s\": %m"</literal></expr></argument>,
+							<argument><expr><name>path</name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+		<comment type="block">/*no cover end*/</comment>
+	</block_content>}</block></else></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * rm the files in pg_csnlog.
+ */</comment>
+<function><type><name>void</name></type>
+<name>polar_csnlog_remove_all</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>char</name></type>		<name><name>path</name><index>[<expr><name>MAXPGPATH</name></expr>]</index></name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>DIR</name>		  <modifier>*</modifier></type><name>csnlog_dir</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name><name>struct</name> <name>dirent</name></name> <modifier>*</modifier></type><name>csnlog_de</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>snprintf</name><argument_list>(<argument><expr><operator>(</operator><name>path</name><operator>)</operator></expr></argument>, <argument><expr><name>MAXPGPATH</name></expr></argument>, <argument><expr><literal type="string">"%s/%s"</literal></expr></argument>, <argument><expr><ternary><condition><expr><call><name>POLAR_FILE_IN_SHARED_STORAGE</name><argument_list>()</argument_list></call></expr> ?</condition><then> 
+																<expr><name>polar_datadir</name></expr> </then><else>: <expr><name>DataDir</name></expr></else></ternary></expr></argument>, <argument><expr><name>CSNLOG_DIR</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>csnlog_dir</name> <operator>=</operator> <call><name>polar_allocate_dir</name><argument_list>(<argument><expr><name>path</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*no cover begin*/</comment>
+	<if_stmt><if>if <condition>(<expr><name>csnlog_dir</name> <operator>==</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return;</return></block_content></block></if></if_stmt>
+	<comment type="block">/*no cover end*/</comment>
+
+	<while>while <condition>(<expr><operator>(</operator><name>csnlog_de</name> <operator>=</operator> <call><name>ReadDir</name><argument_list>(<argument><expr><name>csnlog_dir</name></expr></argument>, <argument><expr><name>path</name></expr></argument>)</argument_list></call><operator>)</operator> <operator>!=</operator> <name>NULL</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>char</name></type>		<name><name>file_path</name><index>[<expr><name>MAXPGPATH</name></expr>]</index></name></decl>;</decl_stmt>
+
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>strcmp</name><argument_list>(<argument><expr><name><name>csnlog_de</name><operator>-&gt;</operator><name>d_name</name></name></expr></argument>, <argument><expr><literal type="string">"."</literal></expr></argument>)</argument_list></call>
+			<operator>||</operator> <operator>!</operator><call><name>strcmp</name><argument_list>(<argument><expr><name><name>csnlog_de</name><operator>-&gt;</operator><name>d_name</name></name></expr></argument>, <argument><expr><literal type="string">".."</literal></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<continue>continue;</continue></block_content></block></if></if_stmt>
+
+		<expr_stmt><expr><call><name>snprintf</name><argument_list>(<argument><expr><name>file_path</name></expr></argument>, <argument><expr><name>MAXPGPATH</name></expr></argument>, <argument><expr><literal type="string">"%s/%s"</literal></expr></argument>, <argument><expr><name>path</name></expr></argument>, <argument><expr><name><name>csnlog_de</name><operator>-&gt;</operator><name>d_name</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>LOG</name></expr></argument>, <argument><expr><literal type="string">"polar_csnlog remove  %s"</literal></expr></argument>, <argument><expr><name>file_path</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>durable_unlink</name><argument_list>(<argument><expr><name>file_path</name></expr></argument>, <argument><expr><name>LOG</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></while>
+
+	<expr_stmt><expr><call><name>FreeDir</name><argument_list>(<argument><expr><name>csnlog_dir</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * This func must be called ONCE on system install.  It creates
+ * the initial CSNLOG segment.  (The pg_csnlog directory is assumed to
+ * have been created by initdb, and polar_csnlog_shmem_init must have been
+ * called already.)
+ */</comment>
+<function><type><name>void</name></type>
+<name>polar_csnlog_bootstrap</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>SlruCtl</name></type>		<name>csnlog_ctl</name> <init>= <expr><call><name>polar_csnlog_get_ctl</name><argument_list>()</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>slotno</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>LWLockAcquire</name><argument_list>(<argument><expr><name>CSNLogControlLock</name></expr></argument>, <argument><expr><name>LW_EXCLUSIVE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Create and zero the first page of the csnlog */</comment>
+	<expr_stmt><expr><name>slotno</name> <operator>=</operator> <call><name>polar_csnlog_zero_page</name><argument_list>(<argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Make sure it's written out */</comment>
+	<expr_stmt><expr><call><name>SimpleLruWritePage</name><argument_list>(<argument><expr><name>csnlog_ctl</name></expr></argument>, <argument><expr><name>slotno</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><operator>!</operator><name><name>csnlog_ctl</name><operator>-&gt;</operator><name>shared</name><operator>-&gt;</operator><name>page_dirty</name><index>[<expr><name>slotno</name></expr>]</index></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><name>CSNLogControlLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * Redo a ZEROPAGE xlog record
+ */</comment>
+<function><type><name>void</name></type>
+<name>polar_csnlog_zero_page_redo</name><parameter_list>(<parameter><decl><type><name>int</name></type> <name>pageno</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>int</name></type>			<name>slotno</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>i</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>SlruCtl</name></type>		<name>csnlog_ctl</name> <init>= <expr><call><name>polar_csnlog_get_ctl</name><argument_list>()</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>pageno</name> <operator>%</operator> <name>BATCH_SIZE</name> <operator>==</operator> <literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>LWLockAcquire</name><argument_list>(<argument><expr><name>CSNLogControlLock</name></expr></argument>, <argument><expr><name>LW_EXCLUSIVE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Zero the page */</comment>
+	<for>for <control>(<init><expr><name>i</name> <operator>=</operator> <name>pageno</name></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name>pageno</name> <operator>+</operator> <name>BATCH_SIZE</name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control>
+	<block>{<block_content>
+		<expr_stmt><expr><name>slotno</name> <operator>=</operator> <call><name>polar_csnlog_zero_page</name><argument_list>(<argument><expr><name>i</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>SimpleLruWritePage</name><argument_list>(<argument><expr><name>csnlog_ctl</name></expr></argument>, <argument><expr><name>slotno</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><operator>!</operator><name><name>csnlog_ctl</name><operator>-&gt;</operator><name>shared</name><operator>-&gt;</operator><name>page_dirty</name><index>[<expr><name>slotno</name></expr>]</index></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></for>
+
+	<expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><name>CSNLogControlLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Write a ZEROPAGE xlog record
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>polar_csnlog_write_zero_page_xlog_rec</name><parameter_list>(<parameter><decl><type><name>int</name></type> <name>pageno</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>XLogBeginInsert</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>XLogRegisterData</name><argument_list>(<argument><expr><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <operator>(</operator><operator>&amp;</operator><name>pageno</name><operator>)</operator></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>int</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><operator>(</operator><name>void</name><operator>)</operator> <call><name>XLogInsert</name><argument_list>(<argument><expr><name>RM_XLOG_ID</name></expr></argument>, <argument><expr><name>XLOG_CSNLOG_ZEROPAGE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Initialize (or reinitialize) a page of CSNLog to zeroes.
+ *
+ * The page is not actually written, just set up in shared memory.
+ * The slot number of the new page is returned.
+ *
+ * Control lock must be held at entry, and will be held at exit.
+ */</comment>
+<function><type><specifier>static</specifier> <name>int</name></type>
+<name>polar_csnlog_zero_page</name><parameter_list>(<parameter><decl><type><name>int</name></type> <name>pageno</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<return>return <expr><call><name>SimpleLruZeroPage</name><argument_list>(<argument><expr><call><name>polar_csnlog_get_ctl</name><argument_list>()</argument_list></call></expr></argument>, <argument><expr><name>pageno</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * This must be called ONCE during postmaster or standalone-backend startup,
+ * after StartupXLOG has initialized ShmemVariableCache-&gt;nextXid.
+ *
+ * oldestActiveXID is the oldest XID of any prepared transaction, or nextXid
+ * if there are none.
+ */</comment>
+<function><type><name>void</name></type>
+<name>polar_csnlog_startup</name><parameter_list>(<parameter><decl><type><name>TransactionId</name></type> <name>oldestActiveXID</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>XidStatus</name></type>	<name>xid_status</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>XLogRecPtr</name></type> 	<name>xid_lsn</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>TransactionId</name></type> <name>xid</name> <init>= <expr><name>oldestActiveXID</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>TransactionId</name></type> <name>end_xid</name> <init>= <expr><name><name>ShmemVariableCache</name><operator>-&gt;</operator><name>nextXid</name></name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type> <name>boundary_pageno</name> <init>= <expr><call><name>TransactionIdToPageNo</name><argument_list>(<argument><expr><name>xid</name></expr></argument>)</argument_list></call> <operator>-</operator> <call><name>TransactionIdToPageNo</name><argument_list>(<argument><expr><name>xid</name></expr></argument>)</argument_list></call> <operator>%</operator> <name>BATCH_SIZE</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>TransactionId</name></type> <name>extend_xid</name> <init>= <expr><name>boundary_pageno</name> <operator>*</operator> <name>CSNLOG_XACTS_PER_PAGE</name></expr></init></decl>;</decl_stmt>
+
+	<comment type="block">/* We should give first xid in csnlog boundary page to make csnlog extend work */</comment>
+	<expr_stmt><expr><call><name>polar_csnlog_extend</name><argument_list>(<argument><expr><name>extend_xid</name></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>SimpleLruFlush</name><argument_list>(<argument><expr><call><name>polar_csnlog_get_ctl</name><argument_list>()</argument_list></call></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		
+	<if_stmt><if>if <condition>(<expr><name>xid</name> <operator>==</operator> <name>end_xid</name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return;</return></block_content></block></if></if_stmt>
+		
+	<comment type="block">/*
+	 * Since we don't expect next_csn to be valid across crashes, new
+	 * committed xact's csn will start from POLAR_CSN_FIRST_NORMAL. so we
+	 * set the committed xact on the currently-active page(s) to POLAR_CSN_FROZEN
+	 * during startup. Whenever we advance into a new page,
+	 * polar_csnlog_extend will likewise zero the new page without regard to
+	 * whatever was previously on disk.
+	 */</comment>
+	<while>while <condition>(<expr><name>xid</name> <operator>!=</operator> <name>end_xid</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name>xid_status</name> <operator>=</operator> <call><name>TransactionIdGetStatus</name><argument_list>(<argument><expr><name>xid</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>xid_lsn</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+        <comment type="block">/* Make sure the page exist */</comment>
+        <expr_stmt><expr><call><name>polar_csnlog_extend</name><argument_list>(<argument><expr><name>xid</name></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name>xid_status</name> <operator>==</operator> <name>TRANSACTION_STATUS_COMMITTED</name></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/* Set POLAR_CSN_FROZEN means committed and can be seen by anyone */</comment>
+			<expr_stmt><expr><call><name>polar_csnlog_set_csn</name><argument_list>(<argument><expr><name>xid</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><name>NULL</name></expr></argument>, <argument><expr><name>POLAR_CSN_FROZEN</name></expr></argument>, <argument><expr><name>InvalidXLogRecPtr</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+			
+		<expr_stmt><expr><call><name>TransactionIdAdvance</name><argument_list>(<argument><expr><name>xid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></while>
+
+	<expr_stmt><expr><call><name>SimpleLruFlush</name><argument_list>(<argument><expr><call><name>polar_csnlog_get_ctl</name><argument_list>()</argument_list></call></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * This must be called ONCE during postmaster or standalone-backend shutdown
+ */</comment>
+<function><type><name>void</name></type>
+<name>polar_csnlog_shutdown</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<comment type="block">/*
+	 * Flush dirty CLOG pages to disk
+	 *
+	 * This is not actually necessary from a correctness point of view. We do
+	 * it merely as a debugging aid.
+	 *
+	 * TRACE borrowed from subtrans
+	 */</comment>
+	<expr_stmt><expr><call><name>TRACE_POSTGRESQL_CSNLOG_CHECKPOINT_START</name><argument_list>(<argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>SimpleLruFlush</name><argument_list>(<argument><expr><call><name>polar_csnlog_get_ctl</name><argument_list>()</argument_list></call></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>TRACE_POSTGRESQL_CSNLOG_CHECKPOINT_DONE</name><argument_list>(<argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Perform a checkpoint --- either during shutdown, or on-the-fly
+ */</comment>
+<function><type><name>void</name></type>
+<name>polar_csnlog_checkpoint</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<comment type="block">/*
+	 * Flush dirty CSNLog pages to disk
+	 *
+	 * This is not actually necessary from a correctness point of view. We do
+	 * it merely to improve the odds that writing of dirty pages is done by
+	 * the checkpoint process and not by backends.
+	 *
+	 * TRACE borrowed from subtrans
+	 */</comment>
+	<expr_stmt><expr><call><name>TRACE_POSTGRESQL_CSNLOG_CHECKPOINT_START</name><argument_list>(<argument><expr><name>true</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>SimpleLruFlush</name><argument_list>(<argument><expr><call><name>polar_csnlog_get_ctl</name><argument_list>()</argument_list></call></expr></argument>, <argument><expr><name>true</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>TRACE_POSTGRESQL_CSNLOG_CHECKPOINT_DONE</name><argument_list>(<argument><expr><name>true</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * Make sure that CSNLOG has room for a newly-allocated XID.
+ *
+ * NB: this is called while holding XidGenLock.  We want it to be very fast
+ * most of the time; even when it's not so fast, no actual I/O need happen
+ * unless we're forced to write out a dirty csnlog page to make room
+ * in shared memory.
+ */</comment>
+<function><type><name>void</name></type>
+<name>polar_csnlog_extend</name><parameter_list>(<parameter><decl><type><name>TransactionId</name></type> <name>newestXact</name></decl></parameter>, <parameter><decl><type><name>bool</name></type> <name>write_wal</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>int</name></type>			<name>i</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>pageno</name></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * No work except at first XID of a page.  But beware: just after
+	 * wraparound, the first XID of page zero is FirstNormalTransactionId.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><call><name>TransactionIdToItemNo</name><argument_list>(<argument><expr><name>newestXact</name></expr></argument>)</argument_list></call> <operator>!=</operator> <literal type="number">0</literal> <operator>&amp;&amp;</operator>
+		<operator>!</operator><call><name>TransactionIdEquals</name><argument_list>(<argument><expr><name>newestXact</name></expr></argument>, <argument><expr><name>FirstNormalTransactionId</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<return>return;</return></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><name>pageno</name> <operator>=</operator> <call><name>TransactionIdToPageNo</name><argument_list>(<argument><expr><name>newestXact</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>pageno</name> <operator>%</operator> <name>BATCH_SIZE</name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return;</return></block_content></block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>write_wal</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>polar_csnlog_write_zero_page_xlog_rec</name><argument_list>(<argument><expr><name>pageno</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>LWLockAcquire</name><argument_list>(<argument><expr><name>CSNLogControlLock</name></expr></argument>, <argument><expr><name>LW_EXCLUSIVE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Zero the page */</comment>
+	<for>for <control>(<init><expr><name>i</name> <operator>=</operator> <name>pageno</name></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name>pageno</name> <operator>+</operator> <name>BATCH_SIZE</name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>polar_csnlog_zero_page</name><argument_list>(<argument><expr><name>i</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></for>
+
+
+	<expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><name>CSNLogControlLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<function><type><name>void</name></type> <name>polar_csnlog_truncate_redo</name><parameter_list>(<parameter><decl><type><name>int</name></type> <name>pageno</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>SlruCtl</name></type>	<name>csnlog_ctl</name> <init>= <expr><call><name>polar_csnlog_get_ctl</name><argument_list>()</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * During XLOG replay, latest_page_number isn't set up yet; insert a
+	 * suitable value to bypass the sanity test in SimpleLruTruncate.
+	 */</comment>
+	<expr_stmt><expr><name><name>csnlog_ctl</name><operator>-&gt;</operator><name>shared</name><operator>-&gt;</operator><name>latest_page_number</name></name> <operator>=</operator> <name>pageno</name></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>SimpleLruTruncate</name><argument_list>(<argument><expr><name>csnlog_ctl</name></expr></argument>, <argument><expr><name>pageno</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Write a CSNLOG TRUNCATE xlog record
+ *
+ * We must flush the xlog record to disk before returning --- see notes
+ * in TruncateCLOG().
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>polar_csnlog_write_truncate_xlog_rec</name><parameter_list>(<parameter><decl><type><name>int</name></type> <name>pageno</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>XLogRecPtr</name></type>	<name>recptr</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>XLogBeginInsert</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>XLogRegisterData</name><argument_list>(<argument><expr><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <operator>(</operator><operator>&amp;</operator><name>pageno</name><operator>)</operator></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>int</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>recptr</name> <operator>=</operator> <call><name>XLogInsert</name><argument_list>(<argument><expr><name>RM_XLOG_ID</name></expr></argument>, <argument><expr><name>XLOG_CSNLOG_TRUNCATE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>XLogFlush</name><argument_list>(<argument><expr><name>recptr</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Remove all CSNLOG segments before the one holding the passed transaction ID
+ *
+ * Before removing any CLOG data, we must flush XLOG to disk, to ensure
+ * that any recently-emitted HEAP_FREEZE records have reached disk; otherwise
+ * a crash and restart might leave us with some unfrozen tuples referencing
+ * removed CLOG data.  We choose to emit a special TRUNCATE XLOG record too.
+ * Replaying the deletion from XLOG is not critical, since the files could
+ * just as well be removed later, but doing so prevents a long-running hot
+ * standby server from acquiring an unreasonably bloated CLOG directory.
+ *
+ * This is normally called during checkpoint, with oldestXact being the
+ * oldest TransactionXmin of any running transaction.
+ */</comment>
+<function><type><name>void</name></type>
+<name>polar_csnlog_truncate</name><parameter_list>(<parameter><decl><type><name>TransactionId</name></type> <name>oldest_xact</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>SlruCtl</name></type>		<name>csnlog_ctl</name> <init>= <expr><call><name>polar_csnlog_get_ctl</name><argument_list>()</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>cutoff_pageno</name></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * The cutoff point is the start of the segment containing oldestXact. We
+	 * pass the *page* containing oldestXact to SimpleLruTruncate.
+	 */</comment>
+	<expr_stmt><expr><name>cutoff_pageno</name> <operator>=</operator> <call><name>TransactionIdToPageNo</name><argument_list>(<argument><expr><name>oldest_xact</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Check to see if there's any files that could be removed */</comment>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>SlruScanDirectory</name><argument_list>(<argument><expr><name>csnlog_ctl</name></expr></argument>, <argument><expr><name>SlruScanDirCbReportPresence</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>cutoff_pageno</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<return>return;</return></block_content></block></if></if_stmt>					<comment type="block">/* nothing to remove */</comment>
+
+	<comment type="block">/*
+	 * Write XLOG record and flush XLOG to disk. 
+	 */</comment>
+	<expr_stmt><expr><call><name>polar_csnlog_write_truncate_xlog_rec</name><argument_list>(<argument><expr><name>cutoff_pageno</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>SimpleLruTruncate</name><argument_list>(<argument><expr><name>csnlog_ctl</name></expr></argument>, <argument><expr><name>cutoff_pageno</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>LOG</name></expr></argument>, <argument><expr><literal type="string">"CSNLog truncate xid:%d"</literal></expr></argument>, <argument><expr><name>oldest_xact</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * Decide which of two CSN log page numbers is "older" for truncation purposes.
+ *
+ * We need to use comparison of TransactionIds here in order to do the right
+ * thing with wraparound XID arithmetic.  However, if we are asked about
+ * page number zero, we don't want to hand InvalidTransactionId to
+ * TransactionIdPrecedes: it'll get weird about permanent xact IDs.  So,
+ * offset both xids by FirstNormalTransactionId to avoid that.
+ */</comment>
+<function><type><specifier>static</specifier> <name>bool</name></type>
+<name>polar_csnlog_page_precedes</name><parameter_list>(<parameter><decl><type><name>int</name></type> <name>page1</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>page2</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>TransactionId</name></type> <name>xid1</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>TransactionId</name></type> <name>xid2</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name>xid1</name> <operator>=</operator> <operator>(</operator><operator>(</operator><name>TransactionId</name><operator>)</operator> <name>page1</name><operator>)</operator> <operator>*</operator> <name>CSNLOG_XACTS_PER_PAGE</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name>xid1</name> <operator>+=</operator> <name>FirstNormalTransactionId</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name>xid2</name> <operator>=</operator> <operator>(</operator><operator>(</operator><name>TransactionId</name><operator>)</operator> <name>page2</name><operator>)</operator> <operator>*</operator> <name>CSNLOG_XACTS_PER_PAGE</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name>xid2</name> <operator>+=</operator> <name>FirstNormalTransactionId</name></expr>;</expr_stmt>
+
+	<return>return <expr><call><name>TransactionIdPrecedes</name><argument_list>(<argument><expr><name>xid1</name></expr></argument>, <argument><expr><name>xid2</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/* 
+ * Do online promote for csnlog
+ */</comment>
+<function><type><name>void</name></type>
+<name>polar_promote_csnlog</name><parameter_list>(<parameter><decl><type><name>TransactionId</name></type> <name>oldest_active_xid</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<comment type="block">/* POLAR: During ro promoting, start up the csnlog base on oldest active xid to make sure csn data is consistent with clog */</comment>
+	<expr_stmt><expr><call><name>polar_csnlog_startup</name><argument_list>(<argument><expr><name>oldest_active_xid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>polar_slru_promote</name><argument_list>(<argument><expr><call><name>polar_csnlog_get_ctl</name><argument_list>()</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/* POLAR: remove csnlog local cache file */</comment>
+<function><type><name>void</name></type>
+<name>polar_remove_csnlog_local_cache_file</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>polar_slru_remove_local_cache_file</name><argument_list>(<argument><expr><call><name>polar_csnlog_get_ctl</name><argument_list>()</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+</unit>

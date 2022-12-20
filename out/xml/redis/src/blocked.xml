@@ -1,0 +1,635 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<unit xmlns="http://www.srcML.org/srcML/src" xmlns:cpp="http://www.srcML.org/srcML/cpp" revision="1.0.0" language="C" filename="/cloned_projects/redis/src/blocked.c"><comment type="block">/* blocked.c - generic support for blocking operations like BLPOP &amp; WAIT.
+ *
+ * Copyright (c) 2009-2012, Salvatore Sanfilippo &lt;antirez at gmail dot com&gt;
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ *   * Redistributions of source code must retain the above copyright notice,
+ *     this list of conditions and the following disclaimer.
+ *   * Redistributions in binary form must reproduce the above copyright
+ *     notice, this list of conditions and the following disclaimer in the
+ *     documentation and/or other materials provided with the distribution.
+ *   * Neither the name of Redis nor the names of its contributors may be used
+ *     to endorse or promote products derived from this software without
+ *     specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ *
+ * ---------------------------------------------------------------------------
+ *
+ * API:
+ *
+ * getTimeoutFromObjectOrReply() is just an utility function to parse a
+ * timeout argument since blocking operations usually require a timeout.
+ *
+ * blockClient() set the CLIENT_BLOCKED flag in the client, and set the
+ * specified block type 'btype' filed to one of BLOCKED_* macros.
+ *
+ * unblockClient() unblocks the client doing the following:
+ * 1) It calls the btype-specific function to cleanup the state.
+ * 2) It unblocks the client by unsetting the CLIENT_BLOCKED flag.
+ * 3) It puts the client into a list of just unblocked clients that are
+ *    processed ASAP in the beforeSleep() event loop callback, so that
+ *    if there is some query buffer to process, we do it. This is also
+ *    required because otherwise there is no 'readable' event fired, we
+ *    already read the pending commands. We also set the CLIENT_UNBLOCKED
+ *    flag to remember the client is in the unblocked_clients list.
+ *
+ * processUnblockedClients() is called inside the beforeSleep() function
+ * to process the query buffer from unblocked clients and remove the clients
+ * from the blocked_clients queue.
+ *
+ * replyToBlockedClientTimedOut() is called by the cron function when
+ * a client blocked reaches the specified timeout (if the timeout is set
+ * to 0, no timeout is processed).
+ * It usually just needs to send a reply to the client.
+ *
+ * When implementing a new type of blocking opeation, the implementation
+ * should modify unblockClient() and replyToBlockedClientTimedOut() in order
+ * to handle the btype-specific behavior of this two functions.
+ * If the blocking operation waits for certain keys to change state, the
+ * clusterRedirectBlockedClientIfNeeded() function should also be updated.
+ */</comment>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"server.h"</cpp:file></cpp:include>
+
+<function_decl><type><name>int</name></type> <name>serveClientBlockedOnList</name><parameter_list>(<parameter><decl><type><name>client</name> <modifier>*</modifier></type><name>receiver</name></decl></parameter>, <parameter><decl><type><name>robj</name> <modifier>*</modifier></type><name>key</name></decl></parameter>, <parameter><decl><type><name>robj</name> <modifier>*</modifier></type><name>dstkey</name></decl></parameter>, <parameter><decl><type><name>redisDb</name> <modifier>*</modifier></type><name>db</name></decl></parameter>, <parameter><decl><type><name>robj</name> <modifier>*</modifier></type><name>value</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>where</name></decl></parameter>)</parameter_list>;</function_decl>
+
+<comment type="block">/* This structure represents the blocked key information that we store
+ * in the client structure. Each client blocked on keys, has a
+ * client-&gt;bpop.keys hash table. The keys of the hash table are Redis
+ * keys pointers to 'robj' structures. The value is this structure.
+ * The structure has two goals: firstly we store the list node that this
+ * client uses to be listed in the database "blocked clients for this key"
+ * list, so we can later unblock in O(1) without a list scan.
+ * Secondly for certain blocking types, we have additional info. Right now
+ * the only use for additional info we have is when clients are blocked
+ * on streams, as we have to remember the ID it blocked for. */</comment>
+<typedef>typedef <type><struct>struct <name>bkinfo</name> <block>{
+    <decl_stmt><decl><type><name>listNode</name> <modifier>*</modifier></type><name>listnode</name></decl>;</decl_stmt>     <comment type="block">/* List node for db-&gt;blocking_keys[key] list. */</comment>
+    <decl_stmt><decl><type><name>streamID</name></type> <name>stream_id</name></decl>;</decl_stmt>     <comment type="block">/* Stream ID if we blocked in a stream. */</comment>
+}</block></struct></type> <name>bkinfo</name>;</typedef>
+
+<comment type="block">/* Get a timeout value from an object and store it into 'timeout'.
+ * The final timeout is always stored as milliseconds as a time where the
+ * timeout will expire, however the parsing is performed according to
+ * the 'unit' that can be seconds or milliseconds.
+ *
+ * Note that if the timeout is zero (usually from the point of view of
+ * commands API this means no timeout) the value stored into 'timeout'
+ * is zero. */</comment>
+<function><type><name>int</name></type> <name>getTimeoutFromObjectOrReply</name><parameter_list>(<parameter><decl><type><name>client</name> <modifier>*</modifier></type><name>c</name></decl></parameter>, <parameter><decl><type><name>robj</name> <modifier>*</modifier></type><name>object</name></decl></parameter>, <parameter><decl><type><name>mstime_t</name> <modifier>*</modifier></type><name>timeout</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>unit</name></decl></parameter>)</parameter_list> <block>{<block_content>
+    <decl_stmt><decl><type><name>PORT_LONGLONG</name></type> <name>tval</name></decl>;</decl_stmt>
+
+    <if_stmt><if>if <condition>(<expr><call><name>getLongLongFromObjectOrReply</name><argument_list>(<argument><expr><name>c</name></expr></argument>,<argument><expr><name>object</name></expr></argument>,<argument><expr><operator>&amp;</operator><name>tval</name></expr></argument>,
+        <argument><expr><literal type="string">"timeout is not an integer or out of range"</literal></expr></argument>)</argument_list></call> <operator>!=</operator> <name>C_OK</name></expr>)</condition><block type="pseudo"><block_content>
+        <return>return <expr><name>C_ERR</name></expr>;</return></block_content></block></if></if_stmt>
+
+    <if_stmt><if>if <condition>(<expr><name>tval</name> <operator>&lt;</operator> <literal type="number">0</literal></expr>)</condition> <block>{<block_content>
+        <expr_stmt><expr><call><name>addReplyError</name><argument_list>(<argument><expr><name>c</name></expr></argument>,<argument><expr><literal type="string">"timeout is negative"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <return>return <expr><name>C_ERR</name></expr>;</return>
+    </block_content>}</block></if></if_stmt>
+
+    <if_stmt><if>if <condition>(<expr><name>tval</name> <operator>&gt;</operator> <literal type="number">0</literal></expr>)</condition> <block>{<block_content>
+        <if_stmt><if>if <condition>(<expr><name>unit</name> <operator>==</operator> <name>UNIT_SECONDS</name></expr>)</condition><block type="pseudo"><block_content> <expr_stmt><expr><name>tval</name> <operator>*=</operator> <literal type="number">1000</literal></expr>;</expr_stmt></block_content></block></if></if_stmt>
+        <expr_stmt><expr><name>tval</name> <operator>+=</operator> <call><name>mstime</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+    </block_content>}</block></if></if_stmt>
+    <expr_stmt><expr><operator>*</operator><name>timeout</name> <operator>=</operator> <name>tval</name></expr>;</expr_stmt>
+
+    <return>return <expr><name>C_OK</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/* Block a client for the specific operation type. Once the CLIENT_BLOCKED
+ * flag is set client query buffer is not longer processed, but accumulated,
+ * and will be processed when the client is unblocked. */</comment>
+<function><type><name>void</name></type> <name>blockClient</name><parameter_list>(<parameter><decl><type><name>client</name> <modifier>*</modifier></type><name>c</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>btype</name></decl></parameter>)</parameter_list> <block>{<block_content>
+    <expr_stmt><expr><name><name>c</name><operator>-&gt;</operator><name>flags</name></name> <operator>|=</operator> <name>CLIENT_BLOCKED</name></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>c</name><operator>-&gt;</operator><name>btype</name></name> <operator>=</operator> <name>btype</name></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>server</name><operator>.</operator><name>blocked_clients</name></name><operator>++</operator></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>server</name><operator>.</operator><name>blocked_clients_by_type</name><index>[<expr><name>btype</name></expr>]</index></name><operator>++</operator></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/* This function is called in the beforeSleep() function of the event loop
+ * in order to process the pending input buffer of clients that were
+ * unblocked after a blocking operation. */</comment>
+<function><type><name>void</name></type> <name>processUnblockedClients</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list> <block>{<block_content>
+    <decl_stmt><decl><type><name>listNode</name> <modifier>*</modifier></type><name>ln</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>client</name> <modifier>*</modifier></type><name>c</name></decl>;</decl_stmt>
+
+    <while>while <condition>(<expr><call><name>listLength</name><argument_list>(<argument><expr><name><name>server</name><operator>.</operator><name>unblocked_clients</name></name></expr></argument>)</argument_list></call></expr>)</condition> <block>{<block_content>
+        <expr_stmt><expr><name>ln</name> <operator>=</operator> <call><name>listFirst</name><argument_list>(<argument><expr><name><name>server</name><operator>.</operator><name>unblocked_clients</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <expr_stmt><expr><call><name>serverAssert</name><argument_list>(<argument><expr><name>ln</name> <operator>!=</operator> <name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <expr_stmt><expr><name>c</name> <operator>=</operator> <name><name>ln</name><operator>-&gt;</operator><name>value</name></name></expr>;</expr_stmt>
+        <expr_stmt><expr><call><name>listDelNode</name><argument_list>(<argument><expr><name><name>server</name><operator>.</operator><name>unblocked_clients</name></name></expr></argument>,<argument><expr><name>ln</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <expr_stmt><expr><name><name>c</name><operator>-&gt;</operator><name>flags</name></name> <operator>&amp;=</operator> <operator>~</operator><name>CLIENT_UNBLOCKED</name></expr>;</expr_stmt>
+
+        <comment type="block">/* Process remaining data in the input buffer, unless the client
+         * is blocked again. Actually processInputBuffer() checks that the
+         * client is not blocked before to proceed, but things may change and
+         * the code is conceptually more correct this way. */</comment>
+        <if_stmt><if>if <condition>(<expr><operator>!</operator><operator>(</operator><name><name>c</name><operator>-&gt;</operator><name>flags</name></name> <operator>&amp;</operator> <name>CLIENT_BLOCKED</name><operator>)</operator></expr>)</condition> <block>{<block_content>
+            <if_stmt><if>if <condition>(<expr><name><name>c</name><operator>-&gt;</operator><name>querybuf</name></name> <operator>&amp;&amp;</operator> <call><name>sdslen</name><argument_list>(<argument><expr><name><name>c</name><operator>-&gt;</operator><name>querybuf</name></name></expr></argument>)</argument_list></call> <operator>&gt;</operator> <literal type="number">0</literal></expr>)</condition> <block>{<block_content>
+                <expr_stmt><expr><call><name>processInputBufferAndReplicate</name><argument_list>(<argument><expr><name>c</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+            </block_content>}</block></if></if_stmt>
+        </block_content>}</block></if></if_stmt>
+    </block_content>}</block></while>
+</block_content>}</block></function>
+
+<comment type="block">/* This function will schedule the client for reprocessing at a safe time.
+ *
+ * This is useful when a client was blocked for some reason (blocking opeation,
+ * CLIENT PAUSE, or whatever), because it may end with some accumulated query
+ * buffer that needs to be processed ASAP:
+ *
+ * 1. When a client is blocked, its readable handler is still active.
+ * 2. However in this case it only gets data into the query buffer, but the
+ *    query is not parsed or executed once there is enough to proceed as
+ *    usually (because the client is blocked... so we can't execute commands).
+ * 3. When the client is unblocked, without this function, the client would
+ *    have to write some query in order for the readable handler to finally
+ *    call processQueryBuffer*() on it.
+ * 4. With this function instead we can put the client in a queue that will
+ *    process it for queries ready to be executed at a safe time.
+ */</comment>
+<function><type><name>void</name></type> <name>queueClientForReprocessing</name><parameter_list>(<parameter><decl><type><name>client</name> <modifier>*</modifier></type><name>c</name></decl></parameter>)</parameter_list> <block>{<block_content>
+    <comment type="block">/* The client may already be into the unblocked list because of a previous
+     * blocking operation, don't add back it into the list multiple times. */</comment>
+    <if_stmt><if>if <condition>(<expr><operator>!</operator><operator>(</operator><name><name>c</name><operator>-&gt;</operator><name>flags</name></name> <operator>&amp;</operator> <name>CLIENT_UNBLOCKED</name><operator>)</operator></expr>)</condition> <block>{<block_content>
+        <expr_stmt><expr><name><name>c</name><operator>-&gt;</operator><name>flags</name></name> <operator>|=</operator> <name>CLIENT_UNBLOCKED</name></expr>;</expr_stmt>
+        <expr_stmt><expr><call><name>listAddNodeTail</name><argument_list>(<argument><expr><name><name>server</name><operator>.</operator><name>unblocked_clients</name></name></expr></argument>,<argument><expr><name>c</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    </block_content>}</block></if></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/* Unblock a client calling the right function depending on the kind
+ * of operation the client is blocking for. */</comment>
+<function><type><name>void</name></type> <name>unblockClient</name><parameter_list>(<parameter><decl><type><name>client</name> <modifier>*</modifier></type><name>c</name></decl></parameter>)</parameter_list> <block>{<block_content>
+    <if_stmt><if>if <condition>(<expr><name><name>c</name><operator>-&gt;</operator><name>btype</name></name> <operator>==</operator> <name>BLOCKED_LIST</name> <operator>||</operator>
+        <name><name>c</name><operator>-&gt;</operator><name>btype</name></name> <operator>==</operator> <name>BLOCKED_ZSET</name> <operator>||</operator>
+        <name><name>c</name><operator>-&gt;</operator><name>btype</name></name> <operator>==</operator> <name>BLOCKED_STREAM</name></expr>)</condition> <block>{<block_content>
+        <expr_stmt><expr><call><name>unblockClientWaitingData</name><argument_list>(<argument><expr><name>c</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    </block_content>}</block></if> <if type="elseif">else if <condition>(<expr><name><name>c</name><operator>-&gt;</operator><name>btype</name></name> <operator>==</operator> <name>BLOCKED_WAIT</name></expr>)</condition> <block>{<block_content>
+        <expr_stmt><expr><call><name>unblockClientWaitingReplicas</name><argument_list>(<argument><expr><name>c</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    </block_content>}</block></if> <if type="elseif">else if <condition>(<expr><name><name>c</name><operator>-&gt;</operator><name>btype</name></name> <operator>==</operator> <name>BLOCKED_MODULE</name></expr>)</condition> <block>{<block_content>
+        <expr_stmt><expr><call><name>unblockClientFromModule</name><argument_list>(<argument><expr><name>c</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    </block_content>}</block></if> <else>else <block>{<block_content>
+        <expr_stmt><expr><call><name>serverPanic</name><argument_list>(<argument><expr><literal type="string">"Unknown btype in unblockClient()."</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    </block_content>}</block></else></if_stmt>
+    <comment type="block">/* Clear the flags, and put the client in the unblocked list so that
+     * we'll process new commands in its query buffer ASAP. */</comment>
+    <expr_stmt><expr><name><name>server</name><operator>.</operator><name>blocked_clients</name></name><operator>--</operator></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>server</name><operator>.</operator><name>blocked_clients_by_type</name><index>[<expr><name><name>c</name><operator>-&gt;</operator><name>btype</name></name></expr>]</index></name><operator>--</operator></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>c</name><operator>-&gt;</operator><name>flags</name></name> <operator>&amp;=</operator> <operator>~</operator><name>CLIENT_BLOCKED</name></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>c</name><operator>-&gt;</operator><name>btype</name></name> <operator>=</operator> <name>BLOCKED_NONE</name></expr>;</expr_stmt>
+    <expr_stmt><expr><call><name>queueClientForReprocessing</name><argument_list>(<argument><expr><name>c</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/* This function gets called when a blocked client timed out in order to
+ * send it a reply of some kind. After this function is called,
+ * unblockClient() will be called with the same client as argument. */</comment>
+<function><type><name>void</name></type> <name>replyToBlockedClientTimedOut</name><parameter_list>(<parameter><decl><type><name>client</name> <modifier>*</modifier></type><name>c</name></decl></parameter>)</parameter_list> <block>{<block_content>
+    <if_stmt><if>if <condition>(<expr><name><name>c</name><operator>-&gt;</operator><name>btype</name></name> <operator>==</operator> <name>BLOCKED_LIST</name> <operator>||</operator>
+        <name><name>c</name><operator>-&gt;</operator><name>btype</name></name> <operator>==</operator> <name>BLOCKED_ZSET</name> <operator>||</operator>
+        <name><name>c</name><operator>-&gt;</operator><name>btype</name></name> <operator>==</operator> <name>BLOCKED_STREAM</name></expr>)</condition> <block>{<block_content>
+        <expr_stmt><expr><call><name>addReply</name><argument_list>(<argument><expr><name>c</name></expr></argument>,<argument><expr><name><name>shared</name><operator>.</operator><name>nullmultibulk</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    </block_content>}</block></if> <if type="elseif">else if <condition>(<expr><name><name>c</name><operator>-&gt;</operator><name>btype</name></name> <operator>==</operator> <name>BLOCKED_WAIT</name></expr>)</condition> <block>{<block_content>
+        <expr_stmt><expr><call><name>addReplyLongLong</name><argument_list>(<argument><expr><name>c</name></expr></argument>,<argument><expr><call><name>replicationCountAcksByOffset</name><argument_list>(<argument><expr><name><name>c</name><operator>-&gt;</operator><name>bpop</name><operator>.</operator><name>reploffset</name></name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    </block_content>}</block></if> <if type="elseif">else if <condition>(<expr><name><name>c</name><operator>-&gt;</operator><name>btype</name></name> <operator>==</operator> <name>BLOCKED_MODULE</name></expr>)</condition> <block>{<block_content>
+        <expr_stmt><expr><call><name>moduleBlockedClientTimedOut</name><argument_list>(<argument><expr><name>c</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    </block_content>}</block></if> <else>else <block>{<block_content>
+        <expr_stmt><expr><call><name>serverPanic</name><argument_list>(<argument><expr><literal type="string">"Unknown btype in replyToBlockedClientTimedOut()."</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    </block_content>}</block></else></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/* Mass-unblock clients because something changed in the instance that makes
+ * blocking no longer safe. For example clients blocked in list operations
+ * in an instance which turns from master to slave is unsafe, so this function
+ * is called when a master turns into a slave.
+ *
+ * The semantics is to send an -UNBLOCKED error to the client, disconnecting
+ * it at the same time. */</comment>
+<function><type><name>void</name></type> <name>disconnectAllBlockedClients</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list> <block>{<block_content>
+    <decl_stmt><decl><type><name>listNode</name> <modifier>*</modifier></type><name>ln</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>listIter</name></type> <name>li</name></decl>;</decl_stmt>
+
+    <expr_stmt><expr><call><name>listRewind</name><argument_list>(<argument><expr><name><name>server</name><operator>.</operator><name>clients</name></name></expr></argument>,<argument><expr><operator>&amp;</operator><name>li</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <while>while<condition>(<expr><operator>(</operator><name>ln</name> <operator>=</operator> <call><name>listNext</name><argument_list>(<argument><expr><operator>&amp;</operator><name>li</name></expr></argument>)</argument_list></call><operator>)</operator></expr>)</condition> <block>{<block_content>
+        <decl_stmt><decl><type><name>client</name> <modifier>*</modifier></type><name>c</name> <init>= <expr><call><name>listNodeValue</name><argument_list>(<argument><expr><name>ln</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+        <if_stmt><if>if <condition>(<expr><name><name>c</name><operator>-&gt;</operator><name>flags</name></name> <operator>&amp;</operator> <name>CLIENT_BLOCKED</name></expr>)</condition> <block>{<block_content>
+            <expr_stmt><expr><call><name>addReplySds</name><argument_list>(<argument><expr><name>c</name></expr></argument>,<argument><expr><call><name>sdsnew</name><argument_list>(
+                <argument><expr><literal type="string">"-UNBLOCKED force unblock from blocking operation, "</literal>
+                <literal type="string">"instance state changed (master -&gt; replica?)\r\n"</literal></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+            <expr_stmt><expr><call><name>unblockClient</name><argument_list>(<argument><expr><name>c</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+            <expr_stmt><expr><name><name>c</name><operator>-&gt;</operator><name>flags</name></name> <operator>|=</operator> <name>CLIENT_CLOSE_AFTER_REPLY</name></expr>;</expr_stmt>
+        </block_content>}</block></if></if_stmt>
+    </block_content>}</block></while>
+</block_content>}</block></function>
+
+<comment type="block">/* This function should be called by Redis every time a single command,
+ * a MULTI/EXEC block, or a Lua script, terminated its execution after
+ * being called by a client. It handles serving clients blocked in
+ * lists, streams, and sorted sets, via a blocking commands.
+ *
+ * All the keys with at least one client blocked that received at least
+ * one new element via some write operation are accumulated into
+ * the server.ready_keys list. This function will run the list and will
+ * serve clients accordingly. Note that the function will iterate again and
+ * again as a result of serving BRPOPLPUSH we can have new blocking clients
+ * to serve because of the PUSH side of BRPOPLPUSH.
+ *
+ * This function is normally "fair", that is, it will server clients
+ * using a FIFO behavior. However this fairness is violated in certain
+ * edge cases, that is, when we have clients blocked at the same time
+ * in a sorted set and in a list, for the same key (a very odd thing to
+ * do client side, indeed!). Because mismatching clients (blocking for
+ * a different type compared to the current key type) are moved in the
+ * other side of the linked list. However as long as the key starts to
+ * be used only for a single type, like virtually any Redis application will
+ * do, the function is already fair. */</comment>
+<function><type><name>void</name></type> <name>handleClientsBlockedOnKeys</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list> <block>{<block_content>
+    <while>while<condition>(<expr><call><name>listLength</name><argument_list>(<argument><expr><name><name>server</name><operator>.</operator><name>ready_keys</name></name></expr></argument>)</argument_list></call> <operator>!=</operator> <literal type="number">0</literal></expr>)</condition> <block>{<block_content>
+        <decl_stmt><decl><type><name>list</name> <modifier>*</modifier></type><name>l</name></decl>;</decl_stmt>
+
+        <comment type="block">/* Point server.ready_keys to a fresh list and save the current one
+         * locally. This way as we run the old list we are free to call
+         * signalKeyAsReady() that may push new elements in server.ready_keys
+         * when handling clients blocked into BRPOPLPUSH. */</comment>
+        <expr_stmt><expr><name>l</name> <operator>=</operator> <name><name>server</name><operator>.</operator><name>ready_keys</name></name></expr>;</expr_stmt>
+        <expr_stmt><expr><name><name>server</name><operator>.</operator><name>ready_keys</name></name> <operator>=</operator> <call><name>listCreate</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+        <while>while<condition>(<expr><call><name>listLength</name><argument_list>(<argument><expr><name>l</name></expr></argument>)</argument_list></call> <operator>!=</operator> <literal type="number">0</literal></expr>)</condition> <block>{<block_content>
+            <decl_stmt><decl><type><name>listNode</name> <modifier>*</modifier></type><name>ln</name> <init>= <expr><call><name>listFirst</name><argument_list>(<argument><expr><name>l</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+            <decl_stmt><decl><type><name>readyList</name> <modifier>*</modifier></type><name>rl</name> <init>= <expr><name><name>ln</name><operator>-&gt;</operator><name>value</name></name></expr></init></decl>;</decl_stmt>
+
+            <comment type="block">/* First of all remove this key from db-&gt;ready_keys so that
+             * we can safely call signalKeyAsReady() against this key. */</comment>
+            <expr_stmt><expr><call><name>dictDelete</name><argument_list>(<argument><expr><name><name>rl</name><operator>-&gt;</operator><name>db</name><operator>-&gt;</operator><name>ready_keys</name></name></expr></argument>,<argument><expr><name><name>rl</name><operator>-&gt;</operator><name>key</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+            <comment type="block">/* Even if we are not inside call(), increment the call depth
+             * in order to make sure that keys are expired against a fixed
+             * reference time, and not against the wallclock time. This
+             * way we can lookup an object multiple times (BRPOPLPUSH does
+             * that) without the risk of it being freed in the second
+             * lookup, invalidating the first one.
+             * See https://github.com/antirez/redis/pull/6554. */</comment>
+            <expr_stmt><expr><name><name>server</name><operator>.</operator><name>fixed_time_expire</name></name><operator>++</operator></expr>;</expr_stmt>
+            <expr_stmt><expr><call><name>updateCachedTime</name><argument_list>(<argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+            <comment type="block">/* Serve clients blocked on list key. */</comment>
+            <decl_stmt><decl><type><name>robj</name> <modifier>*</modifier></type><name>o</name> <init>= <expr><call><name>lookupKeyWrite</name><argument_list>(<argument><expr><name><name>rl</name><operator>-&gt;</operator><name>db</name></name></expr></argument>,<argument><expr><name><name>rl</name><operator>-&gt;</operator><name>key</name></name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+            <if_stmt><if>if <condition>(<expr><name>o</name> <operator>!=</operator> <name>NULL</name> <operator>&amp;&amp;</operator> <name><name>o</name><operator>-&gt;</operator><name>type</name></name> <operator>==</operator> <name>OBJ_LIST</name></expr>)</condition> <block>{<block_content>
+                <decl_stmt><decl><type><name>dictEntry</name> <modifier>*</modifier></type><name>de</name></decl>;</decl_stmt>
+
+                <comment type="block">/* We serve clients in the same order they blocked for
+                 * this key, from the first blocked to the last. */</comment>
+                <expr_stmt><expr><name>de</name> <operator>=</operator> <call><name>dictFind</name><argument_list>(<argument><expr><name><name>rl</name><operator>-&gt;</operator><name>db</name><operator>-&gt;</operator><name>blocking_keys</name></name></expr></argument>,<argument><expr><name><name>rl</name><operator>-&gt;</operator><name>key</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+                <if_stmt><if>if <condition>(<expr><name>de</name></expr>)</condition> <block>{<block_content>
+                    <decl_stmt><decl><type><name>list</name> <modifier>*</modifier></type><name>clients</name> <init>= <expr><call><name>dictGetVal</name><argument_list>(<argument><expr><name>de</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+                    <decl_stmt><decl><type><name>int</name></type> <name>numclients</name> <init>= <expr><call><name>listLength</name><argument_list>(<argument><expr><name>clients</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+                    <while>while<condition>(<expr><name>numclients</name><operator>--</operator></expr>)</condition> <block>{<block_content>
+                        <decl_stmt><decl><type><name>listNode</name> <modifier>*</modifier></type><name>clientnode</name> <init>= <expr><call><name>listFirst</name><argument_list>(<argument><expr><name>clients</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+                        <decl_stmt><decl><type><name>client</name> <modifier>*</modifier></type><name>receiver</name> <init>= <expr><name><name>clientnode</name><operator>-&gt;</operator><name>value</name></name></expr></init></decl>;</decl_stmt>
+
+                        <if_stmt><if>if <condition>(<expr><name><name>receiver</name><operator>-&gt;</operator><name>btype</name></name> <operator>!=</operator> <name>BLOCKED_LIST</name></expr>)</condition> <block>{<block_content>
+                            <comment type="block">/* Put at the tail, so that at the next call
+                             * we'll not run into it again. */</comment>
+                            <expr_stmt><expr><call><name>listRotateHeadToTail</name><argument_list>(<argument><expr><name>clients</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+                            <continue>continue;</continue>
+                        </block_content>}</block></if></if_stmt>
+
+                        <decl_stmt><decl><type><name>robj</name> <modifier>*</modifier></type><name>dstkey</name> <init>= <expr><name><name>receiver</name><operator>-&gt;</operator><name>bpop</name><operator>.</operator><name>target</name></name></expr></init></decl>;</decl_stmt>
+                        <decl_stmt><decl><type><name>int</name></type> <name>where</name> <init>= <expr><ternary><condition><expr><operator>(</operator><name><name>receiver</name><operator>-&gt;</operator><name>lastcmd</name></name> <operator>&amp;&amp;</operator>
+                                     <name><name>receiver</name><operator>-&gt;</operator><name>lastcmd</name><operator>-&gt;</operator><name>proc</name></name> <operator>==</operator> <name>blpopCommand</name><operator>)</operator></expr> ?</condition><then>
+                                     <expr><name>LIST_HEAD</name></expr> </then><else>: <expr><name>LIST_TAIL</name></expr></else></ternary></expr></init></decl>;</decl_stmt>
+                        <decl_stmt><decl><type><name>robj</name> <modifier>*</modifier></type><name>value</name> <init>= <expr><call><name>listTypePop</name><argument_list>(<argument><expr><name>o</name></expr></argument>,<argument><expr><name>where</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+                        <if_stmt><if>if <condition>(<expr><name>value</name></expr>)</condition> <block>{<block_content>
+                            <comment type="block">/* Protect receiver-&gt;bpop.target, that will be
+                             * freed by the next unblockClient()
+                             * call. */</comment>
+                            <if_stmt><if>if <condition>(<expr><name>dstkey</name></expr>)</condition><block type="pseudo"><block_content> <expr_stmt><expr><call><name>incrRefCount</name><argument_list>(<argument><expr><name>dstkey</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+                            <expr_stmt><expr><call><name>unblockClient</name><argument_list>(<argument><expr><name>receiver</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+                            <if_stmt><if>if <condition>(<expr><call><name>serveClientBlockedOnList</name><argument_list>(<argument><expr><name>receiver</name></expr></argument>,
+                                <argument><expr><name><name>rl</name><operator>-&gt;</operator><name>key</name></name></expr></argument>,<argument><expr><name>dstkey</name></expr></argument>,<argument><expr><name><name>rl</name><operator>-&gt;</operator><name>db</name></name></expr></argument>,<argument><expr><name>value</name></expr></argument>,
+                                <argument><expr><name>where</name></expr></argument>)</argument_list></call> <operator>==</operator> <name>C_ERR</name></expr>)</condition>
+                            <block>{<block_content>
+                                <comment type="block">/* If we failed serving the client we need
+                                 * to also undo the POP operation. */</comment>
+                                <expr_stmt><expr><call><name>listTypePush</name><argument_list>(<argument><expr><name>o</name></expr></argument>,<argument><expr><name>value</name></expr></argument>,<argument><expr><name>where</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+                            </block_content>}</block></if></if_stmt>
+
+                            <if_stmt><if>if <condition>(<expr><name>dstkey</name></expr>)</condition><block type="pseudo"><block_content> <expr_stmt><expr><call><name>decrRefCount</name><argument_list>(<argument><expr><name>dstkey</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+                            <expr_stmt><expr><call><name>decrRefCount</name><argument_list>(<argument><expr><name>value</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+                        </block_content>}</block></if> <else>else <block>{<block_content>
+                            <break>break;</break>
+                        </block_content>}</block></else></if_stmt>
+                    </block_content>}</block></while>
+                </block_content>}</block></if></if_stmt>
+
+                <if_stmt><if>if <condition>(<expr><call><name>listTypeLength</name><argument_list>(<argument><expr><name>o</name></expr></argument>)</argument_list></call> <operator>==</operator> <literal type="number">0</literal></expr>)</condition> <block>{<block_content>
+                    <expr_stmt><expr><call><name>dbDelete</name><argument_list>(<argument><expr><name><name>rl</name><operator>-&gt;</operator><name>db</name></name></expr></argument>,<argument><expr><name><name>rl</name><operator>-&gt;</operator><name>key</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+                    <expr_stmt><expr><call><name>notifyKeyspaceEvent</name><argument_list>(<argument><expr><name>NOTIFY_GENERIC</name></expr></argument>,<argument><expr><literal type="string">"del"</literal></expr></argument>,<argument><expr><name><name>rl</name><operator>-&gt;</operator><name>key</name></name></expr></argument>,<argument><expr><name><name>rl</name><operator>-&gt;</operator><name>db</name><operator>-&gt;</operator><name>id</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+                </block_content>}</block></if></if_stmt>
+                <comment type="block">/* We don't call signalModifiedKey() as it was already called
+                 * when an element was pushed on the list. */</comment>
+            </block_content>}</block></if>
+
+            <comment type="block">/* Serve clients blocked on sorted set key. */</comment>
+            <if type="elseif">else if <condition>(<expr><name>o</name> <operator>!=</operator> <name>NULL</name> <operator>&amp;&amp;</operator> <name><name>o</name><operator>-&gt;</operator><name>type</name></name> <operator>==</operator> <name>OBJ_ZSET</name></expr>)</condition> <block>{<block_content>
+                <decl_stmt><decl><type><name>dictEntry</name> <modifier>*</modifier></type><name>de</name></decl>;</decl_stmt>
+
+                <comment type="block">/* We serve clients in the same order they blocked for
+                 * this key, from the first blocked to the last. */</comment>
+                <expr_stmt><expr><name>de</name> <operator>=</operator> <call><name>dictFind</name><argument_list>(<argument><expr><name><name>rl</name><operator>-&gt;</operator><name>db</name><operator>-&gt;</operator><name>blocking_keys</name></name></expr></argument>,<argument><expr><name><name>rl</name><operator>-&gt;</operator><name>key</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+                <if_stmt><if>if <condition>(<expr><name>de</name></expr>)</condition> <block>{<block_content>
+                    <decl_stmt><decl><type><name>list</name> <modifier>*</modifier></type><name>clients</name> <init>= <expr><call><name>dictGetVal</name><argument_list>(<argument><expr><name>de</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+                    <decl_stmt><decl><type><name>int</name></type> <name>numclients</name> <init>= <expr><call><name>listLength</name><argument_list>(<argument><expr><name>clients</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+                    <decl_stmt><decl><type><name>PORT_ULONG</name></type> <name>zcard</name> <init>= <expr><call><name>zsetLength</name><argument_list>(<argument><expr><name>o</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+                    <while>while<condition>(<expr><name>numclients</name><operator>--</operator> <operator>&amp;&amp;</operator> <name>zcard</name></expr>)</condition> <block>{<block_content>
+                        <decl_stmt><decl><type><name>listNode</name> <modifier>*</modifier></type><name>clientnode</name> <init>= <expr><call><name>listFirst</name><argument_list>(<argument><expr><name>clients</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+                        <decl_stmt><decl><type><name>client</name> <modifier>*</modifier></type><name>receiver</name> <init>= <expr><name><name>clientnode</name><operator>-&gt;</operator><name>value</name></name></expr></init></decl>;</decl_stmt>
+
+                        <if_stmt><if>if <condition>(<expr><name><name>receiver</name><operator>-&gt;</operator><name>btype</name></name> <operator>!=</operator> <name>BLOCKED_ZSET</name></expr>)</condition> <block>{<block_content>
+                            <comment type="block">/* Put at the tail, so that at the next call
+                             * we'll not run into it again. */</comment>
+                            <expr_stmt><expr><call><name>listRotateHeadToTail</name><argument_list>(<argument><expr><name>clients</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+                            <continue>continue;</continue>
+                        </block_content>}</block></if></if_stmt>
+
+                        <decl_stmt><decl><type><name>int</name></type> <name>where</name> <init>= <expr><ternary><condition><expr><operator>(</operator><name><name>receiver</name><operator>-&gt;</operator><name>lastcmd</name></name> <operator>&amp;&amp;</operator>
+                                     <name><name>receiver</name><operator>-&gt;</operator><name>lastcmd</name><operator>-&gt;</operator><name>proc</name></name> <operator>==</operator> <name>bzpopminCommand</name><operator>)</operator></expr>
+                                     ?</condition><then> <expr><name>ZSET_MIN</name></expr> </then><else>: <expr><name>ZSET_MAX</name></expr></else></ternary></expr></init></decl>;</decl_stmt>
+                        <expr_stmt><expr><call><name>unblockClient</name><argument_list>(<argument><expr><name>receiver</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+                        <expr_stmt><expr><call><name>genericZpopCommand</name><argument_list>(<argument><expr><name>receiver</name></expr></argument>,<argument><expr><operator>&amp;</operator><name><name>rl</name><operator>-&gt;</operator><name>key</name></name></expr></argument>,<argument><expr><literal type="number">1</literal></expr></argument>,<argument><expr><name>where</name></expr></argument>,<argument><expr><literal type="number">1</literal></expr></argument>,<argument><expr><name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+                        <expr_stmt><expr><name>zcard</name><operator>--</operator></expr>;</expr_stmt>
+
+                        <comment type="block">/* Replicate the command. */</comment>
+                        <decl_stmt><decl><type><name>robj</name> <modifier>*</modifier></type><name><name>argv</name><index>[<expr><literal type="number">2</literal></expr>]</index></name></decl>;</decl_stmt>
+                        <decl_stmt><decl><type><name><name>struct</name> <name>redisCommand</name></name> <modifier>*</modifier></type><name>cmd</name> <init>= <expr><ternary><condition><expr><name>where</name> <operator>==</operator> <name>ZSET_MIN</name></expr> ?</condition><then>
+                                                   <expr><name><name>server</name><operator>.</operator><name>zpopminCommand</name></name></expr> </then><else>:
+                                                   <expr><name><name>server</name><operator>.</operator><name>zpopmaxCommand</name></name></expr></else></ternary></expr></init></decl>;</decl_stmt>
+                        <expr_stmt><expr><name><name>argv</name><index>[<expr><literal type="number">0</literal></expr>]</index></name> <operator>=</operator> <call><name>createStringObject</name><argument_list>(<argument><expr><name><name>cmd</name><operator>-&gt;</operator><name>name</name></name></expr></argument>,<argument><expr><call><name>strlen</name><argument_list>(<argument><expr><name><name>cmd</name><operator>-&gt;</operator><name>name</name></name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+                        <expr_stmt><expr><name><name>argv</name><index>[<expr><literal type="number">1</literal></expr>]</index></name> <operator>=</operator> <name><name>rl</name><operator>-&gt;</operator><name>key</name></name></expr>;</expr_stmt>
+                        <expr_stmt><expr><call><name>incrRefCount</name><argument_list>(<argument><expr><name><name>rl</name><operator>-&gt;</operator><name>key</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+                        <expr_stmt><expr><call><name>propagate</name><argument_list>(<argument><expr><name>cmd</name></expr></argument>,<argument><expr><name><name>receiver</name><operator>-&gt;</operator><name>db</name><operator>-&gt;</operator><name>id</name></name></expr></argument>,
+                                  <argument><expr><name>argv</name></expr></argument>,<argument><expr><literal type="number">2</literal></expr></argument>,<argument><expr><name>PROPAGATE_AOF</name><operator>|</operator><name>PROPAGATE_REPL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+                        <expr_stmt><expr><call><name>decrRefCount</name><argument_list>(<argument><expr><name><name>argv</name><index>[<expr><literal type="number">0</literal></expr>]</index></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+                        <expr_stmt><expr><call><name>decrRefCount</name><argument_list>(<argument><expr><name><name>argv</name><index>[<expr><literal type="number">1</literal></expr>]</index></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+                    </block_content>}</block></while>
+                </block_content>}</block></if></if_stmt>
+            </block_content>}</block></if>
+
+            <comment type="block">/* Serve clients blocked on stream key. */</comment>
+            <if type="elseif">else if <condition>(<expr><name>o</name> <operator>!=</operator> <name>NULL</name> <operator>&amp;&amp;</operator> <name><name>o</name><operator>-&gt;</operator><name>type</name></name> <operator>==</operator> <name>OBJ_STREAM</name></expr>)</condition> <block>{<block_content>
+                <decl_stmt><decl><type><name>dictEntry</name> <modifier>*</modifier></type><name>de</name> <init>= <expr><call><name>dictFind</name><argument_list>(<argument><expr><name><name>rl</name><operator>-&gt;</operator><name>db</name><operator>-&gt;</operator><name>blocking_keys</name></name></expr></argument>,<argument><expr><name><name>rl</name><operator>-&gt;</operator><name>key</name></name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+                <decl_stmt><decl><type><name>stream</name> <modifier>*</modifier></type><name>s</name> <init>= <expr><name><name>o</name><operator>-&gt;</operator><name>ptr</name></name></expr></init></decl>;</decl_stmt>
+
+                <comment type="block">/* We need to provide the new data arrived on the stream
+                 * to all the clients that are waiting for an offset smaller
+                 * than the current top item. */</comment>
+                <if_stmt><if>if <condition>(<expr><name>de</name></expr>)</condition> <block>{<block_content>
+                    <decl_stmt><decl><type><name>list</name> <modifier>*</modifier></type><name>clients</name> <init>= <expr><call><name>dictGetVal</name><argument_list>(<argument><expr><name>de</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+                    <decl_stmt><decl><type><name>listNode</name> <modifier>*</modifier></type><name>ln</name></decl>;</decl_stmt>
+                    <decl_stmt><decl><type><name>listIter</name></type> <name>li</name></decl>;</decl_stmt>
+                    <expr_stmt><expr><call><name>listRewind</name><argument_list>(<argument><expr><name>clients</name></expr></argument>,<argument><expr><operator>&amp;</operator><name>li</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+                    <while>while<condition>(<expr><operator>(</operator><name>ln</name> <operator>=</operator> <call><name>listNext</name><argument_list>(<argument><expr><operator>&amp;</operator><name>li</name></expr></argument>)</argument_list></call><operator>)</operator></expr>)</condition> <block>{<block_content>
+                        <decl_stmt><decl><type><name>client</name> <modifier>*</modifier></type><name>receiver</name> <init>= <expr><call><name>listNodeValue</name><argument_list>(<argument><expr><name>ln</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+                        <if_stmt><if>if <condition>(<expr><name><name>receiver</name><operator>-&gt;</operator><name>btype</name></name> <operator>!=</operator> <name>BLOCKED_STREAM</name></expr>)</condition><block type="pseudo"><block_content> <continue>continue;</continue></block_content></block></if></if_stmt>
+                        <decl_stmt><decl><type><name>bkinfo</name> <modifier>*</modifier></type><name>bki</name> <init>= <expr><call><name>dictFetchValue</name><argument_list>(<argument><expr><name><name>receiver</name><operator>-&gt;</operator><name>bpop</name><operator>.</operator><name>keys</name></name></expr></argument>,
+                                                     <argument><expr><name><name>rl</name><operator>-&gt;</operator><name>key</name></name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+                        <decl_stmt><decl><type><name>streamID</name> <modifier>*</modifier></type><name>gt</name> <init>= <expr><operator>&amp;</operator><name><name>bki</name><operator>-&gt;</operator><name>stream_id</name></name></expr></init></decl>;</decl_stmt>
+
+                        <comment type="block">/* If we blocked in the context of a consumer
+                         * group, we need to resolve the group and update the
+                         * last ID the client is blocked for: this is needed
+                         * because serving other clients in the same consumer
+                         * group will alter the "last ID" of the consumer
+                         * group, and clients blocked in a consumer group are
+                         * always blocked for the "&gt;" ID: we need to deliver
+                         * only new messages and avoid unblocking the client
+                         * otherwise. */</comment>
+                        <decl_stmt><decl><type><name>streamCG</name> <modifier>*</modifier></type><name>group</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+                        <if_stmt><if>if <condition>(<expr><name><name>receiver</name><operator>-&gt;</operator><name>bpop</name><operator>.</operator><name>xread_group</name></name></expr>)</condition> <block>{<block_content>
+                            <expr_stmt><expr><name>group</name> <operator>=</operator> <call><name>streamLookupCG</name><argument_list>(<argument><expr><name>s</name></expr></argument>,
+                                    <argument><expr><name><name>receiver</name><operator>-&gt;</operator><name>bpop</name><operator>.</operator><name>xread_group</name><operator>-&gt;</operator><name>ptr</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+                            <comment type="block">/* If the group was not found, send an error
+                             * to the consumer. */</comment>
+                            <if_stmt><if>if <condition>(<expr><operator>!</operator><name>group</name></expr>)</condition> <block>{<block_content>
+                                <expr_stmt><expr><call><name>addReplyError</name><argument_list>(<argument><expr><name>receiver</name></expr></argument>,
+                                    <argument><expr><literal type="string">"-NOGROUP the consumer group this client "</literal>
+                                    <literal type="string">"was blocked on no longer exists"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+                                <expr_stmt><expr><call><name>unblockClient</name><argument_list>(<argument><expr><name>receiver</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+                                <continue>continue;</continue>
+                            </block_content>}</block></if> <else>else <block>{<block_content>
+                                <expr_stmt><expr><operator>*</operator><name>gt</name> <operator>=</operator> <name><name>group</name><operator>-&gt;</operator><name>last_id</name></name></expr>;</expr_stmt>
+                            </block_content>}</block></else></if_stmt>
+                        </block_content>}</block></if></if_stmt>
+
+                        <if_stmt><if>if <condition>(<expr><call><name>streamCompareID</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>s</name><operator>-&gt;</operator><name>last_id</name></name></expr></argument>, <argument><expr><name>gt</name></expr></argument>)</argument_list></call> <operator>&gt;</operator> <literal type="number">0</literal></expr>)</condition> <block>{<block_content>
+                            <decl_stmt><decl><type><name>streamID</name></type> <name>start</name> <init>= <expr><operator>*</operator><name>gt</name></expr></init></decl>;</decl_stmt>
+                            <expr_stmt><expr><call><name>streamIncrID</name><argument_list>(<argument><expr><operator>&amp;</operator><name>start</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+                            <comment type="block">/* Lookup the consumer for the group, if any. */</comment>
+                            <decl_stmt><decl><type><name>streamConsumer</name> <modifier>*</modifier></type><name>consumer</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+                            <decl_stmt><decl><type><name>int</name></type> <name>noack</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+
+                            <if_stmt><if>if <condition>(<expr><name>group</name></expr>)</condition> <block>{<block_content>
+                                <expr_stmt><expr><name>consumer</name> <operator>=</operator> <call><name>streamLookupConsumer</name><argument_list>(<argument><expr><name>group</name></expr></argument>,
+                                           <argument><expr><name><name>receiver</name><operator>-&gt;</operator><name>bpop</name><operator>.</operator><name>xread_consumer</name><operator>-&gt;</operator><name>ptr</name></name></expr></argument>,
+                                           <argument><expr><name>SLC_NONE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+                                <expr_stmt><expr><name>noack</name> <operator>=</operator> <name><name>receiver</name><operator>-&gt;</operator><name>bpop</name><operator>.</operator><name>xread_group_noack</name></name></expr>;</expr_stmt>
+                            </block_content>}</block></if></if_stmt>
+
+                            <comment type="block">/* Emit the two elements sub-array consisting of
+                             * the name of the stream and the data we
+                             * extracted from it. Wrapped in a single-item
+                             * array, since we have just one key. */</comment>
+                            <expr_stmt><expr><call><name>addReplyMultiBulkLen</name><argument_list>(<argument><expr><name>receiver</name></expr></argument>,<argument><expr><literal type="number">1</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+                            <expr_stmt><expr><call><name>addReplyMultiBulkLen</name><argument_list>(<argument><expr><name>receiver</name></expr></argument>,<argument><expr><literal type="number">2</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+                            <expr_stmt><expr><call><name>addReplyBulk</name><argument_list>(<argument><expr><name>receiver</name></expr></argument>,<argument><expr><name><name>rl</name><operator>-&gt;</operator><name>key</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+                            <decl_stmt><decl><type><name>streamPropInfo</name></type> <name>pi</name> <init>= <expr><block>{
+                                <expr><name><name>rl</name><operator>-&gt;</operator><name>key</name></name></expr>,
+                                <expr><name><name>receiver</name><operator>-&gt;</operator><name>bpop</name><operator>.</operator><name>xread_group</name></name></expr>
+                            }</block></expr></init></decl>;</decl_stmt>
+                            <expr_stmt><expr><call><name>streamReplyWithRange</name><argument_list>(<argument><expr><name>receiver</name></expr></argument>,<argument><expr><name>s</name></expr></argument>,<argument><expr><operator>&amp;</operator><name>start</name></expr></argument>,<argument><expr><name>NULL</name></expr></argument>,
+                                                 <argument><expr><name><name>receiver</name><operator>-&gt;</operator><name>bpop</name><operator>.</operator><name>xread_count</name></name></expr></argument>,
+                                                 <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><name>group</name></expr></argument>, <argument><expr><name>consumer</name></expr></argument>, <argument><expr><name>noack</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>pi</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+                            <comment type="block">/* Note that after we unblock the client, 'gt'
+                             * and other receiver-&gt;bpop stuff are no longer
+                             * valid, so we must do the setup above before
+                             * this call. */</comment>
+                            <expr_stmt><expr><call><name>unblockClient</name><argument_list>(<argument><expr><name>receiver</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+                        </block_content>}</block></if></if_stmt>
+                    </block_content>}</block></while>
+                </block_content>}</block></if></if_stmt>
+            </block_content>}</block></if></if_stmt>
+            <expr_stmt><expr><name><name>server</name><operator>.</operator><name>fixed_time_expire</name></name><operator>--</operator></expr>;</expr_stmt>
+
+            <comment type="block">/* Free this item. */</comment>
+            <expr_stmt><expr><call><name>decrRefCount</name><argument_list>(<argument><expr><name><name>rl</name><operator>-&gt;</operator><name>key</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+            <expr_stmt><expr><call><name>zfree</name><argument_list>(<argument><expr><name>rl</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+            <expr_stmt><expr><call><name>listDelNode</name><argument_list>(<argument><expr><name>l</name></expr></argument>,<argument><expr><name>ln</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        </block_content>}</block></while>
+        <expr_stmt><expr><call><name>listRelease</name><argument_list>(<argument><expr><name>l</name></expr></argument>)</argument_list></call></expr>;</expr_stmt> <comment type="block">/* We have the new list on place at this point. */</comment>
+    </block_content>}</block></while>
+</block_content>}</block></function>
+
+<comment type="block">/* This is how the current blocking lists/sorted sets/streams work, we use
+ * BLPOP as example, but the concept is the same for other list ops, sorted
+ * sets and XREAD.
+ * - If the user calls BLPOP and the key exists and contains a non empty list
+ *   then LPOP is called instead. So BLPOP is semantically the same as LPOP
+ *   if blocking is not required.
+ * - If instead BLPOP is called and the key does not exists or the list is
+ *   empty we need to block. In order to do so we remove the notification for
+ *   new data to read in the client socket (so that we'll not serve new
+ *   requests if the blocking request is not served). Also we put the client
+ *   in a dictionary (db-&gt;blocking_keys) mapping keys to a list of clients
+ *   blocking for this keys.
+ * - If a PUSH operation against a key with blocked clients waiting is
+ *   performed, we mark this key as "ready", and after the current command,
+ *   MULTI/EXEC block, or script, is executed, we serve all the clients waiting
+ *   for this list, from the one that blocked first, to the last, accordingly
+ *   to the number of elements we have in the ready list.
+ */</comment>
+
+<comment type="block">/* Set a client in blocking mode for the specified key (list, zset or stream),
+ * with the specified timeout. The 'type' argument is BLOCKED_LIST,
+ * BLOCKED_ZSET or BLOCKED_STREAM depending on the kind of operation we are
+ * waiting for an empty key in order to awake the client. The client is blocked
+ * for all the 'numkeys' keys as in the 'keys' argument. When we block for
+ * stream keys, we also provide an array of streamID structures: clients will
+ * be unblocked only when items with an ID greater or equal to the specified
+ * one is appended to the stream. */</comment>
+<function><type><name>void</name></type> <name>blockForKeys</name><parameter_list>(<parameter><decl><type><name>client</name> <modifier>*</modifier></type><name>c</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>btype</name></decl></parameter>, <parameter><decl><type><name>robj</name> <modifier>*</modifier><modifier>*</modifier></type><name>keys</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>numkeys</name></decl></parameter>, <parameter><decl><type><name>mstime_t</name></type> <name>timeout</name></decl></parameter>, <parameter><decl><type><name>robj</name> <modifier>*</modifier></type><name>target</name></decl></parameter>, <parameter><decl><type><name>streamID</name> <modifier>*</modifier></type><name>ids</name></decl></parameter>)</parameter_list> <block>{<block_content>
+    <decl_stmt><decl><type><name>dictEntry</name> <modifier>*</modifier></type><name>de</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>list</name> <modifier>*</modifier></type><name>l</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>int</name></type> <name>j</name></decl>;</decl_stmt>
+
+    <expr_stmt><expr><name><name>c</name><operator>-&gt;</operator><name>bpop</name><operator>.</operator><name>timeout</name></name> <operator>=</operator> <name>timeout</name></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>c</name><operator>-&gt;</operator><name>bpop</name><operator>.</operator><name>target</name></name> <operator>=</operator> <name>target</name></expr>;</expr_stmt>
+
+    <if_stmt><if>if <condition>(<expr><name>target</name> <operator>!=</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content> <expr_stmt><expr><call><name>incrRefCount</name><argument_list>(<argument><expr><name>target</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+    <for>for <control>(<init><expr><name>j</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>j</name> <operator>&lt;</operator> <name>numkeys</name></expr>;</condition> <incr><expr><name>j</name><operator>++</operator></expr></incr>)</control> <block>{<block_content>
+        <comment type="block">/* Allocate our bkinfo structure, associated to each key the client
+         * is blocked for. */</comment>
+        <decl_stmt><decl><type><name>bkinfo</name> <modifier>*</modifier></type><name>bki</name> <init>= <expr><call><name>zmalloc</name><argument_list>(<argument><expr><sizeof>sizeof<argument_list>(<argument><expr><operator>*</operator><name>bki</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+        <if_stmt><if>if <condition>(<expr><name>btype</name> <operator>==</operator> <name>BLOCKED_STREAM</name></expr>)</condition><block type="pseudo"><block_content>
+            <expr_stmt><expr><name><name>bki</name><operator>-&gt;</operator><name>stream_id</name></name> <operator>=</operator> <name><name>ids</name><index>[<expr><name>j</name></expr>]</index></name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+        <comment type="block">/* If the key already exists in the dictionary ignore it. */</comment>
+        <if_stmt><if>if <condition>(<expr><call><name>dictAdd</name><argument_list>(<argument><expr><name><name>c</name><operator>-&gt;</operator><name>bpop</name><operator>.</operator><name>keys</name></name></expr></argument>,<argument><expr><name><name>keys</name><index>[<expr><name>j</name></expr>]</index></name></expr></argument>,<argument><expr><name>bki</name></expr></argument>)</argument_list></call> <operator>!=</operator> <name>DICT_OK</name></expr>)</condition> <block>{<block_content>
+            <expr_stmt><expr><call><name>zfree</name><argument_list>(<argument><expr><name>bki</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+            <continue>continue;</continue>
+        </block_content>}</block></if></if_stmt>
+        <expr_stmt><expr><call><name>incrRefCount</name><argument_list>(<argument><expr><name><name>keys</name><index>[<expr><name>j</name></expr>]</index></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+        <comment type="block">/* And in the other "side", to map keys -&gt; clients */</comment>
+        <expr_stmt><expr><name>de</name> <operator>=</operator> <call><name>dictFind</name><argument_list>(<argument><expr><name><name>c</name><operator>-&gt;</operator><name>db</name><operator>-&gt;</operator><name>blocking_keys</name></name></expr></argument>,<argument><expr><name><name>keys</name><index>[<expr><name>j</name></expr>]</index></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <if_stmt><if>if <condition>(<expr><name>de</name> <operator>==</operator> <name>NULL</name></expr>)</condition> <block>{<block_content>
+            <decl_stmt><decl><type><name>int</name></type> <name>retval</name></decl>;</decl_stmt>
+
+            <comment type="block">/* For every key we take a list of clients blocked for it */</comment>
+            <expr_stmt><expr><name>l</name> <operator>=</operator> <call><name>listCreate</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+            <expr_stmt><expr><name>retval</name> <operator>=</operator> <call><name>dictAdd</name><argument_list>(<argument><expr><name><name>c</name><operator>-&gt;</operator><name>db</name><operator>-&gt;</operator><name>blocking_keys</name></name></expr></argument>,<argument><expr><name><name>keys</name><index>[<expr><name>j</name></expr>]</index></name></expr></argument>,<argument><expr><name>l</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+            <expr_stmt><expr><call><name>incrRefCount</name><argument_list>(<argument><expr><name><name>keys</name><index>[<expr><name>j</name></expr>]</index></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+            <expr_stmt><expr><call><name>serverAssertWithInfo</name><argument_list>(<argument><expr><name>c</name></expr></argument>,<argument><expr><name><name>keys</name><index>[<expr><name>j</name></expr>]</index></name></expr></argument>,<argument><expr><name>retval</name> <operator>==</operator> <name>DICT_OK</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        </block_content>}</block></if> <else>else <block>{<block_content>
+            <expr_stmt><expr><name>l</name> <operator>=</operator> <call><name>dictGetVal</name><argument_list>(<argument><expr><name>de</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        </block_content>}</block></else></if_stmt>
+        <expr_stmt><expr><call><name>listAddNodeTail</name><argument_list>(<argument><expr><name>l</name></expr></argument>,<argument><expr><name>c</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <expr_stmt><expr><name><name>bki</name><operator>-&gt;</operator><name>listnode</name></name> <operator>=</operator> <call><name>listLast</name><argument_list>(<argument><expr><name>l</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    </block_content>}</block></for>
+    <expr_stmt><expr><call><name>blockClient</name><argument_list>(<argument><expr><name>c</name></expr></argument>,<argument><expr><name>btype</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/* Unblock a client that's waiting in a blocking operation such as BLPOP.
+ * You should never call this function directly, but unblockClient() instead. */</comment>
+<function><type><name>void</name></type> <name>unblockClientWaitingData</name><parameter_list>(<parameter><decl><type><name>client</name> <modifier>*</modifier></type><name>c</name></decl></parameter>)</parameter_list> <block>{<block_content>
+    <decl_stmt><decl><type><name>dictEntry</name> <modifier>*</modifier></type><name>de</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>dictIterator</name> <modifier>*</modifier></type><name>di</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>list</name> <modifier>*</modifier></type><name>l</name></decl>;</decl_stmt>
+
+    <expr_stmt><expr><call><name>serverAssertWithInfo</name><argument_list>(<argument><expr><name>c</name></expr></argument>,<argument><expr><name>NULL</name></expr></argument>,<argument><expr><call><name>dictSize</name><argument_list>(<argument><expr><name><name>c</name><operator>-&gt;</operator><name>bpop</name><operator>.</operator><name>keys</name></name></expr></argument>)</argument_list></call> <operator>!=</operator> <literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><name>di</name> <operator>=</operator> <call><name>dictGetIterator</name><argument_list>(<argument><expr><name><name>c</name><operator>-&gt;</operator><name>bpop</name><operator>.</operator><name>keys</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <comment type="block">/* The client may wait for multiple keys, so unblock it for every key. */</comment>
+    <while>while<condition>(<expr><operator>(</operator><name>de</name> <operator>=</operator> <call><name>dictNext</name><argument_list>(<argument><expr><name>di</name></expr></argument>)</argument_list></call><operator>)</operator> <operator>!=</operator> <name>NULL</name></expr>)</condition> <block>{<block_content>
+        <decl_stmt><decl><type><name>robj</name> <modifier>*</modifier></type><name>key</name> <init>= <expr><call><name>dictGetKey</name><argument_list>(<argument><expr><name>de</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+        <decl_stmt><decl><type><name>bkinfo</name> <modifier>*</modifier></type><name>bki</name> <init>= <expr><call><name>dictGetVal</name><argument_list>(<argument><expr><name>de</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+        <comment type="block">/* Remove this client from the list of clients waiting for this key. */</comment>
+        <expr_stmt><expr><name>l</name> <operator>=</operator> <call><name>dictFetchValue</name><argument_list>(<argument><expr><name><name>c</name><operator>-&gt;</operator><name>db</name><operator>-&gt;</operator><name>blocking_keys</name></name></expr></argument>,<argument><expr><name>key</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <expr_stmt><expr><call><name>serverAssertWithInfo</name><argument_list>(<argument><expr><name>c</name></expr></argument>,<argument><expr><name>key</name></expr></argument>,<argument><expr><name>l</name> <operator>!=</operator> <name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <expr_stmt><expr><call><name>listDelNode</name><argument_list>(<argument><expr><name>l</name></expr></argument>,<argument><expr><name><name>bki</name><operator>-&gt;</operator><name>listnode</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <comment type="block">/* If the list is empty we need to remove it to avoid wasting memory */</comment>
+        <if_stmt><if>if <condition>(<expr><call><name>listLength</name><argument_list>(<argument><expr><name>l</name></expr></argument>)</argument_list></call> <operator>==</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+            <expr_stmt><expr><call><name>dictDelete</name><argument_list>(<argument><expr><name><name>c</name><operator>-&gt;</operator><name>db</name><operator>-&gt;</operator><name>blocking_keys</name></name></expr></argument>,<argument><expr><name>key</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+    </block_content>}</block></while>
+    <expr_stmt><expr><call><name>dictReleaseIterator</name><argument_list>(<argument><expr><name>di</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+    <comment type="block">/* Cleanup the client structure */</comment>
+    <expr_stmt><expr><call><name>dictEmpty</name><argument_list>(<argument><expr><name><name>c</name><operator>-&gt;</operator><name>bpop</name><operator>.</operator><name>keys</name></name></expr></argument>,<argument><expr><name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <if_stmt><if>if <condition>(<expr><name><name>c</name><operator>-&gt;</operator><name>bpop</name><operator>.</operator><name>target</name></name></expr>)</condition> <block>{<block_content>
+        <expr_stmt><expr><call><name>decrRefCount</name><argument_list>(<argument><expr><name><name>c</name><operator>-&gt;</operator><name>bpop</name><operator>.</operator><name>target</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <expr_stmt><expr><name><name>c</name><operator>-&gt;</operator><name>bpop</name><operator>.</operator><name>target</name></name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+    </block_content>}</block></if></if_stmt>
+    <if_stmt><if>if <condition>(<expr><name><name>c</name><operator>-&gt;</operator><name>bpop</name><operator>.</operator><name>xread_group</name></name></expr>)</condition> <block>{<block_content>
+        <expr_stmt><expr><call><name>decrRefCount</name><argument_list>(<argument><expr><name><name>c</name><operator>-&gt;</operator><name>bpop</name><operator>.</operator><name>xread_group</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <expr_stmt><expr><call><name>decrRefCount</name><argument_list>(<argument><expr><name><name>c</name><operator>-&gt;</operator><name>bpop</name><operator>.</operator><name>xread_consumer</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <expr_stmt><expr><name><name>c</name><operator>-&gt;</operator><name>bpop</name><operator>.</operator><name>xread_group</name></name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+        <expr_stmt><expr><name><name>c</name><operator>-&gt;</operator><name>bpop</name><operator>.</operator><name>xread_consumer</name></name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+    </block_content>}</block></if></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/* If the specified key has clients blocked waiting for list pushes, this
+ * function will put the key reference into the server.ready_keys list.
+ * Note that db-&gt;ready_keys is a hash table that allows us to avoid putting
+ * the same key again and again in the list in case of multiple pushes
+ * made by a script or in the context of MULTI/EXEC.
+ *
+ * The list will be finally processed by handleClientsBlockedOnLists() */</comment>
+<function><type><name>void</name></type> <name>signalKeyAsReady</name><parameter_list>(<parameter><decl><type><name>redisDb</name> <modifier>*</modifier></type><name>db</name></decl></parameter>, <parameter><decl><type><name>robj</name> <modifier>*</modifier></type><name>key</name></decl></parameter>)</parameter_list> <block>{<block_content>
+    <decl_stmt><decl><type><name>readyList</name> <modifier>*</modifier></type><name>rl</name></decl>;</decl_stmt>
+
+    <comment type="block">/* No clients blocking for this key? No need to queue it. */</comment>
+    <if_stmt><if>if <condition>(<expr><call><name>dictFind</name><argument_list>(<argument><expr><name><name>db</name><operator>-&gt;</operator><name>blocking_keys</name></name></expr></argument>,<argument><expr><name>key</name></expr></argument>)</argument_list></call> <operator>==</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content> <return>return;</return></block_content></block></if></if_stmt>
+
+    <comment type="block">/* Key was already signaled? No need to queue it again. */</comment>
+    <if_stmt><if>if <condition>(<expr><call><name>dictFind</name><argument_list>(<argument><expr><name><name>db</name><operator>-&gt;</operator><name>ready_keys</name></name></expr></argument>,<argument><expr><name>key</name></expr></argument>)</argument_list></call> <operator>!=</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content> <return>return;</return></block_content></block></if></if_stmt>
+
+    <comment type="block">/* Ok, we need to queue this key into server.ready_keys. */</comment>
+    <expr_stmt><expr><name>rl</name> <operator>=</operator> <call><name>zmalloc</name><argument_list>(<argument><expr><sizeof>sizeof<argument_list>(<argument><expr><operator>*</operator><name>rl</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>rl</name><operator>-&gt;</operator><name>key</name></name> <operator>=</operator> <name>key</name></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>rl</name><operator>-&gt;</operator><name>db</name></name> <operator>=</operator> <name>db</name></expr>;</expr_stmt>
+    <expr_stmt><expr><call><name>incrRefCount</name><argument_list>(<argument><expr><name>key</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><call><name>listAddNodeTail</name><argument_list>(<argument><expr><name><name>server</name><operator>.</operator><name>ready_keys</name></name></expr></argument>,<argument><expr><name>rl</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+    <comment type="block">/* We also add the key in the db-&gt;ready_keys dictionary in order
+     * to avoid adding it multiple times into a list with a simple O(1)
+     * check. */</comment>
+    <expr_stmt><expr><call><name>incrRefCount</name><argument_list>(<argument><expr><name>key</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><call><name>serverAssert</name><argument_list>(<argument><expr><call><name>dictAdd</name><argument_list>(<argument><expr><name><name>db</name><operator>-&gt;</operator><name>ready_keys</name></name></expr></argument>,<argument><expr><name>key</name></expr></argument>,<argument><expr><name>NULL</name></expr></argument>)</argument_list></call> <operator>==</operator> <name>DICT_OK</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+
+</unit>

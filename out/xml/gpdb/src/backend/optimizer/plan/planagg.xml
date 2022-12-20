@@ -1,0 +1,576 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<unit xmlns="http://www.srcML.org/srcML/src" xmlns:cpp="http://www.srcML.org/srcML/cpp" revision="1.0.0" language="C" filename="/cloned_projects/gpdb/src/backend/optimizer/plan/planagg.c"><comment type="block">/*-------------------------------------------------------------------------
+ *
+ * planagg.c
+ *	  Special planning for aggregate queries.
+ *
+ * This module tries to replace MIN/MAX aggregate functions by subqueries
+ * of the form
+ *		(SELECT col FROM tab
+ *		 WHERE col IS NOT NULL AND existing-quals
+ *		 ORDER BY col ASC/DESC
+ *		 LIMIT 1)
+ * Given a suitable index on tab.col, this can be much faster than the
+ * generic scan-all-the-rows aggregation plan.  We can handle multiple
+ * MIN/MAX aggregates by generating multiple subqueries, and their
+ * orderings can be different.  However, if the query contains any
+ * non-optimizable aggregates, there's no point since we'll have to
+ * scan all the rows anyway.
+ *
+ *
+ * Portions Copyright (c) 2006-2008, Greenplum inc
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1994, Regents of the University of California
+ *
+ *
+ * IDENTIFICATION
+ *	  src/backend/optimizer/plan/planagg.c
+ *
+ *-------------------------------------------------------------------------
+ */</comment>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"postgres.h"</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/htup_details.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/pg_aggregate.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/pg_type.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"nodes/makefuncs.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"nodes/nodeFuncs.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"optimizer/clauses.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"optimizer/cost.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"optimizer/optimizer.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"optimizer/pathnode.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"optimizer/paths.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"optimizer/planmain.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"optimizer/subselect.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"optimizer/tlist.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"parser/parsetree.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"parser/parse_clause.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"rewrite/rewriteManip.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/lsyscache.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/syscache.h"</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"cdb/cdbpath.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"cdb/cdbsetop.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"cdb/cdbutil.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"cdb/cdbvars.h"</cpp:file></cpp:include>
+
+
+<function_decl><type><specifier>static</specifier> <name>bool</name></type> <name>find_minmax_aggs_walker</name><parameter_list>(<parameter><decl><type><name>Node</name> <modifier>*</modifier></type><name>node</name></decl></parameter>, <parameter><decl><type><name>List</name> <modifier>*</modifier><modifier>*</modifier></type><name>context</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>bool</name></type> <name>build_minmax_path</name><parameter_list>(<parameter><decl><type><name>PlannerInfo</name> <modifier>*</modifier></type><name>root</name></decl></parameter>, <parameter><decl><type><name>MinMaxAggInfo</name> <modifier>*</modifier></type><name>mminfo</name></decl></parameter>,
+							  <parameter><decl><type><name>Oid</name></type> <name>eqop</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>sortop</name></decl></parameter>, <parameter><decl><type><name>bool</name></type> <name>nulls_first</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>minmax_qp_callback</name><parameter_list>(<parameter><decl><type><name>PlannerInfo</name> <modifier>*</modifier></type><name>root</name></decl></parameter>, <parameter><decl><type><name>void</name> <modifier>*</modifier></type><name>extra</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>Oid</name></type>	<name>fetch_agg_sort_op</name><parameter_list>(<parameter><decl><type><name>Oid</name></type> <name>aggfnoid</name></decl></parameter>)</parameter_list>;</function_decl>
+
+
+<comment type="block">/*
+ * preprocess_minmax_aggregates - preprocess MIN/MAX aggregates
+ *
+ * Check to see whether the query contains MIN/MAX aggregate functions that
+ * might be optimizable via indexscans.  If it does, and all the aggregates
+ * are potentially optimizable, then create a MinMaxAggPath and add it to
+ * the (UPPERREL_GROUP_AGG, NULL) upperrel.
+ *
+ * This should be called by grouping_planner() just before it's ready to call
+ * query_planner(), because we generate indexscan paths by cloning the
+ * planner's state and invoking query_planner() on a modified version of
+ * the query parsetree.  Thus, all preprocessing needed before query_planner()
+ * must already be done.
+ */</comment>
+<function><type><name>void</name></type>
+<name>preprocess_minmax_aggregates</name><parameter_list>(<parameter><decl><type><name>PlannerInfo</name> <modifier>*</modifier></type><name>root</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>Query</name>	   <modifier>*</modifier></type><name>parse</name> <init>= <expr><name><name>root</name><operator>-&gt;</operator><name>parse</name></name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>FromExpr</name>   <modifier>*</modifier></type><name>jtnode</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>RangeTblRef</name> <modifier>*</modifier></type><name>rtr</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>RangeTblEntry</name> <modifier>*</modifier></type><name>rte</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>List</name>	   <modifier>*</modifier></type><name>aggs_list</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>RelOptInfo</name> <modifier>*</modifier></type><name>grouped_rel</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>ListCell</name>   <modifier>*</modifier></type><name>lc</name></decl>;</decl_stmt>
+
+	<comment type="block">/* minmax_aggs list should be empty at this point */</comment>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>root</name><operator>-&gt;</operator><name>minmax_aggs</name></name> <operator>==</operator> <name>NIL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Nothing to do if query has no aggregates */</comment>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><name><name>parse</name><operator>-&gt;</operator><name>hasAggs</name></name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return;</return></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><operator>!</operator><name><name>parse</name><operator>-&gt;</operator><name>setOperations</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>	<comment type="block">/* shouldn't get here if a setop */</comment>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>parse</name><operator>-&gt;</operator><name>rowMarks</name></name> <operator>==</operator> <name>NIL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt> <comment type="block">/* nor if FOR UPDATE */</comment>
+
+	<comment type="block">/*
+	 * Reject unoptimizable cases.
+	 *
+	 * We don't handle GROUP BY or windowing, because our current
+	 * implementations of grouping require looking at all the rows anyway, and
+	 * so there's not much point in optimizing MIN/MAX.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>parse</name><operator>-&gt;</operator><name>groupClause</name></name> <operator>||</operator> <call><name>list_length</name><argument_list>(<argument><expr><name><name>parse</name><operator>-&gt;</operator><name>groupingSets</name></name></expr></argument>)</argument_list></call> <operator>&gt;</operator> <literal type="number">1</literal> <operator>||</operator>
+		<name><name>parse</name><operator>-&gt;</operator><name>hasWindowFuncs</name></name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return;</return></block_content></block></if></if_stmt>
+
+	<comment type="block">/*
+	 * Reject if disabled by caller.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><name><name>root</name><operator>-&gt;</operator><name>config</name><operator>-&gt;</operator><name>gp_enable_minmax_optimization</name></name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return;</return></block_content></block></if></if_stmt>
+
+	<comment type="block">/*
+	 * Reject if query contains any CTEs; there's no way to build an indexscan
+	 * on one so we couldn't succeed here.  (If the CTEs are unreferenced,
+	 * that's not true, but it doesn't seem worth expending cycles to check.)
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>parse</name><operator>-&gt;</operator><name>cteList</name></name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return;</return></block_content></block></if></if_stmt>
+
+	<comment type="block">/*
+	 * We also restrict the query to reference exactly one table, since join
+	 * conditions can't be handled reasonably.  (We could perhaps handle a
+	 * query containing cartesian-product joins, but it hardly seems worth the
+	 * trouble.)  However, the single table could be buried in several levels
+	 * of FromExpr due to subqueries.  Note the "single" table could be an
+	 * inheritance parent, too, including the case of a UNION ALL subquery
+	 * that's been flattened to an appendrel.
+	 */</comment>
+	<expr_stmt><expr><name>jtnode</name> <operator>=</operator> <name><name>parse</name><operator>-&gt;</operator><name>jointree</name></name></expr>;</expr_stmt>
+	<while>while <condition>(<expr><call><name>IsA</name><argument_list>(<argument><expr><name>jtnode</name></expr></argument>, <argument><expr><name>FromExpr</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<if_stmt><if>if <condition>(<expr><call><name>list_length</name><argument_list>(<argument><expr><name><name>jtnode</name><operator>-&gt;</operator><name>fromlist</name></name></expr></argument>)</argument_list></call> <operator>!=</operator> <literal type="number">1</literal></expr>)</condition><block type="pseudo"><block_content>
+			<return>return;</return></block_content></block></if></if_stmt>
+		<expr_stmt><expr><name>jtnode</name> <operator>=</operator> <call><name>linitial</name><argument_list>(<argument><expr><name><name>jtnode</name><operator>-&gt;</operator><name>fromlist</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></while>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>IsA</name><argument_list>(<argument><expr><name>jtnode</name></expr></argument>, <argument><expr><name>RangeTblRef</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<return>return;</return></block_content></block></if></if_stmt>
+	<expr_stmt><expr><name>rtr</name> <operator>=</operator> <operator>(</operator><name>RangeTblRef</name> <operator>*</operator><operator>)</operator> <name>jtnode</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name>rte</name> <operator>=</operator> <call><name>planner_rt_fetch</name><argument_list>(<argument><expr><name><name>rtr</name><operator>-&gt;</operator><name>rtindex</name></name></expr></argument>, <argument><expr><name>root</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><name><name>rte</name><operator>-&gt;</operator><name>rtekind</name></name> <operator>==</operator> <name>RTE_RELATION</name></expr>)</condition><block type="pseudo"><block_content>
+		 <comment type="block">/* ordinary relation, ok */</comment> <empty_stmt>;</empty_stmt></block_content></block></if>
+	<if type="elseif">else if <condition>(<expr><name><name>rte</name><operator>-&gt;</operator><name>rtekind</name></name> <operator>==</operator> <name>RTE_SUBQUERY</name> <operator>&amp;&amp;</operator> <name><name>rte</name><operator>-&gt;</operator><name>inh</name></name></expr>)</condition><block type="pseudo"><block_content>
+		 <comment type="block">/* flattened UNION ALL subquery, ok */</comment> <empty_stmt>;</empty_stmt></block_content></block></if>
+	<else>else<block type="pseudo"><block_content>
+		<return>return;</return></block_content></block></else></if_stmt>
+
+	<comment type="block">/*
+	 * Scan the tlist and HAVING qual to find all the aggregates and verify
+	 * all are MIN/MAX aggregates.  Stop as soon as we find one that isn't.
+	 */</comment>
+	<expr_stmt><expr><name>aggs_list</name> <operator>=</operator> <name>NIL</name></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><call><name>find_minmax_aggs_walker</name><argument_list>(<argument><expr><operator>(</operator><name>Node</name> <operator>*</operator><operator>)</operator> <name><name>root</name><operator>-&gt;</operator><name>processed_tlist</name></name></expr></argument>, <argument><expr><operator>&amp;</operator><name>aggs_list</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<return>return;</return></block_content></block></if></if_stmt>
+	<if_stmt><if>if <condition>(<expr><call><name>find_minmax_aggs_walker</name><argument_list>(<argument><expr><name><name>parse</name><operator>-&gt;</operator><name>havingQual</name></name></expr></argument>, <argument><expr><operator>&amp;</operator><name>aggs_list</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<return>return;</return></block_content></block></if></if_stmt>
+
+	<comment type="block">/*
+	 * OK, there is at least the possibility of performing the optimization.
+	 * Build an access path for each aggregate.  If any of the aggregates
+	 * prove to be non-indexable, give up; there is no point in optimizing
+	 * just some of them.
+	 */</comment>
+	<macro><name>foreach</name><argument_list>(<argument>lc</argument>, <argument>aggs_list</argument>)</argument_list></macro>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>MinMaxAggInfo</name> <modifier>*</modifier></type><name>mminfo</name> <init>= <expr><operator>(</operator><name>MinMaxAggInfo</name> <operator>*</operator><operator>)</operator> <call><name>lfirst</name><argument_list>(<argument><expr><name>lc</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>Oid</name></type>			<name>eqop</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>bool</name></type>		<name>reverse</name></decl>;</decl_stmt>
+
+		<comment type="block">/*
+		 * We'll need the equality operator that goes with the aggregate's
+		 * ordering operator.
+		 */</comment>
+		<expr_stmt><expr><name>eqop</name> <operator>=</operator> <call><name>get_equality_op_for_ordering_op</name><argument_list>(<argument><expr><name><name>mminfo</name><operator>-&gt;</operator><name>aggsortop</name></name></expr></argument>, <argument><expr><operator>&amp;</operator><name>reverse</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>OidIsValid</name><argument_list>(<argument><expr><name>eqop</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>	<comment type="block">/* shouldn't happen */</comment>
+			<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"could not find equality operator for ordering operator %u"</literal></expr></argument>,
+				 <argument><expr><name><name>mminfo</name><operator>-&gt;</operator><name>aggsortop</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+		<comment type="block">/*
+		 * We can use either an ordering that gives NULLS FIRST or one that
+		 * gives NULLS LAST; furthermore there's unlikely to be much
+		 * performance difference between them, so it doesn't seem worth
+		 * costing out both ways if we get a hit on the first one.  NULLS
+		 * FIRST is more likely to be available if the operator is a
+		 * reverse-sort operator, so try that first if reverse.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><call><name>build_minmax_path</name><argument_list>(<argument><expr><name>root</name></expr></argument>, <argument><expr><name>mminfo</name></expr></argument>, <argument><expr><name>eqop</name></expr></argument>, <argument><expr><name><name>mminfo</name><operator>-&gt;</operator><name>aggsortop</name></name></expr></argument>, <argument><expr><name>reverse</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<continue>continue;</continue></block_content></block></if></if_stmt>
+		<if_stmt><if>if <condition>(<expr><call><name>build_minmax_path</name><argument_list>(<argument><expr><name>root</name></expr></argument>, <argument><expr><name>mminfo</name></expr></argument>, <argument><expr><name>eqop</name></expr></argument>, <argument><expr><name><name>mminfo</name><operator>-&gt;</operator><name>aggsortop</name></name></expr></argument>, <argument><expr><operator>!</operator><name>reverse</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<continue>continue;</continue></block_content></block></if></if_stmt>
+
+		<comment type="block">/* No indexable path for this aggregate, so fail */</comment>
+		<return>return;</return>
+	</block_content>}</block>
+
+	<comment type="block">/*
+	 * OK, we can do the query this way.  Prepare to create a MinMaxAggPath
+	 * node.
+	 *
+	 * First, create an output Param node for each agg.  (If we end up not
+	 * using the MinMaxAggPath, we'll waste a PARAM_EXEC slot for each agg,
+	 * which is not worth worrying about.  We can't wait till create_plan time
+	 * to decide whether to make the Param, unfortunately.)
+	 */</comment>
+	<macro><name>foreach</name><argument_list>(<argument>lc</argument>, <argument>aggs_list</argument>)</argument_list></macro>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>MinMaxAggInfo</name> <modifier>*</modifier></type><name>mminfo</name> <init>= <expr><operator>(</operator><name>MinMaxAggInfo</name> <operator>*</operator><operator>)</operator> <call><name>lfirst</name><argument_list>(<argument><expr><name>lc</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+		<expr_stmt><expr><name><name>mminfo</name><operator>-&gt;</operator><name>param</name></name> <operator>=</operator>
+			<call><name>SS_make_initplan_output_param</name><argument_list>(<argument><expr><name>root</name></expr></argument>,
+										  <argument><expr><call><name>exprType</name><argument_list>(<argument><expr><operator>(</operator><name>Node</name> <operator>*</operator><operator>)</operator> <name><name>mminfo</name><operator>-&gt;</operator><name>target</name></name></expr></argument>)</argument_list></call></expr></argument>,
+										  <argument><expr><operator>-</operator><literal type="number">1</literal></expr></argument>,
+										  <argument><expr><call><name>exprCollation</name><argument_list>(<argument><expr><operator>(</operator><name>Node</name> <operator>*</operator><operator>)</operator> <name><name>mminfo</name><operator>-&gt;</operator><name>target</name></name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block>
+
+	<comment type="block">/*
+	 * Create a MinMaxAggPath node with the appropriate estimated costs and
+	 * other needed data, and add it to the UPPERREL_GROUP_AGG upperrel, where
+	 * it will compete against the standard aggregate implementation.  (It
+	 * will likely always win, but we need not assume that here.)
+	 *
+	 * Note: grouping_planner won't have created this upperrel yet, but it's
+	 * fine for us to create it first.  We will not have inserted the correct
+	 * consider_parallel value in it, but MinMaxAggPath paths are currently
+	 * never parallel-safe anyway, so that doesn't matter.  Likewise, it
+	 * doesn't matter that we haven't filled FDW-related fields in the rel.
+	 * Also, because there are no rowmarks, we know that the processed_tlist
+	 * doesn't need to change anymore, so making the pathtarget now is safe.
+	 */</comment>
+	<expr_stmt><expr><name>grouped_rel</name> <operator>=</operator> <call><name>fetch_upper_rel</name><argument_list>(<argument><expr><name>root</name></expr></argument>, <argument><expr><name>UPPERREL_GROUP_AGG</name></expr></argument>, <argument><expr><name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>add_path</name><argument_list>(<argument><expr><name>grouped_rel</name></expr></argument>, <argument><expr><operator>(</operator><name>Path</name> <operator>*</operator><operator>)</operator>
+			 <call><name>create_minmaxagg_path</name><argument_list>(<argument><expr><name>root</name></expr></argument>, <argument><expr><name>grouped_rel</name></expr></argument>,
+								   <argument><expr><call><name>create_pathtarget</name><argument_list>(<argument><expr><name>root</name></expr></argument>,
+													 <argument><expr><name><name>root</name><operator>-&gt;</operator><name>processed_tlist</name></name></expr></argument>)</argument_list></call></expr></argument>,
+								   <argument><expr><name>aggs_list</name></expr></argument>,
+								   <argument><expr><operator>(</operator><name>List</name> <operator>*</operator><operator>)</operator> <name><name>parse</name><operator>-&gt;</operator><name>havingQual</name></name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * find_minmax_aggs_walker
+ *		Recursively scan the Aggref nodes in an expression tree, and check
+ *		that each one is a MIN/MAX aggregate.  If so, build a list of the
+ *		distinct aggregate calls in the tree.
+ *
+ * Returns true if a non-MIN/MAX aggregate is found, false otherwise.
+ * (This seemingly-backward definition is used because expression_tree_walker
+ * aborts the scan on true return, which is what we want.)
+ *
+ * Found aggregates are added to the list at *context; it's up to the caller
+ * to initialize the list to NIL.
+ *
+ * This does not descend into subqueries, and so should be used only after
+ * reduction of sublinks to subplans.  There mustn't be outer-aggregate
+ * references either.
+ */</comment>
+<function><type><specifier>static</specifier> <name>bool</name></type>
+<name>find_minmax_aggs_walker</name><parameter_list>(<parameter><decl><type><name>Node</name> <modifier>*</modifier></type><name>node</name></decl></parameter>, <parameter><decl><type><name>List</name> <modifier>*</modifier><modifier>*</modifier></type><name>context</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<if_stmt><if>if <condition>(<expr><name>node</name> <operator>==</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>false</name></expr>;</return></block_content></block></if></if_stmt>
+	<if_stmt><if>if <condition>(<expr><call><name>IsA</name><argument_list>(<argument><expr><name>node</name></expr></argument>, <argument><expr><name>Aggref</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>Aggref</name>	   <modifier>*</modifier></type><name>aggref</name> <init>= <expr><operator>(</operator><name>Aggref</name> <operator>*</operator><operator>)</operator> <name>node</name></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>Oid</name></type>			<name>aggsortop</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>TargetEntry</name> <modifier>*</modifier></type><name>curTarget</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>MinMaxAggInfo</name> <modifier>*</modifier></type><name>mminfo</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>ListCell</name>   <modifier>*</modifier></type><name>l</name></decl>;</decl_stmt>
+
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>aggref</name><operator>-&gt;</operator><name>agglevelsup</name></name> <operator>==</operator> <literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<if_stmt><if>if <condition>(<expr><call><name>list_length</name><argument_list>(<argument><expr><name><name>aggref</name><operator>-&gt;</operator><name>args</name></name></expr></argument>)</argument_list></call> <operator>!=</operator> <literal type="number">1</literal></expr>)</condition><block type="pseudo"><block_content>
+			<return>return <expr><name>true</name></expr>;</return></block_content></block></if></if_stmt>		<comment type="block">/* it couldn't be MIN/MAX */</comment>
+
+		<comment type="block">/*
+		 * ORDER BY is usually irrelevant for MIN/MAX, but it can change the
+		 * outcome if the aggsortop's operator class recognizes non-identical
+		 * values as equal.  For example, 4.0 and 4.00 are equal according to
+		 * numeric_ops, yet distinguishable.  If MIN() receives more than one
+		 * value equal to 4.0 and no value less than 4.0, it is unspecified
+		 * which of those equal values MIN() returns.  An ORDER BY expression
+		 * that differs for each of those equal values of the argument
+		 * expression makes the result predictable once again.  This is a
+		 * niche requirement, and we do not implement it with subquery paths.
+		 * In any case, this test lets us reject ordered-set aggregates
+		 * quickly.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><name><name>aggref</name><operator>-&gt;</operator><name>aggorder</name></name> <operator>!=</operator> <name>NIL</name></expr>)</condition><block type="pseudo"><block_content>
+			<return>return <expr><name>true</name></expr>;</return></block_content></block></if></if_stmt>
+		<comment type="block">/* note: we do not care if DISTINCT is mentioned ... */</comment>
+
+		<comment type="block">/*
+		 * We might implement the optimization when a FILTER clause is present
+		 * by adding the filter to the quals of the generated subquery.  For
+		 * now, just punt.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><name><name>aggref</name><operator>-&gt;</operator><name>aggfilter</name></name> <operator>!=</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+			<return>return <expr><name>true</name></expr>;</return></block_content></block></if></if_stmt>
+
+		<expr_stmt><expr><name>aggsortop</name> <operator>=</operator> <call><name>fetch_agg_sort_op</name><argument_list>(<argument><expr><name><name>aggref</name><operator>-&gt;</operator><name>aggfnoid</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>OidIsValid</name><argument_list>(<argument><expr><name>aggsortop</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<return>return <expr><name>true</name></expr>;</return></block_content></block></if></if_stmt>		<comment type="block">/* not a MIN/MAX aggregate */</comment>
+
+		<expr_stmt><expr><name>curTarget</name> <operator>=</operator> <operator>(</operator><name>TargetEntry</name> <operator>*</operator><operator>)</operator> <call><name>linitial</name><argument_list>(<argument><expr><name><name>aggref</name><operator>-&gt;</operator><name>args</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<if_stmt><if>if <condition>(<expr><call><name>contain_mutable_functions</name><argument_list>(<argument><expr><operator>(</operator><name>Node</name> <operator>*</operator><operator>)</operator> <name><name>curTarget</name><operator>-&gt;</operator><name>expr</name></name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<return>return <expr><name>true</name></expr>;</return></block_content></block></if></if_stmt>		<comment type="block">/* not potentially indexable */</comment>
+
+		<if_stmt><if>if <condition>(<expr><call><name>type_is_rowtype</name><argument_list>(<argument><expr><call><name>exprType</name><argument_list>(<argument><expr><operator>(</operator><name>Node</name> <operator>*</operator><operator>)</operator> <name><name>curTarget</name><operator>-&gt;</operator><name>expr</name></name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<return>return <expr><name>true</name></expr>;</return></block_content></block></if></if_stmt>		<comment type="block">/* IS NOT NULL would have weird semantics */</comment>
+
+		<comment type="block">/*
+		 * Check whether it's already in the list, and add it if not.
+		 */</comment>
+		<macro><name>foreach</name><argument_list>(<argument>l</argument>, <argument>*context</argument>)</argument_list></macro>
+		<block>{<block_content>
+			<expr_stmt><expr><name>mminfo</name> <operator>=</operator> <operator>(</operator><name>MinMaxAggInfo</name> <operator>*</operator><operator>)</operator> <call><name>lfirst</name><argument_list>(<argument><expr><name>l</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<if_stmt><if>if <condition>(<expr><name><name>mminfo</name><operator>-&gt;</operator><name>aggfnoid</name></name> <operator>==</operator> <name><name>aggref</name><operator>-&gt;</operator><name>aggfnoid</name></name> <operator>&amp;&amp;</operator>
+				<call><name>equal</name><argument_list>(<argument><expr><name><name>mminfo</name><operator>-&gt;</operator><name>target</name></name></expr></argument>, <argument><expr><name><name>curTarget</name><operator>-&gt;</operator><name>expr</name></name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+				<return>return <expr><name>false</name></expr>;</return></block_content></block></if></if_stmt>
+		</block_content>}</block>
+
+		<expr_stmt><expr><name>mminfo</name> <operator>=</operator> <call><name>makeNode</name><argument_list>(<argument><expr><name>MinMaxAggInfo</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>mminfo</name><operator>-&gt;</operator><name>aggfnoid</name></name> <operator>=</operator> <name><name>aggref</name><operator>-&gt;</operator><name>aggfnoid</name></name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>mminfo</name><operator>-&gt;</operator><name>aggsortop</name></name> <operator>=</operator> <name>aggsortop</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>mminfo</name><operator>-&gt;</operator><name>target</name></name> <operator>=</operator> <name><name>curTarget</name><operator>-&gt;</operator><name>expr</name></name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>mminfo</name><operator>-&gt;</operator><name>subroot</name></name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt> <comment type="block">/* don't compute path yet */</comment>
+		<expr_stmt><expr><name><name>mminfo</name><operator>-&gt;</operator><name>path</name></name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>mminfo</name><operator>-&gt;</operator><name>pathcost</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>mminfo</name><operator>-&gt;</operator><name>param</name></name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+
+		<expr_stmt><expr><operator>*</operator><name>context</name> <operator>=</operator> <call><name>lappend</name><argument_list>(<argument><expr><operator>*</operator><name>context</name></expr></argument>, <argument><expr><name>mminfo</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/*
+		 * We need not recurse into the argument, since it can't contain any
+		 * aggregates.
+		 */</comment>
+		<return>return <expr><name>false</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><operator>!</operator><call><name>IsA</name><argument_list>(<argument><expr><name>node</name></expr></argument>, <argument><expr><name>SubLink</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<return>return <expr><call><name>expression_tree_walker</name><argument_list>(<argument><expr><name>node</name></expr></argument>, <argument><expr><name>find_minmax_aggs_walker</name></expr></argument>,
+								  <argument><expr><operator>(</operator><name>void</name> <operator>*</operator><operator>)</operator> <name>context</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * build_minmax_path
+ *		Given a MIN/MAX aggregate, try to build an indexscan Path it can be
+ *		optimized with.
+ *
+ * If successful, stash the best path in *mminfo and return true.
+ * Otherwise, return false.
+ */</comment>
+<function><type><specifier>static</specifier> <name>bool</name></type>
+<name>build_minmax_path</name><parameter_list>(<parameter><decl><type><name>PlannerInfo</name> <modifier>*</modifier></type><name>root</name></decl></parameter>, <parameter><decl><type><name>MinMaxAggInfo</name> <modifier>*</modifier></type><name>mminfo</name></decl></parameter>,
+				  <parameter><decl><type><name>Oid</name></type> <name>eqop</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>sortop</name></decl></parameter>, <parameter><decl><type><name>bool</name></type> <name>nulls_first</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>PlannerInfo</name> <modifier>*</modifier></type><name>subroot</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Query</name>	   <modifier>*</modifier></type><name>parse</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>TargetEntry</name> <modifier>*</modifier></type><name>tle</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>List</name>	   <modifier>*</modifier></type><name>tlist</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>NullTest</name>   <modifier>*</modifier></type><name>ntest</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>SortGroupClause</name> <modifier>*</modifier></type><name>sortcl</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>RelOptInfo</name> <modifier>*</modifier></type><name>final_rel</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Path</name>	   <modifier>*</modifier></type><name>sorted_path</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Cost</name></type>		<name>path_cost</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>double</name></type>		<name>path_fraction</name></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * We are going to construct what is effectively a sub-SELECT query, so
+	 * clone the current query level's state and adjust it to make it look
+	 * like a subquery.  Any outer references will now be one level higher
+	 * than before.  (This means that when we are done, there will be no Vars
+	 * of level 1, which is why the subquery can become an initplan.)
+	 */</comment>
+	<expr_stmt><expr><name>subroot</name> <operator>=</operator> <operator>(</operator><name>PlannerInfo</name> <operator>*</operator><operator>)</operator> <call><name>palloc</name><argument_list>(<argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>PlannerInfo</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>memcpy</name><argument_list>(<argument><expr><name>subroot</name></expr></argument>, <argument><expr><name>root</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>PlannerInfo</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>subroot</name><operator>-&gt;</operator><name>query_level</name></name><operator>++</operator></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>subroot</name><operator>-&gt;</operator><name>parent_root</name></name> <operator>=</operator> <name>root</name></expr>;</expr_stmt>
+	<comment type="block">/* reset subplan-related stuff */</comment>
+	<expr_stmt><expr><name><name>subroot</name><operator>-&gt;</operator><name>plan_params</name></name> <operator>=</operator> <name>NIL</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>subroot</name><operator>-&gt;</operator><name>outer_params</name></name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>subroot</name><operator>-&gt;</operator><name>init_plans</name></name> <operator>=</operator> <name>NIL</name></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name><name>subroot</name><operator>-&gt;</operator><name>parse</name></name> <operator>=</operator> <name>parse</name> <operator>=</operator> <call><name>copyObject</name><argument_list>(<argument><expr><name><name>root</name><operator>-&gt;</operator><name>parse</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>IncrementVarSublevelsUp</name><argument_list>(<argument><expr><operator>(</operator><name>Node</name> <operator>*</operator><operator>)</operator> <name>parse</name></expr></argument>, <argument><expr><literal type="number">1</literal></expr></argument>, <argument><expr><literal type="number">1</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* append_rel_list might contain outer Vars? */</comment>
+	<expr_stmt><expr><name><name>subroot</name><operator>-&gt;</operator><name>append_rel_list</name></name> <operator>=</operator> <call><name>copyObject</name><argument_list>(<argument><expr><name><name>root</name><operator>-&gt;</operator><name>append_rel_list</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>IncrementVarSublevelsUp</name><argument_list>(<argument><expr><operator>(</operator><name>Node</name> <operator>*</operator><operator>)</operator> <name><name>subroot</name><operator>-&gt;</operator><name>append_rel_list</name></name></expr></argument>, <argument><expr><literal type="number">1</literal></expr></argument>, <argument><expr><literal type="number">1</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<comment type="block">/* There shouldn't be any OJ info to translate, as yet */</comment>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>subroot</name><operator>-&gt;</operator><name>join_info_list</name></name> <operator>==</operator> <name>NIL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<comment type="block">/* and we haven't made equivalence classes, either */</comment>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>subroot</name><operator>-&gt;</operator><name>eq_classes</name></name> <operator>==</operator> <name>NIL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<comment type="block">/* and we haven't created PlaceHolderInfos, either */</comment>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>subroot</name><operator>-&gt;</operator><name>placeholder_list</name></name> <operator>==</operator> <name>NIL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*----------
+	 * Generate modified query of the form
+	 *		(SELECT col FROM tab
+	 *		 WHERE col IS NOT NULL AND existing-quals
+	 *		 ORDER BY col ASC/DESC
+	 *		 LIMIT 1)
+	 *----------
+	 */</comment>
+	<comment type="block">/* single tlist entry that is the aggregate target */</comment>
+	<expr_stmt><expr><name>tle</name> <operator>=</operator> <call><name>makeTargetEntry</name><argument_list>(<argument><expr><call><name>copyObject</name><argument_list>(<argument><expr><name><name>mminfo</name><operator>-&gt;</operator><name>target</name></name></expr></argument>)</argument_list></call></expr></argument>,
+						  <argument><expr><operator>(</operator><name>AttrNumber</name><operator>)</operator> <literal type="number">1</literal></expr></argument>,
+						  <argument><expr><call><name>pstrdup</name><argument_list>(<argument><expr><literal type="string">"agg_target"</literal></expr></argument>)</argument_list></call></expr></argument>,
+						  <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>tlist</name> <operator>=</operator> <call><name>list_make1</name><argument_list>(<argument><expr><name>tle</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>subroot</name><operator>-&gt;</operator><name>processed_tlist</name></name> <operator>=</operator> <name><name>parse</name><operator>-&gt;</operator><name>targetList</name></name> <operator>=</operator> <name>tlist</name></expr>;</expr_stmt>
+
+	<comment type="block">/* No HAVING, no DISTINCT, no aggregates anymore */</comment>
+	<expr_stmt><expr><name><name>parse</name><operator>-&gt;</operator><name>havingQual</name></name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>subroot</name><operator>-&gt;</operator><name>hasHavingQual</name></name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>parse</name><operator>-&gt;</operator><name>distinctClause</name></name> <operator>=</operator> <name>NIL</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>parse</name><operator>-&gt;</operator><name>hasDistinctOn</name></name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>parse</name><operator>-&gt;</operator><name>hasAggs</name></name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+
+	<comment type="block">/* Build "target IS NOT NULL" expression */</comment>
+	<expr_stmt><expr><name>ntest</name> <operator>=</operator> <call><name>makeNode</name><argument_list>(<argument><expr><name>NullTest</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>ntest</name><operator>-&gt;</operator><name>nulltesttype</name></name> <operator>=</operator> <name>IS_NOT_NULL</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>ntest</name><operator>-&gt;</operator><name>arg</name></name> <operator>=</operator> <call><name>copyObject</name><argument_list>(<argument><expr><name><name>mminfo</name><operator>-&gt;</operator><name>target</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<comment type="block">/* we checked it wasn't a rowtype in find_minmax_aggs_walker */</comment>
+	<expr_stmt><expr><name><name>ntest</name><operator>-&gt;</operator><name>argisrow</name></name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>ntest</name><operator>-&gt;</operator><name>location</name></name> <operator>=</operator> <operator>-</operator><literal type="number">1</literal></expr>;</expr_stmt>
+
+	<comment type="block">/* User might have had that in WHERE already */</comment>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>list_member</name><argument_list>(<argument><expr><operator>(</operator><name>List</name> <operator>*</operator><operator>)</operator> <name><name>parse</name><operator>-&gt;</operator><name>jointree</name><operator>-&gt;</operator><name>quals</name></name></expr></argument>, <argument><expr><name>ntest</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name><name>parse</name><operator>-&gt;</operator><name>jointree</name><operator>-&gt;</operator><name>quals</name></name> <operator>=</operator> <operator>(</operator><name>Node</name> <operator>*</operator><operator>)</operator>
+			<call><name>lcons</name><argument_list>(<argument><expr><name>ntest</name></expr></argument>, <argument><expr><operator>(</operator><name>List</name> <operator>*</operator><operator>)</operator> <name><name>parse</name><operator>-&gt;</operator><name>jointree</name><operator>-&gt;</operator><name>quals</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<comment type="block">/* Build suitable ORDER BY clause */</comment>
+	<expr_stmt><expr><name>sortcl</name> <operator>=</operator> <call><name>makeNode</name><argument_list>(<argument><expr><name>SortGroupClause</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>sortcl</name><operator>-&gt;</operator><name>tleSortGroupRef</name></name> <operator>=</operator> <call><name>assignSortGroupRef</name><argument_list>(<argument><expr><name>tle</name></expr></argument>, <argument><expr><name><name>subroot</name><operator>-&gt;</operator><name>processed_tlist</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>sortcl</name><operator>-&gt;</operator><name>eqop</name></name> <operator>=</operator> <name>eqop</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>sortcl</name><operator>-&gt;</operator><name>sortop</name></name> <operator>=</operator> <name>sortop</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>sortcl</name><operator>-&gt;</operator><name>nulls_first</name></name> <operator>=</operator> <name>nulls_first</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>sortcl</name><operator>-&gt;</operator><name>hashable</name></name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>	<comment type="block">/* no need to make this accurate */</comment>
+	<expr_stmt><expr><name><name>parse</name><operator>-&gt;</operator><name>sortClause</name></name> <operator>=</operator> <call><name>list_make1</name><argument_list>(<argument><expr><name>sortcl</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* set up expressions for LIMIT 1 */</comment>
+	<expr_stmt><expr><name><name>parse</name><operator>-&gt;</operator><name>limitOffset</name></name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>parse</name><operator>-&gt;</operator><name>limitCount</name></name> <operator>=</operator> <operator>(</operator><name>Node</name> <operator>*</operator><operator>)</operator> <call><name>makeConst</name><argument_list>(<argument><expr><name>INT8OID</name></expr></argument>, <argument><expr><operator>-</operator><literal type="number">1</literal></expr></argument>, <argument><expr><name>InvalidOid</name></expr></argument>,
+										   <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>int64</name></expr></argument>)</argument_list></sizeof></expr></argument>,
+										   <argument><expr><call><name>Int64GetDatum</name><argument_list>(<argument><expr><literal type="number">1</literal></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>false</name></expr></argument>,
+										   <argument><expr><name>FLOAT8PASSBYVAL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Generate the best paths for this query, telling query_planner that we
+	 * have LIMIT 1.
+	 */</comment>
+	<expr_stmt><expr><name><name>subroot</name><operator>-&gt;</operator><name>tuple_fraction</name></name> <operator>=</operator> <literal type="number">1.0</literal></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>subroot</name><operator>-&gt;</operator><name>limit_tuples</name></name> <operator>=</operator> <literal type="number">1.0</literal></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>final_rel</name> <operator>=</operator> <call><name>query_planner</name><argument_list>(<argument><expr><name>subroot</name></expr></argument>, <argument><expr><name>minmax_qp_callback</name></expr></argument>, <argument><expr><name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Since we didn't go through subquery_planner() to handle the subquery,
+	 * we have to do some of the same cleanup it would do, in particular cope
+	 * with params and initplans used within this subquery.  (This won't
+	 * matter if we end up not using the subplan.)
+	 */</comment>
+	<expr_stmt><expr><call><name>SS_identify_outer_params</name><argument_list>(<argument><expr><name>subroot</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>SS_charge_for_initplans</name><argument_list>(<argument><expr><name>subroot</name></expr></argument>, <argument><expr><name>final_rel</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Get the best presorted path, that being the one that's cheapest for
+	 * fetching just one row.  If there's no such path, fail.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>final_rel</name><operator>-&gt;</operator><name>rows</name></name> <operator>&gt;</operator> <literal type="number">1.0</literal></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name>path_fraction</name> <operator>=</operator> <literal type="number">1.0</literal> <operator>/</operator> <name><name>final_rel</name><operator>-&gt;</operator><name>rows</name></name></expr>;</expr_stmt></block_content></block></if>
+	<else>else<block type="pseudo"><block_content>
+		<expr_stmt><expr><name>path_fraction</name> <operator>=</operator> <literal type="number">1.0</literal></expr>;</expr_stmt></block_content></block></else></if_stmt>
+
+	<expr_stmt><expr><name>sorted_path</name> <operator>=</operator>
+		<call><name>get_cheapest_fractional_path_for_pathkeys</name><argument_list>(<argument><expr><name><name>final_rel</name><operator>-&gt;</operator><name>pathlist</name></name></expr></argument>,
+												  <argument><expr><name><name>subroot</name><operator>-&gt;</operator><name>query_pathkeys</name></name></expr></argument>,
+												  <argument><expr><name>NULL</name></expr></argument>,
+												  <argument><expr><name>path_fraction</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><name>sorted_path</name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>false</name></expr>;</return></block_content></block></if></if_stmt>
+
+	<comment type="block">/*
+	 * The path might not return exactly what we want, so fix that.  (We
+	 * assume that this won't change any conclusions about which was the
+	 * cheapest path.)
+	 */</comment>
+	<expr_stmt><expr><name>sorted_path</name> <operator>=</operator> <call><name>apply_projection_to_path</name><argument_list>(<argument><expr><name>subroot</name></expr></argument>, <argument><expr><name>final_rel</name></expr></argument>, <argument><expr><name>sorted_path</name></expr></argument>,
+										   <argument><expr><call><name>create_pathtarget</name><argument_list>(<argument><expr><name>subroot</name></expr></argument>,
+															 <argument><expr><name><name>subroot</name><operator>-&gt;</operator><name>processed_tlist</name></name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Need to gather the results to a single node, if it's not already
+	 * like that. Otherwise, we won't get the single min/max row, but
+	 * one min/max row from every segment.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name>Gp_role</name> <operator>==</operator> <name>GP_ROLE_DISPATCH</name> <operator>&amp;&amp;</operator> <call><name>CdbPathLocus_IsPartitioned</name><argument_list>(<argument><expr><name><name>sorted_path</name><operator>-&gt;</operator><name>locus</name></name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>CdbPathLocus</name></type> <name>singleQE</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>List</name>	   <modifier>*</modifier></type><name>pathkeys</name></decl>;</decl_stmt>
+
+		<expr_stmt><expr><call><name>CdbPathLocus_MakeSingleQE</name><argument_list>(<argument><expr><operator>&amp;</operator><name>singleQE</name></expr></argument>, <argument><expr><call><name>getgpsegmentCount</name><argument_list>()</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><name>pathkeys</name> <operator>=</operator> <name><name>sorted_path</name><operator>-&gt;</operator><name>pathkeys</name></name></expr>;</expr_stmt>
+		<expr_stmt><expr><name>sorted_path</name> <operator>=</operator> <call><name>cdbpath_create_motion_path</name><argument_list>(<argument><expr><name>root</name></expr></argument>, <argument><expr><name>sorted_path</name></expr></argument>, <argument><expr><name><name>sorted_path</name><operator>-&gt;</operator><name>pathkeys</name></name></expr></argument>,
+												 <argument><expr><name>false</name></expr></argument>, <argument><expr><name>singleQE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<comment type="block">/*
+		 * Sanity check that order was preserved. (Given how cdbpath_create_motion_path() is
+		 * implemented, pointer equality is enough here, but in principle we should be
+		 * using something more sophisticated for the comparison.)
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><name><name>sorted_path</name><operator>-&gt;</operator><name>pathkeys</name></name> <operator>!=</operator> <name>pathkeys</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"could not create an order-preserving gather motion for min/max path"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/*
+	 * Determine cost to get just the first row of the presorted path.
+	 *
+	 * Note: cost calculation here should match
+	 * compare_fractional_path_costs().
+	 */</comment>
+	<expr_stmt><expr><name>path_cost</name> <operator>=</operator> <name><name>sorted_path</name><operator>-&gt;</operator><name>startup_cost</name></name> <operator>+</operator>
+		<name>path_fraction</name> <operator>*</operator> <operator>(</operator><name><name>sorted_path</name><operator>-&gt;</operator><name>total_cost</name></name> <operator>-</operator> <name><name>sorted_path</name><operator>-&gt;</operator><name>startup_cost</name></name><operator>)</operator></expr>;</expr_stmt>
+
+	<comment type="block">/* Save state for further processing */</comment>
+	<expr_stmt><expr><name><name>mminfo</name><operator>-&gt;</operator><name>subroot</name></name> <operator>=</operator> <name>subroot</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>mminfo</name><operator>-&gt;</operator><name>path</name></name> <operator>=</operator> <name>sorted_path</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>mminfo</name><operator>-&gt;</operator><name>pathcost</name></name> <operator>=</operator> <name>path_cost</name></expr>;</expr_stmt>
+
+	<return>return <expr><name>true</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Compute query_pathkeys and other pathkeys during query_planner()
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>minmax_qp_callback</name><parameter_list>(<parameter><decl><type><name>PlannerInfo</name> <modifier>*</modifier></type><name>root</name></decl></parameter>, <parameter><decl><type><name>void</name> <modifier>*</modifier></type><name>extra</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><name><name>root</name><operator>-&gt;</operator><name>group_pathkeys</name></name> <operator>=</operator> <name>NIL</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>root</name><operator>-&gt;</operator><name>window_pathkeys</name></name> <operator>=</operator> <name>NIL</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>root</name><operator>-&gt;</operator><name>distinct_pathkeys</name></name> <operator>=</operator> <name>NIL</name></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name><name>root</name><operator>-&gt;</operator><name>sort_pathkeys</name></name> <operator>=</operator>
+		<call><name>make_pathkeys_for_sortclauses</name><argument_list>(<argument><expr><name>root</name></expr></argument>,
+									  <argument><expr><name><name>root</name><operator>-&gt;</operator><name>parse</name><operator>-&gt;</operator><name>sortClause</name></name></expr></argument>,
+									  <argument><expr><name><name>root</name><operator>-&gt;</operator><name>parse</name><operator>-&gt;</operator><name>targetList</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name><name>root</name><operator>-&gt;</operator><name>query_pathkeys</name></name> <operator>=</operator> <name><name>root</name><operator>-&gt;</operator><name>sort_pathkeys</name></name></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Get the OID of the sort operator, if any, associated with an aggregate.
+ * Returns InvalidOid if there is no such operator.
+ */</comment>
+<function><type><specifier>static</specifier> <name>Oid</name></type>
+<name>fetch_agg_sort_op</name><parameter_list>(<parameter><decl><type><name>Oid</name></type> <name>aggfnoid</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>HeapTuple</name></type>	<name>aggTuple</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Form_pg_aggregate</name></type> <name>aggform</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Oid</name></type>			<name>aggsortop</name></decl>;</decl_stmt>
+
+	<comment type="block">/* fetch aggregate entry from pg_aggregate */</comment>
+	<expr_stmt><expr><name>aggTuple</name> <operator>=</operator> <call><name>SearchSysCache1</name><argument_list>(<argument><expr><name>AGGFNOID</name></expr></argument>, <argument><expr><call><name>ObjectIdGetDatum</name><argument_list>(<argument><expr><name>aggfnoid</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>HeapTupleIsValid</name><argument_list>(<argument><expr><name>aggTuple</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>InvalidOid</name></expr>;</return></block_content></block></if></if_stmt>
+	<expr_stmt><expr><name>aggform</name> <operator>=</operator> <operator>(</operator><name>Form_pg_aggregate</name><operator>)</operator> <call><name>GETSTRUCT</name><argument_list>(<argument><expr><name>aggTuple</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>aggsortop</name> <operator>=</operator> <name><name>aggform</name><operator>-&gt;</operator><name>aggsortop</name></name></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>ReleaseSysCache</name><argument_list>(<argument><expr><name>aggTuple</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<return>return <expr><name>aggsortop</name></expr>;</return>
+</block_content>}</block></function>
+</unit>

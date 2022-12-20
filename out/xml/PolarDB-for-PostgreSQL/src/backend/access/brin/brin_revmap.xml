@@ -1,0 +1,658 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<unit xmlns="http://www.srcML.org/srcML/src" xmlns:cpp="http://www.srcML.org/srcML/cpp" revision="1.0.0" language="C" filename="/cloned_projects/PolarDB-for-PostgreSQL/src/backend/access/brin/brin_revmap.c"><comment type="block">/*
+ * brin_revmap.c
+ *		Range map for BRIN indexes
+ *
+ * The range map (revmap) is a translation structure for BRIN indexes: for each
+ * page range there is one summary tuple, and its location is tracked by the
+ * revmap.  Whenever a new tuple is inserted into a table that violates the
+ * previously recorded summary values, a new tuple is inserted into the index
+ * and the revmap is updated to point to it.
+ *
+ * The revmap is stored in the first pages of the index, immediately following
+ * the metapage.  When the revmap needs to be expanded, all tuples on the
+ * regular BRIN page at that block (if any) are moved out of the way.
+ *
+ * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1994, Regents of the University of California
+ *
+ * IDENTIFICATION
+ *	  src/backend/access/brin/brin_revmap.c
+ */</comment>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"postgres.h"</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/brin_page.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/brin_pageops.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/brin_revmap.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/brin_tuple.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/brin_xlog.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/rmgr.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/xloginsert.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"miscadmin.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/bufmgr.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/lmgr.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/rel.h"</cpp:file></cpp:include>
+
+
+<comment type="block">/*
+ * In revmap pages, each item stores an ItemPointerData.  These defines let one
+ * find the logical revmap page number and index number of the revmap item for
+ * the given heap block number.
+ */</comment>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>HEAPBLK_TO_REVMAP_BLK</name><parameter_list>(<parameter><type><name>pagesPerRange</name></type></parameter>, <parameter><type><name>heapBlk</name></type></parameter>)</parameter_list></cpp:macro> \
+	<cpp:value>((heapBlk / pagesPerRange) / REVMAP_PAGE_MAXITEMS)</cpp:value></cpp:define>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>HEAPBLK_TO_REVMAP_INDEX</name><parameter_list>(<parameter><type><name>pagesPerRange</name></type></parameter>, <parameter><type><name>heapBlk</name></type></parameter>)</parameter_list></cpp:macro> \
+	<cpp:value>((heapBlk / pagesPerRange) % REVMAP_PAGE_MAXITEMS)</cpp:value></cpp:define>
+
+
+<struct>struct <name>BrinRevmap</name>
+<block>{
+	<decl_stmt><decl><type><name>Relation</name></type>	<name>rm_irel</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>BlockNumber</name></type> <name>rm_pagesPerRange</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>BlockNumber</name></type> <name>rm_lastRevmapPage</name></decl>;</decl_stmt>	<comment type="block">/* cached from the metapage */</comment>
+	<decl_stmt><decl><type><name>Buffer</name></type>		<name>rm_metaBuf</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Buffer</name></type>		<name>rm_currBuf</name></decl>;</decl_stmt>
+}</block>;</struct>
+
+<comment type="block">/* typedef appears in brin_revmap.h */</comment>
+
+
+<function_decl><type><specifier>static</specifier> <name>BlockNumber</name></type> <name>revmap_get_blkno</name><parameter_list>(<parameter><decl><type><name>BrinRevmap</name> <modifier>*</modifier></type><name>revmap</name></decl></parameter>,
+				 <parameter><decl><type><name>BlockNumber</name></type> <name>heapBlk</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>Buffer</name></type> <name>revmap_get_buffer</name><parameter_list>(<parameter><decl><type><name>BrinRevmap</name> <modifier>*</modifier></type><name>revmap</name></decl></parameter>, <parameter><decl><type><name>BlockNumber</name></type> <name>heapBlk</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>BlockNumber</name></type> <name>revmap_extend_and_get_blkno</name><parameter_list>(<parameter><decl><type><name>BrinRevmap</name> <modifier>*</modifier></type><name>revmap</name></decl></parameter>,
+							<parameter><decl><type><name>BlockNumber</name></type> <name>heapBlk</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>revmap_physical_extend</name><parameter_list>(<parameter><decl><type><name>BrinRevmap</name> <modifier>*</modifier></type><name>revmap</name></decl></parameter>)</parameter_list>;</function_decl>
+
+<comment type="block">/*
+ * Initialize an access object for a range map.  This must be freed by
+ * brinRevmapTerminate when caller is done with it.
+ */</comment>
+<function><type><name>BrinRevmap</name> <modifier>*</modifier></type>
+<name>brinRevmapInitialize</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>idxrel</name></decl></parameter>, <parameter><decl><type><name>BlockNumber</name> <modifier>*</modifier></type><name>pagesPerRange</name></decl></parameter>,
+					 <parameter><decl><type><name>Snapshot</name></type> <name>snapshot</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>BrinRevmap</name> <modifier>*</modifier></type><name>revmap</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Buffer</name></type>		<name>meta</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>BrinMetaPageData</name> <modifier>*</modifier></type><name>metadata</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Page</name></type>		<name>page</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name>meta</name> <operator>=</operator> <call><name>ReadBuffer</name><argument_list>(<argument><expr><name>idxrel</name></expr></argument>, <argument><expr><name>BRIN_METAPAGE_BLKNO</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>LockBuffer</name><argument_list>(<argument><expr><name>meta</name></expr></argument>, <argument><expr><name>BUFFER_LOCK_SHARE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>page</name> <operator>=</operator> <call><name>BufferGetPage</name><argument_list>(<argument><expr><name>meta</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>TestForOldSnapshot</name><argument_list>(<argument><expr><name>snapshot</name></expr></argument>, <argument><expr><name>idxrel</name></expr></argument>, <argument><expr><name>page</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>metadata</name> <operator>=</operator> <operator>(</operator><name>BrinMetaPageData</name> <operator>*</operator><operator>)</operator> <call><name>PageGetContents</name><argument_list>(<argument><expr><name>page</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>revmap</name> <operator>=</operator> <call><name>palloc</name><argument_list>(<argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>BrinRevmap</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>revmap</name><operator>-&gt;</operator><name>rm_irel</name></name> <operator>=</operator> <name>idxrel</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>revmap</name><operator>-&gt;</operator><name>rm_pagesPerRange</name></name> <operator>=</operator> <name><name>metadata</name><operator>-&gt;</operator><name>pagesPerRange</name></name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>revmap</name><operator>-&gt;</operator><name>rm_lastRevmapPage</name></name> <operator>=</operator> <name><name>metadata</name><operator>-&gt;</operator><name>lastRevmapPage</name></name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>revmap</name><operator>-&gt;</operator><name>rm_metaBuf</name></name> <operator>=</operator> <name>meta</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>revmap</name><operator>-&gt;</operator><name>rm_currBuf</name></name> <operator>=</operator> <name>InvalidBuffer</name></expr>;</expr_stmt>
+
+	<expr_stmt><expr><operator>*</operator><name>pagesPerRange</name> <operator>=</operator> <name><name>metadata</name><operator>-&gt;</operator><name>pagesPerRange</name></name></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>LockBuffer</name><argument_list>(<argument><expr><name>meta</name></expr></argument>, <argument><expr><name>BUFFER_LOCK_UNLOCK</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<return>return <expr><name>revmap</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Release resources associated with a revmap access object.
+ */</comment>
+<function><type><name>void</name></type>
+<name>brinRevmapTerminate</name><parameter_list>(<parameter><decl><type><name>BrinRevmap</name> <modifier>*</modifier></type><name>revmap</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>ReleaseBuffer</name><argument_list>(<argument><expr><name><name>revmap</name><operator>-&gt;</operator><name>rm_metaBuf</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><name><name>revmap</name><operator>-&gt;</operator><name>rm_currBuf</name></name> <operator>!=</operator> <name>InvalidBuffer</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ReleaseBuffer</name><argument_list>(<argument><expr><name><name>revmap</name><operator>-&gt;</operator><name>rm_currBuf</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	<expr_stmt><expr><call><name>pfree</name><argument_list>(<argument><expr><name>revmap</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Extend the revmap to cover the given heap block number.
+ */</comment>
+<function><type><name>void</name></type>
+<name>brinRevmapExtend</name><parameter_list>(<parameter><decl><type><name>BrinRevmap</name> <modifier>*</modifier></type><name>revmap</name></decl></parameter>, <parameter><decl><type><name>BlockNumber</name></type> <name>heapBlk</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>BlockNumber</name> <name>mapBlk</name></type> <name>PG_USED_FOR_ASSERTS_ONLY</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name>mapBlk</name> <operator>=</operator> <call><name>revmap_extend_and_get_blkno</name><argument_list>(<argument><expr><name>revmap</name></expr></argument>, <argument><expr><name>heapBlk</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Ensure the buffer we got is in the expected range */</comment>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>mapBlk</name> <operator>!=</operator> <name>InvalidBlockNumber</name> <operator>&amp;&amp;</operator>
+		   <name>mapBlk</name> <operator>!=</operator> <name>BRIN_METAPAGE_BLKNO</name> <operator>&amp;&amp;</operator>
+		   <name>mapBlk</name> <operator>&lt;=</operator> <name><name>revmap</name><operator>-&gt;</operator><name>rm_lastRevmapPage</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Prepare to insert an entry into the revmap; the revmap buffer in which the
+ * entry is to reside is locked and returned.  Most callers should call
+ * brinRevmapExtend beforehand, as this routine does not extend the revmap if
+ * it's not long enough.
+ *
+ * The returned buffer is also recorded in the revmap struct; finishing that
+ * releases the buffer, therefore the caller needn't do it explicitly.
+ */</comment>
+<function><type><name>Buffer</name></type>
+<name>brinLockRevmapPageForUpdate</name><parameter_list>(<parameter><decl><type><name>BrinRevmap</name> <modifier>*</modifier></type><name>revmap</name></decl></parameter>, <parameter><decl><type><name>BlockNumber</name></type> <name>heapBlk</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>Buffer</name></type>		<name>rmBuf</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name>rmBuf</name> <operator>=</operator> <call><name>revmap_get_buffer</name><argument_list>(<argument><expr><name>revmap</name></expr></argument>, <argument><expr><name>heapBlk</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>LockBuffer</name><argument_list>(<argument><expr><name>rmBuf</name></expr></argument>, <argument><expr><name>BUFFER_LOCK_EXCLUSIVE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<return>return <expr><name>rmBuf</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * In the given revmap buffer (locked appropriately by caller), which is used
+ * in a BRIN index of pagesPerRange pages per range, set the element
+ * corresponding to heap block number heapBlk to the given TID.
+ *
+ * Once the operation is complete, the caller must update the LSN on the
+ * returned buffer.
+ *
+ * This is used both in regular operation and during WAL replay.
+ */</comment>
+<function><type><name>void</name></type>
+<name>brinSetHeapBlockItemptr</name><parameter_list>(<parameter><decl><type><name>Buffer</name></type> <name>buf</name></decl></parameter>, <parameter><decl><type><name>BlockNumber</name></type> <name>pagesPerRange</name></decl></parameter>,
+						<parameter><decl><type><name>BlockNumber</name></type> <name>heapBlk</name></decl></parameter>, <parameter><decl><type><name>ItemPointerData</name></type> <name>tid</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>RevmapContents</name> <modifier>*</modifier></type><name>contents</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>ItemPointerData</name> <modifier>*</modifier></type><name>iptr</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Page</name></type>		<name>page</name></decl>;</decl_stmt>
+
+	<comment type="block">/* The correct page should already be pinned and locked */</comment>
+	<expr_stmt><expr><name>page</name> <operator>=</operator> <call><name>BufferGetPage</name><argument_list>(<argument><expr><name>buf</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>contents</name> <operator>=</operator> <operator>(</operator><name>RevmapContents</name> <operator>*</operator><operator>)</operator> <call><name>PageGetContents</name><argument_list>(<argument><expr><name>page</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>iptr</name> <operator>=</operator> <operator>(</operator><name>ItemPointerData</name> <operator>*</operator><operator>)</operator> <name><name>contents</name><operator>-&gt;</operator><name>rm_tids</name></name></expr>;</expr_stmt>
+	<expr_stmt><expr><name>iptr</name> <operator>+=</operator> <call><name>HEAPBLK_TO_REVMAP_INDEX</name><argument_list>(<argument><expr><name>pagesPerRange</name></expr></argument>, <argument><expr><name>heapBlk</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><call><name>ItemPointerIsValid</name><argument_list>(<argument><expr><operator>&amp;</operator><name>tid</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ItemPointerSet</name><argument_list>(<argument><expr><name>iptr</name></expr></argument>,
+					   <argument><expr><call><name>ItemPointerGetBlockNumber</name><argument_list>(<argument><expr><operator>&amp;</operator><name>tid</name></expr></argument>)</argument_list></call></expr></argument>,
+					   <argument><expr><call><name>ItemPointerGetOffsetNumber</name><argument_list>(<argument><expr><operator>&amp;</operator><name>tid</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if>
+	<else>else<block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ItemPointerSetInvalid</name><argument_list>(<argument><expr><name>iptr</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></else></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Fetch the BrinTuple for a given heap block.
+ *
+ * The buffer containing the tuple is locked, and returned in *buf.  The
+ * returned tuple points to the shared buffer and must not be freed; if caller
+ * wants to use it after releasing the buffer lock, it must create its own
+ * palloc'ed copy.  As an optimization, the caller can pass a pinned buffer
+ * *buf on entry, which will avoid a pin-unpin cycle when the next tuple is on
+ * the same page as a previous one.
+ *
+ * If no tuple is found for the given heap range, returns NULL. In that case,
+ * *buf might still be updated (and pin must be released by caller), but it's
+ * not locked.
+ *
+ * The output tuple offset within the buffer is returned in *off, and its size
+ * is returned in *size.
+ */</comment>
+<function><type><name>BrinTuple</name> <modifier>*</modifier></type>
+<name>brinGetTupleForHeapBlock</name><parameter_list>(<parameter><decl><type><name>BrinRevmap</name> <modifier>*</modifier></type><name>revmap</name></decl></parameter>, <parameter><decl><type><name>BlockNumber</name></type> <name>heapBlk</name></decl></parameter>,
+						 <parameter><decl><type><name>Buffer</name> <modifier>*</modifier></type><name>buf</name></decl></parameter>, <parameter><decl><type><name>OffsetNumber</name> <modifier>*</modifier></type><name>off</name></decl></parameter>, <parameter><decl><type><name>Size</name> <modifier>*</modifier></type><name>size</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>mode</name></decl></parameter>,
+						 <parameter><decl><type><name>Snapshot</name></type> <name>snapshot</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>Relation</name></type>	<name>idxRel</name> <init>= <expr><name><name>revmap</name><operator>-&gt;</operator><name>rm_irel</name></name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>BlockNumber</name></type> <name>mapBlk</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>RevmapContents</name> <modifier>*</modifier></type><name>contents</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>ItemPointerData</name> <modifier>*</modifier></type><name>iptr</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>BlockNumber</name></type> <name>blk</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Page</name></type>		<name>page</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>ItemId</name></type>		<name>lp</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>BrinTuple</name>  <modifier>*</modifier></type><name>tup</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>ItemPointerData</name></type> <name>previptr</name></decl>;</decl_stmt>
+
+	<comment type="block">/* normalize the heap block number to be the first page in the range */</comment>
+	<expr_stmt><expr><name>heapBlk</name> <operator>=</operator> <operator>(</operator><name>heapBlk</name> <operator>/</operator> <name><name>revmap</name><operator>-&gt;</operator><name>rm_pagesPerRange</name></name><operator>)</operator> <operator>*</operator> <name><name>revmap</name><operator>-&gt;</operator><name>rm_pagesPerRange</name></name></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Compute the revmap page number we need.  If Invalid is returned (i.e.,
+	 * the revmap page hasn't been created yet), the requested page range is
+	 * not summarized.
+	 */</comment>
+	<expr_stmt><expr><name>mapBlk</name> <operator>=</operator> <call><name>revmap_get_blkno</name><argument_list>(<argument><expr><name>revmap</name></expr></argument>, <argument><expr><name>heapBlk</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><name>mapBlk</name> <operator>==</operator> <name>InvalidBlockNumber</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><operator>*</operator><name>off</name> <operator>=</operator> <name>InvalidOffsetNumber</name></expr>;</expr_stmt>
+		<return>return <expr><name>NULL</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>ItemPointerSetInvalid</name><argument_list>(<argument><expr><operator>&amp;</operator><name>previptr</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<for>for <control>(<init>;</init><condition>;</condition><incr/>)</control>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>CHECK_FOR_INTERRUPTS</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name><name>revmap</name><operator>-&gt;</operator><name>rm_currBuf</name></name> <operator>==</operator> <name>InvalidBuffer</name> <operator>||</operator>
+			<call><name>BufferGetBlockNumber</name><argument_list>(<argument><expr><name><name>revmap</name><operator>-&gt;</operator><name>rm_currBuf</name></name></expr></argument>)</argument_list></call> <operator>!=</operator> <name>mapBlk</name></expr>)</condition>
+		<block>{<block_content>
+			<if_stmt><if>if <condition>(<expr><name><name>revmap</name><operator>-&gt;</operator><name>rm_currBuf</name></name> <operator>!=</operator> <name>InvalidBuffer</name></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><call><name>ReleaseBuffer</name><argument_list>(<argument><expr><name><name>revmap</name><operator>-&gt;</operator><name>rm_currBuf</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+			<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>mapBlk</name> <operator>!=</operator> <name>InvalidBlockNumber</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><name><name>revmap</name><operator>-&gt;</operator><name>rm_currBuf</name></name> <operator>=</operator> <call><name>ReadBuffer</name><argument_list>(<argument><expr><name><name>revmap</name><operator>-&gt;</operator><name>rm_irel</name></name></expr></argument>, <argument><expr><name>mapBlk</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+
+		<expr_stmt><expr><call><name>LockBuffer</name><argument_list>(<argument><expr><name><name>revmap</name><operator>-&gt;</operator><name>rm_currBuf</name></name></expr></argument>, <argument><expr><name>BUFFER_LOCK_SHARE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><name>contents</name> <operator>=</operator> <operator>(</operator><name>RevmapContents</name> <operator>*</operator><operator>)</operator>
+			<call><name>PageGetContents</name><argument_list>(<argument><expr><call><name>BufferGetPage</name><argument_list>(<argument><expr><name><name>revmap</name><operator>-&gt;</operator><name>rm_currBuf</name></name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name>iptr</name> <operator>=</operator> <name><name>contents</name><operator>-&gt;</operator><name>rm_tids</name></name></expr>;</expr_stmt>
+		<expr_stmt><expr><name>iptr</name> <operator>+=</operator> <call><name>HEAPBLK_TO_REVMAP_INDEX</name><argument_list>(<argument><expr><name><name>revmap</name><operator>-&gt;</operator><name>rm_pagesPerRange</name></name></expr></argument>, <argument><expr><name>heapBlk</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>ItemPointerIsValid</name><argument_list>(<argument><expr><name>iptr</name></expr></argument>)</argument_list></call></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><call><name>LockBuffer</name><argument_list>(<argument><expr><name><name>revmap</name><operator>-&gt;</operator><name>rm_currBuf</name></name></expr></argument>, <argument><expr><name>BUFFER_LOCK_UNLOCK</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<return>return <expr><name>NULL</name></expr>;</return>
+		</block_content>}</block></if></if_stmt>
+
+		<comment type="block">/*
+		 * Check the TID we got in a previous iteration, if any, and save the
+		 * current TID we got from the revmap; if we loop, we can sanity-check
+		 * that the next one we get is different.  Otherwise we might be stuck
+		 * looping forever if the revmap is somehow badly broken.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><call><name>ItemPointerIsValid</name><argument_list>(<argument><expr><operator>&amp;</operator><name>previptr</name></expr></argument>)</argument_list></call> <operator>&amp;&amp;</operator> <call><name>ItemPointerEquals</name><argument_list>(<argument><expr><operator>&amp;</operator><name>previptr</name></expr></argument>, <argument><expr><name>iptr</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+					<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_INDEX_CORRUPTED</name></expr></argument>)</argument_list></call><operator>,</operator>
+					 <call><name>errmsg_internal</name><argument_list>(<argument><expr><literal type="string">"corrupted BRIN index: inconsistent range map"</literal></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+		<expr_stmt><expr><name>previptr</name> <operator>=</operator> <operator>*</operator><name>iptr</name></expr>;</expr_stmt>
+
+		<expr_stmt><expr><name>blk</name> <operator>=</operator> <call><name>ItemPointerGetBlockNumber</name><argument_list>(<argument><expr><name>iptr</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><operator>*</operator><name>off</name> <operator>=</operator> <call><name>ItemPointerGetOffsetNumber</name><argument_list>(<argument><expr><name>iptr</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><call><name>LockBuffer</name><argument_list>(<argument><expr><name><name>revmap</name><operator>-&gt;</operator><name>rm_currBuf</name></name></expr></argument>, <argument><expr><name>BUFFER_LOCK_UNLOCK</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/* Ok, got a pointer to where the BrinTuple should be. Fetch it. */</comment>
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>BufferIsValid</name><argument_list>(<argument><expr><operator>*</operator><name>buf</name></expr></argument>)</argument_list></call> <operator>||</operator> <call><name>BufferGetBlockNumber</name><argument_list>(<argument><expr><operator>*</operator><name>buf</name></expr></argument>)</argument_list></call> <operator>!=</operator> <name>blk</name></expr>)</condition>
+		<block>{<block_content>
+			<if_stmt><if>if <condition>(<expr><call><name>BufferIsValid</name><argument_list>(<argument><expr><operator>*</operator><name>buf</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><call><name>ReleaseBuffer</name><argument_list>(<argument><expr><operator>*</operator><name>buf</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+			<expr_stmt><expr><operator>*</operator><name>buf</name> <operator>=</operator> <call><name>ReadBuffer</name><argument_list>(<argument><expr><name>idxRel</name></expr></argument>, <argument><expr><name>blk</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+		<expr_stmt><expr><call><name>LockBuffer</name><argument_list>(<argument><expr><operator>*</operator><name>buf</name></expr></argument>, <argument><expr><name>mode</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name>page</name> <operator>=</operator> <call><name>BufferGetPage</name><argument_list>(<argument><expr><operator>*</operator><name>buf</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>TestForOldSnapshot</name><argument_list>(<argument><expr><name>snapshot</name></expr></argument>, <argument><expr><name>idxRel</name></expr></argument>, <argument><expr><name>page</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/* If we land on a revmap page, start over */</comment>
+		<if_stmt><if>if <condition>(<expr><call><name>BRIN_IS_REGULAR_PAGE</name><argument_list>(<argument><expr><name>page</name></expr></argument>)</argument_list></call></expr>)</condition>
+		<block>{<block_content>
+			<if_stmt><if>if <condition>(<expr><operator>*</operator><name>off</name> <operator>&gt;</operator> <call><name>PageGetMaxOffsetNumber</name><argument_list>(<argument><expr><name>page</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+						<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_INDEX_CORRUPTED</name></expr></argument>)</argument_list></call><operator>,</operator>
+						 <call><name>errmsg_internal</name><argument_list>(<argument><expr><literal type="string">"corrupted BRIN index: inconsistent range map"</literal></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+			<expr_stmt><expr><name>lp</name> <operator>=</operator> <call><name>PageGetItemId</name><argument_list>(<argument><expr><name>page</name></expr></argument>, <argument><expr><operator>*</operator><name>off</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<if_stmt><if>if <condition>(<expr><call><name>ItemIdIsUsed</name><argument_list>(<argument><expr><name>lp</name></expr></argument>)</argument_list></call></expr>)</condition>
+			<block>{<block_content>
+				<expr_stmt><expr><name>tup</name> <operator>=</operator> <operator>(</operator><name>BrinTuple</name> <operator>*</operator><operator>)</operator> <call><name>PageGetItem</name><argument_list>(<argument><expr><name>page</name></expr></argument>, <argument><expr><name>lp</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+				<if_stmt><if>if <condition>(<expr><name><name>tup</name><operator>-&gt;</operator><name>bt_blkno</name></name> <operator>==</operator> <name>heapBlk</name></expr>)</condition>
+				<block>{<block_content>
+					<if_stmt><if>if <condition>(<expr><name>size</name></expr>)</condition><block type="pseudo"><block_content>
+						<expr_stmt><expr><operator>*</operator><name>size</name> <operator>=</operator> <call><name>ItemIdGetLength</name><argument_list>(<argument><expr><name>lp</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+					<comment type="block">/* found it! */</comment>
+					<return>return <expr><name>tup</name></expr>;</return>
+				</block_content>}</block></if></if_stmt>
+			</block_content>}</block></if></if_stmt>
+		</block_content>}</block></if></if_stmt>
+
+		<comment type="block">/*
+		 * No luck. Assume that the revmap was updated concurrently.
+		 */</comment>
+		<expr_stmt><expr><call><name>LockBuffer</name><argument_list>(<argument><expr><operator>*</operator><name>buf</name></expr></argument>, <argument><expr><name>BUFFER_LOCK_UNLOCK</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></for>
+	<comment type="block">/* not reached, but keep compiler quiet */</comment>
+	<return>return <expr><name>NULL</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Delete an index tuple, marking a page range as unsummarized.
+ *
+ * Index must be locked in ShareUpdateExclusiveLock mode.
+ *
+ * Return false if caller should retry.
+ */</comment>
+<function><type><name>bool</name></type>
+<name>brinRevmapDesummarizeRange</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>idxrel</name></decl></parameter>, <parameter><decl><type><name>BlockNumber</name></type> <name>heapBlk</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>BrinRevmap</name> <modifier>*</modifier></type><name>revmap</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>BlockNumber</name></type> <name>pagesPerRange</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>RevmapContents</name> <modifier>*</modifier></type><name>contents</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>ItemPointerData</name> <modifier>*</modifier></type><name>iptr</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>ItemPointerData</name></type> <name>invalidIptr</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>BlockNumber</name></type> <name>revmapBlk</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Buffer</name></type>		<name>revmapBuf</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Buffer</name></type>		<name>regBuf</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Page</name></type>		<name>revmapPg</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Page</name></type>		<name>regPg</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>OffsetNumber</name></type> <name>revmapOffset</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>OffsetNumber</name></type> <name>regOffset</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>ItemId</name></type>		<name>lp</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name>revmap</name> <operator>=</operator> <call><name>brinRevmapInitialize</name><argument_list>(<argument><expr><name>idxrel</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>pagesPerRange</name></expr></argument>, <argument><expr><name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>revmapBlk</name> <operator>=</operator> <call><name>revmap_get_blkno</name><argument_list>(<argument><expr><name>revmap</name></expr></argument>, <argument><expr><name>heapBlk</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>BlockNumberIsValid</name><argument_list>(<argument><expr><name>revmapBlk</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* revmap page doesn't exist: range not summarized, we're done */</comment>
+		<expr_stmt><expr><call><name>brinRevmapTerminate</name><argument_list>(<argument><expr><name>revmap</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<return>return <expr><name>true</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/* Lock the revmap page, obtain the index tuple pointer from it */</comment>
+	<expr_stmt><expr><name>revmapBuf</name> <operator>=</operator> <call><name>brinLockRevmapPageForUpdate</name><argument_list>(<argument><expr><name>revmap</name></expr></argument>, <argument><expr><name>heapBlk</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>revmapPg</name> <operator>=</operator> <call><name>BufferGetPage</name><argument_list>(<argument><expr><name>revmapBuf</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>revmapOffset</name> <operator>=</operator> <call><name>HEAPBLK_TO_REVMAP_INDEX</name><argument_list>(<argument><expr><name><name>revmap</name><operator>-&gt;</operator><name>rm_pagesPerRange</name></name></expr></argument>, <argument><expr><name>heapBlk</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>contents</name> <operator>=</operator> <operator>(</operator><name>RevmapContents</name> <operator>*</operator><operator>)</operator> <call><name>PageGetContents</name><argument_list>(<argument><expr><name>revmapPg</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>iptr</name> <operator>=</operator> <name><name>contents</name><operator>-&gt;</operator><name>rm_tids</name></name></expr>;</expr_stmt>
+	<expr_stmt><expr><name>iptr</name> <operator>+=</operator> <name>revmapOffset</name></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>ItemPointerIsValid</name><argument_list>(<argument><expr><name>iptr</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* no index tuple: range not summarized, we're done */</comment>
+		<expr_stmt><expr><call><name>LockBuffer</name><argument_list>(<argument><expr><name>revmapBuf</name></expr></argument>, <argument><expr><name>BUFFER_LOCK_UNLOCK</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>brinRevmapTerminate</name><argument_list>(<argument><expr><name>revmap</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<return>return <expr><name>true</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<expr_stmt><expr><name>regBuf</name> <operator>=</operator> <call><name>ReadBuffer</name><argument_list>(<argument><expr><name>idxrel</name></expr></argument>, <argument><expr><call><name>ItemPointerGetBlockNumber</name><argument_list>(<argument><expr><name>iptr</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>LockBuffer</name><argument_list>(<argument><expr><name>regBuf</name></expr></argument>, <argument><expr><name>BUFFER_LOCK_EXCLUSIVE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>regPg</name> <operator>=</operator> <call><name>BufferGetPage</name><argument_list>(<argument><expr><name>regBuf</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<comment type="block">/*
+	 * We're only removing data, not reading it, so there's no need to
+	 * TestForOldSnapshot here.
+	 */</comment>
+
+	<comment type="block">/* if this is no longer a regular page, tell caller to start over */</comment>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>BRIN_IS_REGULAR_PAGE</name><argument_list>(<argument><expr><name>regPg</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>LockBuffer</name><argument_list>(<argument><expr><name>revmapBuf</name></expr></argument>, <argument><expr><name>BUFFER_LOCK_UNLOCK</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>LockBuffer</name><argument_list>(<argument><expr><name>regBuf</name></expr></argument>, <argument><expr><name>BUFFER_LOCK_UNLOCK</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>brinRevmapTerminate</name><argument_list>(<argument><expr><name>revmap</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<return>return <expr><name>false</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<expr_stmt><expr><name>regOffset</name> <operator>=</operator> <call><name>ItemPointerGetOffsetNumber</name><argument_list>(<argument><expr><name>iptr</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><name>regOffset</name> <operator>&gt;</operator> <call><name>PageGetMaxOffsetNumber</name><argument_list>(<argument><expr><name>regPg</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_INDEX_CORRUPTED</name></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"corrupted BRIN index: inconsistent range map"</literal></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><name>lp</name> <operator>=</operator> <call><name>PageGetItemId</name><argument_list>(<argument><expr><name>regPg</name></expr></argument>, <argument><expr><name>regOffset</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>ItemIdIsUsed</name><argument_list>(<argument><expr><name>lp</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_INDEX_CORRUPTED</name></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"corrupted BRIN index: inconsistent range map"</literal></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<comment type="block">/*
+	 * Placeholder tuples only appear during unfinished summarization, and we
+	 * hold ShareUpdateExclusiveLock, so this function cannot run concurrently
+	 * with that.  So any placeholder tuples that exist are leftovers from a
+	 * crashed or aborted summarization; remove them silently.
+	 */</comment>
+
+	<expr_stmt><expr><call><name>START_CRIT_SECTION</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>ItemPointerSetInvalid</name><argument_list>(<argument><expr><operator>&amp;</operator><name>invalidIptr</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>brinSetHeapBlockItemptr</name><argument_list>(<argument><expr><name>revmapBuf</name></expr></argument>, <argument><expr><name><name>revmap</name><operator>-&gt;</operator><name>rm_pagesPerRange</name></name></expr></argument>, <argument><expr><name>heapBlk</name></expr></argument>,
+							<argument><expr><name>invalidIptr</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>PageIndexTupleDeleteNoCompact</name><argument_list>(<argument><expr><name>regPg</name></expr></argument>, <argument><expr><name>regOffset</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<comment type="block">/* XXX record free space in FSM? */</comment>
+
+	<expr_stmt><expr><call><name>MarkBufferDirty</name><argument_list>(<argument><expr><name>regBuf</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>MarkBufferDirty</name><argument_list>(<argument><expr><name>revmapBuf</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><call><name>RelationNeedsWAL</name><argument_list>(<argument><expr><name>idxrel</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>xl_brin_desummarize</name></type> <name>xlrec</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>XLogRecPtr</name></type>	<name>recptr</name></decl>;</decl_stmt>
+
+		<expr_stmt><expr><name><name>xlrec</name><operator>.</operator><name>pagesPerRange</name></name> <operator>=</operator> <name><name>revmap</name><operator>-&gt;</operator><name>rm_pagesPerRange</name></name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>xlrec</name><operator>.</operator><name>heapBlk</name></name> <operator>=</operator> <name>heapBlk</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>xlrec</name><operator>.</operator><name>regOffset</name></name> <operator>=</operator> <name>regOffset</name></expr>;</expr_stmt>
+
+		<expr_stmt><expr><call><name>XLogBeginInsert</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>XLogRegisterData</name><argument_list>(<argument><expr><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <operator>&amp;</operator><name>xlrec</name></expr></argument>, <argument><expr><name>SizeOfBrinDesummarize</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>XLogRegisterBuffer</name><argument_list>(<argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><name>revmapBuf</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>XLogRegisterBuffer</name><argument_list>(<argument><expr><literal type="number">1</literal></expr></argument>, <argument><expr><name>regBuf</name></expr></argument>, <argument><expr><name>REGBUF_STANDARD</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name>recptr</name> <operator>=</operator> <call><name>XLogInsert</name><argument_list>(<argument><expr><name>RM_BRIN_ID</name></expr></argument>, <argument><expr><name>XLOG_BRIN_DESUMMARIZE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>PageSetLSN</name><argument_list>(<argument><expr><name>revmapPg</name></expr></argument>, <argument><expr><name>recptr</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>PageSetLSN</name><argument_list>(<argument><expr><name>regPg</name></expr></argument>, <argument><expr><name>recptr</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>END_CRIT_SECTION</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>UnlockReleaseBuffer</name><argument_list>(<argument><expr><name>regBuf</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>LockBuffer</name><argument_list>(<argument><expr><name>revmapBuf</name></expr></argument>, <argument><expr><name>BUFFER_LOCK_UNLOCK</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>brinRevmapTerminate</name><argument_list>(<argument><expr><name>revmap</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<return>return <expr><name>true</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Given a heap block number, find the corresponding physical revmap block
+ * number and return it.  If the revmap page hasn't been allocated yet, return
+ * InvalidBlockNumber.
+ */</comment>
+<function><type><specifier>static</specifier> <name>BlockNumber</name></type>
+<name>revmap_get_blkno</name><parameter_list>(<parameter><decl><type><name>BrinRevmap</name> <modifier>*</modifier></type><name>revmap</name></decl></parameter>, <parameter><decl><type><name>BlockNumber</name></type> <name>heapBlk</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>BlockNumber</name></type> <name>targetblk</name></decl>;</decl_stmt>
+
+	<comment type="block">/* obtain revmap block number, skip 1 for metapage block */</comment>
+	<expr_stmt><expr><name>targetblk</name> <operator>=</operator> <call><name>HEAPBLK_TO_REVMAP_BLK</name><argument_list>(<argument><expr><name><name>revmap</name><operator>-&gt;</operator><name>rm_pagesPerRange</name></name></expr></argument>, <argument><expr><name>heapBlk</name></expr></argument>)</argument_list></call> <operator>+</operator> <literal type="number">1</literal></expr>;</expr_stmt>
+
+	<comment type="block">/* Normal case: the revmap page is already allocated */</comment>
+	<if_stmt><if>if <condition>(<expr><name>targetblk</name> <operator>&lt;=</operator> <name><name>revmap</name><operator>-&gt;</operator><name>rm_lastRevmapPage</name></name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>targetblk</name></expr>;</return></block_content></block></if></if_stmt>
+
+	<return>return <expr><name>InvalidBlockNumber</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Obtain and return a buffer containing the revmap page for the given heap
+ * page.  The revmap must have been previously extended to cover that page.
+ * The returned buffer is also recorded in the revmap struct; finishing that
+ * releases the buffer, therefore the caller needn't do it explicitly.
+ */</comment>
+<function><type><specifier>static</specifier> <name>Buffer</name></type>
+<name>revmap_get_buffer</name><parameter_list>(<parameter><decl><type><name>BrinRevmap</name> <modifier>*</modifier></type><name>revmap</name></decl></parameter>, <parameter><decl><type><name>BlockNumber</name></type> <name>heapBlk</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>BlockNumber</name></type> <name>mapBlk</name></decl>;</decl_stmt>
+
+	<comment type="block">/* Translate the heap block number to physical index location. */</comment>
+	<expr_stmt><expr><name>mapBlk</name> <operator>=</operator> <call><name>revmap_get_blkno</name><argument_list>(<argument><expr><name>revmap</name></expr></argument>, <argument><expr><name>heapBlk</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>mapBlk</name> <operator>==</operator> <name>InvalidBlockNumber</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"revmap does not cover heap block %u"</literal></expr></argument>, <argument><expr><name>heapBlk</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<comment type="block">/* Ensure the buffer we got is in the expected range */</comment>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>mapBlk</name> <operator>!=</operator> <name>BRIN_METAPAGE_BLKNO</name> <operator>&amp;&amp;</operator>
+		   <name>mapBlk</name> <operator>&lt;=</operator> <name><name>revmap</name><operator>-&gt;</operator><name>rm_lastRevmapPage</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Obtain the buffer from which we need to read.  If we already have the
+	 * correct buffer in our access struct, use that; otherwise, release that,
+	 * (if valid) and read the one we need.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>revmap</name><operator>-&gt;</operator><name>rm_currBuf</name></name> <operator>==</operator> <name>InvalidBuffer</name> <operator>||</operator>
+		<name>mapBlk</name> <operator>!=</operator> <call><name>BufferGetBlockNumber</name><argument_list>(<argument><expr><name><name>revmap</name><operator>-&gt;</operator><name>rm_currBuf</name></name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<if_stmt><if>if <condition>(<expr><name><name>revmap</name><operator>-&gt;</operator><name>rm_currBuf</name></name> <operator>!=</operator> <name>InvalidBuffer</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>ReleaseBuffer</name><argument_list>(<argument><expr><name><name>revmap</name><operator>-&gt;</operator><name>rm_currBuf</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+		<expr_stmt><expr><name><name>revmap</name><operator>-&gt;</operator><name>rm_currBuf</name></name> <operator>=</operator> <call><name>ReadBuffer</name><argument_list>(<argument><expr><name><name>revmap</name><operator>-&gt;</operator><name>rm_irel</name></name></expr></argument>, <argument><expr><name>mapBlk</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<return>return <expr><name><name>revmap</name><operator>-&gt;</operator><name>rm_currBuf</name></name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Given a heap block number, find the corresponding physical revmap block
+ * number and return it. If the revmap page hasn't been allocated yet, extend
+ * the revmap until it is.
+ */</comment>
+<function><type><specifier>static</specifier> <name>BlockNumber</name></type>
+<name>revmap_extend_and_get_blkno</name><parameter_list>(<parameter><decl><type><name>BrinRevmap</name> <modifier>*</modifier></type><name>revmap</name></decl></parameter>, <parameter><decl><type><name>BlockNumber</name></type> <name>heapBlk</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>BlockNumber</name></type> <name>targetblk</name></decl>;</decl_stmt>
+
+	<comment type="block">/* obtain revmap block number, skip 1 for metapage block */</comment>
+	<expr_stmt><expr><name>targetblk</name> <operator>=</operator> <call><name>HEAPBLK_TO_REVMAP_BLK</name><argument_list>(<argument><expr><name><name>revmap</name><operator>-&gt;</operator><name>rm_pagesPerRange</name></name></expr></argument>, <argument><expr><name>heapBlk</name></expr></argument>)</argument_list></call> <operator>+</operator> <literal type="number">1</literal></expr>;</expr_stmt>
+
+	<comment type="block">/* Extend the revmap, if necessary */</comment>
+	<while>while <condition>(<expr><name>targetblk</name> <operator>&gt;</operator> <name><name>revmap</name><operator>-&gt;</operator><name>rm_lastRevmapPage</name></name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>CHECK_FOR_INTERRUPTS</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>revmap_physical_extend</name><argument_list>(<argument><expr><name>revmap</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></while>
+
+	<return>return <expr><name>targetblk</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Try to extend the revmap by one page.  This might not happen for a number of
+ * reasons; caller is expected to retry until the expected outcome is obtained.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>revmap_physical_extend</name><parameter_list>(<parameter><decl><type><name>BrinRevmap</name> <modifier>*</modifier></type><name>revmap</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>Buffer</name></type>		<name>buf</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Page</name></type>		<name>page</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Page</name></type>		<name>metapage</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>BrinMetaPageData</name> <modifier>*</modifier></type><name>metadata</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>BlockNumber</name></type> <name>mapBlk</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>BlockNumber</name></type> <name>nblocks</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Relation</name></type>	<name>irel</name> <init>= <expr><name><name>revmap</name><operator>-&gt;</operator><name>rm_irel</name></name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type>		<name>needLock</name> <init>= <expr><operator>!</operator><call><name>RELATION_IS_LOCAL</name><argument_list>(<argument><expr><name>irel</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * Lock the metapage. This locks out concurrent extensions of the revmap,
+	 * but note that we still need to grab the relation extension lock because
+	 * another backend can extend the index with regular BRIN pages.
+	 */</comment>
+	<expr_stmt><expr><call><name>LockBuffer</name><argument_list>(<argument><expr><name><name>revmap</name><operator>-&gt;</operator><name>rm_metaBuf</name></name></expr></argument>, <argument><expr><name>BUFFER_LOCK_EXCLUSIVE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>metapage</name> <operator>=</operator> <call><name>BufferGetPage</name><argument_list>(<argument><expr><name><name>revmap</name><operator>-&gt;</operator><name>rm_metaBuf</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>metadata</name> <operator>=</operator> <operator>(</operator><name>BrinMetaPageData</name> <operator>*</operator><operator>)</operator> <call><name>PageGetContents</name><argument_list>(<argument><expr><name>metapage</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Check that our cached lastRevmapPage value was up-to-date; if it
+	 * wasn't, update the cached copy and have caller start over.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>metadata</name><operator>-&gt;</operator><name>lastRevmapPage</name></name> <operator>!=</operator> <name><name>revmap</name><operator>-&gt;</operator><name>rm_lastRevmapPage</name></name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name><name>revmap</name><operator>-&gt;</operator><name>rm_lastRevmapPage</name></name> <operator>=</operator> <name><name>metadata</name><operator>-&gt;</operator><name>lastRevmapPage</name></name></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>LockBuffer</name><argument_list>(<argument><expr><name><name>revmap</name><operator>-&gt;</operator><name>rm_metaBuf</name></name></expr></argument>, <argument><expr><name>BUFFER_LOCK_UNLOCK</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<return>return;</return>
+	</block_content>}</block></if></if_stmt>
+	<expr_stmt><expr><name>mapBlk</name> <operator>=</operator> <name><name>metadata</name><operator>-&gt;</operator><name>lastRevmapPage</name></name> <operator>+</operator> <literal type="number">1</literal></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>nblocks</name> <operator>=</operator> <call><name>RelationGetNumberOfBlocks</name><argument_list>(<argument><expr><name>irel</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><name>mapBlk</name> <operator>&lt;</operator> <name>nblocks</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name>buf</name> <operator>=</operator> <call><name>ReadBuffer</name><argument_list>(<argument><expr><name>irel</name></expr></argument>, <argument><expr><name>mapBlk</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>LockBuffer</name><argument_list>(<argument><expr><name>buf</name></expr></argument>, <argument><expr><name>BUFFER_LOCK_EXCLUSIVE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name>page</name> <operator>=</operator> <call><name>BufferGetPage</name><argument_list>(<argument><expr><name>buf</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<else>else
+	<block>{<block_content>
+		<if_stmt><if>if <condition>(<expr><name>needLock</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>LockRelationForExtension</name><argument_list>(<argument><expr><name>irel</name></expr></argument>, <argument><expr><name>ExclusiveLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+		<expr_stmt><expr><name>buf</name> <operator>=</operator> <call><name>ReadBuffer</name><argument_list>(<argument><expr><name>irel</name></expr></argument>, <argument><expr><name>P_NEW</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<if_stmt><if>if <condition>(<expr><call><name>BufferGetBlockNumber</name><argument_list>(<argument><expr><name>buf</name></expr></argument>)</argument_list></call> <operator>!=</operator> <name>mapBlk</name></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/*
+			 * Very rare corner case: somebody extended the relation
+			 * concurrently after we read its length.  If this happens, give
+			 * up and have caller start over.  We will have to evacuate that
+			 * page from under whoever is using it.
+			 */</comment>
+			<if_stmt><if>if <condition>(<expr><name>needLock</name></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><call><name>UnlockRelationForExtension</name><argument_list>(<argument><expr><name>irel</name></expr></argument>, <argument><expr><name>ExclusiveLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+			<expr_stmt><expr><call><name>LockBuffer</name><argument_list>(<argument><expr><name><name>revmap</name><operator>-&gt;</operator><name>rm_metaBuf</name></name></expr></argument>, <argument><expr><name>BUFFER_LOCK_UNLOCK</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>ReleaseBuffer</name><argument_list>(<argument><expr><name>buf</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<return>return;</return>
+		</block_content>}</block></if></if_stmt>
+		<expr_stmt><expr><call><name>LockBuffer</name><argument_list>(<argument><expr><name>buf</name></expr></argument>, <argument><expr><name>BUFFER_LOCK_EXCLUSIVE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name>page</name> <operator>=</operator> <call><name>BufferGetPage</name><argument_list>(<argument><expr><name>buf</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name>needLock</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>UnlockRelationForExtension</name><argument_list>(<argument><expr><name>irel</name></expr></argument>, <argument><expr><name>ExclusiveLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	</block_content>}</block></else></if_stmt>
+
+	<comment type="block">/* Check that it's a regular block (or an empty page) */</comment>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>PageIsNew</name><argument_list>(<argument><expr><name>page</name></expr></argument>)</argument_list></call> <operator>&amp;&amp;</operator> <operator>!</operator><call><name>BRIN_IS_REGULAR_PAGE</name><argument_list>(<argument><expr><name>page</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_INDEX_CORRUPTED</name></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"unexpected page type 0x%04X in BRIN index \"%s\" block %u"</literal></expr></argument>,
+						<argument><expr><call><name>BrinPageType</name><argument_list>(<argument><expr><name>page</name></expr></argument>)</argument_list></call></expr></argument>,
+						<argument><expr><call><name>RelationGetRelationName</name><argument_list>(<argument><expr><name>irel</name></expr></argument>)</argument_list></call></expr></argument>,
+						<argument><expr><call><name>BufferGetBlockNumber</name><argument_list>(<argument><expr><name>buf</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<comment type="block">/* If the page is in use, evacuate it and restart */</comment>
+	<if_stmt><if>if <condition>(<expr><call><name>brin_start_evacuating_page</name><argument_list>(<argument><expr><name>irel</name></expr></argument>, <argument><expr><name>buf</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>LockBuffer</name><argument_list>(<argument><expr><name><name>revmap</name><operator>-&gt;</operator><name>rm_metaBuf</name></name></expr></argument>, <argument><expr><name>BUFFER_LOCK_UNLOCK</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>brin_evacuate_page</name><argument_list>(<argument><expr><name>irel</name></expr></argument>, <argument><expr><name><name>revmap</name><operator>-&gt;</operator><name>rm_pagesPerRange</name></name></expr></argument>, <argument><expr><name>revmap</name></expr></argument>, <argument><expr><name>buf</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/* have caller start over */</comment>
+		<return>return;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/*
+	 * Ok, we have now locked the metapage and the target block. Re-initialize
+	 * the target block as a revmap page, and update the metapage.
+	 */</comment>
+	<expr_stmt><expr><call><name>START_CRIT_SECTION</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* the rm_tids array is initialized to all invalid by PageInit */</comment>
+	<expr_stmt><expr><call><name>brin_page_init</name><argument_list>(<argument><expr><name>page</name></expr></argument>, <argument><expr><name>BRIN_PAGETYPE_REVMAP</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>MarkBufferDirty</name><argument_list>(<argument><expr><name>buf</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name><name>metadata</name><operator>-&gt;</operator><name>lastRevmapPage</name></name> <operator>=</operator> <name>mapBlk</name></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Set pd_lower just past the end of the metadata.  This is essential,
+	 * because without doing so, metadata will be lost if xlog.c compresses
+	 * the page.  (We must do this here because pre-v11 versions of PG did not
+	 * set the metapage's pd_lower correctly, so a pg_upgraded index might
+	 * contain the wrong value.)
+	 */</comment>
+	<expr_stmt><expr><operator>(</operator><operator>(</operator><name>PageHeader</name><operator>)</operator> <name>metapage</name><operator>)</operator><operator>-&gt;</operator><name>pd_lower</name> <operator>=</operator>
+		<operator>(</operator><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <name>metadata</name> <operator>+</operator> <sizeof>sizeof<argument_list>(<argument><expr><name>BrinMetaPageData</name></expr></argument>)</argument_list></sizeof><operator>)</operator> <operator>-</operator> <operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <name>metapage</name></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>MarkBufferDirty</name><argument_list>(<argument><expr><name><name>revmap</name><operator>-&gt;</operator><name>rm_metaBuf</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><call><name>RelationNeedsWAL</name><argument_list>(<argument><expr><name><name>revmap</name><operator>-&gt;</operator><name>rm_irel</name></name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>xl_brin_revmap_extend</name></type> <name>xlrec</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>XLogRecPtr</name></type>	<name>recptr</name></decl>;</decl_stmt>
+
+		<expr_stmt><expr><name><name>xlrec</name><operator>.</operator><name>targetBlk</name></name> <operator>=</operator> <name>mapBlk</name></expr>;</expr_stmt>
+
+		<expr_stmt><expr><call><name>XLogBeginInsert</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>XLogRegisterData</name><argument_list>(<argument><expr><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <operator>&amp;</operator><name>xlrec</name></expr></argument>, <argument><expr><name>SizeOfBrinRevmapExtend</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>XLogRegisterBuffer</name><argument_list>(<argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><name><name>revmap</name><operator>-&gt;</operator><name>rm_metaBuf</name></name></expr></argument>, <argument><expr><name>REGBUF_STANDARD</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><call><name>XLogRegisterBuffer</name><argument_list>(<argument><expr><literal type="number">1</literal></expr></argument>, <argument><expr><name>buf</name></expr></argument>, <argument><expr><name>REGBUF_WILL_INIT</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><name>recptr</name> <operator>=</operator> <call><name>XLogInsert</name><argument_list>(<argument><expr><name>RM_BRIN_ID</name></expr></argument>, <argument><expr><name>XLOG_BRIN_REVMAP_EXTEND</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>PageSetLSN</name><argument_list>(<argument><expr><name>metapage</name></expr></argument>, <argument><expr><name>recptr</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>PageSetLSN</name><argument_list>(<argument><expr><name>page</name></expr></argument>, <argument><expr><name>recptr</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>END_CRIT_SECTION</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>LockBuffer</name><argument_list>(<argument><expr><name><name>revmap</name><operator>-&gt;</operator><name>rm_metaBuf</name></name></expr></argument>, <argument><expr><name>BUFFER_LOCK_UNLOCK</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>UnlockReleaseBuffer</name><argument_list>(<argument><expr><name>buf</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+</unit>

@@ -1,0 +1,760 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<unit xmlns="http://www.srcML.org/srcML/src" xmlns:cpp="http://www.srcML.org/srcML/cpp" revision="1.0.0" language="C" filename="/cloned_projects/gpdb/src/backend/utils/mmgr/vmem_tracker.c"><comment type="block">/*-------------------------------------------------------------------------
+ *
+ * vmem_tracker.c
+ *	 Implementation of vmem tracking that provides a mechanism to enforcing
+ *	 a limit on the total memory consumption per-segment. The vmem tracker
+ *	 also collaborates with red zone handler and runaway cleaner to determine
+ *	 sessions that consume excessive vmem and cleans up such sessions by forcing
+ *	 them to release their memory.
+ *
+ * Copyright (c) 2014-Present VMware, Inc. or its affiliates.
+ *
+ *
+ * IDENTIFICATION
+ *	    src/backend/utils/mmgr/vmem_tracker.c
+ *
+ *-------------------------------------------------------------------------
+ */</comment>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"postgres.h"</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;math.h&gt;</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"cdb/cdbvars.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"miscadmin.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"port/atomics.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/guc.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/vmem_tracker.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/resource_manager.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/session_state.h"</cpp:file></cpp:include>
+
+<comment type="block">/* External dependencies within the runaway cleanup framework */</comment>
+<function_decl><type><specifier>extern</specifier> <name>void</name></type> <name>EventVersion_ShmemInit</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>extern</specifier> <name>void</name></type> <name>RedZoneHandler_ShmemInit</name><parameter_list>()</parameter_list>;</function_decl>
+<function_decl><type><specifier>extern</specifier> <name>void</name></type> <name>IdleTracker_ShmemInit</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>extern</specifier> <name>void</name></type> <name>RunawayCleaner_Init</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>extern</specifier> <name>void</name></type> <name>IdleTracker_Init</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>extern</specifier> <name>void</name></type> <name>IdleTracker_Shutdown</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>;</function_decl>
+
+<comment type="block">/* Number of bits in one MB of memory */</comment>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>SHMEM_AVAILABLE_VMEM</name></cpp:macro> <cpp:value>"available vmem on the segment"</cpp:value></cpp:define>
+
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>CHUNKS_TO_MB</name><parameter_list>(<parameter><type><name>chunks</name></type></parameter>)</parameter_list></cpp:macro> <cpp:value>((chunks) &lt;&lt; (VmemTracker_GetChunkSizeInBits() - BITS_IN_MB))</cpp:value></cpp:define>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>MB_TO_CHUNKS</name><parameter_list>(<parameter><type><name>mb</name></type></parameter>)</parameter_list></cpp:macro> <cpp:value>((mb) &gt;&gt; (VmemTracker_GetChunkSizeInBits() - BITS_IN_MB))</cpp:value></cpp:define>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>CHUNKS_TO_BYTES</name><parameter_list>(<parameter><type><name>chunks</name></type></parameter>)</parameter_list></cpp:macro> <cpp:value>(((int64)chunks) &lt;&lt; VmemTracker_GetChunkSizeInBits())</cpp:value></cpp:define>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>BYTES_TO_CHUNKS</name><parameter_list>(<parameter><type><name>bytes</name></type></parameter>)</parameter_list></cpp:macro> <cpp:value>((bytes) &gt;&gt; VmemTracker_GetChunkSizeInBits())</cpp:value></cpp:define>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>BYTES_TO_MB</name><parameter_list>(<parameter><type><name>bytes</name></type></parameter>)</parameter_list></cpp:macro> <cpp:value>((bytes) &gt;&gt; BITS_IN_MB)</cpp:value></cpp:define>
+
+<comment type="block">/* Number of Vmem chunks tracked by this process */</comment>
+<decl_stmt><decl><type><specifier>static</specifier> <name>int32</name></type> <name>trackedVmemChunks</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+<comment type="block">/* Maximum number of vmem chunks tracked by this process */</comment>
+<decl_stmt><decl><type><specifier>static</specifier> <name>int32</name></type> <name>maxVmemChunksTracked</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+<comment type="block">/* Number of bytes tracked (i.e., allocated under the tutelage of vmem tracker) */</comment>
+<decl_stmt><decl><type><specifier>static</specifier> <name>int64</name></type> <name>trackedBytes</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+
+<decl_stmt><decl><type><specifier>static</specifier> <name>int64</name></type> <name>startupBytes</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+<decl_stmt><decl><type><specifier>static</specifier> <name>int32</name></type> <name>startupChunks</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+
+<comment type="block">/* Vmem quota in chunk unit */</comment>
+<decl_stmt><decl><type><specifier>static</specifier> <name>int32</name></type> <name>vmemChunksQuota</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+<comment type="block">/*
+ * Chunk size in bits. By default a chunk is 1MB, but it can be larger
+ * depending on the vmem quota.
+ */</comment>
+<decl_stmt><decl><type><specifier>static</specifier> <name>int</name></type> <name>chunkSizeInBits</name> <init>= <expr><name>BITS_IN_MB</name></expr></init></decl>;</decl_stmt>
+<comment type="block">/* Is vmem tracker was initialized? If not, then we don't track. */</comment>
+<decl_stmt><decl><type><name>bool</name></type> <name>vmemTrackerInited</name> <init>= <expr><name>false</name></expr></init></decl>;</decl_stmt>
+
+<comment type="block">/*
+ * A derived parameter from gp_vmem_limit_per_query in chunks unit,
+ * considering the current chunk size.
+ */</comment>
+<decl_stmt><decl><type><specifier>static</specifier> <name>int32</name></type> <name>maxChunksPerQuery</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+
+<comment type="block">/*
+ * How many chunks are currently waived from checking (e.g., for error
+ * handling)
+ */</comment>
+<decl_stmt><decl><type><specifier>static</specifier> <name>int32</name></type> <name>waivedChunks</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+
+<comment type="block">/*
+ * Consumed vmem on the segment.
+ */</comment>
+<decl_stmt><decl><type><specifier>volatile</specifier> <name>int32</name> <modifier>*</modifier></type><name>segmentVmemChunks</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>ReleaseAllVmemChunks</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>int32</name></type> <name>VmemTracker_GetMaxChunksPerQuery</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>;</function_decl>
+
+<comment type="block">/*
+ * Initializes the shared memory states of the vmem tracker. This
+ * will also initialize the shared memory states of event version
+ * provider, red zone handler and idle tracker.
+ */</comment>
+<function><type><name>void</name></type>
+<name>VmemTracker_ShmemInit</name><parameter_list>()</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><operator>!</operator><name>vmemTrackerInited</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>trackedVmemChunks</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+	<expr_stmt><expr><name>maxVmemChunksTracked</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+	<expr_stmt><expr><name>trackedBytes</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+
+	<decl_stmt><decl><type><name>bool</name></type>		<name>alreadyInShmem</name> <init>= <expr><name>false</name></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name>segmentVmemChunks</name> <operator>=</operator> <operator>(</operator><name>int32</name> <operator>*</operator><operator>)</operator>
+								<call><name>ShmemInitStruct</name><argument_list>(<argument><expr><name>SHMEM_AVAILABLE_VMEM</name></expr></argument>,
+										<argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>int32</name></expr></argument>)</argument_list></sizeof></expr></argument>,
+										<argument><expr><operator>&amp;</operator><name>alreadyInShmem</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>alreadyInShmem</name> <operator>||</operator> <operator>!</operator><name>IsUnderPostmaster</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>NULL</name> <operator>!=</operator> <name>segmentVmemChunks</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if<condition>(<expr><operator>!</operator><name>IsUnderPostmaster</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name>chunkSizeInBits</name> <operator>=</operator> <name>BITS_IN_MB</name></expr>;</expr_stmt>
+
+		<expr_stmt><expr><name>vmemChunksQuota</name> <operator>=</operator> <name>gp_vmem_protect_limit</name></expr>;</expr_stmt>
+		<comment type="block">/*
+		 * If vmem is larger than 16GB (i.e., 16K MB), we make the chunks bigger
+		 * so that the vmem limit in chunks unit is not larger than 16K.
+		 */</comment>
+		<while>while<condition>(<expr><name>vmemChunksQuota</name> <operator>&gt;</operator> <operator>(</operator><literal type="number">16</literal> <operator>*</operator> <literal type="number">1024</literal><operator>)</operator></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><name>chunkSizeInBits</name><operator>++</operator></expr>;</expr_stmt>
+			<expr_stmt><expr><name>vmemChunksQuota</name> <operator>&gt;&gt;=</operator> <literal type="number">1</literal></expr>;</expr_stmt>
+		</block_content>}</block></while>
+
+		<comment type="block">/*
+		 * gp_vmem_limit_per_query is in kB. So, first convert it to MB, and then shift it
+		 * to adjust for cases where we enlarged our chunk size
+		 */</comment>
+		<expr_stmt><expr><name>maxChunksPerQuery</name> <operator>=</operator> <call><name>ceil</name><argument_list>(<argument><expr><name>gp_vmem_limit_per_query</name> <operator>/</operator> <operator>(</operator><literal type="number">1024.0</literal> <operator>*</operator> <operator>(</operator><literal type="number">1</literal> <operator>&lt;&lt;</operator> <operator>(</operator><name>chunkSizeInBits</name> <operator>-</operator> <name>BITS_IN_MB</name><operator>)</operator><operator>)</operator><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/* Initialize the sub-systems */</comment>
+		<expr_stmt><expr><call><name>EventVersion_ShmemInit</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>RedZoneHandler_ShmemInit</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>IdleTracker_ShmemInit</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><operator>*</operator><name>segmentVmemChunks</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Initializes the vmem tracker per-process states. This will also initialize
+ * the per-process states of runaway cleaner and idle tracker.
+ */</comment>
+<function><type><name>void</name></type>
+<name>VmemTracker_Init</name><parameter_list>()</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>NULL</name> <operator>!=</operator> <name>MySessionState</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><operator>!</operator><name>vmemTrackerInited</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>trackedVmemChunks</name> <operator>==</operator> <literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>maxVmemChunksTracked</name> <operator>==</operator> <literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>trackedBytes</name> <operator>==</operator> <literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Even though asserts have passed, make sure that in production system
+	 * we still have 0 values in our counters.
+	 */</comment>
+	<expr_stmt><expr><name>trackedVmemChunks</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+	<expr_stmt><expr><name>maxVmemChunksTracked</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+	<expr_stmt><expr><name>trackedBytes</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><literal type="number">0</literal> <operator>&lt;</operator> <name>vmemChunksQuota</name> <operator>||</operator> <name>Gp_role</name> <operator>!=</operator> <name>GP_ROLE_EXECUTE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>gp_vmem_limit_per_query</name> <operator>==</operator> <literal type="number">0</literal> <operator>||</operator> <operator>(</operator><name>maxChunksPerQuery</name> <operator>!=</operator> <literal type="number">0</literal> <operator>&amp;&amp;</operator> <name>maxChunksPerQuery</name> <operator>&lt;</operator> <name>gp_vmem_limit_per_query</name><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>NULL</name> <operator>!=</operator> <name>segmentVmemChunks</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>IdleTracker_Init</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>RunawayCleaner_Init</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>vmemTrackerInited</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Disables vmem tracking and releases all the memory that this
+ * (i.e., current process) tracker is tracking. This will also
+ * shutdown the idle tracker.
+ */</comment>
+<function><type><name>void</name></type>
+<name>VmemTracker_Shutdown</name><parameter_list>()</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><name>vmemTrackerInited</name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>ReleaseAllVmemChunks</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><operator>*</operator><name>segmentVmemChunks</name> <operator>&gt;=</operator> <literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>IdleTracker_Shutdown</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Resets the maximum reserved vmem to the current reserved vmem
+ */</comment>
+<function><type><name>void</name></type>
+<name>VmemTracker_ResetMaxVmemReserved</name><parameter_list>()</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><name>maxVmemChunksTracked</name> <operator>=</operator> <name>trackedVmemChunks</name></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Reserve 'num_chunks_to_reserve' number of chunks for current process. The
+ * reservation is validated against segment level vmem quota.
+ */</comment>
+<function><type><specifier>static</specifier> <name>MemoryAllocationStatus</name></type>
+<name>VmemTracker_ReserveVmemChunks</name><parameter_list>(<parameter><decl><type><name>int32</name></type> <name>numChunksToReserve</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>vmemTrackerInited</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>NULL</name> <operator>!=</operator> <name>MySessionState</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><literal type="number">0</literal> <operator>&lt;=</operator> <name>numChunksToReserve</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<decl_stmt><decl><type><name>int32</name></type> <name>total</name> <init>= <expr><call><name>pg_atomic_add_fetch_u32</name><argument_list>(<argument><expr><operator>(</operator><name>pg_atomic_uint32</name> <operator>*</operator><operator>)</operator><operator>&amp;</operator><name><name>MySessionState</name><operator>-&gt;</operator><name>sessionVmem</name></name></expr></argument>, <argument><expr><name>numChunksToReserve</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>total</name> <operator>&gt;</operator> <operator>(</operator><name>int32</name><operator>)</operator> <literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+
+	<comment type="block">/* We don't support vmem usage from non-owner thread */</comment>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>MemoryProtection_IsOwnerThread</name><argument_list>()</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<decl_stmt><decl><type><name>bool</name></type> <name>waiverUsed</name> <init>= <expr><name>false</name></expr></init></decl>;</decl_stmt>
+
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>ResGroupReserveMemory</name><argument_list>(<argument><expr><name>numChunksToReserve</name></expr></argument>, <argument><expr><name>waivedChunks</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>waiverUsed</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>pg_atomic_sub_fetch_u32</name><argument_list>(<argument><expr><operator>(</operator><name>pg_atomic_uint32</name> <operator>*</operator><operator>)</operator><operator>&amp;</operator><name><name>MySessionState</name><operator>-&gt;</operator><name>sessionVmem</name></name></expr></argument>, <argument><expr><name>numChunksToReserve</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<return>return <expr><name>MemoryFailure_ResourceGroupMemoryExhausted</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/*
+	 * Query vmem quota exhausted, so rollback the reservation and return error.
+	 * For non-QE processes and processes in critical section, we don't enforce
+	 * VMEM, but we do track the usage.
+	 */</comment>
+	<decl_stmt><decl><type><name>int32</name></type> <name>memLimitPerQuery</name> <init>= <expr><call><name>VmemTracker_GetMaxChunksPerQuery</name><argument_list>()</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>memLimitPerQuery</name> <operator>!=</operator> <literal type="number">0</literal> <operator>&amp;&amp;</operator> <name>total</name> <operator>&gt;</operator> <name>memLimitPerQuery</name> <operator>&amp;&amp;</operator>
+			<name>Gp_role</name> <operator>==</operator> <name>GP_ROLE_EXECUTE</name> <operator>&amp;&amp;</operator> <name>CritSectionCount</name> <operator>==</operator> <literal type="number">0</literal></expr>)</condition>
+	<block>{<block_content>
+		<if_stmt><if>if <condition>(<expr><name>total</name> <operator>&gt;</operator> <name>memLimitPerQuery</name> <operator>+</operator> <name>waivedChunks</name></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/* Revert the reserved space, but don't revert the prev_alloc as we have already set the firstTime to false */</comment>
+			<expr_stmt><expr><call><name>pg_atomic_sub_fetch_u32</name><argument_list>(<argument><expr><operator>(</operator><name>pg_atomic_uint32</name> <operator>*</operator><operator>)</operator><operator>&amp;</operator><name><name>MySessionState</name><operator>-&gt;</operator><name>sessionVmem</name></name></expr></argument>, <argument><expr><name>numChunksToReserve</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<comment type="block">/* Revert resgroup memory reservation */</comment>
+			<expr_stmt><expr><call><name>ResGroupReleaseMemory</name><argument_list>(<argument><expr><name>numChunksToReserve</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<return>return <expr><name>MemoryFailure_QueryMemoryExhausted</name></expr>;</return>
+		</block_content>}</block></if></if_stmt>
+		<expr_stmt><expr><name>waiverUsed</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/* Now reserve vmem at segment level */</comment>
+	<decl_stmt><decl><type><name>int32</name></type> <name>new_vmem</name> <init>= <expr><call><name>pg_atomic_add_fetch_u32</name><argument_list>(<argument><expr><operator>(</operator><name>pg_atomic_uint32</name> <operator>*</operator><operator>)</operator><name>segmentVmemChunks</name></expr></argument>, <argument><expr><name>numChunksToReserve</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int32</name></type> <name>vmemLimitChunks</name> <init>= <expr><call><name>VmemTracker_GetVmemLimitChunks</name><argument_list>()</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * If segment vmem is exhausted, rollback query level reservation. For non-QE
+	 * processes and processes in critical section, we don't enforce VMEM, but we
+	 * do track the usage.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name>new_vmem</name> <operator>&gt;</operator> <name>vmemLimitChunks</name> <operator>&amp;&amp;</operator>
+			<name>Gp_role</name> <operator>==</operator> <name>GP_ROLE_EXECUTE</name> <operator>&amp;&amp;</operator> <name>CritSectionCount</name> <operator>==</operator> <literal type="number">0</literal></expr>)</condition>
+	<block>{<block_content>
+		<if_stmt><if>if <condition>(<expr><name>new_vmem</name> <operator>&gt;</operator> <name>vmemLimitChunks</name> <operator>+</operator> <name>waivedChunks</name></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/* Revert query memory reservation */</comment>
+			<expr_stmt><expr><call><name>pg_atomic_sub_fetch_u32</name><argument_list>(<argument><expr><operator>(</operator><name>pg_atomic_uint32</name> <operator>*</operator><operator>)</operator><operator>&amp;</operator><name><name>MySessionState</name><operator>-&gt;</operator><name>sessionVmem</name></name></expr></argument>, <argument><expr><name>numChunksToReserve</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<comment type="block">/* Revert vmem reservation */</comment>
+			<expr_stmt><expr><call><name>pg_atomic_sub_fetch_u32</name><argument_list>(<argument><expr><operator>(</operator><name>pg_atomic_uint32</name> <operator>*</operator><operator>)</operator><name>segmentVmemChunks</name></expr></argument>, <argument><expr><name>numChunksToReserve</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<comment type="block">/* Revert resgroup memory reservation */</comment>
+			<expr_stmt><expr><call><name>ResGroupReleaseMemory</name><argument_list>(<argument><expr><name>numChunksToReserve</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+			<return>return <expr><name>MemoryFailure_VmemExhausted</name></expr>;</return>
+		</block_content>}</block></if></if_stmt>
+		<expr_stmt><expr><name>waiverUsed</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/* The current process now owns additional vmem in this segment */</comment>
+	<expr_stmt><expr><name>trackedVmemChunks</name> <operator>+=</operator> <name>numChunksToReserve</name></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>maxVmemChunksTracked</name> <operator>=</operator> <call><name>Max</name><argument_list>(<argument><expr><name>maxVmemChunksTracked</name></expr></argument>, <argument><expr><name>trackedVmemChunks</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>waivedChunks</name> <operator>&gt;</operator> <literal type="number">0</literal> <operator>&amp;&amp;</operator> <operator>!</operator><name>waiverUsed</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/*
+		 * We have sufficient free memory that we are no longer using the waiver.
+		 * Therefore reset the waiver.
+		 */</comment>
+		<expr_stmt><expr><name>waivedChunks</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<return>return <expr><name>MemoryAllocation_Success</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Releases "reduction" number of chunks to the session and segment vmem counter.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>VmemTracker_ReleaseVmemChunks</name><parameter_list>(<parameter><decl><type><name>int</name></type> <name>reduction</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><literal type="number">0</literal> <operator>&lt;=</operator> <name>reduction</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<comment type="block">/* We don't support vmem usage from non-owner thread */</comment>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>MemoryProtection_IsOwnerThread</name><argument_list>()</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>pg_atomic_sub_fetch_u32</name><argument_list>(<argument><expr><operator>(</operator><name>pg_atomic_uint32</name> <operator>*</operator><operator>)</operator> <name>segmentVmemChunks</name></expr></argument>, <argument><expr><name>reduction</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><operator>*</operator><name>segmentVmemChunks</name> <operator>&gt;=</operator> <literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>NULL</name> <operator>!=</operator> <name>MySessionState</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>pg_atomic_sub_fetch_u32</name><argument_list>(<argument><expr><operator>(</operator><name>pg_atomic_uint32</name> <operator>*</operator><operator>)</operator><operator>&amp;</operator><name><name>MySessionState</name><operator>-&gt;</operator><name>sessionVmem</name></name></expr></argument>, <argument><expr><name>reduction</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>ResGroupReleaseMemory</name><argument_list>(<argument><expr><name>reduction</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><literal type="number">0</literal> <operator>&lt;=</operator> <name><name>MySessionState</name><operator>-&gt;</operator><name>sessionVmem</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>trackedVmemChunks</name> <operator>-=</operator> <name>reduction</name></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Releases all vmem reserved by this process.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>ReleaseAllVmemChunks</name><parameter_list>()</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>VmemTracker_ReleaseVmemChunks</name><argument_list>(<argument><expr><name>trackedVmemChunks</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><literal type="number">0</literal> <operator>==</operator> <name>trackedVmemChunks</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>trackedBytes</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Returns the available VMEM in "chunks" unit. If the available chunks
+ * is less than 0, it return 0.
+ */</comment>
+<function><type><specifier>static</specifier> <name>int32</name></type>
+<name>VmemTracker_GetNonNegativeAvailableVmemChunks</name><parameter_list>()</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>int32</name></type> <name>usedChunks</name> <init>= <expr><operator>*</operator><name>segmentVmemChunks</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int32</name></type> <name>vmemLimitChunks</name> <init>= <expr><call><name>VmemTracker_GetVmemLimitChunks</name><argument_list>()</argument_list></call></expr></init></decl>;</decl_stmt>
+	<if_stmt><if>if <condition>(<expr><name>vmemLimitChunks</name> <operator>&gt;</operator> <name>usedChunks</name></expr>)</condition>
+	<block>{<block_content>
+		<return>return <expr><name>vmemLimitChunks</name> <operator>-</operator> <name>usedChunks</name></expr>;</return>
+	</block_content>}</block></if>
+	<else>else
+	<block>{<block_content>
+		<return>return <expr><literal type="number">0</literal></expr>;</return>
+	</block_content>}</block></else></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Returns the available query chunks. If the available chunks
+ * is less than 0, it return 0.
+ */</comment>
+<function><type><specifier>static</specifier> <name>int32</name></type>
+<name>VmemTracker_GetNonNegativeAvailableQueryChunks</name><parameter_list>()</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>int32</name></type> <name>curSessionVmem</name> <init>= <expr><name><name>MySessionState</name><operator>-&gt;</operator><name>sessionVmem</name></name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int32</name></type> <name>memLimitPerQuery</name> <init>= <expr><call><name>VmemTracker_GetMaxChunksPerQuery</name><argument_list>()</argument_list></call></expr></init></decl>;</decl_stmt>
+	<if_stmt><if>if <condition>(<expr><name>memLimitPerQuery</name> <operator>&gt;</operator> <name>curSessionVmem</name></expr>)</condition>
+	<block>{<block_content>
+		<return>return <expr><name>memLimitPerQuery</name> <operator>-</operator> <name>curSessionVmem</name></expr>;</return>
+	</block_content>}</block></if>
+	<else>else
+	<block>{<block_content>
+		<return>return <expr><literal type="number">0</literal></expr>;</return>
+	</block_content>}</block></else></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/* Converts chunks to MB */</comment>
+<function><type><name>int32</name></type>
+<name>VmemTracker_ConvertVmemChunksToMB</name><parameter_list>(<parameter><decl><type><name>int</name></type> <name>chunks</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<return>return <expr><call><name>CHUNKS_TO_MB</name><argument_list>(<argument><expr><name>chunks</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/* Converts MB to chunks */</comment>
+<function><type><name>int32</name></type>
+<name>VmemTracker_ConvertVmemMBToChunks</name><parameter_list>(<parameter><decl><type><name>int</name></type> <name>mb</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<return>return <expr><call><name>MB_TO_CHUNKS</name><argument_list>(<argument><expr><name>mb</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/* Converts chunks to bytes */</comment>
+<function><type><name>int64</name></type>
+<name>VmemTracker_ConvertVmemChunksToBytes</name><parameter_list>(<parameter><decl><type><name>int</name></type> <name>chunks</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<return>return <expr><call><name>CHUNKS_TO_BYTES</name><argument_list>(<argument><expr><name>chunks</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/* Converts bytes to chunks */</comment>
+<function><type><name>int32</name></type>
+<name>VmemTracker_ConvertVmemBytesToChunks</name><parameter_list>(<parameter><decl><type><name>int64</name></type> <name>bytes</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<return>return <expr><call><name>BYTES_TO_CHUNKS</name><argument_list>(<argument><expr><name>bytes</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Returns the maximum vmem consumed by current process in "chunks" unit.
+ */</comment>
+<function><type><name>int64</name></type>
+<name>VmemTracker_GetMaxReservedVmemChunks</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>maxVmemChunksTracked</name> <operator>&gt;=</operator> <name>trackedVmemChunks</name> <operator>-</operator> <name>startupChunks</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<return>return <expr><name>maxVmemChunksTracked</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Returns the maximum vmem consumed by current process in "MB" unit.
+ */</comment>
+<function><type><name>int64</name></type>
+<name>VmemTracker_GetMaxReservedVmemMB</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>maxVmemChunksTracked</name> <operator>&gt;=</operator> <name>trackedVmemChunks</name> <operator>-</operator> <name>startupChunks</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<return>return <expr><call><name>CHUNKS_TO_MB</name><argument_list>(<argument><expr><name>maxVmemChunksTracked</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Returns the maximum vmem consumed by current process in "bytes" unit.
+ */</comment>
+<function><type><name>int64</name></type>
+<name>VmemTracker_GetMaxReservedVmemBytes</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>maxVmemChunksTracked</name> <operator>&gt;=</operator> <name>trackedVmemChunks</name> <operator>-</operator> <name>startupChunks</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<return>return <expr><call><name>CHUNKS_TO_BYTES</name><argument_list>(<argument><expr><name>maxVmemChunksTracked</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Returns the vmem limit in "bytes" unit.
+ */</comment>
+<function><type><name>int64</name></type>
+<name>VmemTracker_GetVmemLimitBytes</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<return>return <expr><call><name>CHUNKS_TO_BYTES</name><argument_list>(<argument><expr><call><name>VmemTracker_GetVmemLimitChunks</name><argument_list>()</argument_list></call></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Returns the vmem limit in "chunks" unit.
+ */</comment>
+<function><type><name>int32</name></type>
+<name>VmemTracker_GetVmemLimitChunks</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<comment type="block">/*
+	 * TODO:
+	 * For backend who has vmem tracker initialized and resource
+	 * group enabled, the vmem limit is not expected to be used
+	 * until resource group is activated, otherwise, there might
+	 * be an inconsistency about the vmem limit.
+	 */</comment>
+	<return>return <expr><ternary><condition><expr><call><name>IsResGroupEnabled</name><argument_list>()</argument_list></call></expr> ?</condition><then>
+		<expr><call><name>ResGroupGetVmemLimitChunks</name><argument_list>()</argument_list></call></expr> </then><else>: <expr><name>vmemChunksQuota</name></expr></else></ternary></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Return the chunk size in bits.
+ */</comment>
+<function><type><name>int32</name></type>
+<name>VmemTracker_GetChunkSizeInBits</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<comment type="block">/*
+	 * TODO:
+	 * For backend who has vmem tracker initialized and resource
+	 * group enabled, the chunk size is not expected to be used
+	 * until resource group is activated, otherwise, there might
+	 * be an inconsistency about the chunk size.
+	 */</comment>
+	<return>return <expr><ternary><condition><expr><call><name>IsResGroupEnabled</name><argument_list>()</argument_list></call></expr> ?</condition><then>
+		<expr><call><name>ResGroupGetVmemChunkSizeInBits</name><argument_list>()</argument_list></call></expr> </then><else>: <expr><name>chunkSizeInBits</name></expr></else></ternary></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Returns the vmem  in "chunks" unit.
+ */</comment>
+<function><type><specifier>static</specifier> <name>int32</name></type>
+<name>VmemTracker_GetMaxChunksPerQuery</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<return>return <expr><ternary><condition><expr><call><name>IsResGroupEnabled</name><argument_list>()</argument_list></call></expr> ?</condition><then>
+		<expr><call><name>ResGroupGetMaxChunksPerQuery</name><argument_list>()</argument_list></call></expr> </then><else>: <expr><name>maxChunksPerQuery</name></expr></else></ternary></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Returns the vmem usage of current process in "chunks" unit.
+ */</comment>
+<function><type><name>int32</name></type>
+<name>VmemTracker_GetReservedVmemChunks</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<return>return <expr><name>trackedVmemChunks</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Returns the vmem usage of current process in "bytes" unit.
+ */</comment>
+<function><type><name>int64</name></type>
+<name>VmemTracker_GetReservedVmemBytes</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<return>return <expr><call><name>CHUNKS_TO_BYTES</name><argument_list>(<argument><expr><name>trackedVmemChunks</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Returns the available VMEM in "bytes" unit
+ */</comment>
+<function><type><name>int64</name></type>
+<name>VmemTracker_GetAvailableVmemBytes</name><parameter_list>()</parameter_list>
+<block>{<block_content>
+	<return>return <expr><call><name>CHUNKS_TO_BYTES</name><argument_list>(<argument><expr><call><name>VmemTracker_GetNonNegativeAvailableVmemChunks</name><argument_list>()</argument_list></call></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Returns the available VMEM in "MB" unit
+ */</comment>
+<function><type><name>int32</name></type>
+<name>VmemTracker_GetAvailableVmemMB</name><parameter_list>()</parameter_list>
+<block>{<block_content>
+	<return>return <expr><call><name>CHUNKS_TO_MB</name><argument_list>(<argument><expr><call><name>VmemTracker_GetNonNegativeAvailableVmemChunks</name><argument_list>()</argument_list></call></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Returns the available per-query VMEM in "MB" unit
+ */</comment>
+<function><type><name>int32</name></type>
+<name>VmemTracker_GetAvailableQueryVmemMB</name><parameter_list>()</parameter_list>
+<block>{<block_content>
+	<return>return <expr><call><name>CHUNKS_TO_MB</name><argument_list>(<argument><expr><call><name>VmemTracker_GetNonNegativeAvailableQueryChunks</name><argument_list>()</argument_list></call></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Reserve newly_requested bytes from the vmem system.
+ *
+ * For performance reason, this method only reserves in chunk units and if the new
+ * request can be met from previous chunk reservation, it does not try to reserve a new
+ * chunk.
+ */</comment>
+<function><type><name>MemoryAllocationStatus</name></type>
+<name>VmemTracker_ReserveVmem</name><parameter_list>(<parameter><decl><type><name>int64</name></type> <name>newlyRequestedBytes</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>VmemTrackerIsActivated</name><argument_list>()</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><literal type="number">0</literal> <operator>==</operator> <name>trackedVmemChunks</name> <operator>-</operator> <name>startupChunks</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<return>return <expr><name>MemoryAllocation_Success</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>gp_mp_inited</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>newlyRequestedBytes</name> <operator>&gt;=</operator> <literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>trackedBytes</name> <operator>+=</operator> <name>newlyRequestedBytes</name></expr>;</expr_stmt>
+
+	<decl_stmt><decl><type><name>int32</name></type> <name>newszChunk</name> <init>= <expr><name>trackedBytes</name> <operator>&gt;&gt;</operator> <call><name>VmemTracker_GetChunkSizeInBits</name><argument_list>()</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<decl_stmt><decl><type><name>MemoryAllocationStatus</name></type> <name>status</name> <init>= <expr><name>MemoryAllocation_Success</name></expr></init></decl>;</decl_stmt>
+
+	<if_stmt><if>if<condition>(<expr><name>newszChunk</name> <operator>&gt;</operator> <name>trackedVmemChunks</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/*
+		 * Undo trackedBytes, as the VmemTracker_TerminateRunawayQuery() may
+		 * not return
+		 */</comment>
+		<expr_stmt><expr><name>trackedBytes</name> <operator>-=</operator> <name>newlyRequestedBytes</name></expr>;</expr_stmt>
+
+		<comment type="block">/*
+		 * Detect a runaway session. Moreover, if the current session is deemed
+		 * as runaway, start cleanup.
+		 *
+		 * Caution: this method may not return as it has the potential to call
+		 * elog(ERROR, ...).
+		 */</comment>
+		<expr_stmt><expr><call><name>RedZoneHandler_DetectRunawaySession</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/*
+		 * Before reserving further VMEM, check if the current session has a pending
+		 * query cancellation or other pending interrupts. This ensures more responsive
+		 * interrupt processing, including query cancellation requests without depending
+		 * on CHECK_FOR_INTERRUPTS(). In a sense, this is a lightweight CHECK_FOR_INTERRUPTS
+		 * as we don't execute BackoffBackendTick() and some runaway detection code.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><name>vmem_process_interrupt</name> <operator>&amp;&amp;</operator> <name>InterruptPending</name></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/* ProcessInterrupts should check for InterruptHoldoffCount and CritSectionCount */</comment>
+			<expr_stmt><expr><call><name>ProcessInterrupts</name><argument_list>(<argument><expr><name>__FILE__</name></expr></argument>, <argument><expr><name>__LINE__</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+
+		<comment type="block">/*
+		 * Redo, as we returned from VmemTracker_TerminateRunawayQuery and
+		 * we are successfully reserving this vmem
+		 */</comment>
+		<expr_stmt><expr><name>trackedBytes</name> <operator>+=</operator> <name>newlyRequestedBytes</name></expr>;</expr_stmt>
+
+		<comment type="block">/*
+		 * Before attempting to reserve vmem, we check if there was any OOM
+		 * situation, and report our consumption if there was any. This accurately
+		 * tells us our share of fault in an OOM situation.
+		 */</comment>
+		<expr_stmt><expr><call><name>ReportOOMConsumption</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+		<decl_stmt><decl><type><name>int32</name></type> <name>needChunk</name> <init>= <expr><name>newszChunk</name> <operator>-</operator> <name>trackedVmemChunks</name></expr></init></decl>;</decl_stmt>
+		<expr_stmt><expr><name>status</name> <operator>=</operator> <call><name>VmemTracker_ReserveVmemChunks</name><argument_list>(<argument><expr><name>needChunk</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/* Failed to reserve vmem chunks. Revert changes to trackedBytes */</comment>
+	<if_stmt><if>if <condition>(<expr><name>MemoryAllocation_Success</name> <operator>!=</operator> <name>status</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name>trackedBytes</name> <operator>-=</operator> <name>newlyRequestedBytes</name></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<return>return <expr><name>status</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Releases toBeFreedRequested bytes from the vmem system.
+ *
+ * For performance reason this method accumulates free requests until it has
+ * enough bytes to free a whole chunk.
+ */</comment>
+<function><type><name>void</name></type>
+<name>VmemTracker_ReleaseVmem</name><parameter_list>(<parameter><decl><type><name>int64</name></type> <name>toBeFreedRequested</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><name>vmemTrackerInited</name> <operator>||</operator>
+	   <operator>(</operator><call><name>IsResGroupEnabled</name><argument_list>()</argument_list></call> <operator>&amp;&amp;</operator>
+		<operator>!</operator><call><name>IsResGroupActivated</name><argument_list>()</argument_list></call><operator>)</operator></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><literal type="number">0</literal> <operator>==</operator> <name>trackedVmemChunks</name> <operator>-</operator> <name>startupChunks</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<return>return;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>gp_mp_inited</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * We need this adjustment as GPDB may request to free more VMEM than it reserved, apparently
+	 * because a bug somewhere that tries to release vmem for allocations made before the vmem
+	 * system was initialized.
+	 */</comment>
+	<decl_stmt><decl><type><name>int64</name></type> <name>toBeFreed</name> <init>= <expr><call><name>Min</name><argument_list>(<argument><expr><name>trackedBytes</name> <operator>-</operator> <name>startupBytes</name></expr></argument>, <argument><expr><name>toBeFreedRequested</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<if_stmt><if>if <condition>(<expr><literal type="number">0</literal> <operator>==</operator> <name>toBeFreed</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><literal type="number">0</literal> <operator>==</operator> <name>trackedVmemChunks</name> <operator>-</operator> <name>startupChunks</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<return>return;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<expr_stmt><expr><name>trackedBytes</name> <operator>-=</operator> <name>toBeFreed</name></expr>;</expr_stmt>
+
+	<decl_stmt><decl><type><name>int</name></type> <name>newszChunk</name> <init>= <expr><name>trackedBytes</name> <operator>&gt;&gt;</operator> <call><name>VmemTracker_GetChunkSizeInBits</name><argument_list>()</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>newszChunk</name> <operator>&lt;</operator> <name>trackedVmemChunks</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>int</name></type> <name>reduction</name> <init>= <expr><name>trackedVmemChunks</name> <operator>-</operator> <name>newszChunk</name></expr></init></decl>;</decl_stmt>
+
+		<expr_stmt><expr><call><name>VmemTracker_ReleaseVmemChunks</name><argument_list>(<argument><expr><name>reduction</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Register the startup memory to vmem tracker.
+ *
+ * The startup memory will always be tracked, but an OOM error will be raised
+ * if the memory usage exceeds the limits.
+ */</comment>
+<function><type><name>MemoryAllocationStatus</name></type>
+<name>VmemTracker_RegisterStartupMemory</name><parameter_list>(<parameter><decl><type><name>int64</name></type> <name>bytes</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>int64</name></type>		<name>chunkSizeInBytes</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>vmemTrackerInited</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>chunkSizeInBytes</name> <operator>=</operator> <literal type="number">1L</literal> <operator>&lt;&lt;</operator> <call><name>VmemTracker_GetChunkSizeInBits</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Align to chunks */</comment>
+	<expr_stmt><expr><name>startupChunks</name> <operator>=</operator> <call><name>BYTES_TO_CHUNKS</name><argument_list>(<argument><expr><name>bytes</name> <operator>+</operator> <name>chunkSizeInBytes</name> <operator>-</operator> <literal type="number">1</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>startupBytes</name> <operator>=</operator> <call><name>CHUNKS_TO_BYTES</name><argument_list>(<argument><expr><name>startupChunks</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Step 1, add the startup memory forcefully as these memory were already
+	 * in-use before the call to this function.
+	 *
+	 * Do not add the startup memory to resource group as resource group only
+	 * tracks memory allocated via vmem tracker.
+	 */</comment>
+
+	<expr_stmt><expr><name>trackedBytes</name> <operator>+=</operator> <name>startupBytes</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name>trackedVmemChunks</name> <operator>+=</operator> <name>startupChunks</name></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>MySessionState</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>pg_atomic_add_fetch_u32</name><argument_list>(<argument><expr><operator>(</operator><name>pg_atomic_uint32</name> <operator>*</operator><operator>)</operator> <operator>&amp;</operator><name><name>MySessionState</name><operator>-&gt;</operator><name>sessionVmem</name></name></expr></argument>,
+								<argument><expr><name>startupChunks</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>pg_atomic_add_fetch_u32</name><argument_list>(<argument><expr><operator>(</operator><name>pg_atomic_uint32</name> <operator>*</operator><operator>)</operator> <name>segmentVmemChunks</name></expr></argument>,
+							<argument><expr><name>startupChunks</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Step 2, check if an OOM error should be raised by allocating 0 chunk.
+	 */</comment>
+
+	<return>return <expr><call><name>VmemTracker_ReserveVmemChunks</name><argument_list>(<argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Unregister the startup memory from vmem tracker.
+ */</comment>
+<function><type><name>void</name></type>
+<name>VmemTracker_UnregisterStartupMemory</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>vmemTrackerInited</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>pg_atomic_sub_fetch_u32</name><argument_list>(<argument><expr><operator>(</operator><name>pg_atomic_uint32</name> <operator>*</operator><operator>)</operator> <name>segmentVmemChunks</name></expr></argument>,
+							<argument><expr><name>startupChunks</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>MySessionState</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>pg_atomic_sub_fetch_u32</name><argument_list>(<argument><expr><operator>(</operator><name>pg_atomic_uint32</name> <operator>*</operator><operator>)</operator> <operator>&amp;</operator><name><name>MySessionState</name><operator>-&gt;</operator><name>sessionVmem</name></name></expr></argument>,
+								<argument><expr><name>startupChunks</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><name>trackedBytes</name> <operator>-=</operator> <name>startupBytes</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name>trackedVmemChunks</name> <operator>-=</operator> <name>startupChunks</name></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>startupBytes</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+	<expr_stmt><expr><name>startupChunks</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Request additional VMEM bytes beyond per-session or system vmem limit for
+ * OOM error handling.
+ *
+ * Note, the waiver_bytes are converted to chunk unit, and ceiled. This
+ * means asking for 1 byte would result in 1 chunk, which can be multiples
+ * of 1 MB.
+ *
+ * This method does nothing if the previously requested waiver is at least
+ * as large as the newly requested waiver.
+ */</comment>
+<function><type><name>void</name></type>
+<name>VmemTracker_RequestWaiver</name><parameter_list>(<parameter><decl><type><name>int64</name></type> <name>waiver_bytes</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>gp_mp_inited</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<decl_stmt><decl><type><name>int</name></type> <name>chunks</name> <init>= <expr><call><name>BYTES_TO_CHUNKS</name><argument_list>(<argument><expr><name>waiver_bytes</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<comment type="block">/* Handle ceiling */</comment>
+	<if_stmt><if>if <condition>(<expr><name>waiver_bytes</name> <operator>&gt;</operator> <call><name>CHUNKS_TO_BYTES</name><argument_list>(<argument><expr><name>chunks</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name>chunks</name> <operator>+=</operator> <literal type="number">1</literal></expr>;</expr_stmt>
+
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>waiver_bytes</name> <operator>&lt;</operator> <call><name>CHUNKS_TO_BYTES</name><argument_list>(<argument><expr><name>chunks</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<expr_stmt><expr><name>waivedChunks</name> <operator>=</operator> <call><name>Max</name><argument_list>(<argument><expr><name>chunks</name></expr></argument>, <argument><expr><name>waivedChunks</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Reset requested waiver to zero.
+ */</comment>
+<function><type><name>void</name></type>
+<name>VmemTracker_ResetWaiver</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><name>waivedChunks</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<function><type><name>bool</name></type>
+<name>VmemTrackerIsActivated</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<comment type="block">/*
+	 * If resource group is enabled, the segment vmem limit
+	 * and chunk size are undetermined until resource group
+	 * is activated, so before that, the vmem tracker should
+	 * stay unactivated.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><call><name>IsResGroupEnabled</name><argument_list>()</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<return>return <expr><name>vmemTrackerInited</name> <operator>&amp;&amp;</operator>
+			<call><name>IsResGroupActivated</name><argument_list>()</argument_list></call></expr>;</return>	
+	</block_content>}</block></if>
+	<else>else
+	<block>{<block_content>
+		<return>return <expr><name>vmemTrackerInited</name></expr>;</return>
+	</block_content>}</block></else></if_stmt>
+</block_content>}</block></function>
+</unit>

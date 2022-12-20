@@ -1,0 +1,720 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<unit xmlns="http://www.srcML.org/srcML/src" xmlns:cpp="http://www.srcML.org/srcML/cpp" revision="1.0.0" language="C" filename="/cloned_projects/timescaledb/tsl/src/partialize_finalize.c"><comment type="block">/*
+ * This file and its contents are licensed under the Timescale License.
+ * Please see the included NOTICE for copyright information and
+ * LICENSE-TIMESCALE for a copy of the license.
+ */</comment>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;postgres.h&gt;</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;access/htup_details.h&gt;</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;catalog/namespace.h&gt;</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;catalog/pg_aggregate.h&gt;</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;catalog/pg_collation.h&gt;</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;catalog/pg_type.h&gt;</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;fmgr.h&gt;</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;parser/parse_agg.h&gt;</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;parser/parse_coerce.h&gt;</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;utils/builtins.h&gt;</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;utils/datum.h&gt;</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;utils/fmgroids.h&gt;</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;utils/syscache.h&gt;</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"partialize_finalize.h"</cpp:file></cpp:include>
+
+<comment type="block">/*
+ * This file implements functions to split the calculation of partial and final
+ * aggregates into separate steps such that the partials can be passed out of a
+ * sql query (in their internal state) and then passed into another sql query to
+ * be finalized and the actual aggregate returned.
+ *
+ * For instance: `SELECT sum(a) FROM foo;` can be transformed into `SELECT
+ * finalize(partial_sum_a) FROM (SELECT partialize(sum(a)) FROM foo);`
+ *
+ * This is especially useful in continuous aggs, where partials are stored and
+ * finalized at query time to give accurate aggregates and in the distributed
+ * database in which partials are calculated by individual data nodes and
+ * then passed back to the access node for finalization.
+ *
+ * The partialize function is implemented as a regular function, the function
+ * call itself does very little except ensure that the type returned is what the
+ * node is expecting, most of the work is done in plan_partialize.c, where calls
+ * to that function are intercepted and the plan is modified to return the
+ * partial state of the aggregate rather than its finalized state. It always
+ * returns a BYTEA.
+ *
+ * The finalize function is implemented as an aggregate which takes in the
+ * schema qualified name of the agg we're finalizing (we'll call this the inner
+ * agg from now on), the partial/transition state of the inner agg (as a BYTEA),
+ * some collation info and the return type of the original inner agg (an
+ * ANYELEMENT that will just be a null/dummy element that tells the planner what
+ * type we're going to return from our agg). This function then serves basically
+ * as a wrapper, it takes the transition state of the inner aggregate as its
+ * input, calls the combine function of the inner aggregate as its transition
+ * function and the finalfunc of the inner aggregate.
+ */</comment>
+
+<comment type="block">/*
+ * We're modeling much of our design on nodeAgg.c, and the long comment there
+ * describes the design decisions well, we won't repeat all of that here, but we
+ * will repeat some of it. Namely  that we want to split out as much state as
+ * possible that can eventually be moved to being instantiated in an higher
+ * memory context than per group as it is invariant between groups and the
+ * lookups/extra memory overhead per group can have a significant impact.
+ * Therefore we have 3 structs, one to define all of the invariants to apply the
+ * combine function of the inner agg, one to define all of the invariants needed
+ * to apply the finalize function of the inner agg and a third that carries the
+ * current state of the agg in the group.
+ *
+ * tsl_finalize_agg_sfunc is the state transition function
+ * tsl_finalize_agg_ffunc is the finalize function
+ */</comment>
+
+<comment type="block">/* State for calling the combine + deserialize functions of the inner aggregate */</comment>
+<typedef>typedef <type><struct>struct <name>FACombineFnMeta</name>
+<block>{
+	<decl_stmt><decl><type><name>Oid</name></type> <name>combinefnoid</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Oid</name></type> <name>deserialfnoid</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Oid</name></type> <name>transtype</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Oid</name></type> <name>recv_fn</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Oid</name></type> <name>typIOParam</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>FmgrInfo</name></type> <name>deserialfn</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>FmgrInfo</name></type> <name>internal_deserialfn</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>FmgrInfo</name></type> <name>combinefn</name></decl>;</decl_stmt>
+	<comment type="block">/* either deserialfn_fcinfo or internal_deserialfn_fcinfo is valid*/</comment>
+	<decl_stmt><decl><type><name>FunctionCallInfo</name></type> <name>deserialfn_fcinfo</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>FunctionCallInfo</name></type> <name>internal_deserialfn_fcinfo</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>FunctionCallInfo</name></type> <name>combfn_fcinfo</name></decl>;</decl_stmt>
+
+}</block></struct></type> <name>FACombineFnMeta</name>;</typedef>
+
+<comment type="block">/* State for calling the final function of the inner aggregate */</comment>
+<typedef>typedef <type><struct>struct <name>FAFinalFnMeta</name>
+<block>{
+	<decl_stmt><decl><type><name>Oid</name></type> <name>finalfnoid</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>FmgrInfo</name></type> <name>finalfn</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>FunctionCallInfo</name></type> <name>finalfn_fcinfo</name></decl>;</decl_stmt>
+}</block></struct></type> <name>FAFinalFnMeta</name>;</typedef>
+
+<comment type="block">/*
+ * Per group state of the finalize aggregate. Note that if we have a strict combine
+ * function, both arg values have to be non-null (like min/max). When we see
+ * first non-null value, initialize trans_value and set trans_value_initialized true. see PG11
+ * advance_transition_function
+ */</comment>
+<typedef>typedef <type><struct>struct <name>FAPerGroupState</name>
+<block>{
+	<decl_stmt><decl><type><name>Datum</name></type> <name>trans_value</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type> <name>trans_value_isnull</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type> <name>trans_value_initialized</name></decl>;</decl_stmt>
+}</block></struct></type> <name>FAPerGroupState</name>;</typedef>
+
+<comment type="block">/* metadata information that is common for the entire query */</comment>
+<typedef>typedef <type><struct>struct <name>FAPerQueryState</name>
+<block>{
+	<decl_stmt><decl><type><name>FACombineFnMeta</name></type> <name>combine_meta</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>FAFinalFnMeta</name></type> <name>final_meta</name></decl>;</decl_stmt>
+}</block></struct></type> <name>FAPerQueryState</name>;</typedef>
+
+<typedef>typedef <type><struct>struct <name>FATransitionState</name>
+<block>{
+	<decl_stmt><decl><type><name>FAPerQueryState</name> <modifier>*</modifier></type><name>per_query_state</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>FAPerGroupState</name> <modifier>*</modifier></type><name>per_group_state</name></decl>;</decl_stmt>
+}</block></struct></type> <name>FATransitionState</name>;</typedef>
+
+<function><type><specifier>static</specifier> <name>Oid</name></type>
+<name>aggfnoid_from_aggname</name><parameter_list>(<parameter><decl><type><name>text</name> <modifier>*</modifier></type><name>aggfn</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>char</name> <modifier>*</modifier></type><name>funcname</name> <init>= <expr><call><name>text_to_cstring</name><argument_list>(<argument><expr><name>aggfn</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Oid</name></type> <name>oid</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name>oid</name> <operator>=</operator> <call><name>DatumGetObjectId</name><argument_list>(<argument><expr><call><name>DirectFunctionCall1</name><argument_list>(<argument><expr><name>regprocedurein</name></expr></argument>,
+
+											   <argument><expr><call><name>CStringGetDatum</name><argument_list>(<argument><expr><name>funcname</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>OidIsValid</name><argument_list>(<argument><expr><name>oid</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_UNDEFINED_FUNCTION</name></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"function \"%s\" does not exist"</literal></expr></argument>, <argument><expr><name>funcname</name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<return>return <expr><name>oid</name></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><specifier>static</specifier> <name>Oid</name></type>
+<name>collation_oid_from_name</name><parameter_list>(<parameter><decl><type><name>char</name> <modifier>*</modifier></type><name>schema_name</name></decl></parameter>, <parameter><decl><type><name>char</name> <modifier>*</modifier></type><name>collation_name</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>List</name> <modifier>*</modifier></type><name>namel</name> <init>= <expr><name>NIL</name></expr></init></decl>;</decl_stmt>
+	<if_stmt><if>if <condition>(<expr><name>NULL</name> <operator>==</operator> <name>collation_name</name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>InvalidOid</name></expr>;</return></block_content></block></if></if_stmt>
+	<if_stmt><if>if <condition>(<expr><name>NULL</name> <operator>!=</operator> <name>schema_name</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name>namel</name> <operator>=</operator> <call><name>list_make1</name><argument_list>(<argument><expr><call><name>makeString</name><argument_list>(<argument><expr><name>schema_name</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	<expr_stmt><expr><name>namel</name> <operator>=</operator> <call><name>lappend</name><argument_list>(<argument><expr><name>namel</name></expr></argument>, <argument><expr><call><name>makeString</name><argument_list>(<argument><expr><name>collation_name</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<return>return <expr><call><name>get_collation_oid</name><argument_list>(<argument><expr><name>namel</name></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<cpp:if>#<cpp:directive>if</cpp:directive> <expr><name>PG14_GE</name></expr></cpp:if>
+<comment type="block">/*
+ * =======================================
+ * Record serialized partials errata here:
+ * =======================================
+ *
+ * ================================================================================================
+ * The numeric format changed between PG13 and PG14 to include infinities. Consequently the
+ * internal aggregate for the combine functions changed as well, which lead to the serialized
+ * partial state of numeric aggregates also changing format.
+ *
+ * If a user that has stored partials (by using Continuous Aggregates or calling
+ * _timescaledb_internal.finalize_agg()) upgrades to PG14 then the partial state deserialization
+ * will lead to errors due to the mismatch with the PG14 code.
+ *
+ * For F_NUMERIC_AVG_DESERIALIZE and F_NUMERIC_DESERIALIZE the length of the serialized aggregate
+ * state is 16 bytes longer than the previous versions. It suffices to zero out the extra bytes of
+ * pInfcount and nInfcount in the numeric aggregate combine state. Those fields are only there to
+ * support infinity and -infinity in the numeric type, which wasn't supported in older PostgreSQL
+ * versions.
+ *
+ * PostgreSQL versions &lt; 14
+ * F_NUMERIC_AVG_DESERIALIZE serialized partial length = X
+ * F_NUMERIC_DESERIALIZE serialized partial length = X + 10
+ *
+ * PostgreSQL versions &gt;= 14
+ * F_NUMERIC_AVG_DESERIALIZE serialized partial length = X + 16
+ * F_NUMERIC_DESERIALIZE serialized partial length = X + 10 + 16
+ *
+ * For more information see: https://www.postgresql.org/message-id/606717.1591924582@sss.pgh.pa.us
+ *
+ * Non-numeric aggregate functions affected:
+ * 1. var_pop(int8)
+ * 2. var_samp(int8)
+ * 3. variance(int8)
+ * 4. stddev_pop(int8)
+ * 5. stddev_samp(int8)
+ * 6. stddev(int8)
+ * ================================================================================================
+ * F_NUMERIC_POLY_DESERIALIZE depends on compiler support for HAVE_INT128. As a result, recompiling
+ * the same versions of PostgreSQL and TimescaleDB with a different compiler can lead to corruption
+ * if the same database is reused.
+ *
+ * Non-numeric aggregate functions affected:
+ * 1. var_pop(int4)
+ * 2. var_pop(int2)
+ * 3. var_samp(int4)
+ * 4. var_samp(int2)
+ * 5. variance(int4)
+ * 6. variance(int2)
+ * 7. stddev_pop(int4)
+ * 8. stddev_pop(int2)
+ * 9. stddev_samp(int4)
+ * 10. stddev_samp(int2)
+ * 11. stddev(int4)
+ * 12. stddev(int2)
+ */</comment>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>NUMERIC_PARTIAL_MISSING_LENGTH</name></cpp:macro> <cpp:value>(16)</cpp:value></cpp:define>
+
+<function><type><specifier>static</specifier> <name>bytea</name> <modifier>*</modifier></type>
+<name>zero_fill_bytearray</name><parameter_list>(<parameter><decl><type><name>bytea</name> <modifier>*</modifier></type><name>serialized_partial</name></decl></parameter>, <parameter><decl><type><name>size_t</name></type> <name>missing_length</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>size_t</name></type> <name>original_length</name> <init>= <expr><call><name>VARSIZE_ANY_EXHDR</name><argument_list>(<argument><expr><name>serialized_partial</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>size_t</name></type> <name>desired_length</name> <init>= <expr><name>original_length</name> <operator>+</operator> <name>missing_length</name></expr></init></decl>;</decl_stmt>
+
+	<decl_stmt><decl><type><name>bytea</name> <modifier>*</modifier></type><name>new_bytea</name> <init>= <expr><call><name>repalloc</name><argument_list>(<argument><expr><name>serialized_partial</name></expr></argument>, <argument><expr><name>desired_length</name> <operator>+</operator> <name>VARHDRSZ</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>SET_VARSIZE</name><argument_list>(<argument><expr><name>new_bytea</name></expr></argument>, <argument><expr><name>desired_length</name> <operator>+</operator> <name>VARHDRSZ</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<decl_stmt><decl><type><name>void</name> <modifier>*</modifier></type><name>end_of_serialized_partial</name> <init>= <expr><call><name>VARDATA</name><argument_list>(<argument><expr><name>new_bytea</name></expr></argument>)</argument_list></call> <operator>+</operator> <name>original_length</name></expr></init></decl>;</decl_stmt>
+	<expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><name>end_of_serialized_partial</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><name>missing_length</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<return>return <expr><name>new_bytea</name></expr>;</return>
+</block_content>}</block></function>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+<comment type="block">/* Only call this function if the partial is known to be problematic. */</comment>
+<function><type><specifier>static</specifier> <name>bytea</name> <modifier>*</modifier></type>
+<name>sanitize_serialized_partial</name><parameter_list>(<parameter><decl><type><name>Oid</name></type> <name>deserialfnoid</name></decl></parameter>, <parameter><decl><type><name>bytea</name> <modifier>*</modifier></type><name>serialized_partial</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+<cpp:if>#<cpp:directive>if</cpp:directive> <expr><name>PG14_GE</name></expr></cpp:if>
+	<if_stmt><if>if <condition>(<expr><operator>(</operator><name>deserialfnoid</name> <operator>==</operator> <name>F_NUMERIC_DESERIALIZE</name><operator>)</operator> <operator>||</operator> <operator>(</operator><name>deserialfnoid</name> <operator>==</operator> <name>F_NUMERIC_AVG_DESERIALIZE</name><operator>)</operator></expr>)</condition><block type="pseudo"><block_content>
+		<comment type="block">/*
+		 * Always add NUMERIC_PARTIAL_MISSING_LENGTH extra bytes because the length is not fixed.
+		 * This is only safe to do when the partial state is known to be short, otherwise an
+		 * exception is thrown if the serialized_partial is not fully consumed by deserialfn().
+		 */</comment>
+		<return>return <expr><call><name>zero_fill_bytearray</name><argument_list>(<argument><expr><name>serialized_partial</name></expr></argument>, <argument><expr><name>NUMERIC_PARTIAL_MISSING_LENGTH</name></expr></argument>)</argument_list></call></expr>;</return></block_content></block></if></if_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+	<return>return <expr><name>serialized_partial</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * deserialize from the internal format in which data is stored in bytea
+ * parameter. Callers need to check deserialized_isnull . Only if this is set to false,
+ * a valid value is returned.
+ * The serialized_partial argument is declared volatile to avoid the mistaken
+ * gcc-11 warning -Wclobbered.
+ */</comment>
+<function><type><specifier>static</specifier> <name>Datum</name></type>
+<name>inner_agg_deserialize</name><parameter_list>(<parameter><decl><type><name>FACombineFnMeta</name> <modifier>*</modifier></type><name>combine_meta</name></decl></parameter>, <parameter><decl><type><name>bytea</name> <modifier>*</modifier><specifier>volatile</specifier></type> <name>serialized_partial</name></decl></parameter>,
+					  <parameter><decl><type><name>bool</name></type> <name>serialized_isnull</name></decl></parameter>, <parameter><decl><type><name>bool</name> <modifier>*</modifier></type><name>deserialized_isnull</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>Datum</name></type> <name>deserialized</name> <init>= <expr><operator>(</operator><name>Datum</name><operator>)</operator> <literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>FunctionCallInfo</name></type> <name>deser_fcinfo</name> <init>= <expr><name><name>combine_meta</name><operator>-&gt;</operator><name>deserialfn_fcinfo</name></name></expr></init></decl>;</decl_stmt>
+	<expr_stmt><expr><operator>*</operator><name>deserialized_isnull</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><call><name>OidIsValid</name><argument_list>(<argument><expr><name><name>combine_meta</name><operator>-&gt;</operator><name>deserialfnoid</name></name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<if_stmt><if>if <condition>(<expr><name>serialized_isnull</name> <operator>&amp;&amp;</operator> <name><name>combine_meta</name><operator>-&gt;</operator><name>deserialfn</name><operator>.</operator><name>fn_strict</name></name></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><call><name>PG_RETURN_VOID</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+			<comment type="block">/*don't call the deser function */</comment>
+		</block_content>}</block></if></if_stmt>
+
+		<expr_stmt><expr><call><name>FC_ARG</name><argument_list>(<argument><expr><name>deser_fcinfo</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call> <operator>=</operator> <call><name>PointerGetDatum</name><argument_list>(<argument><expr><name>serialized_partial</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>FC_NULL</name><argument_list>(<argument><expr><name>deser_fcinfo</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call> <operator>=</operator> <name>serialized_isnull</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>deser_fcinfo</name><operator>-&gt;</operator><name>isnull</name></name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+
+		<comment type="block">/*
+		 * When an exception is thrown and longjmp() is called, CurrentMemoryContext is potentially
+		 * different than what it was inside the PG_TRY() block below.
+		 *
+		 * Restore it to the old value so that the code in the subsequent PG_CATCH() block does not
+		 * corrupt the memory.
+		 *
+		 * No need for volatile variables since we don't modify any of this function's stack frame
+		 * inside the PG_TRY() block.
+		 */</comment>
+		<decl_stmt><decl><type><name>MemoryContext</name></type> <name>oldcontext</name> <init>= <expr><name>CurrentMemoryContext</name></expr></init></decl>;</decl_stmt>
+		<expr_stmt><expr><call><name>PG_TRY</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+		<block>{<block_content>
+			<expr_stmt><expr><name>deserialized</name> <operator>=</operator> <call><name>FunctionCallInvoke</name><argument_list>(<argument><expr><name>deser_fcinfo</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block>
+		<expr_stmt><expr><call><name>PG_CATCH</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+		<block>{<block_content>
+			<expr_stmt><expr><name>CurrentMemoryContext</name> <operator>=</operator> <name>oldcontext</name></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>FlushErrorState</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+			<comment type="block">/* attempt to repair the serialized partial */</comment>
+			<expr_stmt><expr><name>serialized_partial</name> <operator>=</operator>
+				<call><name>sanitize_serialized_partial</name><argument_list>(<argument><expr><name><name>combine_meta</name><operator>-&gt;</operator><name>deserialfnoid</name></name></expr></argument>, <argument><expr><name>serialized_partial</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>FC_ARG</name><argument_list>(<argument><expr><name>deser_fcinfo</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call> <operator>=</operator> <call><name>PointerGetDatum</name><argument_list>(<argument><expr><name>serialized_partial</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><name><name>deser_fcinfo</name><operator>-&gt;</operator><name>isnull</name></name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+			<expr_stmt><expr><name>deserialized</name> <operator>=</operator> <call><name>FunctionCallInvoke</name><argument_list>(<argument><expr><name>deser_fcinfo</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block>
+		<expr_stmt><expr><call><name>PG_END_TRY</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><operator>*</operator><name>deserialized_isnull</name> <operator>=</operator> <name><name>deser_fcinfo</name><operator>-&gt;</operator><name>isnull</name></name></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<if type="elseif">else if <condition>(<expr><operator>!</operator><name>serialized_isnull</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>int32</name></type> <name>typmod</name> <init>= <expr><operator>-</operator><literal type="number">1</literal></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>StringInfo</name></type> <name>string</name> <init>= <expr><call><name>makeStringInfo</name><argument_list>()</argument_list></call></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>FunctionCallInfo</name></type> <name>internal_deserialfn_fcinfo</name> <init>= <expr><name><name>combine_meta</name><operator>-&gt;</operator><name>internal_deserialfn_fcinfo</name></name></expr></init></decl>;</decl_stmt>
+
+		<expr_stmt><expr><call><name>appendBinaryStringInfo</name><argument_list>(<argument><expr><name>string</name></expr></argument>,
+							   <argument><expr><call><name>VARDATA_ANY</name><argument_list>(<argument><expr><name>serialized_partial</name></expr></argument>)</argument_list></call></expr></argument>,
+							   <argument><expr><call><name>VARSIZE_ANY_EXHDR</name><argument_list>(<argument><expr><name>serialized_partial</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>FC_SET_ARG</name><argument_list>(<argument><expr><name>internal_deserialfn_fcinfo</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><call><name>PointerGetDatum</name><argument_list>(<argument><expr><name>string</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>FC_SET_ARG</name><argument_list>(<argument><expr><name>internal_deserialfn_fcinfo</name></expr></argument>, <argument><expr><literal type="number">1</literal></expr></argument>, <argument><expr><call><name>ObjectIdGetDatum</name><argument_list>(<argument><expr><name><name>combine_meta</name><operator>-&gt;</operator><name>typIOParam</name></name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>FC_SET_ARG</name><argument_list>(<argument><expr><name>internal_deserialfn_fcinfo</name></expr></argument>, <argument><expr><literal type="number">2</literal></expr></argument>, <argument><expr><call><name>Int32GetDatum</name><argument_list>(<argument><expr><name>typmod</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><name><name>internal_deserialfn_fcinfo</name><operator>-&gt;</operator><name>isnull</name></name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+
+		<expr_stmt><expr><name>deserialized</name> <operator>=</operator> <call><name>FunctionCallInvoke</name><argument_list>(<argument><expr><name>internal_deserialfn_fcinfo</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><operator>*</operator><name>deserialized_isnull</name> <operator>=</operator> <name><name>internal_deserialfn_fcinfo</name><operator>-&gt;</operator><name>isnull</name></name></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+	<expr_stmt><expr><call><name>PG_RETURN_DATUM</name><argument_list>(<argument><expr><name>deserialized</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/* Convert a 2-dimensional array of schema, names to type OIDs */</comment>
+<function><type><specifier>static</specifier> <name>Oid</name> <modifier>*</modifier></type>
+<name>get_input_types</name><parameter_list>(<parameter><decl><type><name>ArrayType</name> <modifier>*</modifier></type><name>input_types</name></decl></parameter>, <parameter><decl><type><name>size_t</name> <modifier>*</modifier></type><name>number_types</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>ArrayMetaState</name></type> <name>meta</name> <init>= <expr><block>{ <expr><operator>.</operator><name>element_type</name> <operator>=</operator> <name>NAMEOID</name></expr> }</block></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>ArrayIterator</name></type> <name>iter</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Datum</name></type> <name>slice_datum</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type> <name>slice_null</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Oid</name> <modifier>*</modifier></type><name>type_oids</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type> <name>type_index</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>input_types</name> <operator>==</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"cannot pass null input_type with FINALFUNC_EXTRA aggregates"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>get_typlenbyvalalign</name><argument_list>(<argument><expr><name><name>meta</name><operator>.</operator><name>element_type</name></name></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>meta</name><operator>.</operator><name>typlen</name></name></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>meta</name><operator>.</operator><name>typbyval</name></name></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>meta</name><operator>.</operator><name>typalign</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><call><name>ARR_NDIM</name><argument_list>(<argument><expr><name>input_types</name></expr></argument>)</argument_list></call> <operator>!=</operator> <literal type="number">2</literal></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"invalid input type array: wrong number of dimensions"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><operator>*</operator><name>number_types</name> <operator>=</operator> <call><name>ARR_DIMS</name><argument_list>(<argument><expr><name>input_types</name></expr></argument>)</argument_list></call><index>[<expr><literal type="number">0</literal></expr>]</index></expr>;</expr_stmt>
+	<expr_stmt><expr><name>type_oids</name> <operator>=</operator> <call><name>palloc0</name><argument_list>(<argument><expr><sizeof>sizeof<argument_list>(<argument><expr><operator>*</operator><name>type_oids</name></expr></argument>)</argument_list></sizeof> <operator>*</operator> <operator>(</operator><operator>*</operator><name>number_types</name><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>iter</name> <operator>=</operator> <call><name>array_create_iterator</name><argument_list>(<argument><expr><name>input_types</name></expr></argument>, <argument><expr><literal type="number">1</literal></expr></argument>, <argument><expr><operator>&amp;</operator><name>meta</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<while>while <condition>(<expr><call><name>array_iterate</name><argument_list>(<argument><expr><name>iter</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>slice_datum</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>slice_null</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>Datum</name> <modifier>*</modifier></type><name>slice_fields</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>int</name></type> <name>slice_elems</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>Name</name></type> <name>schema</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>Name</name></type> <name>type_name</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>Oid</name></type> <name>schema_oid</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>Oid</name></type> <name>type_oid</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>ArrayType</name> <modifier>*</modifier></type><name>slice_array</name> <init>= <expr><call><name>DatumGetArrayTypeP</name><argument_list>(<argument><expr><name>slice_datum</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+		<if_stmt><if>if <condition>(<expr><name>slice_null</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"invalid input type array slice: cannot be null"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+		<expr_stmt><expr><call><name>deconstruct_array</name><argument_list>(<argument><expr><name>slice_array</name></expr></argument>,
+						  <argument><expr><name><name>meta</name><operator>.</operator><name>element_type</name></name></expr></argument>,
+						  <argument><expr><name><name>meta</name><operator>.</operator><name>typlen</name></name></expr></argument>,
+						  <argument><expr><name><name>meta</name><operator>.</operator><name>typbyval</name></name></expr></argument>,
+						  <argument><expr><name><name>meta</name><operator>.</operator><name>typalign</name></name></expr></argument>,
+						  <argument><expr><operator>&amp;</operator><name>slice_fields</name></expr></argument>,
+						  <argument><expr><name>NULL</name></expr></argument>,
+						  <argument><expr><operator>&amp;</operator><name>slice_elems</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<if_stmt><if>if <condition>(<expr><name>slice_elems</name> <operator>!=</operator> <literal type="number">2</literal></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"invalid input type array: expecting slices of size 2"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+		<expr_stmt><expr><name>schema</name> <operator>=</operator> <call><name>DatumGetName</name><argument_list>(<argument><expr><name><name>slice_fields</name><index>[<expr><literal type="number">0</literal></expr>]</index></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name>type_name</name> <operator>=</operator> <call><name>DatumGetName</name><argument_list>(<argument><expr><name><name>slice_fields</name><index>[<expr><literal type="number">1</literal></expr>]</index></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><name>schema_oid</name> <operator>=</operator> <call><name>get_namespace_oid</name><argument_list>(<argument><expr><call><name>NameStr</name><argument_list>(<argument><expr><operator>*</operator><name>schema</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name>type_oid</name> <operator>=</operator> <call><name>GetSysCacheOid2</name><argument_list>(<argument><expr><name>TYPENAMENSP</name></expr></argument>,
+								   <argument><expr><name>Anum_pg_type_oid</name></expr></argument>,
+								   <argument><expr><call><name>PointerGetDatum</name><argument_list>(<argument><expr><call><name>NameStr</name><argument_list>(<argument><expr><operator>*</operator><name>type_name</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr></argument>,
+								   <argument><expr><call><name>ObjectIdGetDatum</name><argument_list>(<argument><expr><name>schema_oid</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>OidIsValid</name><argument_list>(<argument><expr><name>type_oid</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"invalid input type: %s.%s"</literal></expr></argument>, <argument><expr><call><name>NameStr</name><argument_list>(<argument><expr><operator>*</operator><name>schema</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><call><name>NameStr</name><argument_list>(<argument><expr><operator>*</operator><name>type_name</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+		<expr_stmt><expr><name><name>type_oids</name><index>[<expr><name>type_index</name><operator>++</operator></expr>]</index></name> <operator>=</operator> <name>type_oid</name></expr>;</expr_stmt>
+	</block_content>}</block></while>
+	<return>return <expr><name>type_oids</name></expr>;</return>
+</block_content>}</block></function><empty_stmt>;</empty_stmt>
+
+<function><type><specifier>static</specifier> <name>FATransitionState</name> <modifier>*</modifier></type>
+<name>fa_transition_state_init</name><parameter_list>(<parameter><decl><type><name>MemoryContext</name> <modifier>*</modifier></type><name>fa_context</name></decl></parameter>, <parameter><decl><type><name>FAPerQueryState</name> <modifier>*</modifier></type><name>qstate</name></decl></parameter>, <parameter><decl><type><name>AggState</name> <modifier>*</modifier></type><name>fa_aggstate</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>FATransitionState</name> <modifier>*</modifier></type><name>tstate</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+	<expr_stmt><expr><name>tstate</name> <operator>=</operator> <operator>(</operator><name>FATransitionState</name> <operator>*</operator><operator>)</operator> <call><name>MemoryContextAlloc</name><argument_list>(<argument><expr><operator>*</operator><name>fa_context</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><operator>*</operator><name>tstate</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>tstate</name><operator>-&gt;</operator><name>per_query_state</name></name> <operator>=</operator> <name>qstate</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>tstate</name><operator>-&gt;</operator><name>per_group_state</name></name> <operator>=</operator>
+		<operator>(</operator><name>FAPerGroupState</name> <operator>*</operator><operator>)</operator> <call><name>MemoryContextAlloc</name><argument_list>(<argument><expr><operator>*</operator><name>fa_context</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><operator>*</operator><name><name>tstate</name><operator>-&gt;</operator><name>per_group_state</name></name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Need to init tstate-&gt;per_group_state-&gt;trans_value */</comment>
+	<expr_stmt><expr><name><name>tstate</name><operator>-&gt;</operator><name>per_group_state</name><operator>-&gt;</operator><name>trans_value_isnull</name></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>tstate</name><operator>-&gt;</operator><name>per_group_state</name><operator>-&gt;</operator><name>trans_value_initialized</name></name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+	<return>return <expr><name>tstate</name></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><specifier>static</specifier> <name>FAPerQueryState</name> <modifier>*</modifier></type>
+<name>fa_perquery_state_init</name><parameter_list>(<parameter><decl><type><name>FunctionCallInfo</name></type> <name>fcinfo</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>char</name> <modifier>*</modifier></type><name>inner_agg_input_coll_schema</name> <init>= <expr><ternary><condition><expr><call><name>PG_ARGISNULL</name><argument_list>(<argument><expr><literal type="number">2</literal></expr></argument>)</argument_list></call></expr> ?</condition><then> <expr><name>NULL</name></expr> </then><else>: <expr><call><name>NameStr</name><argument_list>(<argument><expr><operator>*</operator><call><name>PG_GETARG_NAME</name><argument_list>(<argument><expr><literal type="number">2</literal></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr></else></ternary></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>char</name> <modifier>*</modifier></type><name>inner_agg_input_coll_name</name> <init>= <expr><ternary><condition><expr><call><name>PG_ARGISNULL</name><argument_list>(<argument><expr><literal type="number">3</literal></expr></argument>)</argument_list></call></expr> ?</condition><then> <expr><name>NULL</name></expr> </then><else>: <expr><call><name>NameStr</name><argument_list>(<argument><expr><operator>*</operator><call><name>PG_GETARG_NAME</name><argument_list>(<argument><expr><literal type="number">3</literal></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr></else></ternary></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>ArrayType</name> <modifier>*</modifier></type><name>input_types</name> <init>= <expr><ternary><condition><expr><call><name>PG_ARGISNULL</name><argument_list>(<argument><expr><literal type="number">4</literal></expr></argument>)</argument_list></call></expr> ?</condition><then> <expr><name>NULL</name></expr> </then><else>: <expr><call><name>PG_GETARG_ARRAYTYPE_P</name><argument_list>(<argument><expr><literal type="number">4</literal></expr></argument>)</argument_list></call></expr></else></ternary></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Oid</name></type> <name>inner_agg_fn_oid</name> <init>= <expr><call><name>aggfnoid_from_aggname</name><argument_list>(<argument><expr><call><name>PG_GETARG_TEXT_PP</name><argument_list>(<argument><expr><literal type="number">1</literal></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<decl_stmt><decl><type><name>Oid</name></type> <name>collation</name> <init>= <expr><call><name>collation_oid_from_name</name><argument_list>(<argument><expr><name>inner_agg_input_coll_schema</name></expr></argument>, <argument><expr><name>inner_agg_input_coll_name</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>FAPerQueryState</name> <modifier>*</modifier></type><name>tstate</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>HeapTuple</name></type> <name>inner_agg_tuple</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Form_pg_aggregate</name></type> <name>inner_agg_form</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>MemoryContext</name></type> <name>qcontext</name> <init>= <expr><name><name>fcinfo</name><operator>-&gt;</operator><name>flinfo</name><operator>-&gt;</operator><name>fn_mcxt</name></name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>MemoryContext</name></type> <name>oldcontext</name> <init>= <expr><call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>qcontext</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>AggState</name> <modifier>*</modifier></type><name>fa_aggstate</name> <init>= <expr><operator>(</operator><name>AggState</name> <operator>*</operator><operator>)</operator> <name><name>fcinfo</name><operator>-&gt;</operator><name>context</name></name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type> <name>aggfinalextra</name></decl>;</decl_stmt>
+
+	<comment type="block">/* look up catalog entry and populate what we need */</comment>
+	<expr_stmt><expr><name>inner_agg_tuple</name> <operator>=</operator> <call><name>SearchSysCache1</name><argument_list>(<argument><expr><name>AGGFNOID</name></expr></argument>, <argument><expr><name>inner_agg_fn_oid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>HeapTupleIsValid</name><argument_list>(<argument><expr><name>inner_agg_tuple</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"cache lookup failed for aggregate %u"</literal></expr></argument>, <argument><expr><name>inner_agg_fn_oid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	<expr_stmt><expr><name>inner_agg_form</name> <operator>=</operator> <operator>(</operator><name>Form_pg_aggregate</name><operator>)</operator> <call><name>GETSTRUCT</name><argument_list>(<argument><expr><name>inner_agg_tuple</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<comment type="block">/* we only support aggregates with 0 direct args (only ordered set aggs do not meet this
+	 * condition)*/</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>inner_agg_form</name><operator>-&gt;</operator><name>aggnumdirectargs</name></name> <operator>!=</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+			 <argument><expr><literal type="string">"function calls with direct args are not supported by TimescaleDB finalize agg"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	<expr_stmt><expr><name>tstate</name> <operator>=</operator> <operator>(</operator><name>FAPerQueryState</name> <operator>*</operator><operator>)</operator> <call><name>MemoryContextAlloc</name><argument_list>(<argument><expr><name>qcontext</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>FAPerQueryState</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name><name>tstate</name><operator>-&gt;</operator><name>final_meta</name><operator>.</operator><name>finalfnoid</name></name> <operator>=</operator> <name><name>inner_agg_form</name><operator>-&gt;</operator><name>aggfinalfn</name></name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>tstate</name><operator>-&gt;</operator><name>combine_meta</name><operator>.</operator><name>combinefnoid</name></name> <operator>=</operator> <name><name>inner_agg_form</name><operator>-&gt;</operator><name>aggcombinefn</name></name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>tstate</name><operator>-&gt;</operator><name>combine_meta</name><operator>.</operator><name>deserialfnoid</name></name> <operator>=</operator> <name><name>inner_agg_form</name><operator>-&gt;</operator><name>aggdeserialfn</name></name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>tstate</name><operator>-&gt;</operator><name>combine_meta</name><operator>.</operator><name>transtype</name></name> <operator>=</operator> <name><name>inner_agg_form</name><operator>-&gt;</operator><name>aggtranstype</name></name></expr>;</expr_stmt>
+	<expr_stmt><expr><name>aggfinalextra</name> <operator>=</operator> <name><name>inner_agg_form</name><operator>-&gt;</operator><name>aggfinalextra</name></name></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>ReleaseSysCache</name><argument_list>(<argument><expr><name>inner_agg_tuple</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* initialize combine specific state, both the deserialize function and combine function */</comment>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>OidIsValid</name><argument_list>(<argument><expr><name><name>tstate</name><operator>-&gt;</operator><name>combine_meta</name><operator>.</operator><name>combinefnoid</name></name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+			 <argument><expr><literal type="string">"no valid combine function for the aggregate specified in Timescale finalize call"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>fmgr_info_cxt</name><argument_list>(<argument><expr><name><name>tstate</name><operator>-&gt;</operator><name>combine_meta</name><operator>.</operator><name>combinefnoid</name></name></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>tstate</name><operator>-&gt;</operator><name>combine_meta</name><operator>.</operator><name>combinefn</name></name></expr></argument>, <argument><expr><name>qcontext</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>tstate</name><operator>-&gt;</operator><name>combine_meta</name><operator>.</operator><name>combfn_fcinfo</name></name> <operator>=</operator> <call><name>HEAP_FCINFO</name><argument_list>(<argument><expr><literal type="number">2</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>InitFunctionCallInfoData</name><argument_list>(<argument><expr><operator>*</operator><name><name>tstate</name><operator>-&gt;</operator><name>combine_meta</name><operator>.</operator><name>combfn_fcinfo</name></name></expr></argument>,
+							 <argument><expr><operator>&amp;</operator><name><name>tstate</name><operator>-&gt;</operator><name>combine_meta</name><operator>.</operator><name>combinefn</name></name></expr></argument>,
+							 <argument><expr><literal type="number">2</literal></expr></argument>, <comment type="block">/* combine fn always has two args */</comment>
+							 <argument><expr><name>collation</name></expr></argument>,
+							 <argument><expr><operator>(</operator><name>void</name> <operator>*</operator><operator>)</operator> <name>fa_aggstate</name></expr></argument>,
+							 <argument><expr><name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><call><name>OidIsValid</name><argument_list>(<argument><expr><name><name>tstate</name><operator>-&gt;</operator><name>combine_meta</name><operator>.</operator><name>deserialfnoid</name></name></expr></argument>)</argument_list></call></expr>)</condition> <comment type="block">/* deserial fn not necessary, no need to
+															throw errors if not found */</comment>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>fmgr_info_cxt</name><argument_list>(<argument><expr><name><name>tstate</name><operator>-&gt;</operator><name>combine_meta</name><operator>.</operator><name>deserialfnoid</name></name></expr></argument>,
+					  <argument><expr><operator>&amp;</operator><name><name>tstate</name><operator>-&gt;</operator><name>combine_meta</name><operator>.</operator><name>deserialfn</name></name></expr></argument>,
+					  <argument><expr><name>qcontext</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>tstate</name><operator>-&gt;</operator><name>combine_meta</name><operator>.</operator><name>deserialfn_fcinfo</name></name> <operator>=</operator> <call><name>HEAP_FCINFO</name><argument_list>(<argument><expr><literal type="number">1</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>InitFunctionCallInfoData</name><argument_list>(<argument><expr><operator>*</operator><name><name>tstate</name><operator>-&gt;</operator><name>combine_meta</name><operator>.</operator><name>deserialfn_fcinfo</name></name></expr></argument>,
+								 <argument><expr><operator>&amp;</operator><name><name>tstate</name><operator>-&gt;</operator><name>combine_meta</name><operator>.</operator><name>deserialfn</name></name></expr></argument>,
+								 <argument><expr><literal type="number">1</literal></expr></argument>, <comment type="block">/* deserialize always has 1 arg */</comment>
+								 <argument><expr><name>collation</name></expr></argument>,
+								 <argument><expr><operator>(</operator><name>void</name> <operator>*</operator><operator>)</operator> <name>fa_aggstate</name></expr></argument>,
+								 <argument><expr><name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<else>else
+	<block>{<block_content>
+		<comment type="block">/* save information for internal deserialization. caching instead
+		   of calling ReceiveFunctionCall */</comment>
+
+		<comment type="block">/* If the argument type of the aggregate function is a pseudotype the
+		 * lookup/execution of the input function will fail. In that case we
+		 * use the argument type of the finalize_agg_ffunc return_type_dummy_val
+		 * argument instead. */</comment>
+		<decl_stmt><decl><type><name>Oid</name></type> <name>column_type</name></decl>;</decl_stmt>
+		<if_stmt><if>if <condition>(<expr><call><name>TypeCategory</name><argument_list>(<argument><expr><name><name>tstate</name><operator>-&gt;</operator><name>combine_meta</name><operator>.</operator><name>transtype</name></name></expr></argument>)</argument_list></call> <operator>!=</operator> <name>TYPCATEGORY_PSEUDOTYPE</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><name>column_type</name> <operator>=</operator> <name><name>tstate</name><operator>-&gt;</operator><name>combine_meta</name><operator>.</operator><name>transtype</name></name></expr>;</expr_stmt></block_content></block></if>
+		<else>else<block type="pseudo"><block_content>
+			<expr_stmt><expr><name>column_type</name> <operator>=</operator> <call><name>get_fn_expr_argtype</name><argument_list>(<argument><expr><name><name>fcinfo</name><operator>-&gt;</operator><name>flinfo</name></name></expr></argument>, <argument><expr><literal type="number">6</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></else></if_stmt>
+
+		<expr_stmt><expr><call><name>getTypeBinaryInputInfo</name><argument_list>(<argument><expr><name>column_type</name></expr></argument>,
+							   <argument><expr><operator>&amp;</operator><name><name>tstate</name><operator>-&gt;</operator><name>combine_meta</name><operator>.</operator><name>recv_fn</name></name></expr></argument>,
+							   <argument><expr><operator>&amp;</operator><name><name>tstate</name><operator>-&gt;</operator><name>combine_meta</name><operator>.</operator><name>typIOParam</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>fmgr_info_cxt</name><argument_list>(<argument><expr><name><name>tstate</name><operator>-&gt;</operator><name>combine_meta</name><operator>.</operator><name>recv_fn</name></name></expr></argument>,
+					  <argument><expr><operator>&amp;</operator><name><name>tstate</name><operator>-&gt;</operator><name>combine_meta</name><operator>.</operator><name>internal_deserialfn</name></name></expr></argument>,
+					  <argument><expr><name>qcontext</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>tstate</name><operator>-&gt;</operator><name>combine_meta</name><operator>.</operator><name>internal_deserialfn_fcinfo</name></name> <operator>=</operator> <call><name>HEAP_FCINFO</name><argument_list>(<argument><expr><literal type="number">3</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>InitFunctionCallInfoData</name><argument_list>(<argument><expr><operator>*</operator><name><name>tstate</name><operator>-&gt;</operator><name>combine_meta</name><operator>.</operator><name>internal_deserialfn_fcinfo</name></name></expr></argument>,
+								 <argument><expr><operator>&amp;</operator><name><name>tstate</name><operator>-&gt;</operator><name>combine_meta</name><operator>.</operator><name>internal_deserialfn</name></name></expr></argument>,
+								 <argument><expr><literal type="number">3</literal></expr></argument>,
+								 <argument><expr><name>InvalidOid</name></expr></argument>,
+								 <argument><expr><name>NULL</name></expr></argument>,
+								 <argument><expr><name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></else></if_stmt>
+	<comment type="block">/* initialize finalfn specific state */</comment>
+	<if_stmt><if>if <condition>(<expr><call><name>OidIsValid</name><argument_list>(<argument><expr><name><name>tstate</name><operator>-&gt;</operator><name>final_meta</name><operator>.</operator><name>finalfnoid</name></name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>int</name></type> <name>num_args</name> <init>= <expr><literal type="number">1</literal></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>Oid</name> <modifier>*</modifier></type><name>types</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>size_t</name></type> <name>number_types</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+		<if_stmt><if>if <condition>(<expr><name>aggfinalextra</name></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><name>types</name> <operator>=</operator> <call><name>get_input_types</name><argument_list>(<argument><expr><name>input_types</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>number_types</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><name>num_args</name> <operator>+=</operator> <name>number_types</name></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+		<if_stmt><if>if <condition>(<expr><name>num_args</name> <operator>!=</operator> <call><name>get_func_nargs</name><argument_list>(<argument><expr><name><name>tstate</name><operator>-&gt;</operator><name>final_meta</name><operator>.</operator><name>finalfnoid</name></name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"invalid number of input types"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+		<expr_stmt><expr><call><name>fmgr_info_cxt</name><argument_list>(<argument><expr><name><name>tstate</name><operator>-&gt;</operator><name>final_meta</name><operator>.</operator><name>finalfnoid</name></name></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>tstate</name><operator>-&gt;</operator><name>final_meta</name><operator>.</operator><name>finalfn</name></name></expr></argument>, <argument><expr><name>qcontext</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<comment type="block">/* pass the aggstate information from our current call context */</comment>
+		<expr_stmt><expr><name><name>tstate</name><operator>-&gt;</operator><name>final_meta</name><operator>.</operator><name>finalfn_fcinfo</name></name> <operator>=</operator> <call><name>HEAP_FCINFO</name><argument_list>(<argument><expr><name>num_args</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>InitFunctionCallInfoData</name><argument_list>(<argument><expr><operator>*</operator><name><name>tstate</name><operator>-&gt;</operator><name>final_meta</name><operator>.</operator><name>finalfn_fcinfo</name></name></expr></argument>,
+								 <argument><expr><operator>&amp;</operator><name><name>tstate</name><operator>-&gt;</operator><name>final_meta</name><operator>.</operator><name>finalfn</name></name></expr></argument>,
+								 <argument><expr><name>num_args</name></expr></argument>,
+								 <argument><expr><name>collation</name></expr></argument>,
+								 <argument><expr><operator>(</operator><name>void</name> <operator>*</operator><operator>)</operator> <name>fa_aggstate</name></expr></argument>,
+								 <argument><expr><name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<if_stmt><if>if <condition>(<expr><name>number_types</name> <operator>&gt;</operator> <literal type="number">0</literal></expr>)</condition>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>Expr</name> <modifier>*</modifier></type><name>expr</name></decl>;</decl_stmt>
+			<decl_stmt><decl><type><name>int</name></type> <name>i</name></decl>;</decl_stmt>
+			<expr_stmt><expr><call><name>build_aggregate_finalfn_expr</name><argument_list>(<argument><expr><name>types</name></expr></argument>,
+										 <argument><expr><name>num_args</name></expr></argument>,
+										 <argument><expr><name><name>tstate</name><operator>-&gt;</operator><name>combine_meta</name><operator>.</operator><name>transtype</name></name></expr></argument>,
+										 <argument><expr><name><name>types</name><index>[<expr><name>number_types</name> <operator>-</operator> <literal type="number">1</literal></expr>]</index></name></expr></argument>,
+										 <argument><expr><name>collation</name></expr></argument>,
+										 <argument><expr><name><name>tstate</name><operator>-&gt;</operator><name>final_meta</name><operator>.</operator><name>finalfnoid</name></name></expr></argument>,
+										 <argument><expr><operator>&amp;</operator><name>expr</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>fmgr_info_set_expr</name><argument_list>(<argument><expr><operator>(</operator><name>Node</name> <operator>*</operator><operator>)</operator> <name>expr</name></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>tstate</name><operator>-&gt;</operator><name>final_meta</name><operator>.</operator><name>finalfn</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">1</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name>num_args</name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control><block type="pseudo"><block_content>
+				<expr_stmt><expr><call><name>FC_SET_NULL</name><argument_list>(<argument><expr><name><name>tstate</name><operator>-&gt;</operator><name>final_meta</name><operator>.</operator><name>finalfn_fcinfo</name></name></expr></argument>, <argument><expr><name>i</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></for>
+		</block_content>}</block></if></if_stmt>
+	</block_content>}</block></if></if_stmt>
+	<expr_stmt><expr><name><name>fcinfo</name><operator>-&gt;</operator><name>flinfo</name><operator>-&gt;</operator><name>fn_extra</name></name> <operator>=</operator> <operator>(</operator><name>void</name> <operator>*</operator><operator>)</operator> <name>tstate</name></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>oldcontext</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<return>return <expr><name>tstate</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Take the previous value in the group state and call the combine function specified to combine
+ * with the new value that's passed in.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>group_state_advance</name><parameter_list>(<parameter><decl><type><name>FAPerGroupState</name> <modifier>*</modifier></type><name>per_group_state</name></decl></parameter>, <parameter><decl><type><name>FACombineFnMeta</name> <modifier>*</modifier></type><name>combine_meta</name></decl></parameter>, <parameter><decl><type><name>Datum</name></type> <name>newval</name></decl></parameter>,
+					<parameter><decl><type><name>bool</name></type> <name>newval_isnull</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>FC_ARG</name><argument_list>(<argument><expr><name><name>combine_meta</name><operator>-&gt;</operator><name>combfn_fcinfo</name></name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call> <operator>=</operator> <name><name>per_group_state</name><operator>-&gt;</operator><name>trans_value</name></name></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>FC_NULL</name><argument_list>(<argument><expr><name><name>combine_meta</name><operator>-&gt;</operator><name>combfn_fcinfo</name></name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call> <operator>=</operator> <name><name>per_group_state</name><operator>-&gt;</operator><name>trans_value_isnull</name></name></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>FC_ARG</name><argument_list>(<argument><expr><name><name>combine_meta</name><operator>-&gt;</operator><name>combfn_fcinfo</name></name></expr></argument>, <argument><expr><literal type="number">1</literal></expr></argument>)</argument_list></call> <operator>=</operator> <name>newval</name></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>FC_NULL</name><argument_list>(<argument><expr><name><name>combine_meta</name><operator>-&gt;</operator><name>combfn_fcinfo</name></name></expr></argument>, <argument><expr><literal type="number">1</literal></expr></argument>)</argument_list></call> <operator>=</operator> <name>newval_isnull</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>combine_meta</name><operator>-&gt;</operator><name>combfn_fcinfo</name><operator>-&gt;</operator><name>isnull</name></name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>per_group_state</name><operator>-&gt;</operator><name>trans_value</name></name> <operator>=</operator> <call><name>FunctionCallInvoke</name><argument_list>(<argument><expr><name><name>combine_meta</name><operator>-&gt;</operator><name>combfn_fcinfo</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>per_group_state</name><operator>-&gt;</operator><name>trans_value_isnull</name></name> <operator>=</operator> <name><name>combine_meta</name><operator>-&gt;</operator><name>combfn_fcinfo</name><operator>-&gt;</operator><name>isnull</name></name></expr>;</expr_stmt>
+</block_content>}</block></function><empty_stmt>;</empty_stmt>
+<comment type="block">/*
+ * The parameters for tsl_finalize_agg_sfunc (see util_aggregates.sql sql input names)
+ * tstate The internal state of the aggregate
+ * Text aggregatefn: text format of agg function whose state is passed,
+ *     this should match the output of regprocedureout(&lt;oid&gt;)
+ *     we use this to retrieve the inner_agg_fn_oid by calling regprocedurein.
+ * Name inner_agg_collation_schema: schema name for input collation name used by the aggregate
+ * Name inner_agg_collation_name: input collation name used by the aggregate when state was stored.
+ * bytea inner_agg_serialized_state: the partial state of the inner aggregate, in its serialized
+ * form (as stored in the materialization table in materialized aggs) ANYELEMENT
+ * return_type_dummy_val: used for type inference of the return type, populated from the initial agg
+ * node.
+ *
+ * We use the combine function of the aggregatefn to combine the states.
+ * Respect the "strict" nature of the combine function when we encounter
+ * nulls in the data.
+ */</comment>
+<function><type><name>Datum</name></type>
+<name>tsl_finalize_agg_sfunc</name><parameter_list>(<parameter><decl><type><name>PG_FUNCTION_ARGS</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>FATransitionState</name> <modifier>*</modifier></type><name>tstate</name> <init>= <expr><ternary><condition><expr><call><name>PG_ARGISNULL</name><argument_list>(<argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr> ?</condition><then> <expr><name>NULL</name></expr> </then><else>: <expr><operator>(</operator><name>FATransitionState</name> <operator>*</operator><operator>)</operator> <call><name>PG_GETARG_POINTER</name><argument_list>(<argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr></else></ternary></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bytea</name> <modifier>*</modifier></type><name>inner_agg_serialized_state</name> <init>= <expr><ternary><condition><expr><call><name>PG_ARGISNULL</name><argument_list>(<argument><expr><literal type="number">5</literal></expr></argument>)</argument_list></call></expr> ?</condition><then> <expr><name>NULL</name></expr> </then><else>: <expr><call><name>PG_GETARG_BYTEA_P</name><argument_list>(<argument><expr><literal type="number">5</literal></expr></argument>)</argument_list></call></expr></else></ternary></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type> <name>inner_agg_serialized_state_isnull</name> <init>= <expr><ternary><condition><expr><call><name>PG_ARGISNULL</name><argument_list>(<argument><expr><literal type="number">5</literal></expr></argument>)</argument_list></call></expr> ?</condition><then> <expr><name>true</name></expr> </then><else>: <expr><name>false</name></expr></else></ternary></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Datum</name></type> <name>inner_agg_deserialized_state</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>MemoryContext</name></type> <name>fa_context</name></decl>, <decl><type ref="prev"/><name>old_context</name></decl>;</decl_stmt>
+
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>AggCheckCallContext</name><argument_list>(<argument><expr><name>fcinfo</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>fa_context</name></expr></argument>)</argument_list></call> <operator>||</operator> <operator>!</operator><call><name>IsA</name><argument_list>(<argument><expr><name><name>fcinfo</name><operator>-&gt;</operator><name>context</name></name></expr></argument>, <argument><expr><name>AggState</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* cannot be called directly because of internal-type argument */</comment>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"finalize_agg_sfunc called in non-aggregate context"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+	<if_stmt><if>if <condition>(<expr><call><name>PG_ARGISNULL</name><argument_list>(<argument><expr><literal type="number">1</literal></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"finalize_agg_sfunc called with NULL aggfn"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	<expr_stmt><expr><name>old_context</name> <operator>=</operator> <call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>fa_context</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>tstate</name> <operator>==</operator> <name>NULL</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>FAPerQueryState</name> <modifier>*</modifier></type><name>qstate</name> <init>= <expr><operator>(</operator><name>FAPerQueryState</name> <operator>*</operator><operator>)</operator> <name><name>fcinfo</name><operator>-&gt;</operator><name>flinfo</name><operator>-&gt;</operator><name>fn_extra</name></name></expr></init></decl>;</decl_stmt>
+		<if_stmt><if>if <condition>(<expr><name>qstate</name> <operator>==</operator> <name>NULL</name></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><name>qstate</name> <operator>=</operator> <call><name>fa_perquery_state_init</name><argument_list>(<argument><expr><name>fcinfo</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>fcinfo</name><operator>-&gt;</operator><name>flinfo</name><operator>-&gt;</operator><name>fn_extra</name></name> <operator>!=</operator> <name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+		<expr_stmt><expr><name>tstate</name> <operator>=</operator> <call><name>fa_transition_state_init</name><argument_list>(<argument><expr><operator>&amp;</operator><name>fa_context</name></expr></argument>, <argument><expr><name>qstate</name></expr></argument>, <argument><expr><operator>(</operator><name>AggState</name> <operator>*</operator><operator>)</operator> <name><name>fcinfo</name><operator>-&gt;</operator><name>context</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<comment type="block">/* initial trans_value = the partial state of the inner agg from first invocation */</comment>
+		<expr_stmt><expr><name><name>tstate</name><operator>-&gt;</operator><name>per_group_state</name><operator>-&gt;</operator><name>trans_value</name></name> <operator>=</operator>
+			<call><name>inner_agg_deserialize</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>tstate</name><operator>-&gt;</operator><name>per_query_state</name><operator>-&gt;</operator><name>combine_meta</name></name></expr></argument>,
+								  <argument><expr><name>inner_agg_serialized_state</name></expr></argument>,
+								  <argument><expr><name>inner_agg_serialized_state_isnull</name></expr></argument>,
+								  <argument><expr><operator>&amp;</operator><name><name>tstate</name><operator>-&gt;</operator><name>per_group_state</name><operator>-&gt;</operator><name>trans_value_isnull</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>tstate</name><operator>-&gt;</operator><name>per_group_state</name><operator>-&gt;</operator><name>trans_value_initialized</name></name> <operator>=</operator>
+			<operator>!</operator><operator>(</operator><name><name>tstate</name><operator>-&gt;</operator><name>per_group_state</name><operator>-&gt;</operator><name>trans_value_isnull</name></name><operator>)</operator></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<else>else
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>bool</name></type> <name>deser_isnull</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>bool</name></type> <name>call_combine</name></decl>;</decl_stmt>
+		<expr_stmt><expr><name>inner_agg_deserialized_state</name> <operator>=</operator> <call><name>inner_agg_deserialize</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>tstate</name><operator>-&gt;</operator><name>per_query_state</name><operator>-&gt;</operator><name>combine_meta</name></name></expr></argument>,
+															 <argument><expr><name>inner_agg_serialized_state</name></expr></argument>,
+															 <argument><expr><name>inner_agg_serialized_state_isnull</name></expr></argument>,
+															 <argument><expr><operator>&amp;</operator><name>deser_isnull</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<comment type="block">/*
+		 * When we have a strict combine function, both arguments to combinefn
+		 * have to be non-null. It also means that if we initialized our
+		 * trans_value with a null value above, it doesn't actually count, so we
+		 * need to try that again if so.
+		 */</comment>
+		<expr_stmt><expr><name>call_combine</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+		<if_stmt><if>if <condition>(<expr><name><name>tstate</name><operator>-&gt;</operator><name>per_query_state</name><operator>-&gt;</operator><name>combine_meta</name><operator>.</operator><name>combinefn</name><operator>.</operator><name>fn_strict</name></name></expr>)</condition>
+		<block>{<block_content>
+			<if_stmt><if>if <condition>(<expr><name><name>tstate</name><operator>-&gt;</operator><name>per_group_state</name><operator>-&gt;</operator><name>trans_value_initialized</name></name> <operator>==</operator> <name>false</name> <operator>&amp;&amp;</operator> <name>deser_isnull</name> <operator>==</operator> <name>false</name></expr>)</condition>
+			<block>{<block_content>
+				<comment type="block">/* first time we got non-null value, so init the trans_value with it*/</comment>
+				<expr_stmt><expr><name><name>tstate</name><operator>-&gt;</operator><name>per_group_state</name><operator>-&gt;</operator><name>trans_value</name></name> <operator>=</operator> <name>inner_agg_deserialized_state</name></expr>;</expr_stmt>
+				<expr_stmt><expr><name><name>tstate</name><operator>-&gt;</operator><name>per_group_state</name><operator>-&gt;</operator><name>trans_value_isnull</name></name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+				<expr_stmt><expr><name><name>tstate</name><operator>-&gt;</operator><name>per_group_state</name><operator>-&gt;</operator><name>trans_value_initialized</name></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+				<expr_stmt><expr><name>call_combine</name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+			</block_content>}</block></if>
+			<if type="elseif">else if <condition>(<expr><name>deser_isnull</name> <operator>||</operator> <name><name>tstate</name><operator>-&gt;</operator><name>per_group_state</name><operator>-&gt;</operator><name>trans_value_isnull</name></name></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><name>call_combine</name> <operator>=</operator> <name>false</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+		</block_content>}</block></if></if_stmt>
+		<if_stmt><if>if <condition>(<expr><name>call_combine</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>group_state_advance</name><argument_list>(<argument><expr><name><name>tstate</name><operator>-&gt;</operator><name>per_group_state</name></name></expr></argument>,
+								<argument><expr><operator>&amp;</operator><name><name>tstate</name><operator>-&gt;</operator><name>per_query_state</name><operator>-&gt;</operator><name>combine_meta</name></name></expr></argument>,
+								<argument><expr><name>inner_agg_deserialized_state</name></expr></argument>,
+								<argument><expr><name>deser_isnull</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	</block_content>}</block></else></if_stmt>
+	<expr_stmt><expr><call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>old_context</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>PG_RETURN_POINTER</name><argument_list>(<argument><expr><name>tstate</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Apply the finalize function on the state we have accumulated
+ *
+ * The state passed down to this function can be used by other aggregate
+ * functions so it is important to not change the state when computing the
+ * final result.
+ */</comment>
+<function><type><name>Datum</name></type>
+<name>tsl_finalize_agg_ffunc</name><parameter_list>(<parameter><decl><type><name>PG_FUNCTION_ARGS</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>FATransitionState</name> <modifier>*</modifier></type><name>tstate</name> <init>= <expr><ternary><condition><expr><call><name>PG_ARGISNULL</name><argument_list>(<argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr> ?</condition><then> <expr><name>NULL</name></expr> </then><else>: <expr><operator>(</operator><name>FATransitionState</name> <operator>*</operator><operator>)</operator> <call><name>PG_GETARG_POINTER</name><argument_list>(<argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr></else></ternary></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>MemoryContext</name></type> <name>fa_context</name></decl>, <decl><type ref="prev"/><name>old_context</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Datum</name></type> <name>result</name> <init>= <expr><name><name>tstate</name><operator>-&gt;</operator><name>per_group_state</name><operator>-&gt;</operator><name>trans_value</name></name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type> <name>result_isnull</name> <init>= <expr><name><name>tstate</name><operator>-&gt;</operator><name>per_group_state</name><operator>-&gt;</operator><name>trans_value_isnull</name></name></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>tstate</name> <operator>!=</operator> <name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>AggCheckCallContext</name><argument_list>(<argument><expr><name>fcinfo</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>fa_context</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* cannot be called directly because of internal-type argument */</comment>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"finalize_agg_ffunc called in non-aggregate context"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+	<expr_stmt><expr><name>old_context</name> <operator>=</operator> <call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>fa_context</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><call><name>OidIsValid</name><argument_list>(<argument><expr><name><name>tstate</name><operator>-&gt;</operator><name>per_query_state</name><operator>-&gt;</operator><name>final_meta</name><operator>.</operator><name>finalfnoid</name></name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* don't execute if strict and the trans value is NULL or there are extra args (all extra
+		 * args are always NULL) */</comment>
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><operator>(</operator><name><name>tstate</name><operator>-&gt;</operator><name>per_query_state</name><operator>-&gt;</operator><name>final_meta</name><operator>.</operator><name>finalfn</name><operator>.</operator><name>fn_strict</name></name> <operator>&amp;&amp;</operator>
+			  <name><name>tstate</name><operator>-&gt;</operator><name>per_group_state</name><operator>-&gt;</operator><name>trans_value_isnull</name></name><operator>)</operator> <operator>&amp;&amp;</operator>
+			<operator>!</operator><operator>(</operator><name><name>tstate</name><operator>-&gt;</operator><name>per_query_state</name><operator>-&gt;</operator><name>final_meta</name><operator>.</operator><name>finalfn</name><operator>.</operator><name>fn_strict</name></name> <operator>&amp;&amp;</operator>
+			  <name><name>tstate</name><operator>-&gt;</operator><name>per_query_state</name><operator>-&gt;</operator><name>final_meta</name><operator>.</operator><name>finalfn_fcinfo</name><operator>-&gt;</operator><name>nargs</name></name> <operator>&gt;</operator> <literal type="number">1</literal><operator>)</operator></expr>)</condition>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>FunctionCallInfo</name></type> <name>finalfn_fcinfo</name> <init>= <expr><name><name>tstate</name><operator>-&gt;</operator><name>per_query_state</name><operator>-&gt;</operator><name>final_meta</name><operator>.</operator><name>finalfn_fcinfo</name></name></expr></init></decl>;</decl_stmt>
+			<expr_stmt><expr><call><name>FC_ARG</name><argument_list>(<argument><expr><name>finalfn_fcinfo</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call> <operator>=</operator> <name><name>tstate</name><operator>-&gt;</operator><name>per_group_state</name><operator>-&gt;</operator><name>trans_value</name></name></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>FC_NULL</name><argument_list>(<argument><expr><name>finalfn_fcinfo</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call> <operator>=</operator> <name><name>tstate</name><operator>-&gt;</operator><name>per_group_state</name><operator>-&gt;</operator><name>trans_value_isnull</name></name></expr>;</expr_stmt>
+			<expr_stmt><expr><name><name>finalfn_fcinfo</name><operator>-&gt;</operator><name>isnull</name></name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+
+			<expr_stmt><expr><name>result</name> <operator>=</operator> <call><name>FunctionCallInvoke</name><argument_list>(<argument><expr><name>finalfn_fcinfo</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><name>result_isnull</name> <operator>=</operator> <name><name>finalfn_fcinfo</name><operator>-&gt;</operator><name>isnull</name></name></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+	</block_content>}</block></if></if_stmt>
+	<expr_stmt><expr><call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>old_context</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><name>result_isnull</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>PG_RETURN_NULL</name><argument_list>()</argument_list></call></expr>;</expr_stmt></block_content></block></if>
+	<else>else<block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>PG_RETURN_DATUM</name><argument_list>(<argument><expr><name>result</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></else></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * the partialize_agg function mainly serves as a marker that the aggregate called
+ * within should return a partial instead of a result. Most of the actual work
+ * occurs in the planner, with the actual function just used to ensure the
+ * return type is correct.
+ */</comment>
+<function><type><name>Datum</name></type>
+<name>tsl_partialize_agg</name><parameter_list>(<parameter><decl><type><name>PG_FUNCTION_ARGS</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>Datum</name></type> <name>arg</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Oid</name></type> <name>arg_type</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Oid</name></type> <name>send_fn</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type> <name>type_is_varlena</name></decl>;</decl_stmt>
+
+	<if_stmt><if>if <condition>(<expr><call><name>PG_ARGISNULL</name><argument_list>(<argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>PG_RETURN_NULL</name><argument_list>()</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><name>arg</name> <operator>=</operator> <call><name>PG_GETARG_DATUM</name><argument_list>(<argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>arg_type</name> <operator>=</operator> <call><name>get_fn_expr_argtype</name><argument_list>(<argument><expr><name><name>fcinfo</name><operator>-&gt;</operator><name>flinfo</name></name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>arg_type</name> <operator>==</operator> <name>BYTEAOID</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>PG_RETURN_DATUM</name><argument_list>(<argument><expr><name>arg</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>getTypeBinaryOutputInfo</name><argument_list>(<argument><expr><name>arg_type</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>send_fn</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>type_is_varlena</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>PG_RETURN_BYTEA_P</name><argument_list>(<argument><expr><call><name>OidSendFunctionCall</name><argument_list>(<argument><expr><name>send_fn</name></expr></argument>, <argument><expr><name>arg</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+</unit>

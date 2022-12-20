@@ -1,0 +1,1150 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<unit xmlns="http://www.srcML.org/srcML/src" xmlns:cpp="http://www.srcML.org/srcML/cpp" revision="1.0.0" language="C" filename="/cloned_projects/TBase/src/backend/storage/freespace/freespace.c"><comment type="block">/*-------------------------------------------------------------------------
+ *
+ * freespace.c
+ *      POSTGRES free space map for quickly finding free space in relations
+ *
+ *
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1994, Regents of the University of California
+ *
+ * IDENTIFICATION
+ *      src/backend/storage/freespace/freespace.c
+ *
+ *
+ * NOTES:
+ *
+ *    Free Space Map keeps track of the amount of free space on pages, and
+ *    allows quickly searching for a page with enough free space. The FSM is
+ *    stored in a dedicated relation fork of all heap relations, and those
+ *    index access methods that need it (see also indexfsm.c). See README for
+ *    more information.
+ *
+ *-------------------------------------------------------------------------
+ */</comment>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"postgres.h"</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/htup_details.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/xlogutils.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"miscadmin.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/freespace.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/fsm_internals.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/extentmapping.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/lmgr.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/smgr.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/guc.h"</cpp:file></cpp:include>
+
+
+<comment type="block">/*
+ * We use just one byte to store the amount of free space on a page, so we
+ * divide the amount of free space a page can have into 256 different
+ * categories. The highest category, 255, represents a page with at least
+ * MaxFSMRequestSize bytes of free space, and the second highest category
+ * represents the range from 254 * FSM_CAT_STEP, inclusive, to
+ * MaxFSMRequestSize, exclusive.
+ *
+ * MaxFSMRequestSize depends on the architecture and BLCKSZ, but assuming
+ * default 8k BLCKSZ, and that MaxFSMRequestSize is 8164 bytes, the
+ * categories look like this:
+ *
+ *
+ * Range     Category
+ * 0    - 31   0
+ * 32    - 63   1
+ * ...    ...  ...
+ * 8096 - 8127 253
+ * 8128 - 8163 254
+ * 8164 - 8192 255
+ *
+ * The reason that MaxFSMRequestSize is special is that if MaxFSMRequestSize
+ * isn't equal to a range boundary, a page with exactly MaxFSMRequestSize
+ * bytes of free space wouldn't satisfy a request for MaxFSMRequestSize
+ * bytes. If there isn't more than MaxFSMRequestSize bytes of free space on a
+ * completely empty page, that would mean that we could never satisfy a
+ * request of exactly MaxFSMRequestSize bytes.
+ */</comment>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>FSM_CATEGORIES</name></cpp:macro>    <cpp:value>256</cpp:value></cpp:define>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>FSM_CAT_STEP</name></cpp:macro>    <cpp:value>(BLCKSZ / FSM_CATEGORIES)</cpp:value></cpp:define>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>MaxFSMRequestSize</name></cpp:macro>    <cpp:value>MaxHeapTupleSize</cpp:value></cpp:define>
+
+<comment type="block">/*
+ * Depth of the on-disk tree. We need to be able to address 2^32-1 blocks,
+ * and 1626 is the smallest number that satisfies X^3 &gt;= 2^32-1. Likewise,
+ * 216 is the smallest number that satisfies X^4 &gt;= 2^32-1. In practice,
+ * this means that 4096 bytes is the smallest BLCKSZ that we can get away
+ * with a 3-level tree, and 512 is the smallest we support.
+ */</comment>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>FSM_TREE_DEPTH</name></cpp:macro>    <cpp:value>((SlotsPerFSMPage &gt;= 1626) ? 3 : 4)</cpp:value></cpp:define>
+
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>FSM_ROOT_LEVEL</name></cpp:macro>    <cpp:value>(FSM_TREE_DEPTH - 1)</cpp:value></cpp:define>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>FSM_BOTTOM_LEVEL</name></cpp:macro> <cpp:value>0</cpp:value></cpp:define>
+
+<comment type="block">/*
+ * The internal FSM routines work on a logical addressing scheme. Each
+ * level of the tree can be thought of as a separately addressable file.
+ */</comment>
+<typedef>typedef <type><struct>struct
+<block>{
+    <decl_stmt><decl><type><name>int</name></type>            <name>level</name></decl>;</decl_stmt>            <comment type="block">/* level */</comment>
+    <decl_stmt><decl><type><name>int</name></type>            <name>logpageno</name></decl>;</decl_stmt>        <comment type="block">/* page number within the level */</comment>
+}</block></struct></type> <name>FSMAddress</name>;</typedef>
+
+<comment type="block">/* Address of the root page. */</comment>
+<decl_stmt><decl><type><specifier>static</specifier> <specifier>const</specifier> <name>FSMAddress</name></type> <name>FSM_ROOT_ADDRESS</name> <init>= <expr><block>{<expr><name>FSM_ROOT_LEVEL</name></expr>, <expr><literal type="number">0</literal></expr>}</block></expr></init></decl>;</decl_stmt>
+
+<comment type="block">/* functions to navigate the tree */</comment>
+<function_decl><type><specifier>static</specifier> <name>FSMAddress</name></type> <name>fsm_get_child</name><parameter_list>(<parameter><decl><type><name>FSMAddress</name></type> <name>parent</name></decl></parameter>, <parameter><decl><type><name>uint16</name></type> <name>slot</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>FSMAddress</name></type> <name>fsm_get_parent</name><parameter_list>(<parameter><decl><type><name>FSMAddress</name></type> <name>child</name></decl></parameter>, <parameter><decl><type><name>uint16</name> <modifier>*</modifier></type><name>slot</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>FSMAddress</name></type> <name>fsm_get_location</name><parameter_list>(<parameter><decl><type><name>BlockNumber</name></type> <name>heapblk</name></decl></parameter>, <parameter><decl><type><name>uint16</name> <modifier>*</modifier></type><name>slot</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>BlockNumber</name></type> <name>fsm_get_heap_blk</name><parameter_list>(<parameter><decl><type><name>FSMAddress</name></type> <name>addr</name></decl></parameter>, <parameter><decl><type><name>uint16</name></type> <name>slot</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>BlockNumber</name></type> <name>fsm_logical_to_physical</name><parameter_list>(<parameter><decl><type><name>FSMAddress</name></type> <name>addr</name></decl></parameter>)</parameter_list>;</function_decl>
+
+<function_decl><type><specifier>static</specifier> <name>Buffer</name></type> <name>fsm_readbuf</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>rel</name></decl></parameter>, <parameter><decl><type><name>FSMAddress</name></type> <name>addr</name></decl></parameter>, <parameter><decl><type><name>bool</name></type> <name>extend</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>fsm_extend</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>rel</name></decl></parameter>, <parameter><decl><type><name>BlockNumber</name></type> <name>fsm_nblocks</name></decl></parameter>)</parameter_list>;</function_decl>
+
+<comment type="block">/* functions to convert amount of free space to a FSM category */</comment>
+<function_decl><type><specifier>static</specifier> <name>uint8</name></type> <name>fsm_space_avail_to_cat</name><parameter_list>(<parameter><decl><type><name>Size</name></type> <name>avail</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>uint8</name></type> <name>fsm_space_needed_to_cat</name><parameter_list>(<parameter><decl><type><name>Size</name></type> <name>needed</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>Size</name></type> <name>fsm_space_cat_to_avail</name><parameter_list>(<parameter><decl><type><name>uint8</name></type> <name>cat</name></decl></parameter>)</parameter_list>;</function_decl>
+
+<comment type="block">/* workhorse functions for various operations */</comment>
+<function_decl><type><specifier>static</specifier> <name>int</name></type> <name>fsm_set_and_search</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>rel</name></decl></parameter>, <parameter><decl><type><name>FSMAddress</name></type> <name>addr</name></decl></parameter>, <parameter><decl><type><name>uint16</name></type> <name>slot</name></decl></parameter>,
+                   <parameter><decl><type><name>uint8</name></type> <name>newValue</name></decl></parameter>, <parameter><decl><type><name>uint8</name></type> <name>minValue</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>BlockNumber</name></type> <name>fsm_search</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>rel</name></decl></parameter>, <parameter><decl><type><name>uint8</name></type> <name>min_cat</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>uint8</name></type> <name>fsm_vacuum_page</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>rel</name></decl></parameter>, <parameter><decl><type><name>FSMAddress</name></type> <name>addr</name></decl></parameter>, <parameter><decl><type><name>bool</name> <modifier>*</modifier></type><name>eof</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>BlockNumber</name></type> <name>fsm_get_lastblckno</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>rel</name></decl></parameter>, <parameter><decl><type><name>FSMAddress</name></type> <name>addr</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>fsm_update_recursive</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>rel</name></decl></parameter>, <parameter><decl><type><name>FSMAddress</name></type> <name>addr</name></decl></parameter>, <parameter><decl><type><name>uint8</name></type> <name>new_cat</name></decl></parameter>)</parameter_list>;</function_decl>
+
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>_SHARDING_</name></cpp:ifdef>
+<function_decl><type><specifier>static</specifier> <name>FSMAddress</name></type> <name>fsm_extentid_to_addr</name><parameter_list>(<parameter><decl><type><name>ExtentID</name></type> <name>eid</name></decl></parameter>)</parameter_list>;</function_decl>
+<comment type="line">//static uint8 fsm_get_extent_max(Relation rel, ExtentID eid);</comment>
+<function_decl><type><specifier>static</specifier> <name>int</name></type> <name>fsm_search_from_extent</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>rel</name></decl></parameter>, <parameter><decl><type><name>uint8</name></type> <name>min_cat</name></decl></parameter>, <parameter><decl><type><name>ExtentID</name></type> <name>eid</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>BlockNumber</name></type>    <name>fsm_search_with_shard</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>rel</name></decl></parameter>, <parameter><decl><type><name>uint8</name></type> <name>min_cat</name></decl></parameter>, <parameter><decl><type><name>ShardID</name></type> <name>sid</name></decl></parameter>)</parameter_list>;</function_decl>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+<comment type="block" format="doxygen">/******** Public API ********/</comment>
+
+<comment type="block">/*
+ * GetPageWithFreeSpace - try to find a page in the given relation with
+ *        at least the specified amount of free space.
+ *
+ * If successful, return the block number; if not, return InvalidBlockNumber.
+ *
+ * The caller must be prepared for the possibility that the returned page
+ * will turn out to have too little space available by the time the caller
+ * gets a lock on it.  In that case, the caller should report the actual
+ * amount of free space available on that page and then try again (see
+ * RecordAndGetPageWithFreeSpace).  If InvalidBlockNumber is returned,
+ * extend the relation.
+ */</comment>
+<function><type><name>BlockNumber</name></type>
+<name>GetPageWithFreeSpace</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>rel</name></decl></parameter>, <parameter><decl><type><name>Size</name></type> <name>spaceNeeded</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <decl_stmt><decl><type><name>uint8</name></type>        <name>min_cat</name> <init>= <expr><call><name>fsm_space_needed_to_cat</name><argument_list>(<argument><expr><name>spaceNeeded</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+    <return>return <expr><call><name>fsm_search</name><argument_list>(<argument><expr><name>rel</name></expr></argument>, <argument><expr><name>min_cat</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>_SHARDING_</name></cpp:ifdef>
+<function><type><name>BlockNumber</name></type>
+<name>GetPageWithFreeSpace_withshard</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>rel</name></decl></parameter>, <parameter><decl><type><name>Size</name></type> <name>spaceNeeded</name></decl></parameter>, <parameter><decl><type><name>ShardID</name></type> <name>sid</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <decl_stmt><decl><type><name>uint8</name></type>        <name>min_cat</name> <init>= <expr><call><name>fsm_space_needed_to_cat</name><argument_list>(<argument><expr><name>spaceNeeded</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+    <if_stmt><if>if<condition>(<expr><call><name>RelationHasExtent</name><argument_list>(<argument><expr><name>rel</name></expr></argument>)</argument_list></call> <operator>&amp;&amp;</operator> <operator>!</operator><call><name>ShardIDIsValid</name><argument_list>(<argument><expr><name>sid</name></expr></argument>)</argument_list></call></expr>)</condition>
+    <block>{<block_content>
+        <expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+                <argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_INTERNAL_ERROR</name></expr></argument>)</argument_list></call><operator>,</operator>
+                 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"getting page with shard can only be executed from extent-orginazied relation"</literal></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    </block_content>}</block></if></if_stmt>
+
+    <if_stmt><if>if<condition>(<expr><call><name>RelationHasExtent</name><argument_list>(<argument><expr><name>rel</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+        <return>return <expr><call><name>fsm_search_with_shard</name><argument_list>(<argument><expr><name>rel</name></expr></argument>, <argument><expr><name>min_cat</name></expr></argument>, <argument><expr><name>sid</name></expr></argument>)</argument_list></call></expr>;</return></block_content></block></if>
+    <else>else<block type="pseudo"><block_content>
+        <return>return <expr><call><name>fsm_search</name><argument_list>(<argument><expr><name>rel</name></expr></argument>, <argument><expr><name>min_cat</name></expr></argument>)</argument_list></call></expr>;</return></block_content></block></else></if_stmt>
+</block_content>}</block></function>
+
+<function><type><name>BlockNumber</name></type>
+<name>GetPageWithFreeSpace_fromextent</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>rel</name></decl></parameter>, <parameter><decl><type><name>Size</name></type> <name>spaceNeeded</name></decl></parameter>, <parameter><decl><type><name>ExtentID</name></type> <name>eid</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <decl_stmt><decl><type><name>uint8</name></type>        <name>min_cat</name> <init>= <expr><call><name>fsm_space_needed_to_cat</name><argument_list>(<argument><expr><name>spaceNeeded</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+    <if_stmt><if>if<condition>(<expr><call><name>RelationHasExtent</name><argument_list>(<argument><expr><name>rel</name></expr></argument>)</argument_list></call></expr>)</condition>
+    <block>{<block_content>
+        <expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+                <argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_INTERNAL_ERROR</name></expr></argument>)</argument_list></call><operator>,</operator>
+                 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"getting page from on extent can only be executed from extent-orginazied relation"</literal></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    </block_content>}</block></if></if_stmt>
+
+    <return>return <expr><call><name>fsm_search_from_extent</name><argument_list>(<argument><expr><name>rel</name></expr></argument>, <argument><expr><name>min_cat</name></expr></argument>, <argument><expr><name>eid</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+<comment type="block">/*
+ * RecordAndGetPageWithFreeSpace - update info about a page and try again.
+ *
+ * We provide this combo form to save some locking overhead, compared to
+ * separate RecordPageWithFreeSpace + GetPageWithFreeSpace calls. There's
+ * also some effort to return a page close to the old page; if there's a
+ * page with enough free space on the same FSM page where the old one page
+ * is located, it is preferred.
+ */</comment>
+<function><type><name>BlockNumber</name></type>
+<name>RecordAndGetPageWithFreeSpace</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>rel</name></decl></parameter>, <parameter><decl><type><name>BlockNumber</name></type> <name>oldPage</name></decl></parameter>,
+                              <parameter><decl><type><name>Size</name></type> <name>oldSpaceAvail</name></decl></parameter>, <parameter><decl><type><name>Size</name></type> <name>spaceNeeded</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <decl_stmt><decl><type><name>int</name></type>            <name>old_cat</name> <init>= <expr><call><name>fsm_space_avail_to_cat</name><argument_list>(<argument><expr><name>oldSpaceAvail</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>int</name></type>            <name>search_cat</name> <init>= <expr><call><name>fsm_space_needed_to_cat</name><argument_list>(<argument><expr><name>spaceNeeded</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>FSMAddress</name></type>    <name>addr</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>uint16</name></type>        <name>slot</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>int</name></type>            <name>search_slot</name></decl>;</decl_stmt>
+
+    <comment type="block">/* Get the location of the FSM byte representing the heap block */</comment>
+    <expr_stmt><expr><name>addr</name> <operator>=</operator> <call><name>fsm_get_location</name><argument_list>(<argument><expr><name>oldPage</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>slot</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+    <expr_stmt><expr><name>search_slot</name> <operator>=</operator> <call><name>fsm_set_and_search</name><argument_list>(<argument><expr><name>rel</name></expr></argument>, <argument><expr><name>addr</name></expr></argument>, <argument><expr><name>slot</name></expr></argument>, <argument><expr><name>old_cat</name></expr></argument>, <argument><expr><name>search_cat</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+    <comment type="block">/*
+     * If fsm_set_and_search found a suitable new block, return that.
+     * Otherwise, search as usual.
+     */</comment>
+    <if_stmt><if>if <condition>(<expr><name>search_slot</name> <operator>!=</operator> <operator>-</operator><literal type="number">1</literal></expr>)</condition><block type="pseudo"><block_content>
+        <return>return <expr><call><name>fsm_get_heap_blk</name><argument_list>(<argument><expr><name>addr</name></expr></argument>, <argument><expr><name>search_slot</name></expr></argument>)</argument_list></call></expr>;</return></block_content></block></if>
+    <else>else<block type="pseudo"><block_content>
+        <return>return <expr><call><name>fsm_search</name><argument_list>(<argument><expr><name>rel</name></expr></argument>, <argument><expr><name>search_cat</name></expr></argument>)</argument_list></call></expr>;</return></block_content></block></else></if_stmt>
+</block_content>}</block></function>
+
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>_SHARDING_</name></cpp:ifdef>
+<function><type><name>BlockNumber</name></type>
+<name>RecordAndGetPageWithFreeSpace_extent</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>rel</name></decl></parameter>, <parameter><decl><type><name>BlockNumber</name></type> <name>oldPage</name></decl></parameter>,
+                              <parameter><decl><type><name>Size</name></type> <name>oldSpaceAvail</name></decl></parameter>, <parameter><decl><type><name>Size</name></type> <name>spaceNeeded</name></decl></parameter>, <parameter><decl><type><name>ShardID</name></type> <name>sid</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <decl_stmt><decl><type><name>int</name></type>            <name>old_cat</name> <init>= <expr><call><name>fsm_space_avail_to_cat</name><argument_list>(<argument><expr><name>oldSpaceAvail</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>int</name></type>            <name>search_cat</name> <init>= <expr><call><name>fsm_space_needed_to_cat</name><argument_list>(<argument><expr><name>spaceNeeded</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>FSMAddress</name></type>    <name>addr</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>uint16</name></type>        <name>slot</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>int</name></type>            <name>search_slot</name></decl>;</decl_stmt>
+
+    <comment type="block">/* Get the location of the FSM byte representing the heap block */</comment>
+    <expr_stmt><expr><name>addr</name> <operator>=</operator> <call><name>fsm_get_location</name><argument_list>(<argument><expr><name>oldPage</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>slot</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+    <expr_stmt><expr><name>search_slot</name> <operator>=</operator> <call><name>fsm_set_and_search</name><argument_list>(<argument><expr><name>rel</name></expr></argument>, <argument><expr><name>addr</name></expr></argument>, <argument><expr><name>slot</name></expr></argument>, <argument><expr><name>old_cat</name></expr></argument>, <argument><expr><name>search_cat</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+    <comment type="block">/*
+     * If fsm_set_and_search found a suitable new block, return that.
+     * Otherwise, search as usual.
+     */</comment>
+    <if_stmt><if>if <condition>(<expr><name>search_slot</name> <operator>!=</operator> <operator>-</operator><literal type="number">1</literal></expr>)</condition><block type="pseudo"><block_content>
+        <return>return <expr><call><name>fsm_get_heap_blk</name><argument_list>(<argument><expr><name>addr</name></expr></argument>, <argument><expr><name>search_slot</name></expr></argument>)</argument_list></call></expr>;</return></block_content></block></if>
+    <else>else
+    <block>{<block_content>
+        <if_stmt><if>if<condition>(<expr><call><name>ShardIDIsValid</name><argument_list>(<argument><expr><name>sid</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+            <return>return <expr><call><name>fsm_search_with_shard</name><argument_list>(<argument><expr><name>rel</name></expr></argument>, <argument><expr><name>search_cat</name></expr></argument>, <argument><expr><name>sid</name></expr></argument>)</argument_list></call></expr>;</return></block_content></block></if>
+        <else>else<block type="pseudo"><block_content>
+            <return>return <expr><call><name>fsm_search</name><argument_list>(<argument><expr><name>rel</name></expr></argument>, <argument><expr><name>search_cat</name></expr></argument>)</argument_list></call></expr>;</return></block_content></block></else></if_stmt>
+    </block_content>}</block></else></if_stmt>
+</block_content>}</block></function>
+
+<function><type><name>void</name></type>
+<name>RecordNewPageWithFullFreeSpace</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>rel</name></decl></parameter>, <parameter><decl><type><name>BlockNumber</name></type> <name>heapBlk</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <decl_stmt><decl><type><name>FSMAddress</name></type>    <name>addr</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>uint16</name></type>        <name>slot</name></decl>;</decl_stmt>
+
+    <comment type="block">/* Get the location of the FSM byte representing the heap block */</comment>
+    <expr_stmt><expr><name>addr</name> <operator>=</operator> <call><name>fsm_get_location</name><argument_list>(<argument><expr><name>heapBlk</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>slot</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+    <expr_stmt><expr><call><name>fsm_set_and_search</name><argument_list>(<argument><expr><name>rel</name></expr></argument>, <argument><expr><name>addr</name></expr></argument>, <argument><expr><name>slot</name></expr></argument>, <argument><expr><name>MAX_FREESPACE</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+<comment type="block">/*
+ * RecordPageWithFreeSpace - update info about a page.
+ *
+ * Note that if the new spaceAvail value is higher than the old value stored
+ * in the FSM, the space might not become visible to searchers until the next
+ * FreeSpaceMapVacuum call, which updates the upper level pages.
+ */</comment>
+<function><type><name>void</name></type>
+<name>RecordPageWithFreeSpace</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>rel</name></decl></parameter>, <parameter><decl><type><name>BlockNumber</name></type> <name>heapBlk</name></decl></parameter>, <parameter><decl><type><name>Size</name></type> <name>spaceAvail</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <decl_stmt><decl><type><name>int</name></type>            <name>new_cat</name> <init>= <expr><call><name>fsm_space_avail_to_cat</name><argument_list>(<argument><expr><name>spaceAvail</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>FSMAddress</name></type>    <name>addr</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>uint16</name></type>        <name>slot</name></decl>;</decl_stmt>
+
+    <comment type="block">/* Get the location of the FSM byte representing the heap block */</comment>
+    <expr_stmt><expr><name>addr</name> <operator>=</operator> <call><name>fsm_get_location</name><argument_list>(<argument><expr><name>heapBlk</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>slot</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+    <expr_stmt><expr><call><name>fsm_set_and_search</name><argument_list>(<argument><expr><name>rel</name></expr></argument>, <argument><expr><name>addr</name></expr></argument>, <argument><expr><name>slot</name></expr></argument>, <argument><expr><name>new_cat</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Update the upper levels of the free space map all the way up to the root
+ * to make sure we don't lose track of new blocks we just inserted.  This is
+ * intended to be used after adding many new blocks to the relation; we judge
+ * it not worth updating the upper levels of the tree every time data for
+ * a single page changes, but for a bulk-extend it's worth it.
+ */</comment>
+<function><type><name>void</name></type>
+<name>UpdateFreeSpaceMap</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>rel</name></decl></parameter>, <parameter><decl><type><name>BlockNumber</name></type> <name>startBlkNum</name></decl></parameter>,
+                   <parameter><decl><type><name>BlockNumber</name></type> <name>endBlkNum</name></decl></parameter>, <parameter><decl><type><name>Size</name></type> <name>freespace</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <decl_stmt><decl><type><name>int</name></type>            <name>new_cat</name> <init>= <expr><call><name>fsm_space_avail_to_cat</name><argument_list>(<argument><expr><name>freespace</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>FSMAddress</name></type>    <name>addr</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>uint16</name></type>        <name>slot</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>BlockNumber</name></type> <name>blockNum</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>BlockNumber</name></type> <name>lastBlkOnPage</name></decl>;</decl_stmt>
+
+    <expr_stmt><expr><name>blockNum</name> <operator>=</operator> <name>startBlkNum</name></expr>;</expr_stmt>
+
+    <while>while <condition>(<expr><name>blockNum</name> <operator>&lt;=</operator> <name>endBlkNum</name></expr>)</condition>
+    <block>{<block_content>
+        <comment type="block">/*
+         * Find FSM address for this block; update tree all the way to the
+         * root.
+         */</comment>
+        <expr_stmt><expr><name>addr</name> <operator>=</operator> <call><name>fsm_get_location</name><argument_list>(<argument><expr><name>blockNum</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>slot</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <expr_stmt><expr><call><name>fsm_update_recursive</name><argument_list>(<argument><expr><name>rel</name></expr></argument>, <argument><expr><name>addr</name></expr></argument>, <argument><expr><name>new_cat</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+        <comment type="block">/*
+         * Get the last block number on this FSM page.  If that's greater than
+         * or equal to our endBlkNum, we're done.  Otherwise, advance to the
+         * first block on the next page.
+         */</comment>
+        <expr_stmt><expr><name>lastBlkOnPage</name> <operator>=</operator> <call><name>fsm_get_lastblckno</name><argument_list>(<argument><expr><name>rel</name></expr></argument>, <argument><expr><name>addr</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <if_stmt><if>if <condition>(<expr><name>lastBlkOnPage</name> <operator>&gt;=</operator> <name>endBlkNum</name></expr>)</condition><block type="pseudo"><block_content>
+            <break>break;</break></block_content></block></if></if_stmt>
+        <expr_stmt><expr><name>blockNum</name> <operator>=</operator> <name>lastBlkOnPage</name> <operator>+</operator> <literal type="number">1</literal></expr>;</expr_stmt>
+    </block_content>}</block></while>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * XLogRecordPageWithFreeSpace - like RecordPageWithFreeSpace, for use in
+ *        WAL replay
+ */</comment>
+<function><type><name>void</name></type>
+<name>XLogRecordPageWithFreeSpace_extent</name><parameter_list>(<parameter><decl><type><name>RelFileNode</name></type> <name>rnode</name></decl></parameter>, <parameter><decl><type><name>BlockNumber</name></type> <name>heapBlk</name></decl></parameter>,
+                            <parameter><decl><type><name>Size</name></type> <name>spaceAvail</name></decl></parameter>, <parameter><decl><type><name>bool</name></type> <name>hasExtent</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <decl_stmt><decl><type><name>int</name></type>            <name>new_cat</name> <init>= <expr><call><name>fsm_space_avail_to_cat</name><argument_list>(<argument><expr><name>spaceAvail</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>FSMAddress</name></type>    <name>addr</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>uint16</name></type>        <name>slot</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>BlockNumber</name></type> <name>blkno</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>Buffer</name></type>        <name>buf</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>Page</name></type>        <name>page</name></decl>;</decl_stmt>
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>_SHARDING_</name></cpp:ifdef>
+    <decl_stmt><decl><type><name>bool</name></type>        <name>root_modified</name> <init>= <expr><name>false</name></expr></init></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>uint8</name></type>        <name>new_root</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+    <comment type="block">/* Get the location of the FSM byte representing the heap block */</comment>
+    <expr_stmt><expr><name>addr</name> <operator>=</operator> <call><name>fsm_get_location</name><argument_list>(<argument><expr><name>heapBlk</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>slot</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><name>blkno</name> <operator>=</operator> <call><name>fsm_logical_to_physical</name><argument_list>(<argument><expr><name>addr</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+    <comment type="block">/* If the page doesn't exist already, extend */</comment>
+    <expr_stmt><expr><name>buf</name> <operator>=</operator> <call><name>XLogReadBufferExtended</name><argument_list>(<argument><expr><name>rnode</name></expr></argument>, <argument><expr><name>FSM_FORKNUM</name></expr></argument>, <argument><expr><name>blkno</name></expr></argument>, <argument><expr><name>RBM_ZERO_ON_ERROR</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><call><name>LockBuffer</name><argument_list>(<argument><expr><name>buf</name></expr></argument>, <argument><expr><name>BUFFER_LOCK_EXCLUSIVE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+    <expr_stmt><expr><name>page</name> <operator>=</operator> <call><name>BufferGetPage</name><argument_list>(<argument><expr><name>buf</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <if_stmt><if>if <condition>(<expr><call><name>PageIsNew</name><argument_list>(<argument><expr><name>page</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+        <expr_stmt><expr><call><name>PageInit</name><argument_list>(<argument><expr><name>page</name></expr></argument>, <argument><expr><name>BLCKSZ</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+    <if_stmt><if>if <condition>(<expr><call><name>fsm_set_avail_extent</name><argument_list>(<argument><expr><name>page</name></expr></argument>, <argument><expr><name>slot</name></expr></argument>, <argument><expr><name>new_cat</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>root_modified</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>new_root</name></expr></argument>, <argument><expr><name>NULL</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+        <expr_stmt><expr><call><name>MarkBufferDirtyHint</name><argument_list>(<argument><expr><name>buf</name></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+    <expr_stmt><expr><call><name>UnlockReleaseBuffer</name><argument_list>(<argument><expr><name>buf</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>_SHARDING_</name></cpp:ifdef>
+    <comment type="block">/*
+    * when redo xlog, extent freespace is updated by xlog.
+    */</comment>
+    <if_stmt><if>if<condition>(<expr><operator>!</operator><name>InRecovery</name> <operator>&amp;&amp;</operator> <name>hasExtent</name> <operator>&amp;&amp;</operator> <name>root_modified</name></expr>)</condition>
+    <block>{<block_content>
+        <decl_stmt><decl><type><name>ExtentID</name></type> <name>eid</name> <init>= <expr><call><name>BLOCKNUMBER_TO_EXTENTID</name><argument_list>(<argument><expr><name>heapBlk</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+        <expr_stmt><expr><call><name>ema_rnode_set_eme_freespace</name><argument_list>(<argument><expr><name>rnode</name></expr></argument>, <argument><expr><name>eid</name></expr></argument>, <argument><expr><name>new_root</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    </block_content>}</block></if></if_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * GetRecordedFreePage - return the amount of free space on a particular page,
+ *        according to the FSM.
+ */</comment>
+<function><type><name>Size</name></type>
+<name>GetRecordedFreeSpace</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>rel</name></decl></parameter>, <parameter><decl><type><name>BlockNumber</name></type> <name>heapBlk</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <decl_stmt><decl><type><name>FSMAddress</name></type>    <name>addr</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>uint16</name></type>        <name>slot</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>Buffer</name></type>        <name>buf</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>uint8</name></type>        <name>cat</name></decl>;</decl_stmt>
+
+    <comment type="block">/* Get the location of the FSM byte representing the heap block */</comment>
+    <expr_stmt><expr><name>addr</name> <operator>=</operator> <call><name>fsm_get_location</name><argument_list>(<argument><expr><name>heapBlk</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>slot</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+    <expr_stmt><expr><name>buf</name> <operator>=</operator> <call><name>fsm_readbuf</name><argument_list>(<argument><expr><name>rel</name></expr></argument>, <argument><expr><name>addr</name></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>BufferIsValid</name><argument_list>(<argument><expr><name>buf</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+        <return>return <expr><literal type="number">0</literal></expr>;</return></block_content></block></if></if_stmt>
+    <expr_stmt><expr><name>cat</name> <operator>=</operator> <call><name>fsm_get_avail</name><argument_list>(<argument><expr><call><name>BufferGetPage</name><argument_list>(<argument><expr><name>buf</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>slot</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><call><name>ReleaseBuffer</name><argument_list>(<argument><expr><name>buf</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+    <return>return <expr><call><name>fsm_space_cat_to_avail</name><argument_list>(<argument><expr><name>cat</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * FreeSpaceMapTruncateRel - adjust for truncation of a relation.
+ *
+ * The caller must hold AccessExclusiveLock on the relation, to ensure that
+ * other backends receive the smgr invalidation event that this function sends
+ * before they access the FSM again.
+ *
+ * nblocks is the new size of the heap.
+ */</comment>
+<function><type><name>void</name></type>
+<name>FreeSpaceMapTruncateRel</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>rel</name></decl></parameter>, <parameter><decl><type><name>BlockNumber</name></type> <name>nblocks</name></decl></parameter>)</parameter_list>
+<block>{<block_content><comment type="line">// #lizard forgives</comment>
+    <decl_stmt><decl><type><name>BlockNumber</name></type> <name>new_nfsmblocks</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>FSMAddress</name></type>    <name>first_removed_address</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>uint16</name></type>        <name>first_removed_slot</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>Buffer</name></type>        <name>buf</name></decl>;</decl_stmt>
+
+    <expr_stmt><expr><call><name>RelationOpenSmgr</name><argument_list>(<argument><expr><name>rel</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+    <comment type="block">/*
+     * If no FSM has been created yet for this relation, there's nothing to
+     * truncate.
+     */</comment>
+    <if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>smgrexists</name><argument_list>(<argument><expr><name><name>rel</name><operator>-&gt;</operator><name>rd_smgr</name></name></expr></argument>, <argument><expr><name>FSM_FORKNUM</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+        <return>return;</return></block_content></block></if></if_stmt>
+
+    <comment type="block">/* Get the location in the FSM of the first removed heap block */</comment>
+    <expr_stmt><expr><name>first_removed_address</name> <operator>=</operator> <call><name>fsm_get_location</name><argument_list>(<argument><expr><name>nblocks</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>first_removed_slot</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+    <comment type="block">/*
+     * Zero out the tail of the last remaining FSM page. If the slot
+     * representing the first removed heap block is at a page boundary, as the
+     * first slot on the FSM page that first_removed_address points to, we can
+     * just truncate that page altogether.
+     */</comment>
+    <if_stmt><if>if <condition>(<expr><name>first_removed_slot</name> <operator>&gt;</operator> <literal type="number">0</literal></expr>)</condition>
+    <block>{<block_content>
+        <expr_stmt><expr><name>buf</name> <operator>=</operator> <call><name>fsm_readbuf</name><argument_list>(<argument><expr><name>rel</name></expr></argument>, <argument><expr><name>first_removed_address</name></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>BufferIsValid</name><argument_list>(<argument><expr><name>buf</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+            <return>return;</return></block_content></block></if></if_stmt>                <comment type="block">/* nothing to do; the FSM was already smaller */</comment>
+        <expr_stmt><expr><call><name>LockBuffer</name><argument_list>(<argument><expr><name>buf</name></expr></argument>, <argument><expr><name>BUFFER_LOCK_EXCLUSIVE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+        <comment type="block">/* NO EREPORT(ERROR) from here till changes are logged */</comment>
+        <expr_stmt><expr><call><name>START_CRIT_SECTION</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+        <expr_stmt><expr><call><name>fsm_truncate_avail</name><argument_list>(<argument><expr><call><name>BufferGetPage</name><argument_list>(<argument><expr><name>buf</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>first_removed_slot</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+        <comment type="block">/*
+         * Truncation of a relation is WAL-logged at a higher-level, and we
+         * will be called at WAL replay. But if checksums are enabled, we need
+         * to still write a WAL record to protect against a torn page, if the
+         * page is flushed to disk before the truncation WAL record. We cannot
+         * use MarkBufferDirtyHint here, because that will not dirty the page
+         * during recovery.
+         */</comment>
+        <expr_stmt><expr><call><name>MarkBufferDirty</name><argument_list>(<argument><expr><name>buf</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <if_stmt><if>if <condition>(<expr><operator>!</operator><name>InRecovery</name> <operator>&amp;&amp;</operator> <call><name>RelationNeedsWAL</name><argument_list>(<argument><expr><name>rel</name></expr></argument>)</argument_list></call> <operator>&amp;&amp;</operator> <call><name>XLogHintBitIsNeeded</name><argument_list>()</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+            <expr_stmt><expr><call><name>log_newpage_buffer</name><argument_list>(<argument><expr><name>buf</name></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+        <expr_stmt><expr><call><name>END_CRIT_SECTION</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+        <expr_stmt><expr><call><name>UnlockReleaseBuffer</name><argument_list>(<argument><expr><name>buf</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+        <expr_stmt><expr><name>new_nfsmblocks</name> <operator>=</operator> <call><name>fsm_logical_to_physical</name><argument_list>(<argument><expr><name>first_removed_address</name></expr></argument>)</argument_list></call> <operator>+</operator> <literal type="number">1</literal></expr>;</expr_stmt>
+    </block_content>}</block></if>
+    <else>else
+    <block>{<block_content>
+        <expr_stmt><expr><name>new_nfsmblocks</name> <operator>=</operator> <call><name>fsm_logical_to_physical</name><argument_list>(<argument><expr><name>first_removed_address</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <if_stmt><if>if <condition>(<expr><call><name>smgrnblocks</name><argument_list>(<argument><expr><name><name>rel</name><operator>-&gt;</operator><name>rd_smgr</name></name></expr></argument>, <argument><expr><name>FSM_FORKNUM</name></expr></argument>)</argument_list></call> <operator>&lt;=</operator> <name>new_nfsmblocks</name></expr>)</condition><block type="pseudo"><block_content>
+            <return>return;</return></block_content></block></if></if_stmt>                <comment type="block">/* nothing to do; the FSM was already smaller */</comment>
+    </block_content>}</block></else></if_stmt>
+
+    <comment type="block">/* Truncate the unused FSM pages, and send smgr inval message */</comment>
+    <expr_stmt><expr><call><name>smgrtruncate</name><argument_list>(<argument><expr><name><name>rel</name><operator>-&gt;</operator><name>rd_smgr</name></name></expr></argument>, <argument><expr><name>FSM_FORKNUM</name></expr></argument>, <argument><expr><name>new_nfsmblocks</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+    <comment type="block">/*
+     * We might as well update the local smgr_fsm_nblocks setting.
+     * smgrtruncate sent an smgr cache inval message, which will cause other
+     * backends to invalidate their copy of smgr_fsm_nblocks, and this one too
+     * at the next command boundary.  But this ensures it isn't outright wrong
+     * until then.
+     */</comment>
+    <if_stmt><if>if <condition>(<expr><name><name>rel</name><operator>-&gt;</operator><name>rd_smgr</name></name></expr>)</condition><block type="pseudo"><block_content>
+        <expr_stmt><expr><name><name>rel</name><operator>-&gt;</operator><name>rd_smgr</name><operator>-&gt;</operator><name>smgr_fsm_nblocks</name></name> <operator>=</operator> <name>new_nfsmblocks</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * FreeSpaceMapVacuum - scan and fix any inconsistencies in the FSM
+ */</comment>
+<function><type><name>void</name></type>
+<name>FreeSpaceMapVacuum</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>rel</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <decl_stmt><decl><type><name>bool</name></type>        <name>dummy</name></decl>;</decl_stmt>
+
+    <comment type="block">/*
+     * Traverse the tree in depth-first order. The tree is stored physically
+     * in depth-first order, so this should be pretty I/O efficient.
+     */</comment>
+    <expr_stmt><expr><call><name>fsm_vacuum_page</name><argument_list>(<argument><expr><name>rel</name></expr></argument>, <argument><expr><name>FSM_ROOT_ADDRESS</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>dummy</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block" format="doxygen">/******** Internal routines ********/</comment>
+
+<comment type="block">/*
+ * Return category corresponding x bytes of free space
+ */</comment>
+<function><type><specifier>static</specifier> <name>uint8</name></type>
+<name>fsm_space_avail_to_cat</name><parameter_list>(<parameter><decl><type><name>Size</name></type> <name>avail</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <decl_stmt><decl><type><name>int</name></type>            <name>cat</name></decl>;</decl_stmt>
+
+    <expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>avail</name> <operator>&lt;</operator> <name>BLCKSZ</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+    <if_stmt><if>if <condition>(<expr><name>avail</name> <operator>&gt;=</operator> <name>MaxFSMRequestSize</name></expr>)</condition><block type="pseudo"><block_content>
+        <return>return <expr><literal type="number">255</literal></expr>;</return></block_content></block></if></if_stmt>
+
+    <expr_stmt><expr><name>cat</name> <operator>=</operator> <name>avail</name> <operator>/</operator> <name>FSM_CAT_STEP</name></expr>;</expr_stmt>
+
+    <comment type="block">/*
+     * The highest category, 255, is reserved for MaxFSMRequestSize bytes or
+     * more.
+     */</comment>
+    <if_stmt><if>if <condition>(<expr><name>cat</name> <operator>&gt;</operator> <literal type="number">254</literal></expr>)</condition><block type="pseudo"><block_content>
+        <expr_stmt><expr><name>cat</name> <operator>=</operator> <literal type="number">254</literal></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+    <return>return <expr><operator>(</operator><name>uint8</name><operator>)</operator> <name>cat</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Return the lower bound of the range of free space represented by given
+ * category.
+ */</comment>
+<function><type><specifier>static</specifier> <name>Size</name></type>
+<name>fsm_space_cat_to_avail</name><parameter_list>(<parameter><decl><type><name>uint8</name></type> <name>cat</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <comment type="block">/* The highest category represents exactly MaxFSMRequestSize bytes. */</comment>
+    <if_stmt><if>if <condition>(<expr><name>cat</name> <operator>==</operator> <literal type="number">255</literal></expr>)</condition><block type="pseudo"><block_content>
+        <return>return <expr><name>MaxFSMRequestSize</name></expr>;</return></block_content></block></if>
+    <else>else<block type="pseudo"><block_content>
+        <return>return <expr><name>cat</name> <operator>*</operator> <name>FSM_CAT_STEP</name></expr>;</return></block_content></block></else></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Which category does a page need to have, to accommodate x bytes of data?
+ * While fsm_size_to_avail_cat() rounds down, this needs to round up.
+ */</comment>
+<function><type><specifier>static</specifier> <name>uint8</name></type>
+<name>fsm_space_needed_to_cat</name><parameter_list>(<parameter><decl><type><name>Size</name></type> <name>needed</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <decl_stmt><decl><type><name>int</name></type>            <name>cat</name></decl>;</decl_stmt>
+
+    <comment type="block">/* Can't ask for more space than the highest category represents */</comment>
+    <if_stmt><if>if <condition>(<expr><name>needed</name> <operator>&gt;</operator> <name>MaxFSMRequestSize</name></expr>)</condition><block type="pseudo"><block_content>
+        <expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"invalid FSM request size %zu"</literal></expr></argument>, <argument><expr><name>needed</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+    <if_stmt><if>if <condition>(<expr><name>needed</name> <operator>==</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+        <return>return <expr><literal type="number">1</literal></expr>;</return></block_content></block></if></if_stmt>
+
+    <expr_stmt><expr><name>cat</name> <operator>=</operator> <operator>(</operator><name>needed</name> <operator>+</operator> <name>FSM_CAT_STEP</name> <operator>-</operator> <literal type="number">1</literal><operator>)</operator> <operator>/</operator> <name>FSM_CAT_STEP</name></expr>;</expr_stmt>
+
+    <if_stmt><if>if <condition>(<expr><name>cat</name> <operator>&gt;</operator> <literal type="number">255</literal></expr>)</condition><block type="pseudo"><block_content>
+        <expr_stmt><expr><name>cat</name> <operator>=</operator> <literal type="number">255</literal></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+    <return>return <expr><operator>(</operator><name>uint8</name><operator>)</operator> <name>cat</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Returns the physical block number of a FSM page
+ */</comment>
+<function><type><specifier>static</specifier> <name>BlockNumber</name></type>
+<name>fsm_logical_to_physical</name><parameter_list>(<parameter><decl><type><name>FSMAddress</name></type> <name>addr</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <decl_stmt><decl><type><name>BlockNumber</name></type> <name>pages</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>int</name></type>            <name>leafno</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>int</name></type>            <name>l</name></decl>;</decl_stmt>
+
+    <comment type="block">/*
+     * Calculate the logical page number of the first leaf page below the
+     * given page.
+     */</comment>
+    <expr_stmt><expr><name>leafno</name> <operator>=</operator> <name><name>addr</name><operator>.</operator><name>logpageno</name></name></expr>;</expr_stmt>
+    <for>for <control>(<init><expr><name>l</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>l</name> <operator>&lt;</operator> <name><name>addr</name><operator>.</operator><name>level</name></name></expr>;</condition> <incr><expr><name>l</name><operator>++</operator></expr></incr>)</control><block type="pseudo"><block_content>
+        <expr_stmt><expr><name>leafno</name> <operator>*=</operator> <name>SlotsPerFSMPage</name></expr>;</expr_stmt></block_content></block></for>
+
+    <comment type="block">/* Count upper level nodes required to address the leaf page */</comment>
+    <expr_stmt><expr><name>pages</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+    <for>for <control>(<init><expr><name>l</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>l</name> <operator>&lt;</operator> <name>FSM_TREE_DEPTH</name></expr>;</condition> <incr><expr><name>l</name><operator>++</operator></expr></incr>)</control>
+    <block>{<block_content>
+        <expr_stmt><expr><name>pages</name> <operator>+=</operator> <name>leafno</name> <operator>+</operator> <literal type="number">1</literal></expr>;</expr_stmt>
+        <expr_stmt><expr><name>leafno</name> <operator>/=</operator> <name>SlotsPerFSMPage</name></expr>;</expr_stmt>
+    </block_content>}</block></for>
+
+    <comment type="block">/*
+     * If the page we were asked for wasn't at the bottom level, subtract the
+     * additional lower level pages we counted above.
+     */</comment>
+    <expr_stmt><expr><name>pages</name> <operator>-=</operator> <name><name>addr</name><operator>.</operator><name>level</name></name></expr>;</expr_stmt>
+
+    <comment type="block">/* Turn the page count into 0-based block number */</comment>
+    <return>return <expr><name>pages</name> <operator>-</operator> <literal type="number">1</literal></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Return the FSM location corresponding to given heap block.
+ */</comment>
+<function><type><specifier>static</specifier> <name>FSMAddress</name></type>
+<name>fsm_get_location</name><parameter_list>(<parameter><decl><type><name>BlockNumber</name></type> <name>heapblk</name></decl></parameter>, <parameter><decl><type><name>uint16</name> <modifier>*</modifier></type><name>slot</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <decl_stmt><decl><type><name>FSMAddress</name></type>    <name>addr</name></decl>;</decl_stmt>
+
+    <expr_stmt><expr><name><name>addr</name><operator>.</operator><name>level</name></name> <operator>=</operator> <name>FSM_BOTTOM_LEVEL</name></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>addr</name><operator>.</operator><name>logpageno</name></name> <operator>=</operator> <name>heapblk</name> <operator>/</operator> <name>SlotsPerFSMPage</name></expr>;</expr_stmt>
+    <expr_stmt><expr><operator>*</operator><name>slot</name> <operator>=</operator> <name>heapblk</name> <operator>%</operator> <name>SlotsPerFSMPage</name></expr>;</expr_stmt>
+
+    <return>return <expr><name>addr</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Return the heap block number corresponding to given location in the FSM.
+ */</comment>
+<function><type><specifier>static</specifier> <name>BlockNumber</name></type>
+<name>fsm_get_heap_blk</name><parameter_list>(<parameter><decl><type><name>FSMAddress</name></type> <name>addr</name></decl></parameter>, <parameter><decl><type><name>uint16</name></type> <name>slot</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>addr</name><operator>.</operator><name>level</name></name> <operator>==</operator> <name>FSM_BOTTOM_LEVEL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <return>return <expr><operator>(</operator><operator>(</operator><name>unsigned</name> <name>int</name><operator>)</operator> <name><name>addr</name><operator>.</operator><name>logpageno</name></name><operator>)</operator> <operator>*</operator> <name>SlotsPerFSMPage</name> <operator>+</operator> <name>slot</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Given a logical address of a child page, get the logical page number of
+ * the parent, and the slot within the parent corresponding to the child.
+ */</comment>
+<function><type><specifier>static</specifier> <name>FSMAddress</name></type>
+<name>fsm_get_parent</name><parameter_list>(<parameter><decl><type><name>FSMAddress</name></type> <name>child</name></decl></parameter>, <parameter><decl><type><name>uint16</name> <modifier>*</modifier></type><name>slot</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <decl_stmt><decl><type><name>FSMAddress</name></type>    <name>parent</name></decl>;</decl_stmt>
+
+    <expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>child</name><operator>.</operator><name>level</name></name> <operator>&lt;</operator> <name>FSM_ROOT_LEVEL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+    <expr_stmt><expr><name><name>parent</name><operator>.</operator><name>level</name></name> <operator>=</operator> <name><name>child</name><operator>.</operator><name>level</name></name> <operator>+</operator> <literal type="number">1</literal></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>parent</name><operator>.</operator><name>logpageno</name></name> <operator>=</operator> <name><name>child</name><operator>.</operator><name>logpageno</name></name> <operator>/</operator> <name>SlotsPerFSMPage</name></expr>;</expr_stmt>
+    <expr_stmt><expr><operator>*</operator><name>slot</name> <operator>=</operator> <name><name>child</name><operator>.</operator><name>logpageno</name></name> <operator>%</operator> <name>SlotsPerFSMPage</name></expr>;</expr_stmt>
+
+    <return>return <expr><name>parent</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Given a logical address of a parent page and a slot number, get the
+ * logical address of the corresponding child page.
+ */</comment>
+<function><type><specifier>static</specifier> <name>FSMAddress</name></type>
+<name>fsm_get_child</name><parameter_list>(<parameter><decl><type><name>FSMAddress</name></type> <name>parent</name></decl></parameter>, <parameter><decl><type><name>uint16</name></type> <name>slot</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <decl_stmt><decl><type><name>FSMAddress</name></type>    <name>child</name></decl>;</decl_stmt>
+
+    <expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>parent</name><operator>.</operator><name>level</name></name> <operator>&gt;</operator> <name>FSM_BOTTOM_LEVEL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+    <expr_stmt><expr><name><name>child</name><operator>.</operator><name>level</name></name> <operator>=</operator> <name><name>parent</name><operator>.</operator><name>level</name></name> <operator>-</operator> <literal type="number">1</literal></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>child</name><operator>.</operator><name>logpageno</name></name> <operator>=</operator> <name><name>parent</name><operator>.</operator><name>logpageno</name></name> <operator>*</operator> <name>SlotsPerFSMPage</name> <operator>+</operator> <name>slot</name></expr>;</expr_stmt>
+
+    <return>return <expr><name>child</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Read a FSM page.
+ *
+ * If the page doesn't exist, InvalidBuffer is returned, or if 'extend' is
+ * true, the FSM file is extended.
+ */</comment>
+<function><type><specifier>static</specifier> <name>Buffer</name></type>
+<name>fsm_readbuf</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>rel</name></decl></parameter>, <parameter><decl><type><name>FSMAddress</name></type> <name>addr</name></decl></parameter>, <parameter><decl><type><name>bool</name></type> <name>extend</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <decl_stmt><decl><type><name>BlockNumber</name></type> <name>blkno</name> <init>= <expr><call><name>fsm_logical_to_physical</name><argument_list>(<argument><expr><name>addr</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>Buffer</name></type>        <name>buf</name></decl>;</decl_stmt>
+
+    <expr_stmt><expr><call><name>RelationOpenSmgr</name><argument_list>(<argument><expr><name>rel</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+    <comment type="block">/*
+     * If we haven't cached the size of the FSM yet, check it first.  Also
+     * recheck if the requested block seems to be past end, since our cached
+     * value might be stale.  (We send smgr inval messages on truncation, but
+     * not on extension.)
+     */</comment>
+    <if_stmt><if>if <condition>(<expr><name><name>rel</name><operator>-&gt;</operator><name>rd_smgr</name><operator>-&gt;</operator><name>smgr_fsm_nblocks</name></name> <operator>==</operator> <name>InvalidBlockNumber</name> <operator>||</operator>
+        <name>blkno</name> <operator>&gt;=</operator> <name><name>rel</name><operator>-&gt;</operator><name>rd_smgr</name><operator>-&gt;</operator><name>smgr_fsm_nblocks</name></name></expr>)</condition>
+    <block>{<block_content>
+        <if_stmt><if>if <condition>(<expr><call><name>smgrexists</name><argument_list>(<argument><expr><name><name>rel</name><operator>-&gt;</operator><name>rd_smgr</name></name></expr></argument>, <argument><expr><name>FSM_FORKNUM</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+            <expr_stmt><expr><name><name>rel</name><operator>-&gt;</operator><name>rd_smgr</name><operator>-&gt;</operator><name>smgr_fsm_nblocks</name></name> <operator>=</operator> <call><name>smgrnblocks</name><argument_list>(<argument><expr><name><name>rel</name><operator>-&gt;</operator><name>rd_smgr</name></name></expr></argument>,
+                                                         <argument><expr><name>FSM_FORKNUM</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if>
+        <else>else<block type="pseudo"><block_content>
+            <expr_stmt><expr><name><name>rel</name><operator>-&gt;</operator><name>rd_smgr</name><operator>-&gt;</operator><name>smgr_fsm_nblocks</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt></block_content></block></else></if_stmt>
+    </block_content>}</block></if></if_stmt>
+
+    <comment type="block">/* Handle requests beyond EOF */</comment>
+    <if_stmt><if>if <condition>(<expr><name>blkno</name> <operator>&gt;=</operator> <name><name>rel</name><operator>-&gt;</operator><name>rd_smgr</name><operator>-&gt;</operator><name>smgr_fsm_nblocks</name></name></expr>)</condition>
+    <block>{<block_content>
+        <if_stmt><if>if <condition>(<expr><name>extend</name></expr>)</condition><block type="pseudo"><block_content>
+            <expr_stmt><expr><call><name>fsm_extend</name><argument_list>(<argument><expr><name>rel</name></expr></argument>, <argument><expr><name>blkno</name> <operator>+</operator> <literal type="number">1</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if>
+        <else>else<block type="pseudo"><block_content>
+            <return>return <expr><name>InvalidBuffer</name></expr>;</return></block_content></block></else></if_stmt>
+    </block_content>}</block></if></if_stmt>
+
+    <comment type="block">/*
+     * Use ZERO_ON_ERROR mode, and initialize the page if necessary. The FSM
+     * information is not accurate anyway, so it's better to clear corrupt
+     * pages than error out. Since the FSM changes are not WAL-logged, the
+     * so-called torn page problem on crash can lead to pages with corrupt
+     * headers, for example.
+     */</comment>
+    <expr_stmt><expr><name>buf</name> <operator>=</operator> <call><name>ReadBufferExtended</name><argument_list>(<argument><expr><name>rel</name></expr></argument>, <argument><expr><name>FSM_FORKNUM</name></expr></argument>, <argument><expr><name>blkno</name></expr></argument>, <argument><expr><name>RBM_ZERO_ON_ERROR</name></expr></argument>, <argument><expr><name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <if_stmt><if>if <condition>(<expr><call><name>PageIsNew</name><argument_list>(<argument><expr><call><name>BufferGetPage</name><argument_list>(<argument><expr><name>buf</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+        <expr_stmt><expr><call><name>PageInit</name><argument_list>(<argument><expr><call><name>BufferGetPage</name><argument_list>(<argument><expr><name>buf</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>BLCKSZ</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+    <return>return <expr><name>buf</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Ensure that the FSM fork is at least fsm_nblocks long, extending
+ * it if necessary with empty pages. And by empty, I mean pages filled
+ * with zeros, meaning there's no free space.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>fsm_extend</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>rel</name></decl></parameter>, <parameter><decl><type><name>BlockNumber</name></type> <name>fsm_nblocks</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <decl_stmt><decl><type><name>BlockNumber</name></type> <name>fsm_nblocks_now</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>Page</name></type>        <name>pg</name></decl>;</decl_stmt>
+
+    <expr_stmt><expr><name>pg</name> <operator>=</operator> <operator>(</operator><name>Page</name><operator>)</operator> <call><name>palloc</name><argument_list>(<argument><expr><name>BLCKSZ</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><call><name>PageInit</name><argument_list>(<argument><expr><name>pg</name></expr></argument>, <argument><expr><name>BLCKSZ</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+    <comment type="block">/*
+     * We use the relation extension lock to lock out other backends trying to
+     * extend the FSM at the same time. It also locks out extension of the
+     * main fork, unnecessarily, but extending the FSM happens seldom enough
+     * that it doesn't seem worthwhile to have a separate lock tag type for
+     * it.
+     *
+     * Note that another backend might have extended or created the relation
+     * by the time we get the lock.
+     */</comment>
+    <expr_stmt><expr><call><name>LockRelationForExtension</name><argument_list>(<argument><expr><name>rel</name></expr></argument>, <argument><expr><name>ExclusiveLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+    <comment type="block">/* Might have to re-open if a cache flush happened */</comment>
+    <expr_stmt><expr><call><name>RelationOpenSmgr</name><argument_list>(<argument><expr><name>rel</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+    <comment type="block">/*
+     * Create the FSM file first if it doesn't exist.  If smgr_fsm_nblocks is
+     * positive then it must exist, no need for an smgrexists call.
+     */</comment>
+    <if_stmt><if>if <condition>(<expr><operator>(</operator><name><name>rel</name><operator>-&gt;</operator><name>rd_smgr</name><operator>-&gt;</operator><name>smgr_fsm_nblocks</name></name> <operator>==</operator> <literal type="number">0</literal> <operator>||</operator>
+         <name><name>rel</name><operator>-&gt;</operator><name>rd_smgr</name><operator>-&gt;</operator><name>smgr_fsm_nblocks</name></name> <operator>==</operator> <name>InvalidBlockNumber</name><operator>)</operator> <operator>&amp;&amp;</operator>
+        <operator>!</operator><call><name>smgrexists</name><argument_list>(<argument><expr><name><name>rel</name><operator>-&gt;</operator><name>rd_smgr</name></name></expr></argument>, <argument><expr><name>FSM_FORKNUM</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+        <expr_stmt><expr><call><name>smgrcreate</name><argument_list>(<argument><expr><name><name>rel</name><operator>-&gt;</operator><name>rd_smgr</name></name></expr></argument>, <argument><expr><name>FSM_FORKNUM</name></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+    <expr_stmt><expr><name>fsm_nblocks_now</name> <operator>=</operator> <call><name>smgrnblocks</name><argument_list>(<argument><expr><name><name>rel</name><operator>-&gt;</operator><name>rd_smgr</name></name></expr></argument>, <argument><expr><name>FSM_FORKNUM</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+    <while>while <condition>(<expr><name>fsm_nblocks_now</name> <operator>&lt;</operator> <name>fsm_nblocks</name></expr>)</condition>
+    <block>{<block_content>
+        <expr_stmt><expr><call><name>PageSetChecksumInplace</name><argument_list>(<argument><expr><name>pg</name></expr></argument>, <argument><expr><name>fsm_nblocks_now</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+        <expr_stmt><expr><call><name>smgrextend</name><argument_list>(<argument><expr><name><name>rel</name><operator>-&gt;</operator><name>rd_smgr</name></name></expr></argument>, <argument><expr><name>FSM_FORKNUM</name></expr></argument>, <argument><expr><name>fsm_nblocks_now</name></expr></argument>,
+                   <argument><expr><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <name>pg</name></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <expr_stmt><expr><name>fsm_nblocks_now</name><operator>++</operator></expr>;</expr_stmt>
+    </block_content>}</block></while>
+
+    <comment type="block">/* Update local cache with the up-to-date size */</comment>
+    <expr_stmt><expr><name><name>rel</name><operator>-&gt;</operator><name>rd_smgr</name><operator>-&gt;</operator><name>smgr_fsm_nblocks</name></name> <operator>=</operator> <name>fsm_nblocks_now</name></expr>;</expr_stmt>
+
+    <expr_stmt><expr><call><name>UnlockRelationForExtension</name><argument_list>(<argument><expr><name>rel</name></expr></argument>, <argument><expr><name>ExclusiveLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+    <expr_stmt><expr><call><name>pfree</name><argument_list>(<argument><expr><name>pg</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Set value in given FSM page and slot.
+ *
+ * If minValue &gt; 0, the updated page is also searched for a page with at
+ * least minValue of free space. If one is found, its slot number is
+ * returned, -1 otherwise.
+ */</comment>
+<function><type><specifier>static</specifier> <name>int</name></type>
+<name>fsm_set_and_search</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>rel</name></decl></parameter>, <parameter><decl><type><name>FSMAddress</name></type> <name>addr</name></decl></parameter>, <parameter><decl><type><name>uint16</name></type> <name>slot</name></decl></parameter>,
+                   <parameter><decl><type><name>uint8</name></type> <name>newValue</name></decl></parameter>, <parameter><decl><type><name>uint8</name></type> <name>minValue</name></decl></parameter>)</parameter_list>
+<block>{<block_content><comment type="line">// #lizard forgives</comment>
+    <decl_stmt><decl><type><name>Buffer</name></type>        <name>buf</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>Page</name></type>        <name>page</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>int</name></type>            <name>newslot</name> <init>= <expr><operator>-</operator><literal type="number">1</literal></expr></init></decl>;</decl_stmt>
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>_SHARDING_</name></cpp:ifdef>
+    <decl_stmt><decl><type><name>bool</name></type>         <name>root_modified</name> <init>= <expr><name>false</name></expr></init></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>uint8</name></type>        <name>new_root</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>uint8</name></type>        <name>old_root</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+    <expr_stmt><expr><name>buf</name> <operator>=</operator> <call><name>fsm_readbuf</name><argument_list>(<argument><expr><name>rel</name></expr></argument>, <argument><expr><name>addr</name></expr></argument>, <argument><expr><name>true</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><call><name>LockBuffer</name><argument_list>(<argument><expr><name>buf</name></expr></argument>, <argument><expr><name>BUFFER_LOCK_EXCLUSIVE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+    <expr_stmt><expr><name>page</name> <operator>=</operator> <call><name>BufferGetPage</name><argument_list>(<argument><expr><name>buf</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <if_stmt><if>if <condition>(<expr><call><name>fsm_set_avail_extent</name><argument_list>(<argument><expr><name>page</name></expr></argument>, <argument><expr><name>slot</name></expr></argument>, <argument><expr><name>newValue</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>root_modified</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>new_root</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>old_root</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+        <expr_stmt><expr><call><name>MarkBufferDirtyHint</name><argument_list>(<argument><expr><name>buf</name></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>_SHARDING_</name></cpp:ifdef>
+    
+    <if_stmt><if>if<condition>(<expr><call><name>RelationHasExtent</name><argument_list>(<argument><expr><name>rel</name></expr></argument>)</argument_list></call> <operator>&amp;&amp;</operator> <name><name>addr</name><operator>.</operator><name>level</name></name> <operator>==</operator> <name>FSM_BOTTOM_LEVEL</name> <operator>&amp;&amp;</operator> <name>root_modified</name></expr>)</condition>
+    <block>{<block_content>
+        <decl_stmt><decl><type><name>Size</name></type>     <name>saveFreeSpace</name></decl>;</decl_stmt>
+        <decl_stmt><decl><type><name>int</name></type>     <name>save_cat</name></decl>;</decl_stmt>
+        <decl_stmt><decl><type><name>ExtentID</name></type> <name>eid</name> <init>= <expr><operator>(</operator><name>ExtentID</name><operator>)</operator><name><name>addr</name><operator>.</operator><name>logpageno</name></name></expr></init></decl>;</decl_stmt>
+        <decl_stmt><decl><type><name>bool</name></type>     <name>occupied</name> <init>= <expr><name>false</name></expr></init></decl>;</decl_stmt>
+        
+        <expr_stmt><expr><operator>(</operator><name>void</name><operator>)</operator><call><name>ema_next_alloc</name><argument_list>(<argument><expr><name>rel</name></expr></argument>, <argument><expr><name>eid</name></expr></argument>, <argument><expr><name>false</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>occupied</name></expr></argument>, <argument><expr><name>NULL</name></expr></argument>, <argument><expr><name>NULL</name></expr></argument>, <argument><expr><name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+        <if_stmt><if>if<condition>(<expr><name>occupied</name></expr>)</condition>
+        <block>{<block_content>
+            <expr_stmt><expr><call><name>ema_set_eme_freespace</name><argument_list>(<argument><expr><name>rel</name></expr></argument>, <argument><expr><name>eid</name></expr></argument>, <argument><expr><name>new_root</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+            <expr_stmt><expr><name>saveFreeSpace</name> <operator>=</operator> <call><name>RelationGetTargetPageFreeSpace</name><argument_list>(<argument><expr><name>rel</name></expr></argument>, <argument><expr><name>HEAP_DEFAULT_FILLFACTOR</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+            <expr_stmt><expr><name>save_cat</name> <operator>=</operator> <call><name>fsm_space_needed_to_cat</name><argument_list>(<argument><expr><name>saveFreeSpace</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+            <expr_stmt><expr><name>save_cat</name> <operator>=</operator> <ternary><condition><expr><name>save_cat</name> <operator>&gt;=</operator> <name>EXTENT_SAVED_MINCAT</name></expr> ?</condition><then> <expr><name>save_cat</name></expr> </then><else>: <expr><name>EXTENT_SAVED_MINCAT</name></expr></else></ternary></expr>;</expr_stmt>
+
+            <if_stmt><if>if<condition>(<expr><name>new_root</name> <operator>&lt;=</operator> <name>save_cat</name> <operator>&amp;&amp;</operator> <name>old_root</name> <operator>&gt;</operator> <name>save_cat</name></expr>)</condition>
+            <block>{<block_content>
+                <comment type="block">/*dettach this extent from alloc list*/</comment>
+                <expr_stmt><expr><call><name>MarkExtentFull</name><argument_list>(<argument><expr><name>rel</name></expr></argument>, <argument><expr><name>eid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+            </block_content>}</block></if></if_stmt>
+
+            <if_stmt><if>if<condition>(<expr><name>new_root</name> <operator>&gt;</operator> <name>save_cat</name> <operator>&amp;&amp;</operator> <name>old_root</name> <operator>&lt;=</operator> <name>save_cat</name></expr>)</condition>
+            <block>{<block_content>
+                <expr_stmt><expr><call><name>MarkExtentAvailable</name><argument_list>(<argument><expr><name>rel</name></expr></argument>, <argument><expr><name>eid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+            </block_content>}</block></if></if_stmt>
+        </block_content>}</block></if></if_stmt>
+    </block_content>}</block></if></if_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+    <if_stmt><if>if <condition>(<expr><name>minValue</name> <operator>!=</operator> <literal type="number">0</literal></expr>)</condition>
+    <block>{<block_content>
+        <comment type="block">/* Search while we still hold the lock */</comment>
+        <expr_stmt><expr><name>newslot</name> <operator>=</operator> <call><name>fsm_search_avail</name><argument_list>(<argument><expr><name>buf</name></expr></argument>, <argument><expr><name>minValue</name></expr></argument>,
+                                   <argument><expr><name><name>addr</name><operator>.</operator><name>level</name></name> <operator>==</operator> <name>FSM_BOTTOM_LEVEL</name></expr></argument>,
+                                   <argument><expr><name>true</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    </block_content>}</block></if></if_stmt>
+
+    <expr_stmt><expr><call><name>UnlockReleaseBuffer</name><argument_list>(<argument><expr><name>buf</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+    <return>return <expr><name>newslot</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Search the tree for a heap page with at least min_cat of free space
+ */</comment>
+<function><type><specifier>static</specifier> <name>BlockNumber</name></type>
+<name>fsm_search</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>rel</name></decl></parameter>, <parameter><decl><type><name>uint8</name></type> <name>min_cat</name></decl></parameter>)</parameter_list>
+<block>{<block_content><comment type="line">// #lizard forgives</comment>
+    <decl_stmt><decl><type><name>int</name></type>            <name>restarts</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>FSMAddress</name></type>    <name>addr</name> <init>= <expr><name>FSM_ROOT_ADDRESS</name></expr></init></decl>;</decl_stmt>
+
+    <for>for <control>(<init>;</init><condition>;</condition><incr/>)</control>
+    <block>{<block_content>
+        <decl_stmt><decl><type><name>int</name></type>            <name>slot</name></decl>;</decl_stmt>
+        <decl_stmt><decl><type><name>Buffer</name></type>        <name>buf</name></decl>;</decl_stmt>
+        <decl_stmt><decl><type><name>uint8</name></type>        <name>max_avail</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+
+        <comment type="block">/* Read the FSM page. */</comment>
+        <expr_stmt><expr><name>buf</name> <operator>=</operator> <call><name>fsm_readbuf</name><argument_list>(<argument><expr><name>rel</name></expr></argument>, <argument><expr><name>addr</name></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+        <comment type="block">/* Search within the page */</comment>
+        <if_stmt><if>if <condition>(<expr><call><name>BufferIsValid</name><argument_list>(<argument><expr><name>buf</name></expr></argument>)</argument_list></call></expr>)</condition>
+        <block>{<block_content>
+            <expr_stmt><expr><call><name>LockBuffer</name><argument_list>(<argument><expr><name>buf</name></expr></argument>, <argument><expr><name>BUFFER_LOCK_SHARE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+            <expr_stmt><expr><name>slot</name> <operator>=</operator> <call><name>fsm_search_avail</name><argument_list>(<argument><expr><name>buf</name></expr></argument>, <argument><expr><name>min_cat</name></expr></argument>,
+                                    <argument><expr><operator>(</operator><name><name>addr</name><operator>.</operator><name>level</name></name> <operator>==</operator> <name>FSM_BOTTOM_LEVEL</name><operator>)</operator></expr></argument>,
+                                    <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+            <if_stmt><if>if <condition>(<expr><name>slot</name> <operator>==</operator> <operator>-</operator><literal type="number">1</literal></expr>)</condition><block type="pseudo"><block_content>
+                <expr_stmt><expr><name>max_avail</name> <operator>=</operator> <call><name>fsm_get_max_avail</name><argument_list>(<argument><expr><call><name>BufferGetPage</name><argument_list>(<argument><expr><name>buf</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+            <expr_stmt><expr><call><name>UnlockReleaseBuffer</name><argument_list>(<argument><expr><name>buf</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        </block_content>}</block></if>
+        <else>else<block type="pseudo"><block_content>
+            <expr_stmt><expr><name>slot</name> <operator>=</operator> <operator>-</operator><literal type="number">1</literal></expr>;</expr_stmt></block_content></block></else></if_stmt>
+
+        <if_stmt><if>if <condition>(<expr><name>slot</name> <operator>!=</operator> <operator>-</operator><literal type="number">1</literal></expr>)</condition>
+        <block>{<block_content>
+            <comment type="block">/*
+             * Descend the tree, or return the found block if we're at the
+             * bottom.
+             */</comment>
+            <if_stmt><if>if <condition>(<expr><name><name>addr</name><operator>.</operator><name>level</name></name> <operator>==</operator> <name>FSM_BOTTOM_LEVEL</name></expr>)</condition><block type="pseudo"><block_content>
+                <return>return <expr><call><name>fsm_get_heap_blk</name><argument_list>(<argument><expr><name>addr</name></expr></argument>, <argument><expr><name>slot</name></expr></argument>)</argument_list></call></expr>;</return></block_content></block></if></if_stmt>
+
+            <expr_stmt><expr><name>addr</name> <operator>=</operator> <call><name>fsm_get_child</name><argument_list>(<argument><expr><name>addr</name></expr></argument>, <argument><expr><name>slot</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        </block_content>}</block></if>
+        <if type="elseif">else if <condition>(<expr><name><name>addr</name><operator>.</operator><name>level</name></name> <operator>==</operator> <name>FSM_ROOT_LEVEL</name></expr>)</condition>
+        <block>{<block_content>
+            <comment type="block">/*
+             * At the root, failure means there's no page with enough free
+             * space in the FSM. Give up.
+             */</comment>
+            <return>return <expr><name>InvalidBlockNumber</name></expr>;</return>
+        </block_content>}</block></if>
+        <else>else
+        <block>{<block_content>
+            <decl_stmt><decl><type><name>uint16</name></type>        <name>parentslot</name></decl>;</decl_stmt>
+            <decl_stmt><decl><type><name>FSMAddress</name></type>    <name>parent</name></decl>;</decl_stmt>
+
+            <comment type="block">/*
+             * At lower level, failure can happen if the value in the upper-
+             * level node didn't reflect the value on the lower page. Update
+             * the upper node, to avoid falling into the same trap again, and
+             * start over.
+             *
+             * There's a race condition here, if another backend updates this
+             * page right after we release it, and gets the lock on the parent
+             * page before us. We'll then update the parent page with the now
+             * stale information we had. It's OK, because it should happen
+             * rarely, and will be fixed by the next vacuum.
+             */</comment>
+            <expr_stmt><expr><name>parent</name> <operator>=</operator> <call><name>fsm_get_parent</name><argument_list>(<argument><expr><name>addr</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>parentslot</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+            <expr_stmt><expr><call><name>fsm_set_and_search</name><argument_list>(<argument><expr><name>rel</name></expr></argument>, <argument><expr><name>parent</name></expr></argument>, <argument><expr><name>parentslot</name></expr></argument>, <argument><expr><name>max_avail</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+            <comment type="block">/*
+             * If the upper pages are badly out of date, we might need to loop
+             * quite a few times, updating them as we go. Any inconsistencies
+             * should eventually be corrected and the loop should end. Looping
+             * indefinitely is nevertheless scary, so provide an emergency
+             * valve.
+             */</comment>
+            <if_stmt><if>if <condition>(<expr><name>restarts</name><operator>++</operator> <operator>&gt;</operator> <literal type="number">10000</literal></expr>)</condition><block type="pseudo"><block_content>
+                <return>return <expr><name>InvalidBlockNumber</name></expr>;</return></block_content></block></if></if_stmt>
+
+            <comment type="block">/* Start search all over from the root */</comment>
+            <expr_stmt><expr><name>addr</name> <operator>=</operator> <name>FSM_ROOT_ADDRESS</name></expr>;</expr_stmt>
+        </block_content>}</block></else></if_stmt>
+    </block_content>}</block></for>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * Recursive guts of FreeSpaceMapVacuum
+ */</comment>
+<function><type><specifier>static</specifier> <name>uint8</name></type>
+<name>fsm_vacuum_page</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>rel</name></decl></parameter>, <parameter><decl><type><name>FSMAddress</name></type> <name>addr</name></decl></parameter>, <parameter><decl><type><name>bool</name> <modifier>*</modifier></type><name>eof_p</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <decl_stmt><decl><type><name>Buffer</name></type>        <name>buf</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>Page</name></type>        <name>page</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>uint8</name></type>        <name>max_avail</name></decl>;</decl_stmt>
+
+    <comment type="block">/* Read the page if it exists, or return EOF */</comment>
+    <expr_stmt><expr><name>buf</name> <operator>=</operator> <call><name>fsm_readbuf</name><argument_list>(<argument><expr><name>rel</name></expr></argument>, <argument><expr><name>addr</name></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>BufferIsValid</name><argument_list>(<argument><expr><name>buf</name></expr></argument>)</argument_list></call></expr>)</condition>
+    <block>{<block_content>
+        <expr_stmt><expr><operator>*</operator><name>eof_p</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+        <return>return <expr><literal type="number">0</literal></expr>;</return>
+    </block_content>}</block></if>
+    <else>else<block type="pseudo"><block_content>
+        <expr_stmt><expr><operator>*</operator><name>eof_p</name> <operator>=</operator> <name>false</name></expr>;</expr_stmt></block_content></block></else></if_stmt>
+
+    <expr_stmt><expr><name>page</name> <operator>=</operator> <call><name>BufferGetPage</name><argument_list>(<argument><expr><name>buf</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+    <comment type="block">/*
+     * Recurse into children, and fix the information stored about them at
+     * this level.
+     */</comment>
+    <if_stmt><if>if <condition>(<expr><name><name>addr</name><operator>.</operator><name>level</name></name> <operator>&gt;</operator> <name>FSM_BOTTOM_LEVEL</name></expr>)</condition>
+    <block>{<block_content>
+        <decl_stmt><decl><type><name>int</name></type>            <name>slot</name></decl>;</decl_stmt>
+        <decl_stmt><decl><type><name>bool</name></type>        <name>eof</name> <init>= <expr><name>false</name></expr></init></decl>;</decl_stmt>
+
+        <for>for <control>(<init><expr><name>slot</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>slot</name> <operator>&lt;</operator> <name>SlotsPerFSMPage</name></expr>;</condition> <incr><expr><name>slot</name><operator>++</operator></expr></incr>)</control>
+        <block>{<block_content>
+            <decl_stmt><decl><type><name>int</name></type>            <name>child_avail</name></decl>;</decl_stmt>
+
+            <expr_stmt><expr><call><name>CHECK_FOR_INTERRUPTS</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+            <comment type="block">/* After we hit end-of-file, just clear the rest of the slots */</comment>
+            <if_stmt><if>if <condition>(<expr><operator>!</operator><name>eof</name></expr>)</condition><block type="pseudo"><block_content>
+                <expr_stmt><expr><name>child_avail</name> <operator>=</operator> <call><name>fsm_vacuum_page</name><argument_list>(<argument><expr><name>rel</name></expr></argument>, <argument><expr><call><name>fsm_get_child</name><argument_list>(<argument><expr><name>addr</name></expr></argument>, <argument><expr><name>slot</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><operator>&amp;</operator><name>eof</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if>
+            <else>else<block type="pseudo"><block_content>
+                <expr_stmt><expr><name>child_avail</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt></block_content></block></else></if_stmt>
+
+            <comment type="block">/* Update information about the child */</comment>
+            <if_stmt><if>if <condition>(<expr><call><name>fsm_get_avail</name><argument_list>(<argument><expr><name>page</name></expr></argument>, <argument><expr><name>slot</name></expr></argument>)</argument_list></call> <operator>!=</operator> <name>child_avail</name></expr>)</condition>
+            <block>{<block_content>
+                <expr_stmt><expr><call><name>LockBuffer</name><argument_list>(<argument><expr><name>buf</name></expr></argument>, <argument><expr><name>BUFFER_LOCK_EXCLUSIVE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+                <expr_stmt><expr><call><name>fsm_set_avail</name><argument_list>(<argument><expr><call><name>BufferGetPage</name><argument_list>(<argument><expr><name>buf</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>slot</name></expr></argument>, <argument><expr><name>child_avail</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+                <expr_stmt><expr><call><name>MarkBufferDirtyHint</name><argument_list>(<argument><expr><name>buf</name></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+                <expr_stmt><expr><call><name>LockBuffer</name><argument_list>(<argument><expr><name>buf</name></expr></argument>, <argument><expr><name>BUFFER_LOCK_UNLOCK</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+            </block_content>}</block></if></if_stmt>
+        </block_content>}</block></for>
+    </block_content>}</block></if></if_stmt>
+
+    <expr_stmt><expr><name>max_avail</name> <operator>=</operator> <call><name>fsm_get_max_avail</name><argument_list>(<argument><expr><call><name>BufferGetPage</name><argument_list>(<argument><expr><name>buf</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+    <comment type="block">/*
+     * Reset the next slot pointer. This encourages the use of low-numbered
+     * pages, increasing the chances that a later vacuum can truncate the
+     * relation.
+     */</comment>
+	<if_stmt><if>if <condition>(<expr><name>enable_buffer_mprotect</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>LockBuffer</name><argument_list>(<argument><expr><name>buf</name></expr></argument>, <argument><expr><name>BUFFER_LOCK_EXCLUSIVE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><operator>(</operator><operator>(</operator><name>FSMPage</name><operator>)</operator> <call><name>PageGetContents</name><argument_list>(<argument><expr><name>page</name></expr></argument>)</argument_list></call><operator>)</operator><operator>-&gt;</operator><name>fp_next_slot</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>LockBuffer</name><argument_list>(<argument><expr><name>buf</name></expr></argument>, <argument><expr><name>BUFFER_LOCK_UNLOCK</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<else>else
+	<block>{<block_content>
+		<expr_stmt><expr><operator>(</operator><operator>(</operator><name>FSMPage</name><operator>)</operator> <call><name>PageGetContents</name><argument_list>(<argument><expr><name>page</name></expr></argument>)</argument_list></call><operator>)</operator><operator>-&gt;</operator><name>fp_next_slot</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+	</block_content>}</block></else></if_stmt>
+
+    <expr_stmt><expr><call><name>ReleaseBuffer</name><argument_list>(<argument><expr><name>buf</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+    <return>return <expr><name>max_avail</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * This function will return the last block number stored on given
+ * FSM page address.
+ */</comment>
+<function><type><specifier>static</specifier> <name>BlockNumber</name></type>
+<name>fsm_get_lastblckno</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>rel</name></decl></parameter>, <parameter><decl><type><name>FSMAddress</name></type> <name>addr</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <decl_stmt><decl><type><name>int</name></type>            <name>slot</name></decl>;</decl_stmt>
+
+    <comment type="block">/*
+     * Get the last slot number on the given address and convert that to block
+     * number
+     */</comment>
+    <expr_stmt><expr><name>slot</name> <operator>=</operator> <name>SlotsPerFSMPage</name> <operator>-</operator> <literal type="number">1</literal></expr>;</expr_stmt>
+    <return>return <expr><call><name>fsm_get_heap_blk</name><argument_list>(<argument><expr><name>addr</name></expr></argument>, <argument><expr><name>slot</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Recursively update the FSM tree from given address to
+ * all the way up to root.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>fsm_update_recursive</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>rel</name></decl></parameter>, <parameter><decl><type><name>FSMAddress</name></type> <name>addr</name></decl></parameter>, <parameter><decl><type><name>uint8</name></type> <name>new_cat</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <decl_stmt><decl><type><name>uint16</name></type>        <name>parentslot</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>FSMAddress</name></type>    <name>parent</name></decl>;</decl_stmt>
+
+    <if_stmt><if>if <condition>(<expr><name><name>addr</name><operator>.</operator><name>level</name></name> <operator>==</operator> <name>FSM_ROOT_LEVEL</name></expr>)</condition><block type="pseudo"><block_content>
+        <return>return;</return></block_content></block></if></if_stmt>
+
+    <comment type="block">/*
+     * Get the parent page and our slot in the parent page, and update the
+     * information in that.
+     */</comment>
+    <expr_stmt><expr><name>parent</name> <operator>=</operator> <call><name>fsm_get_parent</name><argument_list>(<argument><expr><name>addr</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>parentslot</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><call><name>fsm_set_and_search</name><argument_list>(<argument><expr><name>rel</name></expr></argument>, <argument><expr><name>parent</name></expr></argument>, <argument><expr><name>parentslot</name></expr></argument>, <argument><expr><name>new_cat</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><call><name>fsm_update_recursive</name><argument_list>(<argument><expr><name>rel</name></expr></argument>, <argument><expr><name>parent</name></expr></argument>, <argument><expr><name>new_cat</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>_SHARDING_</name></cpp:ifdef>
+<function><type><specifier>static</specifier> <name>FSMAddress</name></type> 
+<name>fsm_extentid_to_addr</name><parameter_list>(<parameter><decl><type><name>ExtentID</name></type> <name>eid</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <decl_stmt><decl><type><name>FSMAddress</name></type> <name>addr</name></decl>;</decl_stmt>
+
+    <expr_stmt><expr><name><name>addr</name><operator>.</operator><name>level</name></name> <operator>=</operator> <name>FSM_BOTTOM_LEVEL</name></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>addr</name><operator>.</operator><name>logpageno</name></name> <operator>=</operator> <name>eid</name></expr>;</expr_stmt>
+
+    <return>return <expr><name>addr</name></expr>;</return>
+</block_content>}</block></function>
+<cpp:if>#<cpp:directive>if</cpp:directive> <expr><literal type="number">0</literal></expr></cpp:if>
+static uint8
+fsm_get_extent_max(Relation rel, ExtentID eid)
+{
+    FSMAddress    addr;
+    Buffer        buf;
+    uint8        max_avail = -1;
+    
+    addr = fsm_extentid_to_addr(eid);
+
+    buf = fsm_readbuf(rel, addr, false);
+    if (BufferIsValid(buf))
+    {
+        FSMPage page;
+        LockBuffer(buf, BUFFER_LOCK_SHARE);
+        page = (FSMPage)BufferGetPage(buf);
+        max_avail = page-&gt;fp_nodes[0];
+        UnlockReleaseBuffer(buf);
+    }
+    
+    return max_avail;
+}
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+<function><type><specifier>static</specifier> <name>int</name></type>
+<name>fsm_search_from_extent</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>rel</name></decl></parameter>, <parameter><decl><type><name>uint8</name></type> <name>min_cat</name></decl></parameter>, <parameter><decl><type><name>ExtentID</name></type> <name>eid</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <decl_stmt><decl><type><name>FSMAddress</name></type>    <name>addr</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>Buffer</name></type>        <name>buf</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>int</name></type>         <name>slot</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>uint8</name></type>        <name>max_avail</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+    
+    <expr_stmt><expr><name>addr</name> <operator>=</operator> <call><name>fsm_extentid_to_addr</name><argument_list>(<argument><expr><name>eid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+    <expr_stmt><expr><name>buf</name> <operator>=</operator> <call><name>fsm_readbuf</name><argument_list>(<argument><expr><name>rel</name></expr></argument>, <argument><expr><name>addr</name></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <if_stmt><if>if <condition>(<expr><call><name>BufferIsValid</name><argument_list>(<argument><expr><name>buf</name></expr></argument>)</argument_list></call></expr>)</condition>
+    <block>{<block_content>
+        <expr_stmt><expr><call><name>LockBuffer</name><argument_list>(<argument><expr><name>buf</name></expr></argument>, <argument><expr><name>BUFFER_LOCK_SHARE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <expr_stmt><expr><name>slot</name> <operator>=</operator> <call><name>fsm_search_avail</name><argument_list>(<argument><expr><name>buf</name></expr></argument>, <argument><expr><name>min_cat</name></expr></argument>,
+                                <argument><expr><operator>(</operator><name><name>addr</name><operator>.</operator><name>level</name></name> <operator>==</operator> <name>FSM_BOTTOM_LEVEL</name><operator>)</operator></expr></argument>,
+                                <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <if_stmt><if>if <condition>(<expr><name>slot</name> <operator>==</operator> <operator>-</operator><literal type="number">1</literal></expr>)</condition><block type="pseudo"><block_content>
+            <expr_stmt><expr><name>max_avail</name> <operator>=</operator> <call><name>fsm_get_max_avail</name><argument_list>(<argument><expr><call><name>BufferGetPage</name><argument_list>(<argument><expr><name>buf</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+        <expr_stmt><expr><call><name>UnlockReleaseBuffer</name><argument_list>(<argument><expr><name>buf</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+        <if_stmt><if>if<condition>(<expr><name>slot</name> <operator>==</operator> <operator>-</operator><literal type="number">1</literal></expr>)</condition>
+        <block>{<block_content>
+            <comment type="line">//repaire extent's max avail</comment>
+            <expr_stmt><expr><call><name>ema_set_eme_freespace</name><argument_list>(<argument><expr><name>rel</name></expr></argument>, <argument><expr><name>eid</name></expr></argument>, <argument><expr><name>max_avail</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        </block_content>}</block></if></if_stmt>
+    </block_content>}</block></if>
+    <else>else<block type="pseudo"><block_content>
+        <expr_stmt><expr><name>slot</name> <operator>=</operator> <operator>-</operator><literal type="number">1</literal></expr>;</expr_stmt></block_content></block></else></if_stmt>
+
+    <return>return <expr><name>slot</name></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><specifier>static</specifier> <name>BlockNumber</name></type>
+<name>fsm_search_with_shard</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>rel</name></decl></parameter>, <parameter><decl><type><name>uint8</name></type> <name>min_cat</name></decl></parameter>, <parameter><decl><type><name>ShardID</name></type> <name>sid</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <decl_stmt><decl><type><name>ExtentID</name></type>    <name>eid</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>int</name></type>         <name>slot</name> <init>= <expr><operator>-</operator><literal type="number">1</literal></expr></init></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>FSMAddress</name></type>    <name>addr</name></decl>;</decl_stmt>
+
+    <while>while<condition>(<expr><name>slot</name> <operator>&lt;</operator> <literal type="number">0</literal></expr>)</condition>
+    <block>{<block_content>
+        <expr_stmt><expr><name>eid</name> <operator>=</operator> <call><name>GetExtentWithFreeSpace</name><argument_list>(<argument><expr><name>rel</name></expr></argument>, <argument><expr><name>sid</name></expr></argument>, <argument><expr><name>min_cat</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>    
+        <if_stmt><if>if<condition>(<expr><name>eid</name> <operator>==</operator> <name>InvalidExtentID</name></expr>)</condition>
+        <block>{<block_content>
+            <return>return <expr><name>InvalidBlockNumber</name></expr>;</return>
+        </block_content>}</block></if>
+        <else>else<block type="pseudo"><block_content>
+            <expr_stmt><expr><name>slot</name> <operator>=</operator> <call><name>fsm_search_from_extent</name><argument_list>(<argument><expr><name>rel</name></expr></argument>, <argument><expr><name>min_cat</name></expr></argument>, <argument><expr><name>eid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></else></if_stmt>
+    </block_content>}</block></while>
+
+    <expr_stmt><expr><name><name>addr</name><operator>.</operator><name>level</name></name> <operator>=</operator> <name>FSM_BOTTOM_LEVEL</name></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>addr</name><operator>.</operator><name>logpageno</name></name> <operator>=</operator> <name>eid</name></expr>;</expr_stmt>
+    
+    <return>return <expr><call><name>fsm_get_heap_blk</name><argument_list>(<argument><expr><name>addr</name></expr></argument>, <argument><expr><name>slot</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><name>uint8</name></type>
+<name>GetMaxAvailWithExtent</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>rel</name></decl></parameter>, <parameter><decl><type><name>ExtentID</name></type> <name>eid</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <decl_stmt><decl><type><name>Buffer</name></type>    <name>buf</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>FSMAddress</name></type>    <name>addr</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>uint8</name></type>     <name>max_avail</name></decl>;</decl_stmt>
+    
+    <expr_stmt><expr><name>addr</name> <operator>=</operator> <call><name>fsm_extentid_to_addr</name><argument_list>(<argument><expr><name>eid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><name>buf</name> <operator>=</operator> <call><name>fsm_readbuf</name><argument_list>(<argument><expr><name>rel</name></expr></argument>, <argument><expr><name>addr</name></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <if_stmt><if>if <condition>(<expr><call><name>BufferIsValid</name><argument_list>(<argument><expr><name>buf</name></expr></argument>)</argument_list></call></expr>)</condition>
+    <block>{<block_content>
+        <expr_stmt><expr><call><name>LockBuffer</name><argument_list>(<argument><expr><name>buf</name></expr></argument>, <argument><expr><name>BUFFER_LOCK_SHARE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <expr_stmt><expr><name>max_avail</name> <operator>=</operator> <call><name>fsm_get_max_avail</name><argument_list>(<argument><expr><call><name>BufferGetPage</name><argument_list>(<argument><expr><name>buf</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <expr_stmt><expr><call><name>UnlockReleaseBuffer</name><argument_list>(<argument><expr><name>buf</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    </block_content>}</block></if>
+    <else>else<block type="pseudo"><block_content>
+        <expr_stmt><expr><name>max_avail</name> <operator>=</operator> <operator>(</operator><name>uint8</name><operator>)</operator><literal type="number">255</literal></expr>;</expr_stmt></block_content></block></else></if_stmt>
+
+    <return>return <expr><name>max_avail</name></expr>;</return>
+</block_content>}</block></function>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+</unit>

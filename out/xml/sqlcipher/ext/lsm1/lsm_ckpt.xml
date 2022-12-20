@@ -1,0 +1,1241 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<unit xmlns="http://www.srcML.org/srcML/src" xmlns:cpp="http://www.srcML.org/srcML/cpp" revision="1.0.0" language="C" filename="/cloned_projects/sqlcipher/ext/lsm1/lsm_ckpt.c"><comment type="block">/*
+** 2011-09-11
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+*************************************************************************
+**
+** This file contains code to read and write checkpoints.
+**
+** A checkpoint represents the database layout at a single point in time.
+** It includes a log offset. When an existing database is opened, the
+** current state is determined by reading the newest checkpoint and updating
+** it with all committed transactions from the log that follow the specified
+** offset.
+*/</comment>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"lsmInt.h"</cpp:file></cpp:include>
+
+<comment type="block">/*
+** CHECKPOINT BLOB FORMAT:
+**
+** A checkpoint blob is a series of unsigned 32-bit integers stored in
+** big-endian byte order. As follows:
+**
+**   Checkpoint header (see the CKPT_HDR_XXX #defines):
+**
+**     1. The checkpoint id MSW.
+**     2. The checkpoint id LSW.
+**     3. The number of integer values in the entire checkpoint, including 
+**        the two checksum values.
+**     4. The compression scheme id.
+**     5. The total number of blocks in the database.
+**     6. The block size.
+**     7. The number of levels.
+**     8. The nominal database page size.
+**     9. The number of pages (in total) written to the database file.
+**
+**   Log pointer:
+**
+**     1. The log offset MSW.
+**     2. The log offset LSW.
+**     3. Log checksum 0.
+**     4. Log checksum 1.
+**
+**     Note that the "log offset" is not the literal byte offset. Instead,
+**     it is the byte offset multiplied by 2, with least significant bit
+**     toggled each time the log pointer value is changed. This is to make
+**     sure that this field changes each time the log pointer is updated,
+**     even if the log file itself is disabled. See lsmTreeMakeOld().
+**
+**     See ckptExportLog() and ckptImportLog().
+**
+**   Append points:
+**
+**     8 integers (4 * 64-bit page numbers). See ckptExportAppendlist().
+**
+**   For each level in the database, a level record. Formatted as follows:
+**
+**     0. Age of the level (least significant 16-bits). And flags mask (most
+**        significant 16-bits).
+**     1. The number of right-hand segments (nRight, possibly 0),
+**     2. Segment record for left-hand segment (8 integers defined below),
+**     3. Segment record for each right-hand segment (8 integers defined below),
+**     4. If nRight&gt;0, The number of segments involved in the merge
+**     5. if nRight&gt;0, Current nSkip value (see Merge structure defn.),
+**     6. For each segment in the merge:
+**        5a. Page number of next cell to read during merge (this field
+**            is 64-bits - 2 integers)
+**        5b. Cell number of next cell to read during merge
+**     7. Page containing current split-key (64-bits - 2 integers).
+**     8. Cell within page containing current split-key.
+**     9. Current pointer value (64-bits - 2 integers).
+**
+**   The block redirect array:
+**
+**     1. Number of redirections (maximum LSM_MAX_BLOCK_REDIRECTS).
+**     2. For each redirection:
+**        a. "from" block number
+**        b. "to" block number
+**
+**   The in-memory freelist entries. Each entry is either an insert or a
+**   delete. The in-memory freelist is to the free-block-list as the
+**   in-memory tree is to the users database content.
+**
+**     1. Number of free-list entries stored in checkpoint header.
+**     2. Number of free blocks (in total).
+**     3. Total number of blocks freed during database lifetime.
+**     4. For each entry:
+**        2a. Block number of free block.
+**        2b. A 64-bit integer (MSW followed by LSW). -1 for a delete entry,
+**            or the associated checkpoint id for an insert.
+**
+**   The checksum:
+**
+**     1. Checksum value 1.
+**     2. Checksum value 2.
+**
+** In the above, a segment record consists of the following four 64-bit 
+** fields (converted to 2 * u32 by storing the MSW followed by LSW):
+**
+**     1. First page of array,
+**     2. Last page of array,
+**     3. Root page of array (or 0),
+**     4. Size of array in pages.
+*/</comment>
+
+<comment type="block">/*
+** LARGE NUMBERS OF LEVEL RECORDS:
+**
+** A limit on the number of rhs segments that may be present in the database
+** file. Defining this limit ensures that all level records fit within
+** the 4096 byte limit for checkpoint blobs.
+**
+** The number of right-hand-side segments in a database is counted as 
+** follows:
+**
+**   * For each level in the database not undergoing a merge, add 1.
+**
+**   * For each level in the database that is undergoing a merge, add 
+**     the number of segments on the rhs of the level.
+**
+** A level record not undergoing a merge is 10 integers. A level record 
+** with nRhs rhs segments and (nRhs+1) input segments (i.e. including the 
+** separators from the next level) is (11*nRhs+20) integers. The maximum
+** per right-hand-side level is therefore 21 integers. So the maximum
+** size of all level records in a checkpoint is 21*40=820 integers.
+**
+** TODO: Before pointer values were changed from 32 to 64 bits, the above
+** used to come to 420 bytes - leaving significant space for a free-list
+** prefix. No more. To fix this, reduce the size of the level records in
+** a db snapshot, and improve management of the free-list tail in 
+** lsm_sorted.c. 
+*/</comment>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>LSM_MAX_RHS_SEGMENTS</name></cpp:macro> <cpp:value>40</cpp:value></cpp:define>
+
+<comment type="block">/*
+** LARGE NUMBERS OF FREELIST ENTRIES:
+**
+** There is also a limit (LSM_MAX_FREELIST_ENTRIES - defined in lsmInt.h)
+** on the number of free-list entries stored in a checkpoint. Since each 
+** free-list entry consists of 3 integers, the maximum free-list size is 
+** 3*100=300 integers. Combined with the limit on rhs segments defined
+** above, this ensures that a checkpoint always fits within a 4096 byte
+** meta page.
+**
+** If the database contains more than 100 free blocks, the "overflow" flag
+** in the checkpoint header is set and the remainder are stored in the
+** system FREELIST entry in the LSM (along with user data). The value
+** accompanying the FREELIST key in the LSM is, like a checkpoint, an array
+** of 32-bit big-endian integers. As follows:
+**
+**     For each entry:
+**       a. Block number of free block.
+**       b. MSW of associated checkpoint id.
+**       c. LSW of associated checkpoint id.
+**
+** The number of entries is not required - it is implied by the size of the
+** value blob containing the integer array.
+**
+** Note that the limit defined by LSM_MAX_FREELIST_ENTRIES is a hard limit.
+** The actual value used may be configured using LSM_CONFIG_MAX_FREELIST.
+*/</comment>
+
+<comment type="block">/*
+** The argument to this macro must be of type u32. On a little-endian
+** architecture, it returns the u32 value that results from interpreting
+** the 4 bytes as a big-endian value. On a big-endian architecture, it
+** returns the value that would be produced by intepreting the 4 bytes
+** of the input value as a little-endian integer.
+*/</comment>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>BYTESWAP32</name><parameter_list>(<parameter><type><name>x</name></type></parameter>)</parameter_list></cpp:macro> <cpp:value>( \
+   (((x)&amp;0x000000FF)&lt;&lt;24) + (((x)&amp;0x0000FF00)&lt;&lt;8)  \
+ + (((x)&amp;0x00FF0000)&gt;&gt;8)  + (((x)&amp;0xFF000000)&gt;&gt;24) \
+)</cpp:value></cpp:define>
+
+<decl_stmt><decl><type><specifier>static</specifier> <specifier>const</specifier> <name>int</name></type> <name>one</name> <init>= <expr><literal type="number">1</literal></expr></init></decl>;</decl_stmt>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>LSM_LITTLE_ENDIAN</name></cpp:macro> <cpp:value>(*(u8 *)(&amp;one))</cpp:value></cpp:define>
+
+<comment type="block">/* Sizes, in integers, of various parts of the checkpoint. */</comment>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>CKPT_HDR_SIZE</name></cpp:macro>         <cpp:value>9</cpp:value></cpp:define>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>CKPT_LOGPTR_SIZE</name></cpp:macro>      <cpp:value>4</cpp:value></cpp:define>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>CKPT_APPENDLIST_SIZE</name></cpp:macro>  <cpp:value>(LSM_APPLIST_SZ * 2)</cpp:value></cpp:define>
+
+<comment type="block">/* A #define to describe each integer in the checkpoint header. */</comment>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>CKPT_HDR_ID_MSW</name></cpp:macro>   <cpp:value>0</cpp:value></cpp:define>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>CKPT_HDR_ID_LSW</name></cpp:macro>   <cpp:value>1</cpp:value></cpp:define>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>CKPT_HDR_NCKPT</name></cpp:macro>    <cpp:value>2</cpp:value></cpp:define>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>CKPT_HDR_CMPID</name></cpp:macro>    <cpp:value>3</cpp:value></cpp:define>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>CKPT_HDR_NBLOCK</name></cpp:macro>   <cpp:value>4</cpp:value></cpp:define>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>CKPT_HDR_BLKSZ</name></cpp:macro>    <cpp:value>5</cpp:value></cpp:define>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>CKPT_HDR_NLEVEL</name></cpp:macro>   <cpp:value>6</cpp:value></cpp:define>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>CKPT_HDR_PGSZ</name></cpp:macro>     <cpp:value>7</cpp:value></cpp:define>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>CKPT_HDR_NWRITE</name></cpp:macro>   <cpp:value>8</cpp:value></cpp:define>
+
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>CKPT_HDR_LO_MSW</name></cpp:macro>     <cpp:value>9</cpp:value></cpp:define>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>CKPT_HDR_LO_LSW</name></cpp:macro>    <cpp:value>10</cpp:value></cpp:define>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>CKPT_HDR_LO_CKSUM1</name></cpp:macro> <cpp:value>11</cpp:value></cpp:define>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>CKPT_HDR_LO_CKSUM2</name></cpp:macro> <cpp:value>12</cpp:value></cpp:define>
+
+<typedef>typedef <type><name><name>struct</name> <name>CkptBuffer</name></name></type> <name>CkptBuffer</name>;</typedef>
+
+<comment type="block">/*
+** Dynamic buffer used to accumulate data for a checkpoint.
+*/</comment>
+<struct>struct <name>CkptBuffer</name> <block>{
+  <decl_stmt><decl><type><name>lsm_env</name> <modifier>*</modifier></type><name>pEnv</name></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>int</name></type> <name>nAlloc</name></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>u32</name> <modifier>*</modifier></type><name>aCkpt</name></decl>;</decl_stmt>
+}</block>;</struct>
+
+<comment type="block">/*
+** Calculate the checksum of the checkpoint specified by arguments aCkpt and
+** nCkpt. Store the checksum in *piCksum1 and *piCksum2 before returning.
+**
+** The value of the nCkpt parameter includes the two checksum values at
+** the end of the checkpoint. They are not used as inputs to the checksum 
+** calculation. The checksum is based on the array of (nCkpt-2) integers
+** at aCkpt[].
+*/</comment>
+<function><type><specifier>static</specifier> <name>void</name></type> <name>ckptChecksum</name><parameter_list>(<parameter><decl><type><name>u32</name> <modifier>*</modifier></type><name>aCkpt</name></decl></parameter>, <parameter><decl><type><name>u32</name></type> <name>nCkpt</name></decl></parameter>, <parameter><decl><type><name>u32</name> <modifier>*</modifier></type><name>piCksum1</name></decl></parameter>, <parameter><decl><type><name>u32</name> <modifier>*</modifier></type><name>piCksum2</name></decl></parameter>)</parameter_list><block>{<block_content>
+  <decl_stmt><decl><type><name>u32</name></type> <name>i</name></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>u32</name></type> <name>cksum1</name> <init>= <expr><literal type="number">1</literal></expr></init></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>u32</name></type> <name>cksum2</name> <init>= <expr><literal type="number">2</literal></expr></init></decl>;</decl_stmt>
+
+  <if_stmt><if>if<condition>( <expr><name>nCkpt</name> <operator>%</operator> <literal type="number">2</literal></expr> )</condition><block>{<block_content>
+    <expr_stmt><expr><name>cksum1</name> <operator>+=</operator> <name><name>aCkpt</name><index>[<expr><name>nCkpt</name><operator>-</operator><literal type="number">3</literal></expr>]</index></name> <operator>&amp;</operator> <literal type="number">0x0000FFFF</literal></expr>;</expr_stmt>
+    <expr_stmt><expr><name>cksum2</name> <operator>+=</operator> <name><name>aCkpt</name><index>[<expr><name>nCkpt</name><operator>-</operator><literal type="number">3</literal></expr>]</index></name> <operator>&amp;</operator> <literal type="number">0xFFFF0000</literal></expr>;</expr_stmt>
+  </block_content>}</block></if></if_stmt>
+
+  <for>for<control>(<init><expr><name>i</name><operator>=</operator><literal type="number">0</literal></expr>;</init> <condition><expr><operator>(</operator><name>i</name><operator>+</operator><literal type="number">3</literal><operator>)</operator><operator>&lt;</operator><name>nCkpt</name></expr>;</condition> <incr><expr><name>i</name><operator>+=</operator><literal type="number">2</literal></expr></incr>)</control><block>{<block_content>
+    <expr_stmt><expr><name>cksum1</name> <operator>+=</operator> <name>cksum2</name> <operator>+</operator> <name><name>aCkpt</name><index>[<expr><name>i</name></expr>]</index></name></expr>;</expr_stmt>
+    <expr_stmt><expr><name>cksum2</name> <operator>+=</operator> <name>cksum1</name> <operator>+</operator> <name><name>aCkpt</name><index>[<expr><name>i</name><operator>+</operator><literal type="number">1</literal></expr>]</index></name></expr>;</expr_stmt>
+  </block_content>}</block></for>
+
+  <expr_stmt><expr><operator>*</operator><name>piCksum1</name> <operator>=</operator> <name>cksum1</name></expr>;</expr_stmt>
+  <expr_stmt><expr><operator>*</operator><name>piCksum2</name> <operator>=</operator> <name>cksum2</name></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+** Set integer iIdx of the checkpoint accumulating in buffer *p to iVal.
+*/</comment>
+<function><type><specifier>static</specifier> <name>void</name></type> <name>ckptSetValue</name><parameter_list>(<parameter><decl><type><name>CkptBuffer</name> <modifier>*</modifier></type><name>p</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>iIdx</name></decl></parameter>, <parameter><decl><type><name>u32</name></type> <name>iVal</name></decl></parameter>, <parameter><decl><type><name>int</name> <modifier>*</modifier></type><name>pRc</name></decl></parameter>)</parameter_list><block>{<block_content>
+  <if_stmt><if>if<condition>( <expr><operator>*</operator><name>pRc</name></expr> )</condition><block type="pseudo"><block_content> <return>return;</return></block_content></block></if></if_stmt>
+  <if_stmt><if>if<condition>( <expr><name>iIdx</name><operator>&gt;=</operator><name><name>p</name><operator>-&gt;</operator><name>nAlloc</name></name></expr> )</condition><block>{<block_content>
+    <decl_stmt><decl><type><name>int</name></type> <name>nNew</name> <init>= <expr><call><name>LSM_MAX</name><argument_list>(<argument><expr><literal type="number">8</literal></expr></argument>, <argument><expr><name>iIdx</name><operator>*</operator><literal type="number">2</literal></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+    <expr_stmt><expr><name><name>p</name><operator>-&gt;</operator><name>aCkpt</name></name> <operator>=</operator> <operator>(</operator><name>u32</name> <operator>*</operator><operator>)</operator><call><name>lsmReallocOrFree</name><argument_list>(<argument><expr><name><name>p</name><operator>-&gt;</operator><name>pEnv</name></name></expr></argument>, <argument><expr><name><name>p</name><operator>-&gt;</operator><name>aCkpt</name></name></expr></argument>, <argument><expr><name>nNew</name><operator>*</operator><sizeof>sizeof<argument_list>(<argument><expr><name>u32</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <if_stmt><if>if<condition>( <expr><operator>!</operator><name><name>p</name><operator>-&gt;</operator><name>aCkpt</name></name></expr> )</condition><block>{<block_content>
+      <expr_stmt><expr><operator>*</operator><name>pRc</name> <operator>=</operator> <name>LSM_NOMEM_BKPT</name></expr>;</expr_stmt>
+      <return>return;</return>
+    </block_content>}</block></if></if_stmt>
+    <expr_stmt><expr><name><name>p</name><operator>-&gt;</operator><name>nAlloc</name></name> <operator>=</operator> <name>nNew</name></expr>;</expr_stmt>
+  </block_content>}</block></if></if_stmt>
+  <expr_stmt><expr><name><name>p</name><operator>-&gt;</operator><name>aCkpt</name><index>[<expr><name>iIdx</name></expr>]</index></name> <operator>=</operator> <name>iVal</name></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+** Argument aInt points to an array nInt elements in size. Switch the 
+** endian-ness of each element of the array.
+*/</comment>
+<function><type><specifier>static</specifier> <name>void</name></type> <name>ckptChangeEndianness</name><parameter_list>(<parameter><decl><type><name>u32</name> <modifier>*</modifier></type><name>aInt</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>nInt</name></decl></parameter>)</parameter_list><block>{<block_content>
+  <if_stmt><if>if<condition>( <expr><name>LSM_LITTLE_ENDIAN</name></expr> )</condition><block>{<block_content>
+    <decl_stmt><decl><type><name>int</name></type> <name>i</name></decl>;</decl_stmt>
+    <for>for<control>(<init><expr><name>i</name><operator>=</operator><literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name><operator>&lt;</operator><name>nInt</name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control><block type="pseudo"><block_content> <expr_stmt><expr><name><name>aInt</name><index>[<expr><name>i</name></expr>]</index></name> <operator>=</operator> <call><name>BYTESWAP32</name><argument_list>(<argument><expr><name><name>aInt</name><index>[<expr><name>i</name></expr>]</index></name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></for>
+  </block_content>}</block></if></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+** Object *p contains a checkpoint in native byte-order. The checkpoint is
+** nCkpt integers in size, not including any checksum. This function sets
+** the two checksum elements of the checkpoint accordingly.
+*/</comment>
+<function><type><specifier>static</specifier> <name>void</name></type> <name>ckptAddChecksum</name><parameter_list>(<parameter><decl><type><name>CkptBuffer</name> <modifier>*</modifier></type><name>p</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>nCkpt</name></decl></parameter>, <parameter><decl><type><name>int</name> <modifier>*</modifier></type><name>pRc</name></decl></parameter>)</parameter_list><block>{<block_content>
+  <if_stmt><if>if<condition>( <expr><operator>*</operator><name>pRc</name><operator>==</operator><name>LSM_OK</name></expr> )</condition><block>{<block_content>
+    <decl_stmt><decl><type><name>u32</name></type> <name><name>aCksum</name><index>[<expr><literal type="number">2</literal></expr>]</index></name> <init>= <expr><block>{<expr><literal type="number">0</literal></expr>, <expr><literal type="number">0</literal></expr>}</block></expr></init></decl>;</decl_stmt>
+    <expr_stmt><expr><call><name>ckptChecksum</name><argument_list>(<argument><expr><name><name>p</name><operator>-&gt;</operator><name>aCkpt</name></name></expr></argument>, <argument><expr><name>nCkpt</name><operator>+</operator><literal type="number">2</literal></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>aCksum</name><index>[<expr><literal type="number">0</literal></expr>]</index></name></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>aCksum</name><index>[<expr><literal type="number">1</literal></expr>]</index></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><call><name>ckptSetValue</name><argument_list>(<argument><expr><name>p</name></expr></argument>, <argument><expr><name>nCkpt</name></expr></argument>, <argument><expr><name><name>aCksum</name><index>[<expr><literal type="number">0</literal></expr>]</index></name></expr></argument>, <argument><expr><name>pRc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><call><name>ckptSetValue</name><argument_list>(<argument><expr><name>p</name></expr></argument>, <argument><expr><name>nCkpt</name><operator>+</operator><literal type="number">1</literal></expr></argument>, <argument><expr><name><name>aCksum</name><index>[<expr><literal type="number">1</literal></expr>]</index></name></expr></argument>, <argument><expr><name>pRc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  </block_content>}</block></if></if_stmt>
+</block_content>}</block></function>
+
+<function><type><specifier>static</specifier> <name>void</name></type> <name>ckptAppend64</name><parameter_list>(<parameter><decl><type><name>CkptBuffer</name> <modifier>*</modifier></type><name>p</name></decl></parameter>, <parameter><decl><type><name>int</name> <modifier>*</modifier></type><name>piOut</name></decl></parameter>, <parameter><decl><type><name>i64</name></type> <name>iVal</name></decl></parameter>, <parameter><decl><type><name>int</name> <modifier>*</modifier></type><name>pRc</name></decl></parameter>)</parameter_list><block>{<block_content>
+  <decl_stmt><decl><type><name>int</name></type> <name>iOut</name> <init>= <expr><operator>*</operator><name>piOut</name></expr></init></decl>;</decl_stmt>
+  <expr_stmt><expr><call><name>ckptSetValue</name><argument_list>(<argument><expr><name>p</name></expr></argument>, <argument><expr><name>iOut</name><operator>++</operator></expr></argument>, <argument><expr><operator>(</operator><name>iVal</name> <operator>&gt;&gt;</operator> <literal type="number">32</literal><operator>)</operator> <operator>&amp;</operator> <literal type="number">0xFFFFFFFF</literal></expr></argument>, <argument><expr><name>pRc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><call><name>ckptSetValue</name><argument_list>(<argument><expr><name>p</name></expr></argument>, <argument><expr><name>iOut</name><operator>++</operator></expr></argument>, <argument><expr><operator>(</operator><name>iVal</name> <operator>&amp;</operator> <literal type="number">0xFFFFFFFF</literal><operator>)</operator></expr></argument>, <argument><expr><name>pRc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><operator>*</operator><name>piOut</name> <operator>=</operator> <name>iOut</name></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<function><type><specifier>static</specifier> <name>i64</name></type> <name>ckptRead64</name><parameter_list>(<parameter><decl><type><name>u32</name> <modifier>*</modifier></type><name>a</name></decl></parameter>)</parameter_list><block>{<block_content>
+  <return>return <expr><operator>(</operator><operator>(</operator><operator>(</operator><name>i64</name><operator>)</operator><name><name>a</name><index>[<expr><literal type="number">0</literal></expr>]</index></name><operator>)</operator> <operator>&lt;&lt;</operator> <literal type="number">32</literal><operator>)</operator> <operator>+</operator> <operator>(</operator><name>i64</name><operator>)</operator><name><name>a</name><index>[<expr><literal type="number">1</literal></expr>]</index></name></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><specifier>static</specifier> <name>i64</name></type> <name>ckptGobble64</name><parameter_list>(<parameter><decl><type><name>u32</name> <modifier>*</modifier></type><name>a</name></decl></parameter>, <parameter><decl><type><name>int</name> <modifier>*</modifier></type><name>piIn</name></decl></parameter>)</parameter_list><block>{<block_content>
+  <decl_stmt><decl><type><name>int</name></type> <name>iIn</name> <init>= <expr><operator>*</operator><name>piIn</name></expr></init></decl>;</decl_stmt>
+  <expr_stmt><expr><operator>*</operator><name>piIn</name> <operator>+=</operator> <literal type="number">2</literal></expr>;</expr_stmt>
+  <return>return <expr><call><name>ckptRead64</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>a</name><index>[<expr><name>iIn</name></expr>]</index></name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+** Append a 6-value segment record corresponding to pSeg to the checkpoint 
+** buffer passed as the third argument.
+*/</comment>
+<function><type><specifier>static</specifier> <name>void</name></type> <name>ckptExportSegment</name><parameter_list>(
+  <parameter><decl><type><name>Segment</name> <modifier>*</modifier></type><name>pSeg</name></decl></parameter>, 
+  <parameter><decl><type><name>CkptBuffer</name> <modifier>*</modifier></type><name>p</name></decl></parameter>, 
+  <parameter><decl><type><name>int</name> <modifier>*</modifier></type><name>piOut</name></decl></parameter>, 
+  <parameter><decl><type><name>int</name> <modifier>*</modifier></type><name>pRc</name></decl></parameter>
+)</parameter_list><block>{<block_content>
+  <expr_stmt><expr><call><name>ckptAppend64</name><argument_list>(<argument><expr><name>p</name></expr></argument>, <argument><expr><name>piOut</name></expr></argument>, <argument><expr><name><name>pSeg</name><operator>-&gt;</operator><name>iFirst</name></name></expr></argument>, <argument><expr><name>pRc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><call><name>ckptAppend64</name><argument_list>(<argument><expr><name>p</name></expr></argument>, <argument><expr><name>piOut</name></expr></argument>, <argument><expr><name><name>pSeg</name><operator>-&gt;</operator><name>iLastPg</name></name></expr></argument>, <argument><expr><name>pRc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><call><name>ckptAppend64</name><argument_list>(<argument><expr><name>p</name></expr></argument>, <argument><expr><name>piOut</name></expr></argument>, <argument><expr><name><name>pSeg</name><operator>-&gt;</operator><name>iRoot</name></name></expr></argument>, <argument><expr><name>pRc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><call><name>ckptAppend64</name><argument_list>(<argument><expr><name>p</name></expr></argument>, <argument><expr><name>piOut</name></expr></argument>, <argument><expr><name><name>pSeg</name><operator>-&gt;</operator><name>nSize</name></name></expr></argument>, <argument><expr><name>pRc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<function><type><specifier>static</specifier> <name>void</name></type> <name>ckptExportLevel</name><parameter_list>(
+  <parameter><decl><type><name>Level</name> <modifier>*</modifier></type><name>pLevel</name></decl></parameter>,                  <comment type="block">/* Level object to serialize */</comment>
+  <parameter><decl><type><name>CkptBuffer</name> <modifier>*</modifier></type><name>p</name></decl></parameter>,                  <comment type="block">/* Append new level record to this ckpt */</comment>
+  <parameter><decl><type><name>int</name> <modifier>*</modifier></type><name>piOut</name></decl></parameter>,                     <comment type="block">/* IN/OUT: Size of checkpoint so far */</comment>
+  <parameter><decl><type><name>int</name> <modifier>*</modifier></type><name>pRc</name></decl></parameter>                        <comment type="block">/* IN/OUT: Error code */</comment>
+)</parameter_list><block>{<block_content>
+  <decl_stmt><decl><type><name>int</name></type> <name>iOut</name> <init>= <expr><operator>*</operator><name>piOut</name></expr></init></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>Merge</name> <modifier>*</modifier></type><name>pMerge</name></decl>;</decl_stmt>
+
+  <expr_stmt><expr><name>pMerge</name> <operator>=</operator> <name><name>pLevel</name><operator>-&gt;</operator><name>pMerge</name></name></expr>;</expr_stmt>
+  <expr_stmt><expr><call><name>ckptSetValue</name><argument_list>(<argument><expr><name>p</name></expr></argument>, <argument><expr><name>iOut</name><operator>++</operator></expr></argument>, <argument><expr><operator>(</operator><name>u32</name><operator>)</operator><name><name>pLevel</name><operator>-&gt;</operator><name>iAge</name></name> <operator>+</operator> <operator>(</operator><name>u32</name><operator>)</operator><operator>(</operator><name><name>pLevel</name><operator>-&gt;</operator><name>flags</name></name><operator>&lt;&lt;</operator><literal type="number">16</literal><operator>)</operator></expr></argument>, <argument><expr><name>pRc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><call><name>ckptSetValue</name><argument_list>(<argument><expr><name>p</name></expr></argument>, <argument><expr><name>iOut</name><operator>++</operator></expr></argument>, <argument><expr><name><name>pLevel</name><operator>-&gt;</operator><name>nRight</name></name></expr></argument>, <argument><expr><name>pRc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><call><name>ckptExportSegment</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>pLevel</name><operator>-&gt;</operator><name>lhs</name></name></expr></argument>, <argument><expr><name>p</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>iOut</name></expr></argument>, <argument><expr><name>pRc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+  <expr_stmt><expr><call><name>assert</name><argument_list>( <argument><expr><operator>(</operator><name><name>pLevel</name><operator>-&gt;</operator><name>nRight</name></name><operator>&gt;</operator><literal type="number">0</literal><operator>)</operator><operator>==</operator><operator>(</operator><name>pMerge</name><operator>!=</operator><literal type="number">0</literal><operator>)</operator></expr></argument> )</argument_list></call></expr>;</expr_stmt>
+  <if_stmt><if>if<condition>( <expr><name>pMerge</name></expr> )</condition><block>{<block_content>
+    <decl_stmt><decl><type><name>int</name></type> <name>i</name></decl>;</decl_stmt>
+    <for>for<control>(<init><expr><name>i</name><operator>=</operator><literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name><operator>&lt;</operator><name><name>pLevel</name><operator>-&gt;</operator><name>nRight</name></name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control><block>{<block_content>
+      <expr_stmt><expr><call><name>ckptExportSegment</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>pLevel</name><operator>-&gt;</operator><name>aRhs</name><index>[<expr><name>i</name></expr>]</index></name></expr></argument>, <argument><expr><name>p</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>iOut</name></expr></argument>, <argument><expr><name>pRc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    </block_content>}</block></for>
+    <expr_stmt><expr><call><name>assert</name><argument_list>( <argument><expr><name><name>pMerge</name><operator>-&gt;</operator><name>nInput</name></name><operator>==</operator><name><name>pLevel</name><operator>-&gt;</operator><name>nRight</name></name> 
+         <operator>||</operator> <name><name>pMerge</name><operator>-&gt;</operator><name>nInput</name></name><operator>==</operator><name><name>pLevel</name><operator>-&gt;</operator><name>nRight</name></name><operator>+</operator><literal type="number">1</literal></expr></argument> 
+    )</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><call><name>ckptSetValue</name><argument_list>(<argument><expr><name>p</name></expr></argument>, <argument><expr><name>iOut</name><operator>++</operator></expr></argument>, <argument><expr><name><name>pMerge</name><operator>-&gt;</operator><name>nInput</name></name></expr></argument>, <argument><expr><name>pRc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><call><name>ckptSetValue</name><argument_list>(<argument><expr><name>p</name></expr></argument>, <argument><expr><name>iOut</name><operator>++</operator></expr></argument>, <argument><expr><name><name>pMerge</name><operator>-&gt;</operator><name>nSkip</name></name></expr></argument>, <argument><expr><name>pRc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <for>for<control>(<init><expr><name>i</name><operator>=</operator><literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name><operator>&lt;</operator><name><name>pMerge</name><operator>-&gt;</operator><name>nInput</name></name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control><block>{<block_content>
+      <expr_stmt><expr><call><name>ckptAppend64</name><argument_list>(<argument><expr><name>p</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>iOut</name></expr></argument>, <argument><expr><name><name>pMerge</name><operator>-&gt;</operator><name>aInput</name><index>[<expr><name>i</name></expr>]</index></name><operator>.</operator><name>iPg</name></expr></argument>, <argument><expr><name>pRc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+      <expr_stmt><expr><call><name>ckptSetValue</name><argument_list>(<argument><expr><name>p</name></expr></argument>, <argument><expr><name>iOut</name><operator>++</operator></expr></argument>, <argument><expr><name><name>pMerge</name><operator>-&gt;</operator><name>aInput</name><index>[<expr><name>i</name></expr>]</index></name><operator>.</operator><name>iCell</name></expr></argument>, <argument><expr><name>pRc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    </block_content>}</block></for>
+    <expr_stmt><expr><call><name>ckptAppend64</name><argument_list>(<argument><expr><name>p</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>iOut</name></expr></argument>, <argument><expr><name><name>pMerge</name><operator>-&gt;</operator><name>splitkey</name><operator>.</operator><name>iPg</name></name></expr></argument>, <argument><expr><name>pRc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><call><name>ckptSetValue</name><argument_list>(<argument><expr><name>p</name></expr></argument>, <argument><expr><name>iOut</name><operator>++</operator></expr></argument>, <argument><expr><name><name>pMerge</name><operator>-&gt;</operator><name>splitkey</name><operator>.</operator><name>iCell</name></name></expr></argument>, <argument><expr><name>pRc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><call><name>ckptAppend64</name><argument_list>(<argument><expr><name>p</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>iOut</name></expr></argument>, <argument><expr><name><name>pMerge</name><operator>-&gt;</operator><name>iCurrentPtr</name></name></expr></argument>, <argument><expr><name>pRc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  </block_content>}</block></if></if_stmt>
+
+  <expr_stmt><expr><operator>*</operator><name>piOut</name> <operator>=</operator> <name>iOut</name></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+** Populate the log offset fields of the checkpoint buffer. 4 values.
+*/</comment>
+<function><type><specifier>static</specifier> <name>void</name></type> <name>ckptExportLog</name><parameter_list>(
+  <parameter><decl><type><name>lsm_db</name> <modifier>*</modifier></type><name>pDb</name></decl></parameter>, 
+  <parameter><decl><type><name>int</name></type> <name>bFlush</name></decl></parameter>,
+  <parameter><decl><type><name>CkptBuffer</name> <modifier>*</modifier></type><name>p</name></decl></parameter>, 
+  <parameter><decl><type><name>int</name> <modifier>*</modifier></type><name>piOut</name></decl></parameter>, 
+  <parameter><decl><type><name>int</name> <modifier>*</modifier></type><name>pRc</name></decl></parameter>
+)</parameter_list><block>{<block_content>
+  <decl_stmt><decl><type><name>int</name></type> <name>iOut</name> <init>= <expr><operator>*</operator><name>piOut</name></expr></init></decl>;</decl_stmt>
+
+  <expr_stmt><expr><call><name>assert</name><argument_list>( <argument><expr><name>iOut</name><operator>==</operator><name>CKPT_HDR_LO_MSW</name></expr></argument> )</argument_list></call></expr>;</expr_stmt>
+
+  <if_stmt><if>if<condition>( <expr><name>bFlush</name></expr> )</condition><block>{<block_content>
+    <decl_stmt><decl><type><name>i64</name></type> <name>iOff</name> <init>= <expr><name><name>pDb</name><operator>-&gt;</operator><name>treehdr</name><operator>.</operator><name>iOldLog</name></name></expr></init></decl>;</decl_stmt>
+    <expr_stmt><expr><call><name>ckptAppend64</name><argument_list>(<argument><expr><name>p</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>iOut</name></expr></argument>, <argument><expr><name>iOff</name></expr></argument>, <argument><expr><name>pRc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><call><name>ckptSetValue</name><argument_list>(<argument><expr><name>p</name></expr></argument>, <argument><expr><name>iOut</name><operator>++</operator></expr></argument>, <argument><expr><name><name>pDb</name><operator>-&gt;</operator><name>treehdr</name><operator>.</operator><name>oldcksum0</name></name></expr></argument>, <argument><expr><name>pRc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><call><name>ckptSetValue</name><argument_list>(<argument><expr><name>p</name></expr></argument>, <argument><expr><name>iOut</name><operator>++</operator></expr></argument>, <argument><expr><name><name>pDb</name><operator>-&gt;</operator><name>treehdr</name><operator>.</operator><name>oldcksum1</name></name></expr></argument>, <argument><expr><name>pRc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  </block_content>}</block></if><else>else<block>{<block_content>
+    <for>for<control>(<init>;</init> <condition><expr><name>iOut</name><operator>&lt;=</operator><name>CKPT_HDR_LO_CKSUM2</name></expr>;</condition> <incr><expr><name>iOut</name><operator>++</operator></expr></incr>)</control><block>{<block_content>
+      <expr_stmt><expr><call><name>ckptSetValue</name><argument_list>(<argument><expr><name>p</name></expr></argument>, <argument><expr><name>iOut</name></expr></argument>, <argument><expr><name><name>pDb</name><operator>-&gt;</operator><name>pShmhdr</name><operator>-&gt;</operator><name>aSnap2</name><index>[<expr><name>iOut</name></expr>]</index></name></expr></argument>, <argument><expr><name>pRc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    </block_content>}</block></for>
+  </block_content>}</block></else></if_stmt>
+
+  <expr_stmt><expr><call><name>assert</name><argument_list>( <argument><expr><operator>*</operator><name>pRc</name> <operator>||</operator> <name>iOut</name><operator>==</operator><name>CKPT_HDR_LO_CKSUM2</name><operator>+</operator><literal type="number">1</literal></expr></argument> )</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><operator>*</operator><name>piOut</name> <operator>=</operator> <name>iOut</name></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<function><type><specifier>static</specifier> <name>void</name></type> <name>ckptExportAppendlist</name><parameter_list>(
+  <parameter><decl><type><name>lsm_db</name> <modifier>*</modifier></type><name>db</name></decl></parameter>,                     <comment type="block">/* Database connection */</comment>
+  <parameter><decl><type><name>CkptBuffer</name> <modifier>*</modifier></type><name>p</name></decl></parameter>,                  <comment type="block">/* Checkpoint buffer to write to */</comment>
+  <parameter><decl><type><name>int</name> <modifier>*</modifier></type><name>piOut</name></decl></parameter>,                     <comment type="block">/* IN/OUT: Offset within checkpoint buffer */</comment>
+  <parameter><decl><type><name>int</name> <modifier>*</modifier></type><name>pRc</name></decl></parameter>                        <comment type="block">/* IN/OUT: Error code */</comment>
+)</parameter_list><block>{<block_content>
+  <decl_stmt><decl><type><name>int</name></type> <name>i</name></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>LsmPgno</name> <modifier>*</modifier></type><name>aiAppend</name> <init>= <expr><name><name>db</name><operator>-&gt;</operator><name>pWorker</name><operator>-&gt;</operator><name>aiAppend</name></name></expr></init></decl>;</decl_stmt>
+
+  <for>for<control>(<init><expr><name>i</name><operator>=</operator><literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name><operator>&lt;</operator><name>LSM_APPLIST_SZ</name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control><block>{<block_content>
+    <expr_stmt><expr><call><name>ckptAppend64</name><argument_list>(<argument><expr><name>p</name></expr></argument>, <argument><expr><name>piOut</name></expr></argument>, <argument><expr><name><name>aiAppend</name><index>[<expr><name>i</name></expr>]</index></name></expr></argument>, <argument><expr><name>pRc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  </block_content>}</block></for>
+</block_content>}</block></function><empty_stmt>;</empty_stmt>
+
+<function><type><specifier>static</specifier> <name>int</name></type> <name>ckptExportSnapshot</name><parameter_list>( 
+  <parameter><decl><type><name>lsm_db</name> <modifier>*</modifier></type><name>pDb</name></decl></parameter>,                    <comment type="block">/* Connection handle */</comment>
+  <parameter><decl><type><name>int</name></type> <name>bLog</name></decl></parameter>,                       <comment type="block">/* True to update log-offset fields */</comment>
+  <parameter><decl><type><name>i64</name></type> <name>iId</name></decl></parameter>,                        <comment type="block">/* Checkpoint id */</comment>
+  <parameter><decl><type><name>int</name></type> <name>bCksum</name></decl></parameter>,                     <comment type="block">/* If true, include checksums */</comment>
+  <parameter><decl><type><name>void</name> <modifier>*</modifier><modifier>*</modifier></type><name>ppCkpt</name></decl></parameter>,                  <comment type="block">/* OUT: Buffer containing checkpoint */</comment>
+  <parameter><decl><type><name>int</name> <modifier>*</modifier></type><name>pnCkpt</name></decl></parameter>                     <comment type="block">/* OUT: Size of checkpoint in bytes */</comment>
+)</parameter_list><block>{<block_content>
+  <decl_stmt><decl><type><name>int</name></type> <name>rc</name> <init>= <expr><name>LSM_OK</name></expr></init></decl>;</decl_stmt>                <comment type="block">/* Return Code */</comment>
+  <decl_stmt><decl><type><name>FileSystem</name> <modifier>*</modifier></type><name>pFS</name> <init>= <expr><name><name>pDb</name><operator>-&gt;</operator><name>pFS</name></name></expr></init></decl>;</decl_stmt>     <comment type="block">/* File system object */</comment>
+  <decl_stmt><decl><type><name>Snapshot</name> <modifier>*</modifier></type><name>pSnap</name> <init>= <expr><name><name>pDb</name><operator>-&gt;</operator><name>pWorker</name></name></expr></init></decl>;</decl_stmt> <comment type="block">/* Worker snapshot */</comment>
+  <decl_stmt><decl><type><name>int</name></type> <name>nLevel</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>                 <comment type="block">/* Number of levels in checkpoint */</comment>
+  <decl_stmt><decl><type><name>int</name></type> <name>iLevel</name></decl>;</decl_stmt>                     <comment type="block">/* Used to count out nLevel levels */</comment>
+  <decl_stmt><decl><type><name>int</name></type> <name>iOut</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>                   <comment type="block">/* Current offset in aCkpt[] */</comment>
+  <decl_stmt><decl><type><name>Level</name> <modifier>*</modifier></type><name>pLevel</name></decl>;</decl_stmt>                  <comment type="block">/* Level iterator */</comment>
+  <decl_stmt><decl><type><name>int</name></type> <name>i</name></decl>;</decl_stmt>                          <comment type="block">/* Iterator used while serializing freelist */</comment>
+  <decl_stmt><decl><type><name>CkptBuffer</name></type> <name>ckpt</name></decl>;</decl_stmt>
+
+  <comment type="block">/* Initialize the output buffer */</comment>
+  <expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><operator>&amp;</operator><name>ckpt</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>CkptBuffer</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><name><name>ckpt</name><operator>.</operator><name>pEnv</name></name> <operator>=</operator> <name><name>pDb</name><operator>-&gt;</operator><name>pEnv</name></name></expr>;</expr_stmt>
+  <expr_stmt><expr><name>iOut</name> <operator>=</operator> <name>CKPT_HDR_SIZE</name></expr>;</expr_stmt>
+
+  <comment type="block">/* Write the log offset into the checkpoint. */</comment>
+  <expr_stmt><expr><call><name>ckptExportLog</name><argument_list>(<argument><expr><name>pDb</name></expr></argument>, <argument><expr><name>bLog</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>ckpt</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>iOut</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>rc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+  <comment type="block">/* Write the append-point list */</comment>
+  <expr_stmt><expr><call><name>ckptExportAppendlist</name><argument_list>(<argument><expr><name>pDb</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>ckpt</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>iOut</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>rc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+  <comment type="block">/* Figure out how many levels will be written to the checkpoint. */</comment>
+  <for>for<control>(<init><expr><name>pLevel</name><operator>=</operator><call><name>lsmDbSnapshotLevel</name><argument_list>(<argument><expr><name>pSnap</name></expr></argument>)</argument_list></call></expr>;</init> <condition><expr><name>pLevel</name></expr>;</condition> <incr><expr><name>pLevel</name><operator>=</operator><name><name>pLevel</name><operator>-&gt;</operator><name>pNext</name></name></expr></incr>)</control><block type="pseudo"><block_content> <expr_stmt><expr><name>nLevel</name><operator>++</operator></expr>;</expr_stmt></block_content></block></for>
+
+  <comment type="block">/* Serialize nLevel levels. */</comment>
+  <expr_stmt><expr><name>iLevel</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+  <for>for<control>(<init><expr><name>pLevel</name><operator>=</operator><call><name>lsmDbSnapshotLevel</name><argument_list>(<argument><expr><name>pSnap</name></expr></argument>)</argument_list></call></expr>;</init> <condition><expr><name>iLevel</name><operator>&lt;</operator><name>nLevel</name></expr>;</condition> <incr><expr><name>pLevel</name><operator>=</operator><name><name>pLevel</name><operator>-&gt;</operator><name>pNext</name></name></expr></incr>)</control><block>{<block_content>
+    <expr_stmt><expr><call><name>ckptExportLevel</name><argument_list>(<argument><expr><name>pLevel</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>ckpt</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>iOut</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>rc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><name>iLevel</name><operator>++</operator></expr>;</expr_stmt>
+  </block_content>}</block></for>
+
+  <comment type="block">/* Write the block-redirect list */</comment>
+  <expr_stmt><expr><call><name>ckptSetValue</name><argument_list>(<argument><expr><operator>&amp;</operator><name>ckpt</name></expr></argument>, <argument><expr><name>iOut</name><operator>++</operator></expr></argument>, <argument><expr><name><name>pSnap</name><operator>-&gt;</operator><name>redirect</name><operator>.</operator><name>n</name></name></expr></argument>, <argument><expr><operator>&amp;</operator><name>rc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <for>for<control>(<init><expr><name>i</name><operator>=</operator><literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name><operator>&lt;</operator><name><name>pSnap</name><operator>-&gt;</operator><name>redirect</name><operator>.</operator><name>n</name></name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control><block>{<block_content>
+    <expr_stmt><expr><call><name>ckptSetValue</name><argument_list>(<argument><expr><operator>&amp;</operator><name>ckpt</name></expr></argument>, <argument><expr><name>iOut</name><operator>++</operator></expr></argument>, <argument><expr><name><name>pSnap</name><operator>-&gt;</operator><name>redirect</name><operator>.</operator><name>a</name><index>[<expr><name>i</name></expr>]</index></name><operator>.</operator><name>iFrom</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>rc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><call><name>ckptSetValue</name><argument_list>(<argument><expr><operator>&amp;</operator><name>ckpt</name></expr></argument>, <argument><expr><name>iOut</name><operator>++</operator></expr></argument>, <argument><expr><name><name>pSnap</name><operator>-&gt;</operator><name>redirect</name><operator>.</operator><name>a</name><index>[<expr><name>i</name></expr>]</index></name><operator>.</operator><name>iTo</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>rc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  </block_content>}</block></for>
+
+  <comment type="block">/* Write the freelist */</comment>
+  <expr_stmt><expr><call><name>assert</name><argument_list>( <argument><expr><name><name>pSnap</name><operator>-&gt;</operator><name>freelist</name><operator>.</operator><name>nEntry</name></name><operator>&lt;=</operator><name><name>pDb</name><operator>-&gt;</operator><name>nMaxFreelist</name></name></expr></argument> )</argument_list></call></expr>;</expr_stmt>
+  <if_stmt><if>if<condition>( <expr><name>rc</name><operator>==</operator><name>LSM_OK</name></expr> )</condition><block>{<block_content>
+    <decl_stmt><decl><type><name>int</name></type> <name>nFree</name> <init>= <expr><name><name>pSnap</name><operator>-&gt;</operator><name>freelist</name><operator>.</operator><name>nEntry</name></name></expr></init></decl>;</decl_stmt>
+    <expr_stmt><expr><call><name>ckptSetValue</name><argument_list>(<argument><expr><operator>&amp;</operator><name>ckpt</name></expr></argument>, <argument><expr><name>iOut</name><operator>++</operator></expr></argument>, <argument><expr><name>nFree</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>rc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <for>for<control>(<init><expr><name>i</name><operator>=</operator><literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name><operator>&lt;</operator><name>nFree</name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control><block>{<block_content>
+      <decl_stmt><decl><type><name>FreelistEntry</name> <modifier>*</modifier></type><name>p</name> <init>= <expr><operator>&amp;</operator><name><name>pSnap</name><operator>-&gt;</operator><name>freelist</name><operator>.</operator><name>aEntry</name><index>[<expr><name>i</name></expr>]</index></name></expr></init></decl>;</decl_stmt>
+      <expr_stmt><expr><call><name>ckptSetValue</name><argument_list>(<argument><expr><operator>&amp;</operator><name>ckpt</name></expr></argument>, <argument><expr><name>iOut</name><operator>++</operator></expr></argument>, <argument><expr><name><name>p</name><operator>-&gt;</operator><name>iBlk</name></name></expr></argument>, <argument><expr><operator>&amp;</operator><name>rc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+      <expr_stmt><expr><call><name>ckptSetValue</name><argument_list>(<argument><expr><operator>&amp;</operator><name>ckpt</name></expr></argument>, <argument><expr><name>iOut</name><operator>++</operator></expr></argument>, <argument><expr><operator>(</operator><name><name>p</name><operator>-&gt;</operator><name>iId</name></name> <operator>&gt;&gt;</operator> <literal type="number">32</literal><operator>)</operator> <operator>&amp;</operator> <literal type="number">0xFFFFFFFF</literal></expr></argument>, <argument><expr><operator>&amp;</operator><name>rc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+      <expr_stmt><expr><call><name>ckptSetValue</name><argument_list>(<argument><expr><operator>&amp;</operator><name>ckpt</name></expr></argument>, <argument><expr><name>iOut</name><operator>++</operator></expr></argument>, <argument><expr><name><name>p</name><operator>-&gt;</operator><name>iId</name></name> <operator>&amp;</operator> <literal type="number">0xFFFFFFFF</literal></expr></argument>, <argument><expr><operator>&amp;</operator><name>rc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    </block_content>}</block></for>
+  </block_content>}</block></if></if_stmt>
+
+  <comment type="block">/* Write the checkpoint header */</comment>
+  <expr_stmt><expr><call><name>assert</name><argument_list>( <argument><expr><name>iId</name><operator>&gt;=</operator><literal type="number">0</literal></expr></argument> )</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><call><name>assert</name><argument_list>( <argument><expr><name><name>pSnap</name><operator>-&gt;</operator><name>iCmpId</name></name><operator>==</operator><name><name>pDb</name><operator>-&gt;</operator><name>compress</name><operator>.</operator><name>iId</name></name>
+       <operator>||</operator> <name><name>pSnap</name><operator>-&gt;</operator><name>iCmpId</name></name><operator>==</operator><name>LSM_COMPRESSION_EMPTY</name></expr></argument> 
+  )</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><call><name>ckptSetValue</name><argument_list>(<argument><expr><operator>&amp;</operator><name>ckpt</name></expr></argument>, <argument><expr><name>CKPT_HDR_ID_MSW</name></expr></argument>, <argument><expr><operator>(</operator><name>u32</name><operator>)</operator><operator>(</operator><name>iId</name><operator>&gt;&gt;</operator><literal type="number">32</literal><operator>)</operator></expr></argument>, <argument><expr><operator>&amp;</operator><name>rc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><call><name>ckptSetValue</name><argument_list>(<argument><expr><operator>&amp;</operator><name>ckpt</name></expr></argument>, <argument><expr><name>CKPT_HDR_ID_LSW</name></expr></argument>, <argument><expr><operator>(</operator><name>u32</name><operator>)</operator><operator>(</operator><name>iId</name><operator>&amp;</operator><literal type="number">0xFFFFFFFF</literal><operator>)</operator></expr></argument>, <argument><expr><operator>&amp;</operator><name>rc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><call><name>ckptSetValue</name><argument_list>(<argument><expr><operator>&amp;</operator><name>ckpt</name></expr></argument>, <argument><expr><name>CKPT_HDR_NCKPT</name></expr></argument>, <argument><expr><name>iOut</name><operator>+</operator><literal type="number">2</literal></expr></argument>, <argument><expr><operator>&amp;</operator><name>rc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><call><name>ckptSetValue</name><argument_list>(<argument><expr><operator>&amp;</operator><name>ckpt</name></expr></argument>, <argument><expr><name>CKPT_HDR_CMPID</name></expr></argument>, <argument><expr><name><name>pDb</name><operator>-&gt;</operator><name>compress</name><operator>.</operator><name>iId</name></name></expr></argument>, <argument><expr><operator>&amp;</operator><name>rc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><call><name>ckptSetValue</name><argument_list>(<argument><expr><operator>&amp;</operator><name>ckpt</name></expr></argument>, <argument><expr><name>CKPT_HDR_NBLOCK</name></expr></argument>, <argument><expr><name><name>pSnap</name><operator>-&gt;</operator><name>nBlock</name></name></expr></argument>, <argument><expr><operator>&amp;</operator><name>rc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><call><name>ckptSetValue</name><argument_list>(<argument><expr><operator>&amp;</operator><name>ckpt</name></expr></argument>, <argument><expr><name>CKPT_HDR_BLKSZ</name></expr></argument>, <argument><expr><call><name>lsmFsBlockSize</name><argument_list>(<argument><expr><name>pFS</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><operator>&amp;</operator><name>rc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><call><name>ckptSetValue</name><argument_list>(<argument><expr><operator>&amp;</operator><name>ckpt</name></expr></argument>, <argument><expr><name>CKPT_HDR_NLEVEL</name></expr></argument>, <argument><expr><name>nLevel</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>rc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><call><name>ckptSetValue</name><argument_list>(<argument><expr><operator>&amp;</operator><name>ckpt</name></expr></argument>, <argument><expr><name>CKPT_HDR_PGSZ</name></expr></argument>, <argument><expr><call><name>lsmFsPageSize</name><argument_list>(<argument><expr><name>pFS</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><operator>&amp;</operator><name>rc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><call><name>ckptSetValue</name><argument_list>(<argument><expr><operator>&amp;</operator><name>ckpt</name></expr></argument>, <argument><expr><name>CKPT_HDR_NWRITE</name></expr></argument>, <argument><expr><name><name>pSnap</name><operator>-&gt;</operator><name>nWrite</name></name></expr></argument>, <argument><expr><operator>&amp;</operator><name>rc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+  <if_stmt><if>if<condition>( <expr><name>bCksum</name></expr> )</condition><block>{<block_content>
+    <expr_stmt><expr><call><name>ckptAddChecksum</name><argument_list>(<argument><expr><operator>&amp;</operator><name>ckpt</name></expr></argument>, <argument><expr><name>iOut</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>rc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  </block_content>}</block></if><else>else<block>{<block_content>
+    <expr_stmt><expr><call><name>ckptSetValue</name><argument_list>(<argument><expr><operator>&amp;</operator><name>ckpt</name></expr></argument>, <argument><expr><name>iOut</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><operator>&amp;</operator><name>rc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><call><name>ckptSetValue</name><argument_list>(<argument><expr><operator>&amp;</operator><name>ckpt</name></expr></argument>, <argument><expr><name>iOut</name><operator>+</operator><literal type="number">1</literal></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><operator>&amp;</operator><name>rc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  </block_content>}</block></else></if_stmt>
+  <expr_stmt><expr><name>iOut</name> <operator>+=</operator> <literal type="number">2</literal></expr>;</expr_stmt>
+  <expr_stmt><expr><call><name>assert</name><argument_list>( <argument><expr><name>iOut</name><operator>&lt;=</operator><literal type="number">1024</literal></expr></argument> )</argument_list></call></expr>;</expr_stmt>
+
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>LSM_LOG_FREELIST</name></cpp:ifdef>
+  <expr_stmt><expr><call><name>lsmLogMessage</name><argument_list>(<argument><expr><name>pDb</name></expr></argument>, <argument><expr><name>rc</name></expr></argument>, 
+      <argument><expr><literal type="string">"ckptExportSnapshot(): id=%lld freelist: %d"</literal></expr></argument>, <argument><expr><name>iId</name></expr></argument>, <argument><expr><name><name>pSnap</name><operator>-&gt;</operator><name>freelist</name><operator>.</operator><name>nEntry</name></name></expr></argument>
+  )</argument_list></call></expr>;</expr_stmt>
+  <for>for<control>(<init><expr><name>i</name><operator>=</operator><literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name><operator>&lt;</operator><name><name>pSnap</name><operator>-&gt;</operator><name>freelist</name><operator>.</operator><name>nEntry</name></name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control><block>{<block_content>
+  <expr_stmt><expr><call><name>lsmLogMessage</name><argument_list>(<argument><expr><name>pDb</name></expr></argument>, <argument><expr><name>rc</name></expr></argument>, 
+      <argument><expr><literal type="string">"ckptExportSnapshot(): iBlk=%d id=%lld"</literal></expr></argument>, 
+      <argument><expr><name><name>pSnap</name><operator>-&gt;</operator><name>freelist</name><operator>.</operator><name>aEntry</name><index>[<expr><name>i</name></expr>]</index></name><operator>.</operator><name>iBlk</name></expr></argument>,
+      <argument><expr><name><name>pSnap</name><operator>-&gt;</operator><name>freelist</name><operator>.</operator><name>aEntry</name><index>[<expr><name>i</name></expr>]</index></name><operator>.</operator><name>iId</name></expr></argument>
+  )</argument_list></call></expr>;</expr_stmt>
+  </block_content>}</block></for>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+  <expr_stmt><expr><operator>*</operator><name>ppCkpt</name> <operator>=</operator> <operator>(</operator><name>void</name> <operator>*</operator><operator>)</operator><name><name>ckpt</name><operator>.</operator><name>aCkpt</name></name></expr>;</expr_stmt>
+  <if_stmt><if>if<condition>( <expr><name>pnCkpt</name></expr> )</condition><block type="pseudo"><block_content> <expr_stmt><expr><operator>*</operator><name>pnCkpt</name> <operator>=</operator> <sizeof>sizeof<argument_list>(<argument><expr><name>u32</name></expr></argument>)</argument_list></sizeof><operator>*</operator><name>iOut</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+  <return>return <expr><name>rc</name></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+** Helper function for ckptImport().
+*/</comment>
+<function><type><specifier>static</specifier> <name>void</name></type> <name>ckptNewSegment</name><parameter_list>(
+  <parameter><decl><type><name>u32</name> <modifier>*</modifier></type><name>aIn</name></decl></parameter>,
+  <parameter><decl><type><name>int</name> <modifier>*</modifier></type><name>piIn</name></decl></parameter>,
+  <parameter><decl><type><name>Segment</name> <modifier>*</modifier></type><name>pSegment</name></decl></parameter>               <comment type="block">/* Populate this structure */</comment>
+)</parameter_list><block>{<block_content>
+  <expr_stmt><expr><call><name>assert</name><argument_list>( <argument><expr><name><name>pSegment</name><operator>-&gt;</operator><name>iFirst</name></name><operator>==</operator><literal type="number">0</literal> <operator>&amp;&amp;</operator> <name><name>pSegment</name><operator>-&gt;</operator><name>iLastPg</name></name><operator>==</operator><literal type="number">0</literal></expr></argument> )</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><call><name>assert</name><argument_list>( <argument><expr><name><name>pSegment</name><operator>-&gt;</operator><name>nSize</name></name><operator>==</operator><literal type="number">0</literal> <operator>&amp;&amp;</operator> <name><name>pSegment</name><operator>-&gt;</operator><name>iRoot</name></name><operator>==</operator><literal type="number">0</literal></expr></argument> )</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><name><name>pSegment</name><operator>-&gt;</operator><name>iFirst</name></name> <operator>=</operator> <call><name>ckptGobble64</name><argument_list>(<argument><expr><name>aIn</name></expr></argument>, <argument><expr><name>piIn</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><name><name>pSegment</name><operator>-&gt;</operator><name>iLastPg</name></name> <operator>=</operator> <call><name>ckptGobble64</name><argument_list>(<argument><expr><name>aIn</name></expr></argument>, <argument><expr><name>piIn</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><name><name>pSegment</name><operator>-&gt;</operator><name>iRoot</name></name> <operator>=</operator> <call><name>ckptGobble64</name><argument_list>(<argument><expr><name>aIn</name></expr></argument>, <argument><expr><name>piIn</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><name><name>pSegment</name><operator>-&gt;</operator><name>nSize</name></name> <operator>=</operator> <operator>(</operator><name>int</name><operator>)</operator><call><name>ckptGobble64</name><argument_list>(<argument><expr><name>aIn</name></expr></argument>, <argument><expr><name>piIn</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><call><name>assert</name><argument_list>( <argument><expr><name><name>pSegment</name><operator>-&gt;</operator><name>iFirst</name></name></expr></argument> )</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<function><type><specifier>static</specifier> <name>int</name></type> <name>ckptSetupMerge</name><parameter_list>(<parameter><decl><type><name>lsm_db</name> <modifier>*</modifier></type><name>pDb</name></decl></parameter>, <parameter><decl><type><name>u32</name> <modifier>*</modifier></type><name>aInt</name></decl></parameter>, <parameter><decl><type><name>int</name> <modifier>*</modifier></type><name>piIn</name></decl></parameter>, <parameter><decl><type><name>Level</name> <modifier>*</modifier></type><name>pLevel</name></decl></parameter>)</parameter_list><block>{<block_content>
+  <decl_stmt><decl><type><name>Merge</name> <modifier>*</modifier></type><name>pMerge</name></decl>;</decl_stmt>                  <comment type="block">/* Allocated Merge object */</comment>
+  <decl_stmt><decl><type><name>int</name></type> <name>nInput</name></decl>;</decl_stmt>                     <comment type="block">/* Number of input segments in merge */</comment>
+  <decl_stmt><decl><type><name>int</name></type> <name>iIn</name> <init>= <expr><operator>*</operator><name>piIn</name></expr></init></decl>;</decl_stmt>                <comment type="block">/* Next value to read from aInt[] */</comment>
+  <decl_stmt><decl><type><name>int</name></type> <name>i</name></decl>;</decl_stmt>                          <comment type="block">/* Iterator variable */</comment>
+  <decl_stmt><decl><type><name>int</name></type> <name>nByte</name></decl>;</decl_stmt>                      <comment type="block">/* Number of bytes to allocate */</comment>
+
+  <comment type="block">/* Allocate the Merge object. If malloc() fails, return LSM_NOMEM. */</comment>
+  <expr_stmt><expr><name>nInput</name> <operator>=</operator> <operator>(</operator><name>int</name><operator>)</operator><name><name>aInt</name><index>[<expr><name>iIn</name><operator>++</operator></expr>]</index></name></expr>;</expr_stmt>
+  <expr_stmt><expr><name>nByte</name> <operator>=</operator> <sizeof>sizeof<argument_list>(<argument><expr><name>Merge</name></expr></argument>)</argument_list></sizeof> <operator>+</operator> <sizeof>sizeof<argument_list>(<argument><expr><name>MergeInput</name></expr></argument>)</argument_list></sizeof> <operator>*</operator> <name>nInput</name></expr>;</expr_stmt>
+  <expr_stmt><expr><name>pMerge</name> <operator>=</operator> <operator>(</operator><name>Merge</name> <operator>*</operator><operator>)</operator><call><name>lsmMallocZero</name><argument_list>(<argument><expr><name><name>pDb</name><operator>-&gt;</operator><name>pEnv</name></name></expr></argument>, <argument><expr><name>nByte</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <if_stmt><if>if<condition>( <expr><operator>!</operator><name>pMerge</name></expr> )</condition><block type="pseudo"><block_content> <return>return <expr><name>LSM_NOMEM_BKPT</name></expr>;</return></block_content></block></if></if_stmt>
+  <expr_stmt><expr><name><name>pLevel</name><operator>-&gt;</operator><name>pMerge</name></name> <operator>=</operator> <name>pMerge</name></expr>;</expr_stmt>
+
+  <comment type="block">/* Populate the Merge object. */</comment>
+  <expr_stmt><expr><name><name>pMerge</name><operator>-&gt;</operator><name>aInput</name></name> <operator>=</operator> <operator>(</operator><name>MergeInput</name> <operator>*</operator><operator>)</operator><operator>&amp;</operator><name><name>pMerge</name><index>[<expr><literal type="number">1</literal></expr>]</index></name></expr>;</expr_stmt>
+  <expr_stmt><expr><name><name>pMerge</name><operator>-&gt;</operator><name>nInput</name></name> <operator>=</operator> <name>nInput</name></expr>;</expr_stmt>
+  <expr_stmt><expr><name><name>pMerge</name><operator>-&gt;</operator><name>iOutputOff</name></name> <operator>=</operator> <operator>-</operator><literal type="number">1</literal></expr>;</expr_stmt>
+  <expr_stmt><expr><name><name>pMerge</name><operator>-&gt;</operator><name>nSkip</name></name> <operator>=</operator> <operator>(</operator><name>int</name><operator>)</operator><name><name>aInt</name><index>[<expr><name>iIn</name><operator>++</operator></expr>]</index></name></expr>;</expr_stmt>
+  <for>for<control>(<init><expr><name>i</name><operator>=</operator><literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name><operator>&lt;</operator><name>nInput</name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control><block>{<block_content>
+    <expr_stmt><expr><name><name>pMerge</name><operator>-&gt;</operator><name>aInput</name><index>[<expr><name>i</name></expr>]</index></name><operator>.</operator><name>iPg</name> <operator>=</operator> <call><name>ckptGobble64</name><argument_list>(<argument><expr><name>aInt</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>iIn</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>pMerge</name><operator>-&gt;</operator><name>aInput</name><index>[<expr><name>i</name></expr>]</index></name><operator>.</operator><name>iCell</name> <operator>=</operator> <operator>(</operator><name>int</name><operator>)</operator><name><name>aInt</name><index>[<expr><name>iIn</name><operator>++</operator></expr>]</index></name></expr>;</expr_stmt>
+  </block_content>}</block></for>
+  <expr_stmt><expr><name><name>pMerge</name><operator>-&gt;</operator><name>splitkey</name><operator>.</operator><name>iPg</name></name> <operator>=</operator> <call><name>ckptGobble64</name><argument_list>(<argument><expr><name>aInt</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>iIn</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><name><name>pMerge</name><operator>-&gt;</operator><name>splitkey</name><operator>.</operator><name>iCell</name></name> <operator>=</operator> <operator>(</operator><name>int</name><operator>)</operator><name><name>aInt</name><index>[<expr><name>iIn</name><operator>++</operator></expr>]</index></name></expr>;</expr_stmt>
+  <expr_stmt><expr><name><name>pMerge</name><operator>-&gt;</operator><name>iCurrentPtr</name></name> <operator>=</operator> <call><name>ckptGobble64</name><argument_list>(<argument><expr><name>aInt</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>iIn</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+  <comment type="block">/* Set *piIn and return LSM_OK. */</comment>
+  <expr_stmt><expr><operator>*</operator><name>piIn</name> <operator>=</operator> <name>iIn</name></expr>;</expr_stmt>
+  <return>return <expr><name>LSM_OK</name></expr>;</return>
+</block_content>}</block></function>
+
+
+<function><type><specifier>static</specifier> <name>int</name></type> <name>ckptLoadLevels</name><parameter_list>(
+  <parameter><decl><type><name>lsm_db</name> <modifier>*</modifier></type><name>pDb</name></decl></parameter>,
+  <parameter><decl><type><name>u32</name> <modifier>*</modifier></type><name>aIn</name></decl></parameter>, 
+  <parameter><decl><type><name>int</name> <modifier>*</modifier></type><name>piIn</name></decl></parameter>, 
+  <parameter><decl><type><name>int</name></type> <name>nLevel</name></decl></parameter>,
+  <parameter><decl><type><name>Level</name> <modifier>*</modifier><modifier>*</modifier></type><name>ppLevel</name></decl></parameter>
+)</parameter_list><block>{<block_content>
+  <decl_stmt><decl><type><name>int</name></type> <name>i</name></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>int</name></type> <name>rc</name> <init>= <expr><name>LSM_OK</name></expr></init></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>Level</name> <modifier>*</modifier></type><name>pRet</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>Level</name> <modifier>*</modifier><modifier>*</modifier></type><name>ppNext</name></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>int</name></type> <name>iIn</name> <init>= <expr><operator>*</operator><name>piIn</name></expr></init></decl>;</decl_stmt>
+
+  <expr_stmt><expr><name>ppNext</name> <operator>=</operator> <operator>&amp;</operator><name>pRet</name></expr>;</expr_stmt>
+  <for>for<control>(<init><expr><name>i</name><operator>=</operator><literal type="number">0</literal></expr>;</init> <condition><expr><name>rc</name><operator>==</operator><name>LSM_OK</name> <operator>&amp;&amp;</operator> <name>i</name><operator>&lt;</operator><name>nLevel</name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control><block>{<block_content>
+    <decl_stmt><decl><type><name>int</name></type> <name>iRight</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>Level</name> <modifier>*</modifier></type><name>pLevel</name></decl>;</decl_stmt>
+
+    <comment type="block">/* Allocate space for the Level structure and Level.apRight[] array */</comment>
+    <expr_stmt><expr><name>pLevel</name> <operator>=</operator> <operator>(</operator><name>Level</name> <operator>*</operator><operator>)</operator><call><name>lsmMallocZeroRc</name><argument_list>(<argument><expr><name><name>pDb</name><operator>-&gt;</operator><name>pEnv</name></name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>Level</name></expr></argument>)</argument_list></sizeof></expr></argument>, <argument><expr><operator>&amp;</operator><name>rc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <if_stmt><if>if<condition>( <expr><name>rc</name><operator>==</operator><name>LSM_OK</name></expr> )</condition><block>{<block_content>
+      <expr_stmt><expr><name><name>pLevel</name><operator>-&gt;</operator><name>iAge</name></name> <operator>=</operator> <operator>(</operator><name>u16</name><operator>)</operator><operator>(</operator><name><name>aIn</name><index>[<expr><name>iIn</name></expr>]</index></name> <operator>&amp;</operator> <literal type="number">0x0000FFFF</literal><operator>)</operator></expr>;</expr_stmt>
+      <expr_stmt><expr><name><name>pLevel</name><operator>-&gt;</operator><name>flags</name></name> <operator>=</operator> <operator>(</operator><name>u16</name><operator>)</operator><operator>(</operator><operator>(</operator><name><name>aIn</name><index>[<expr><name>iIn</name></expr>]</index></name><operator>&gt;&gt;</operator><literal type="number">16</literal><operator>)</operator> <operator>&amp;</operator> <literal type="number">0x0000FFFF</literal><operator>)</operator></expr>;</expr_stmt>
+      <expr_stmt><expr><name>iIn</name><operator>++</operator></expr>;</expr_stmt>
+      <expr_stmt><expr><name><name>pLevel</name><operator>-&gt;</operator><name>nRight</name></name> <operator>=</operator> <name><name>aIn</name><index>[<expr><name>iIn</name><operator>++</operator></expr>]</index></name></expr>;</expr_stmt>
+      <if_stmt><if>if<condition>( <expr><name><name>pLevel</name><operator>-&gt;</operator><name>nRight</name></name></expr> )</condition><block>{<block_content>
+        <decl_stmt><decl><type><name>int</name></type> <name>nByte</name> <init>= <expr><sizeof>sizeof<argument_list>(<argument><expr><name>Segment</name></expr></argument>)</argument_list></sizeof> <operator>*</operator> <name><name>pLevel</name><operator>-&gt;</operator><name>nRight</name></name></expr></init></decl>;</decl_stmt>
+        <expr_stmt><expr><name><name>pLevel</name><operator>-&gt;</operator><name>aRhs</name></name> <operator>=</operator> <operator>(</operator><name>Segment</name> <operator>*</operator><operator>)</operator><call><name>lsmMallocZeroRc</name><argument_list>(<argument><expr><name><name>pDb</name><operator>-&gt;</operator><name>pEnv</name></name></expr></argument>, <argument><expr><name>nByte</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>rc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+      </block_content>}</block></if></if_stmt>
+      <if_stmt><if>if<condition>( <expr><name>rc</name><operator>==</operator><name>LSM_OK</name></expr> )</condition><block>{<block_content>
+        <expr_stmt><expr><operator>*</operator><name>ppNext</name> <operator>=</operator> <name>pLevel</name></expr>;</expr_stmt>
+        <expr_stmt><expr><name>ppNext</name> <operator>=</operator> <operator>&amp;</operator><name><name>pLevel</name><operator>-&gt;</operator><name>pNext</name></name></expr>;</expr_stmt>
+
+        <comment type="block">/* Allocate the main segment */</comment>
+        <expr_stmt><expr><call><name>ckptNewSegment</name><argument_list>(<argument><expr><name>aIn</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>iIn</name></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>pLevel</name><operator>-&gt;</operator><name>lhs</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+        <comment type="block">/* Allocate each of the right-hand segments, if any */</comment>
+        <for>for<control>(<init><expr><name>iRight</name><operator>=</operator><literal type="number">0</literal></expr>;</init> <condition><expr><name>iRight</name><operator>&lt;</operator><name><name>pLevel</name><operator>-&gt;</operator><name>nRight</name></name></expr>;</condition> <incr><expr><name>iRight</name><operator>++</operator></expr></incr>)</control><block>{<block_content>
+          <expr_stmt><expr><call><name>ckptNewSegment</name><argument_list>(<argument><expr><name>aIn</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>iIn</name></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>pLevel</name><operator>-&gt;</operator><name>aRhs</name><index>[<expr><name>iRight</name></expr>]</index></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        </block_content>}</block></for>
+
+        <comment type="block">/* Set up the Merge object, if required */</comment>
+        <if_stmt><if>if<condition>( <expr><name><name>pLevel</name><operator>-&gt;</operator><name>nRight</name></name><operator>&gt;</operator><literal type="number">0</literal></expr> )</condition><block>{<block_content>
+          <expr_stmt><expr><name>rc</name> <operator>=</operator> <call><name>ckptSetupMerge</name><argument_list>(<argument><expr><name>pDb</name></expr></argument>, <argument><expr><name>aIn</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>iIn</name></expr></argument>, <argument><expr><name>pLevel</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        </block_content>}</block></if></if_stmt>
+      </block_content>}</block></if></if_stmt>
+    </block_content>}</block></if></if_stmt>
+  </block_content>}</block></for>
+
+  <if_stmt><if>if<condition>( <expr><name>rc</name><operator>!=</operator><name>LSM_OK</name></expr> )</condition><block>{<block_content>
+    <comment type="block">/* An OOM must have occurred. Free any level structures allocated and
+    ** return the error to the caller. */</comment>
+    <expr_stmt><expr><call><name>lsmSortedFreeLevel</name><argument_list>(<argument><expr><name><name>pDb</name><operator>-&gt;</operator><name>pEnv</name></name></expr></argument>, <argument><expr><name>pRet</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><name>pRet</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+  </block_content>}</block></if></if_stmt>
+
+  <expr_stmt><expr><operator>*</operator><name>ppLevel</name> <operator>=</operator> <name>pRet</name></expr>;</expr_stmt>
+  <expr_stmt><expr><operator>*</operator><name>piIn</name> <operator>=</operator> <name>iIn</name></expr>;</expr_stmt>
+  <return>return <expr><name>rc</name></expr>;</return>
+</block_content>}</block></function>
+
+
+<function><type><name>int</name></type> <name>lsmCheckpointLoadLevels</name><parameter_list>(<parameter><decl><type><name>lsm_db</name> <modifier>*</modifier></type><name>pDb</name></decl></parameter>, <parameter><decl><type><name>void</name> <modifier>*</modifier></type><name>pVal</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>nVal</name></decl></parameter>)</parameter_list><block>{<block_content>
+  <decl_stmt><decl><type><name>int</name></type> <name>rc</name> <init>= <expr><name>LSM_OK</name></expr></init></decl>;</decl_stmt>
+  <if_stmt><if>if<condition>( <expr><name>nVal</name><operator>&gt;</operator><literal type="number">0</literal></expr> )</condition><block>{<block_content>
+    <decl_stmt><decl><type><name>u32</name> <modifier>*</modifier></type><name>aIn</name></decl>;</decl_stmt>
+
+    <expr_stmt><expr><name>aIn</name> <operator>=</operator> <call><name>lsmMallocRc</name><argument_list>(<argument><expr><name><name>pDb</name><operator>-&gt;</operator><name>pEnv</name></name></expr></argument>, <argument><expr><name>nVal</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>rc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <if_stmt><if>if<condition>( <expr><name>aIn</name></expr> )</condition><block>{<block_content>
+      <decl_stmt><decl><type><name>Level</name> <modifier>*</modifier></type><name>pLevel</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+      <decl_stmt><decl><type><name>Level</name> <modifier>*</modifier></type><name>pParent</name></decl>;</decl_stmt>
+
+      <decl_stmt><decl><type><name>int</name></type> <name>nIn</name></decl>;</decl_stmt>
+      <decl_stmt><decl><type><name>int</name></type> <name>nLevel</name></decl>;</decl_stmt>
+      <decl_stmt><decl><type><name>int</name></type> <name>iIn</name> <init>= <expr><literal type="number">1</literal></expr></init></decl>;</decl_stmt>
+      <expr_stmt><expr><call><name>memcpy</name><argument_list>(<argument><expr><name>aIn</name></expr></argument>, <argument><expr><name>pVal</name></expr></argument>, <argument><expr><name>nVal</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+      <expr_stmt><expr><name>nIn</name> <operator>=</operator> <name>nVal</name> <operator>/</operator> <sizeof>sizeof<argument_list>(<argument><expr><name>u32</name></expr></argument>)</argument_list></sizeof></expr>;</expr_stmt>
+
+      <expr_stmt><expr><call><name>ckptChangeEndianness</name><argument_list>(<argument><expr><name>aIn</name></expr></argument>, <argument><expr><name>nIn</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+      <expr_stmt><expr><name>nLevel</name> <operator>=</operator> <name><name>aIn</name><index>[<expr><literal type="number">0</literal></expr>]</index></name></expr>;</expr_stmt>
+      <expr_stmt><expr><name>rc</name> <operator>=</operator> <call><name>ckptLoadLevels</name><argument_list>(<argument><expr><name>pDb</name></expr></argument>, <argument><expr><name>aIn</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>iIn</name></expr></argument>, <argument><expr><name>nLevel</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>pLevel</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+      <expr_stmt><expr><call><name>lsmFree</name><argument_list>(<argument><expr><name><name>pDb</name><operator>-&gt;</operator><name>pEnv</name></name></expr></argument>, <argument><expr><name>aIn</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+      <expr_stmt><expr><call><name>assert</name><argument_list>( <argument><expr><name>rc</name><operator>==</operator><name>LSM_OK</name> <operator>||</operator> <name>pLevel</name><operator>==</operator><literal type="number">0</literal></expr></argument> )</argument_list></call></expr>;</expr_stmt>
+      <if_stmt><if>if<condition>( <expr><name>rc</name><operator>==</operator><name>LSM_OK</name></expr> )</condition><block>{<block_content>
+        <expr_stmt><expr><name>pParent</name> <operator>=</operator> <call><name>lsmDbSnapshotLevel</name><argument_list>(<argument><expr><name><name>pDb</name><operator>-&gt;</operator><name>pWorker</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <expr_stmt><expr><call><name>assert</name><argument_list>( <argument><expr><name>pParent</name></expr></argument> )</argument_list></call></expr>;</expr_stmt>
+        <while>while<condition>( <expr><name><name>pParent</name><operator>-&gt;</operator><name>pNext</name></name></expr> )</condition><block type="pseudo"><block_content> <expr_stmt><expr><name>pParent</name> <operator>=</operator> <name><name>pParent</name><operator>-&gt;</operator><name>pNext</name></name></expr>;</expr_stmt></block_content></block></while>
+        <expr_stmt><expr><name><name>pParent</name><operator>-&gt;</operator><name>pNext</name></name> <operator>=</operator> <name>pLevel</name></expr>;</expr_stmt>
+      </block_content>}</block></if></if_stmt>
+    </block_content>}</block></if></if_stmt>
+  </block_content>}</block></if></if_stmt>
+
+  <return>return <expr><name>rc</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+** Return the data for the LEVELS record.
+**
+** The size of the checkpoint that can be stored in the database header
+** must not exceed 1024 32-bit integers. Normally, it does not. However,
+** if it does, part of the checkpoint must be stored in the LSM. This
+** routine returns that part.
+*/</comment>
+<function><type><name>int</name></type> <name>lsmCheckpointLevels</name><parameter_list>(
+  <parameter><decl><type><name>lsm_db</name> <modifier>*</modifier></type><name>pDb</name></decl></parameter>,                    <comment type="block">/* Database handle */</comment>
+  <parameter><decl><type><name>int</name></type> <name>nLevel</name></decl></parameter>,                     <comment type="block">/* Number of levels to write to blob */</comment>
+  <parameter><decl><type><name>void</name> <modifier>*</modifier><modifier>*</modifier></type><name>paVal</name></decl></parameter>,                   <comment type="block">/* OUT: Pointer to LEVELS blob */</comment>
+  <parameter><decl><type><name>int</name> <modifier>*</modifier></type><name>pnVal</name></decl></parameter>                      <comment type="block">/* OUT: Size of LEVELS blob in bytes */</comment>
+)</parameter_list><block>{<block_content>
+  <decl_stmt><decl><type><name>Level</name> <modifier>*</modifier></type><name>p</name></decl>;</decl_stmt>                       <comment type="block">/* Used to iterate through levels */</comment>
+  <decl_stmt><decl><type><name>int</name></type> <name>nAll</name><init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>int</name></type> <name>rc</name></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>int</name></type> <name>i</name></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>int</name></type> <name>iOut</name></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>CkptBuffer</name></type> <name>ckpt</name></decl>;</decl_stmt>
+  <expr_stmt><expr><call><name>assert</name><argument_list>( <argument><expr><name>nLevel</name><operator>&gt;</operator><literal type="number">0</literal></expr></argument> )</argument_list></call></expr>;</expr_stmt>
+
+  <for>for<control>(<init><expr><name>p</name><operator>=</operator><call><name>lsmDbSnapshotLevel</name><argument_list>(<argument><expr><name><name>pDb</name><operator>-&gt;</operator><name>pWorker</name></name></expr></argument>)</argument_list></call></expr>;</init> <condition><expr><name>p</name></expr>;</condition> <incr><expr><name>p</name><operator>=</operator><name><name>p</name><operator>-&gt;</operator><name>pNext</name></name></expr></incr>)</control><block type="pseudo"><block_content> <expr_stmt><expr><name>nAll</name><operator>++</operator></expr>;</expr_stmt></block_content></block></for>
+
+  <expr_stmt><expr><call><name>assert</name><argument_list>( <argument><expr><name>nAll</name><operator>&gt;</operator><name>nLevel</name></expr></argument> )</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><name>nAll</name> <operator>-=</operator> <name>nLevel</name></expr>;</expr_stmt>
+  <for>for<control>(<init><expr><name>p</name><operator>=</operator><call><name>lsmDbSnapshotLevel</name><argument_list>(<argument><expr><name><name>pDb</name><operator>-&gt;</operator><name>pWorker</name></name></expr></argument>)</argument_list></call></expr>;</init> <condition><expr><name>p</name> <operator>&amp;&amp;</operator> <name>nAll</name><operator>&gt;</operator><literal type="number">0</literal></expr>;</condition> <incr><expr><name>p</name><operator>=</operator><name><name>p</name><operator>-&gt;</operator><name>pNext</name></name></expr></incr>)</control><block type="pseudo"><block_content> <expr_stmt><expr><name>nAll</name><operator>--</operator></expr>;</expr_stmt></block_content></block></for>
+
+  <expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><operator>&amp;</operator><name>ckpt</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>CkptBuffer</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><name><name>ckpt</name><operator>.</operator><name>pEnv</name></name> <operator>=</operator> <name><name>pDb</name><operator>-&gt;</operator><name>pEnv</name></name></expr>;</expr_stmt>
+
+  <expr_stmt><expr><call><name>ckptSetValue</name><argument_list>(<argument><expr><operator>&amp;</operator><name>ckpt</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><name>nLevel</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>rc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><name>iOut</name> <operator>=</operator> <literal type="number">1</literal></expr>;</expr_stmt>
+  <for>for<control>(<init><expr><name>i</name><operator>=</operator><literal type="number">0</literal></expr>;</init> <condition><expr><name>rc</name><operator>==</operator><name>LSM_OK</name> <operator>&amp;&amp;</operator> <name>i</name><operator>&lt;</operator><name>nLevel</name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control><block>{<block_content>
+    <expr_stmt><expr><call><name>ckptExportLevel</name><argument_list>(<argument><expr><name>p</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>ckpt</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>iOut</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>rc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><name>p</name> <operator>=</operator> <name><name>p</name><operator>-&gt;</operator><name>pNext</name></name></expr>;</expr_stmt>
+  </block_content>}</block></for>
+  <expr_stmt><expr><call><name>assert</name><argument_list>( <argument><expr><name>rc</name><operator>!=</operator><name>LSM_OK</name> <operator>||</operator> <name>p</name><operator>==</operator><literal type="number">0</literal></expr></argument> )</argument_list></call></expr>;</expr_stmt>
+
+  <if_stmt><if>if<condition>( <expr><name>rc</name><operator>==</operator><name>LSM_OK</name></expr> )</condition><block>{<block_content>
+    <expr_stmt><expr><call><name>ckptChangeEndianness</name><argument_list>(<argument><expr><name><name>ckpt</name><operator>.</operator><name>aCkpt</name></name></expr></argument>, <argument><expr><name>iOut</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><operator>*</operator><name>paVal</name> <operator>=</operator> <operator>(</operator><name>void</name> <operator>*</operator><operator>)</operator><name><name>ckpt</name><operator>.</operator><name>aCkpt</name></name></expr>;</expr_stmt>
+    <expr_stmt><expr><operator>*</operator><name>pnVal</name> <operator>=</operator> <name>iOut</name> <operator>*</operator> <sizeof>sizeof<argument_list>(<argument><expr><name>u32</name></expr></argument>)</argument_list></sizeof></expr>;</expr_stmt>
+  </block_content>}</block></if><else>else<block>{<block_content>
+    <expr_stmt><expr><operator>*</operator><name>pnVal</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+    <expr_stmt><expr><operator>*</operator><name>paVal</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+  </block_content>}</block></else></if_stmt>
+
+  <return>return <expr><name>rc</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+** Read the checkpoint id from meta-page pPg.
+*/</comment>
+<function><type><specifier>static</specifier> <name>i64</name></type> <name>ckptLoadId</name><parameter_list>(<parameter><decl><type><name>MetaPage</name> <modifier>*</modifier></type><name>pPg</name></decl></parameter>)</parameter_list><block>{<block_content>
+  <decl_stmt><decl><type><name>i64</name></type> <name>ret</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+  <if_stmt><if>if<condition>( <expr><name>pPg</name></expr> )</condition><block>{<block_content>
+    <decl_stmt><decl><type><name>int</name></type> <name>nData</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>u8</name> <modifier>*</modifier></type><name>aData</name> <init>= <expr><call><name>lsmFsMetaPageData</name><argument_list>(<argument><expr><name>pPg</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>nData</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+    <expr_stmt><expr><name>ret</name> <operator>=</operator> <operator>(</operator><operator>(</operator><operator>(</operator><name>i64</name><operator>)</operator><call><name>lsmGetU32</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>aData</name><index>[<expr><name>CKPT_HDR_ID_MSW</name><operator>*</operator><literal type="number">4</literal></expr>]</index></name></expr></argument>)</argument_list></call><operator>)</operator> <operator>&lt;&lt;</operator> <literal type="number">32</literal><operator>)</operator> <operator>+</operator> 
+          <operator>(</operator><operator>(</operator><name>i64</name><operator>)</operator><call><name>lsmGetU32</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>aData</name><index>[<expr><name>CKPT_HDR_ID_LSW</name><operator>*</operator><literal type="number">4</literal></expr>]</index></name></expr></argument>)</argument_list></call><operator>)</operator></expr>;</expr_stmt>
+  </block_content>}</block></if></if_stmt>
+  <return>return <expr><name>ret</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+** Return true if the buffer passed as an argument contains a valid
+** checkpoint.
+*/</comment>
+<function><type><specifier>static</specifier> <name>int</name></type> <name>ckptChecksumOk</name><parameter_list>(<parameter><decl><type><name>u32</name> <modifier>*</modifier></type><name>aCkpt</name></decl></parameter>)</parameter_list><block>{<block_content>
+  <decl_stmt><decl><type><name>u32</name></type> <name>nCkpt</name> <init>= <expr><name><name>aCkpt</name><index>[<expr><name>CKPT_HDR_NCKPT</name></expr>]</index></name></expr></init></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>u32</name></type> <name>cksum1</name></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>u32</name></type> <name>cksum2</name></decl>;</decl_stmt>
+
+  <if_stmt><if>if<condition>( <expr><call><name><name>nCkpt</name><argument_list type="generic">&lt;<argument><expr><name>CKPT_HDR_NCKPT</name> <operator>||</operator> <name>nCkpt</name></expr></argument>&gt;</argument_list></name><argument_list>(<argument><expr><name>LSM_META_RW_PAGE_SIZE</name></expr></argument>)</argument_list></call><operator>/</operator><sizeof>sizeof<argument_list>(<argument><expr><name>u32</name></expr></argument>)</argument_list></sizeof></expr> )</condition><block>{<block_content>
+    <return>return <expr><literal type="number">0</literal></expr>;</return>
+  </block_content>}</block></if></if_stmt>
+  <expr_stmt><expr><call><name>ckptChecksum</name><argument_list>(<argument><expr><name>aCkpt</name></expr></argument>, <argument><expr><name>nCkpt</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>cksum1</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>cksum2</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <return>return <expr><operator>(</operator><name>cksum1</name><operator>==</operator><name><name>aCkpt</name><index>[<expr><name>nCkpt</name><operator>-</operator><literal type="number">2</literal></expr>]</index></name> <operator>&amp;&amp;</operator> <name>cksum2</name><operator>==</operator><name><name>aCkpt</name><index>[<expr><name>nCkpt</name><operator>-</operator><literal type="number">1</literal></expr>]</index></name><operator>)</operator></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+** Attempt to load a checkpoint from meta page iMeta.
+**
+** This function is a no-op if *pRc is set to any value other than LSM_OK
+** when it is called. If an error occurs, *pRc is set to an LSM error code
+** before returning.
+**
+** If no error occurs and the checkpoint is successfully loaded, copy it to
+** ShmHeader.aSnap1[] and ShmHeader.aSnap2[], and set ShmHeader.iMetaPage 
+** to indicate its origin. In this case return 1. Or, if the checkpoint 
+** cannot be loaded (because the checksum does not compute), return 0.
+*/</comment>
+<function><type><specifier>static</specifier> <name>int</name></type> <name>ckptTryLoad</name><parameter_list>(<parameter><decl><type><name>lsm_db</name> <modifier>*</modifier></type><name>pDb</name></decl></parameter>, <parameter><decl><type><name>MetaPage</name> <modifier>*</modifier></type><name>pPg</name></decl></parameter>, <parameter><decl><type><name>u32</name></type> <name>iMeta</name></decl></parameter>, <parameter><decl><type><name>int</name> <modifier>*</modifier></type><name>pRc</name></decl></parameter>)</parameter_list><block>{<block_content>
+  <decl_stmt><decl><type><name>int</name></type> <name>bLoaded</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>                <comment type="block">/* Return value */</comment>
+  <if_stmt><if>if<condition>( <expr><operator>*</operator><name>pRc</name><operator>==</operator><name>LSM_OK</name></expr> )</condition><block>{<block_content>
+    <decl_stmt><decl><type><name>int</name></type> <name>rc</name> <init>= <expr><name>LSM_OK</name></expr></init></decl>;</decl_stmt>              <comment type="block">/* Error code */</comment>
+    <decl_stmt><decl><type><name>u32</name> <modifier>*</modifier></type><name>aCkpt</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>               <comment type="block">/* Pointer to buffer containing checkpoint */</comment>
+    <decl_stmt><decl><type><name>u32</name></type> <name>nCkpt</name></decl>;</decl_stmt>                    <comment type="block">/* Number of elements in aCkpt[] */</comment>
+    <decl_stmt><decl><type><name>int</name></type> <name>nData</name></decl>;</decl_stmt>                    <comment type="block">/* Bytes of data in aData[] */</comment>
+    <decl_stmt><decl><type><name>u8</name> <modifier>*</modifier></type><name>aData</name></decl>;</decl_stmt>                    <comment type="block">/* Meta page data */</comment>
+   
+    <expr_stmt><expr><name>aData</name> <operator>=</operator> <call><name>lsmFsMetaPageData</name><argument_list>(<argument><expr><name>pPg</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>nData</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><name>nCkpt</name> <operator>=</operator> <operator>(</operator><name>u32</name><operator>)</operator><call><name>lsmGetU32</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>aData</name><index>[<expr><name>CKPT_HDR_NCKPT</name><operator>*</operator><sizeof>sizeof<argument_list>(<argument><expr><name>u32</name></expr></argument>)</argument_list></sizeof></expr>]</index></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <if_stmt><if>if<condition>( <expr><name>nCkpt</name><operator>&lt;=</operator><name>nData</name><operator>/</operator><sizeof>sizeof<argument_list>(<argument><expr><name>u32</name></expr></argument>)</argument_list></sizeof> <operator>&amp;&amp;</operator> <name>nCkpt</name><operator>&gt;</operator><name>CKPT_HDR_NCKPT</name></expr> )</condition><block>{<block_content>
+      <expr_stmt><expr><name>aCkpt</name> <operator>=</operator> <operator>(</operator><name>u32</name> <operator>*</operator><operator>)</operator><call><name>lsmMallocRc</name><argument_list>(<argument><expr><name><name>pDb</name><operator>-&gt;</operator><name>pEnv</name></name></expr></argument>, <argument><expr><name>nCkpt</name><operator>*</operator><sizeof>sizeof<argument_list>(<argument><expr><name>u32</name></expr></argument>)</argument_list></sizeof></expr></argument>, <argument><expr><operator>&amp;</operator><name>rc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    </block_content>}</block></if></if_stmt>
+    <if_stmt><if>if<condition>( <expr><name>aCkpt</name></expr> )</condition><block>{<block_content>
+      <expr_stmt><expr><call><name>memcpy</name><argument_list>(<argument><expr><name>aCkpt</name></expr></argument>, <argument><expr><name>aData</name></expr></argument>, <argument><expr><name>nCkpt</name><operator>*</operator><sizeof>sizeof<argument_list>(<argument><expr><name>u32</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+      <expr_stmt><expr><call><name>ckptChangeEndianness</name><argument_list>(<argument><expr><name>aCkpt</name></expr></argument>, <argument><expr><name>nCkpt</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+      <if_stmt><if>if<condition>( <expr><call><name>ckptChecksumOk</name><argument_list>(<argument><expr><name>aCkpt</name></expr></argument>)</argument_list></call></expr> )</condition><block>{<block_content>
+        <decl_stmt><decl><type><name>ShmHeader</name> <modifier>*</modifier></type><name>pShm</name> <init>= <expr><name><name>pDb</name><operator>-&gt;</operator><name>pShmhdr</name></name></expr></init></decl>;</decl_stmt>
+        <expr_stmt><expr><call><name>memcpy</name><argument_list>(<argument><expr><name><name>pShm</name><operator>-&gt;</operator><name>aSnap1</name></name></expr></argument>, <argument><expr><name>aCkpt</name></expr></argument>, <argument><expr><name>nCkpt</name><operator>*</operator><sizeof>sizeof<argument_list>(<argument><expr><name>u32</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <expr_stmt><expr><call><name>memcpy</name><argument_list>(<argument><expr><name><name>pShm</name><operator>-&gt;</operator><name>aSnap2</name></name></expr></argument>, <argument><expr><name>aCkpt</name></expr></argument>, <argument><expr><name>nCkpt</name><operator>*</operator><sizeof>sizeof<argument_list>(<argument><expr><name>u32</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <expr_stmt><expr><call><name>memcpy</name><argument_list>(<argument><expr><name><name>pDb</name><operator>-&gt;</operator><name>aSnapshot</name></name></expr></argument>, <argument><expr><name>aCkpt</name></expr></argument>, <argument><expr><name>nCkpt</name><operator>*</operator><sizeof>sizeof<argument_list>(<argument><expr><name>u32</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <expr_stmt><expr><name><name>pShm</name><operator>-&gt;</operator><name>iMetaPage</name></name> <operator>=</operator> <name>iMeta</name></expr>;</expr_stmt>
+        <expr_stmt><expr><name>bLoaded</name> <operator>=</operator> <literal type="number">1</literal></expr>;</expr_stmt>
+      </block_content>}</block></if></if_stmt>
+    </block_content>}</block></if></if_stmt>
+
+    <expr_stmt><expr><call><name>lsmFree</name><argument_list>(<argument><expr><name><name>pDb</name><operator>-&gt;</operator><name>pEnv</name></name></expr></argument>, <argument><expr><name>aCkpt</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><operator>*</operator><name>pRc</name> <operator>=</operator> <name>rc</name></expr>;</expr_stmt>
+  </block_content>}</block></if></if_stmt>
+  <return>return <expr><name>bLoaded</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+** Initialize the shared-memory header with an empty snapshot. This function
+** is called when no valid snapshot can be found in the database header.
+*/</comment>
+<function><type><specifier>static</specifier> <name>void</name></type> <name>ckptLoadEmpty</name><parameter_list>(<parameter><decl><type><name>lsm_db</name> <modifier>*</modifier></type><name>pDb</name></decl></parameter>)</parameter_list><block>{<block_content>
+  <decl_stmt><decl><type><name>u32</name></type> <name><name>aCkpt</name><index>[]</index></name> <init>= <expr><block>{
+    <expr><literal type="number">0</literal></expr>,                       <comment type="block">/* CKPT_HDR_ID_MSW */</comment>
+    <expr><literal type="number">10</literal></expr>,                      <comment type="block">/* CKPT_HDR_ID_LSW */</comment>
+    <expr><literal type="number">0</literal></expr>,                       <comment type="block">/* CKPT_HDR_NCKPT */</comment>
+    <expr><name>LSM_COMPRESSION_EMPTY</name></expr>,   <comment type="block">/* CKPT_HDR_CMPID */</comment>
+    <expr><literal type="number">0</literal></expr>,                       <comment type="block">/* CKPT_HDR_NBLOCK */</comment>
+    <expr><literal type="number">0</literal></expr>,                       <comment type="block">/* CKPT_HDR_BLKSZ */</comment>
+    <expr><literal type="number">0</literal></expr>,                       <comment type="block">/* CKPT_HDR_NLEVEL */</comment>
+    <expr><literal type="number">0</literal></expr>,                       <comment type="block">/* CKPT_HDR_PGSZ */</comment>
+    <expr><literal type="number">0</literal></expr>,                       <comment type="block">/* CKPT_HDR_NWRITE */</comment>
+    <expr><literal type="number">0</literal></expr>, <expr><literal type="number">0</literal></expr>, <expr><literal type="number">1234</literal></expr>, <expr><literal type="number">5678</literal></expr>,        <comment type="block">/* The log pointer and initial checksum */</comment>
+    <expr><literal type="number">0</literal></expr>,<expr><literal type="number">0</literal></expr>,<expr><literal type="number">0</literal></expr>,<expr><literal type="number">0</literal></expr>, <expr><literal type="number">0</literal></expr>,<expr><literal type="number">0</literal></expr>,<expr><literal type="number">0</literal></expr>,<expr><literal type="number">0</literal></expr>,        <comment type="block">/* The append list */</comment>
+    <expr><literal type="number">0</literal></expr>,                       <comment type="block">/* The redirected block list */</comment>
+    <expr><literal type="number">0</literal></expr>,                       <comment type="block">/* The free block list */</comment>
+    <expr><literal type="number">0</literal></expr>, <expr><literal type="number">0</literal></expr>                     <comment type="block">/* Space for checksum values */</comment>
+  }</block></expr></init></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>u32</name></type> <name>nCkpt</name> <init>= <expr><call><name>array_size</name><argument_list>(<argument><expr><name>aCkpt</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>ShmHeader</name> <modifier>*</modifier></type><name>pShm</name> <init>= <expr><name><name>pDb</name><operator>-&gt;</operator><name>pShmhdr</name></name></expr></init></decl>;</decl_stmt>
+
+  <expr_stmt><expr><name><name>aCkpt</name><index>[<expr><name>CKPT_HDR_NCKPT</name></expr>]</index></name> <operator>=</operator> <name>nCkpt</name></expr>;</expr_stmt>
+  <expr_stmt><expr><name><name>aCkpt</name><index>[<expr><name>CKPT_HDR_BLKSZ</name></expr>]</index></name> <operator>=</operator> <name><name>pDb</name><operator>-&gt;</operator><name>nDfltBlksz</name></name></expr>;</expr_stmt>
+  <expr_stmt><expr><name><name>aCkpt</name><index>[<expr><name>CKPT_HDR_PGSZ</name></expr>]</index></name> <operator>=</operator> <name><name>pDb</name><operator>-&gt;</operator><name>nDfltPgsz</name></name></expr>;</expr_stmt>
+  <expr_stmt><expr><call><name>ckptChecksum</name><argument_list>(<argument><expr><name>aCkpt</name></expr></argument>, <argument><expr><call><name>array_size</name><argument_list>(<argument><expr><name>aCkpt</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>aCkpt</name><index>[<expr><name>nCkpt</name><operator>-</operator><literal type="number">2</literal></expr>]</index></name></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>aCkpt</name><index>[<expr><name>nCkpt</name><operator>-</operator><literal type="number">1</literal></expr>]</index></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+  <expr_stmt><expr><call><name>memcpy</name><argument_list>(<argument><expr><name><name>pShm</name><operator>-&gt;</operator><name>aSnap1</name></name></expr></argument>, <argument><expr><name>aCkpt</name></expr></argument>, <argument><expr><name>nCkpt</name><operator>*</operator><sizeof>sizeof<argument_list>(<argument><expr><name>u32</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><call><name>memcpy</name><argument_list>(<argument><expr><name><name>pShm</name><operator>-&gt;</operator><name>aSnap2</name></name></expr></argument>, <argument><expr><name>aCkpt</name></expr></argument>, <argument><expr><name>nCkpt</name><operator>*</operator><sizeof>sizeof<argument_list>(<argument><expr><name>u32</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><call><name>memcpy</name><argument_list>(<argument><expr><name><name>pDb</name><operator>-&gt;</operator><name>aSnapshot</name></name></expr></argument>, <argument><expr><name>aCkpt</name></expr></argument>, <argument><expr><name>nCkpt</name><operator>*</operator><sizeof>sizeof<argument_list>(<argument><expr><name>u32</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+** This function is called as part of database recovery to initialize the
+** ShmHeader.aSnap1[] and ShmHeader.aSnap2[] snapshots.
+*/</comment>
+<function><type><name>int</name></type> <name>lsmCheckpointRecover</name><parameter_list>(<parameter><decl><type><name>lsm_db</name> <modifier>*</modifier></type><name>pDb</name></decl></parameter>)</parameter_list><block>{<block_content>
+  <decl_stmt><decl><type><name>int</name></type> <name>rc</name> <init>= <expr><name>LSM_OK</name></expr></init></decl>;</decl_stmt>                <comment type="block">/* Return Code */</comment>
+  <decl_stmt><decl><type><name>i64</name></type> <name>iId1</name></decl>;</decl_stmt>                       <comment type="block">/* Id of checkpoint on meta-page 1 */</comment>
+  <decl_stmt><decl><type><name>i64</name></type> <name>iId2</name></decl>;</decl_stmt>                       <comment type="block">/* Id of checkpoint on meta-page 2 */</comment>
+  <decl_stmt><decl><type><name>int</name></type> <name>bLoaded</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>                <comment type="block">/* True once checkpoint has been loaded */</comment>
+  <decl_stmt><decl><type><name>int</name></type> <name>cmp</name></decl>;</decl_stmt>                        <comment type="block">/* True if (iId2&gt;iId1) */</comment>
+  <decl_stmt><decl><type><name>MetaPage</name> <modifier>*</modifier></type><name><name>apPg</name><index>[<expr><literal type="number">2</literal></expr>]</index></name> <init>= <expr><block>{<expr><literal type="number">0</literal></expr>, <expr><literal type="number">0</literal></expr>}</block></expr></init></decl>;</decl_stmt>     <comment type="block">/* Meta-pages 1 and 2 */</comment>
+
+  <expr_stmt><expr><name>rc</name> <operator>=</operator> <call><name>lsmFsMetaPageGet</name><argument_list>(<argument><expr><name><name>pDb</name><operator>-&gt;</operator><name>pFS</name></name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><literal type="number">1</literal></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>apPg</name><index>[<expr><literal type="number">0</literal></expr>]</index></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <if_stmt><if>if<condition>( <expr><name>rc</name><operator>==</operator><name>LSM_OK</name></expr> )</condition><block type="pseudo"><block_content> <expr_stmt><expr><name>rc</name> <operator>=</operator> <call><name>lsmFsMetaPageGet</name><argument_list>(<argument><expr><name><name>pDb</name><operator>-&gt;</operator><name>pFS</name></name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><literal type="number">2</literal></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>apPg</name><index>[<expr><literal type="number">1</literal></expr>]</index></name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+  <expr_stmt><expr><name>iId1</name> <operator>=</operator> <call><name>ckptLoadId</name><argument_list>(<argument><expr><name><name>apPg</name><index>[<expr><literal type="number">0</literal></expr>]</index></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><name>iId2</name> <operator>=</operator> <call><name>ckptLoadId</name><argument_list>(<argument><expr><name><name>apPg</name><index>[<expr><literal type="number">1</literal></expr>]</index></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><name>cmp</name> <operator>=</operator> <operator>(</operator><name>iId2</name> <operator>&gt;</operator> <name>iId1</name><operator>)</operator></expr>;</expr_stmt>
+  <expr_stmt><expr><name>bLoaded</name> <operator>=</operator> <call><name>ckptTryLoad</name><argument_list>(<argument><expr><name>pDb</name></expr></argument>, <argument><expr><name><name>apPg</name><index>[<expr><ternary><condition><expr><name>cmp</name></expr>?</condition><then><expr><literal type="number">1</literal></expr></then><else>:<expr><literal type="number">0</literal></expr></else></ternary></expr>]</index></name></expr></argument>, <argument><expr><operator>(</operator><ternary><condition><expr><name>cmp</name></expr>?</condition><then><expr><literal type="number">2</literal></expr></then><else>:<expr><literal type="number">1</literal></expr></else></ternary><operator>)</operator></expr></argument>, <argument><expr><operator>&amp;</operator><name>rc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <if_stmt><if>if<condition>( <expr><name>bLoaded</name><operator>==</operator><literal type="number">0</literal></expr> )</condition><block>{<block_content>
+    <expr_stmt><expr><name>bLoaded</name> <operator>=</operator> <call><name>ckptTryLoad</name><argument_list>(<argument><expr><name>pDb</name></expr></argument>, <argument><expr><name><name>apPg</name><index>[<expr><ternary><condition><expr><name>cmp</name></expr>?</condition><then><expr><literal type="number">0</literal></expr></then><else>:<expr><literal type="number">1</literal></expr></else></ternary></expr>]</index></name></expr></argument>, <argument><expr><operator>(</operator><ternary><condition><expr><name>cmp</name></expr>?</condition><then><expr><literal type="number">1</literal></expr></then><else>:<expr><literal type="number">2</literal></expr></else></ternary><operator>)</operator></expr></argument>, <argument><expr><operator>&amp;</operator><name>rc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  </block_content>}</block></if></if_stmt>
+
+  <comment type="block">/* The database does not contain a valid checkpoint. Initialize the shared
+  ** memory header with an empty checkpoint.  */</comment>
+  <if_stmt><if>if<condition>( <expr><name>bLoaded</name><operator>==</operator><literal type="number">0</literal></expr> )</condition><block>{<block_content>
+    <expr_stmt><expr><call><name>ckptLoadEmpty</name><argument_list>(<argument><expr><name>pDb</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  </block_content>}</block></if></if_stmt>
+
+  <expr_stmt><expr><call><name>lsmFsMetaPageRelease</name><argument_list>(<argument><expr><name><name>apPg</name><index>[<expr><literal type="number">0</literal></expr>]</index></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><call><name>lsmFsMetaPageRelease</name><argument_list>(<argument><expr><name><name>apPg</name><index>[<expr><literal type="number">1</literal></expr>]</index></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+  <return>return <expr><name>rc</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/* 
+** Store the snapshot in pDb-&gt;aSnapshot[] in meta-page iMeta.
+*/</comment>
+<function><type><name>int</name></type> <name>lsmCheckpointStore</name><parameter_list>(<parameter><decl><type><name>lsm_db</name> <modifier>*</modifier></type><name>pDb</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>iMeta</name></decl></parameter>)</parameter_list><block>{<block_content>
+  <decl_stmt><decl><type><name>MetaPage</name> <modifier>*</modifier></type><name>pPg</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>int</name></type> <name>rc</name></decl>;</decl_stmt>
+
+  <expr_stmt><expr><call><name>assert</name><argument_list>( <argument><expr><name>iMeta</name><operator>==</operator><literal type="number">1</literal> <operator>||</operator> <name>iMeta</name><operator>==</operator><literal type="number">2</literal></expr></argument> )</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><name>rc</name> <operator>=</operator> <call><name>lsmFsMetaPageGet</name><argument_list>(<argument><expr><name><name>pDb</name><operator>-&gt;</operator><name>pFS</name></name></expr></argument>, <argument><expr><literal type="number">1</literal></expr></argument>, <argument><expr><name>iMeta</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>pPg</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <if_stmt><if>if<condition>( <expr><name>rc</name><operator>==</operator><name>LSM_OK</name></expr> )</condition><block>{<block_content>
+    <decl_stmt><decl><type><name>u8</name> <modifier>*</modifier></type><name>aData</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>int</name></type> <name>nData</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>int</name></type> <name>nCkpt</name></decl>;</decl_stmt>
+
+    <expr_stmt><expr><name>nCkpt</name> <operator>=</operator> <operator>(</operator><name>int</name><operator>)</operator><name><name>pDb</name><operator>-&gt;</operator><name>aSnapshot</name><index>[<expr><name>CKPT_HDR_NCKPT</name></expr>]</index></name></expr>;</expr_stmt>
+    <expr_stmt><expr><name>aData</name> <operator>=</operator> <call><name>lsmFsMetaPageData</name><argument_list>(<argument><expr><name>pPg</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>nData</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><call><name>memcpy</name><argument_list>(<argument><expr><name>aData</name></expr></argument>, <argument><expr><name><name>pDb</name><operator>-&gt;</operator><name>aSnapshot</name></name></expr></argument>, <argument><expr><name>nCkpt</name><operator>*</operator><sizeof>sizeof<argument_list>(<argument><expr><name>u32</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><call><name>ckptChangeEndianness</name><argument_list>(<argument><expr><operator>(</operator><name>u32</name> <operator>*</operator><operator>)</operator><name>aData</name></expr></argument>, <argument><expr><name>nCkpt</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><name>rc</name> <operator>=</operator> <call><name>lsmFsMetaPageRelease</name><argument_list>(<argument><expr><name>pPg</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  </block_content>}</block></if></if_stmt>
+      
+  <return>return <expr><name>rc</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+** Copy the current client snapshot from shared-memory to pDb-&gt;aSnapshot[].
+*/</comment>
+<function><type><name>int</name></type> <name>lsmCheckpointLoad</name><parameter_list>(<parameter><decl><type><name>lsm_db</name> <modifier>*</modifier></type><name>pDb</name></decl></parameter>, <parameter><decl><type><name>int</name> <modifier>*</modifier></type><name>piRead</name></decl></parameter>)</parameter_list><block>{<block_content>
+  <decl_stmt><decl><type><name>int</name></type> <name>nRem</name> <init>= <expr><name>LSM_ATTEMPTS_BEFORE_PROTOCOL</name></expr></init></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>ShmHeader</name> <modifier>*</modifier></type><name>pShm</name> <init>= <expr><name><name>pDb</name><operator>-&gt;</operator><name>pShmhdr</name></name></expr></init></decl>;</decl_stmt>
+  <while>while<condition>( <expr><operator>(</operator><name>nRem</name><operator>--</operator><operator>)</operator><operator>&gt;</operator><literal type="number">0</literal></expr> )</condition><block>{<block_content>
+    <decl_stmt><decl><type><name>int</name></type> <name>nInt</name></decl>;</decl_stmt>
+
+    <expr_stmt><expr><name>nInt</name> <operator>=</operator> <name><name>pShm</name><operator>-&gt;</operator><name>aSnap1</name><index>[<expr><name>CKPT_HDR_NCKPT</name></expr>]</index></name></expr>;</expr_stmt>
+    <if_stmt><if>if<condition>( <expr><name>nInt</name><operator>&lt;=</operator><operator>(</operator><name>LSM_META_RW_PAGE_SIZE</name> <operator>/</operator> <sizeof>sizeof<argument_list>(<argument><expr><name>u32</name></expr></argument>)</argument_list></sizeof><operator>)</operator></expr> )</condition><block>{<block_content>
+      <expr_stmt><expr><call><name>memcpy</name><argument_list>(<argument><expr><name><name>pDb</name><operator>-&gt;</operator><name>aSnapshot</name></name></expr></argument>, <argument><expr><name><name>pShm</name><operator>-&gt;</operator><name>aSnap1</name></name></expr></argument>, <argument><expr><name>nInt</name><operator>*</operator><sizeof>sizeof<argument_list>(<argument><expr><name>u32</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+      <if_stmt><if>if<condition>( <expr><call><name>ckptChecksumOk</name><argument_list>(<argument><expr><name><name>pDb</name><operator>-&gt;</operator><name>aSnapshot</name></name></expr></argument>)</argument_list></call></expr> )</condition><block>{<block_content>
+        <if_stmt><if>if<condition>( <expr><name>piRead</name></expr> )</condition><block type="pseudo"><block_content> <expr_stmt><expr><operator>*</operator><name>piRead</name> <operator>=</operator> <literal type="number">1</literal></expr>;</expr_stmt></block_content></block></if></if_stmt>
+        <return>return <expr><name>LSM_OK</name></expr>;</return>
+      </block_content>}</block></if></if_stmt>
+    </block_content>}</block></if></if_stmt>
+
+    <expr_stmt><expr><name>nInt</name> <operator>=</operator> <name><name>pShm</name><operator>-&gt;</operator><name>aSnap2</name><index>[<expr><name>CKPT_HDR_NCKPT</name></expr>]</index></name></expr>;</expr_stmt>
+    <if_stmt><if>if<condition>( <expr><name>nInt</name><operator>&lt;=</operator><operator>(</operator><name>LSM_META_RW_PAGE_SIZE</name> <operator>/</operator> <sizeof>sizeof<argument_list>(<argument><expr><name>u32</name></expr></argument>)</argument_list></sizeof><operator>)</operator></expr> )</condition><block>{<block_content>
+      <expr_stmt><expr><call><name>memcpy</name><argument_list>(<argument><expr><name><name>pDb</name><operator>-&gt;</operator><name>aSnapshot</name></name></expr></argument>, <argument><expr><name><name>pShm</name><operator>-&gt;</operator><name>aSnap2</name></name></expr></argument>, <argument><expr><name>nInt</name><operator>*</operator><sizeof>sizeof<argument_list>(<argument><expr><name>u32</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+      <if_stmt><if>if<condition>( <expr><call><name>ckptChecksumOk</name><argument_list>(<argument><expr><name><name>pDb</name><operator>-&gt;</operator><name>aSnapshot</name></name></expr></argument>)</argument_list></call></expr> )</condition><block>{<block_content>
+        <if_stmt><if>if<condition>( <expr><name>piRead</name></expr> )</condition><block type="pseudo"><block_content> <expr_stmt><expr><operator>*</operator><name>piRead</name> <operator>=</operator> <literal type="number">2</literal></expr>;</expr_stmt></block_content></block></if></if_stmt>
+        <return>return <expr><name>LSM_OK</name></expr>;</return>
+      </block_content>}</block></if></if_stmt>
+    </block_content>}</block></if></if_stmt>
+
+    <expr_stmt><expr><call><name>lsmShmBarrier</name><argument_list>(<argument><expr><name>pDb</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  </block_content>}</block></while>
+  <return>return <expr><name>LSM_PROTOCOL_BKPT</name></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><name>int</name></type> <name>lsmInfoCompressionId</name><parameter_list>(<parameter><decl><type><name>lsm_db</name> <modifier>*</modifier></type><name>db</name></decl></parameter>, <parameter><decl><type><name>u32</name> <modifier>*</modifier></type><name>piCmpId</name></decl></parameter>)</parameter_list><block>{<block_content>
+  <decl_stmt><decl><type><name>int</name></type> <name>rc</name></decl>;</decl_stmt>
+
+  <expr_stmt><expr><call><name>assert</name><argument_list>( <argument><expr><name><name>db</name><operator>-&gt;</operator><name>pClient</name></name><operator>==</operator><literal type="number">0</literal> <operator>&amp;&amp;</operator> <name><name>db</name><operator>-&gt;</operator><name>pWorker</name></name><operator>==</operator><literal type="number">0</literal></expr></argument> )</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><name>rc</name> <operator>=</operator> <call><name>lsmCheckpointLoad</name><argument_list>(<argument><expr><name>db</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <if_stmt><if>if<condition>( <expr><name>rc</name><operator>==</operator><name>LSM_OK</name></expr> )</condition><block>{<block_content>
+    <expr_stmt><expr><operator>*</operator><name>piCmpId</name> <operator>=</operator> <name><name>db</name><operator>-&gt;</operator><name>aSnapshot</name><index>[<expr><name>CKPT_HDR_CMPID</name></expr>]</index></name></expr>;</expr_stmt>
+  </block_content>}</block></if></if_stmt>
+
+  <return>return <expr><name>rc</name></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><name>int</name></type> <name>lsmCheckpointLoadOk</name><parameter_list>(<parameter><decl><type><name>lsm_db</name> <modifier>*</modifier></type><name>pDb</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>iSnap</name></decl></parameter>)</parameter_list><block>{<block_content>
+  <decl_stmt><decl><type><name>u32</name> <modifier>*</modifier></type><name>aShm</name></decl>;</decl_stmt>
+  <expr_stmt><expr><call><name>assert</name><argument_list>( <argument><expr><name>iSnap</name><operator>==</operator><literal type="number">1</literal> <operator>||</operator> <name>iSnap</name><operator>==</operator><literal type="number">2</literal></expr></argument> )</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><name>aShm</name> <operator>=</operator> <ternary><condition><expr><operator>(</operator><name>iSnap</name><operator>==</operator><literal type="number">1</literal><operator>)</operator></expr> ?</condition><then> <expr><name><name>pDb</name><operator>-&gt;</operator><name>pShmhdr</name><operator>-&gt;</operator><name>aSnap1</name></name></expr> </then><else>: <expr><name><name>pDb</name><operator>-&gt;</operator><name>pShmhdr</name><operator>-&gt;</operator><name>aSnap2</name></name></expr></else></ternary></expr>;</expr_stmt>
+  <return>return <expr><operator>(</operator><call><name>lsmCheckpointId</name><argument_list>(<argument><expr><name><name>pDb</name><operator>-&gt;</operator><name>aSnapshot</name></name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call><operator>==</operator><call><name>lsmCheckpointId</name><argument_list>(<argument><expr><name>aShm</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call> <operator>)</operator></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><name>int</name></type> <name>lsmCheckpointClientCacheOk</name><parameter_list>(<parameter><decl><type><name>lsm_db</name> <modifier>*</modifier></type><name>pDb</name></decl></parameter>)</parameter_list><block>{<block_content>
+  <return>return <expr><operator>(</operator> <name><name>pDb</name><operator>-&gt;</operator><name>pClient</name></name> 
+        <operator>&amp;&amp;</operator> <name><name>pDb</name><operator>-&gt;</operator><name>pClient</name><operator>-&gt;</operator><name>iId</name></name><operator>==</operator><call><name>lsmCheckpointId</name><argument_list>(<argument><expr><name><name>pDb</name><operator>-&gt;</operator><name>aSnapshot</name></name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call>
+        <operator>&amp;&amp;</operator> <name><name>pDb</name><operator>-&gt;</operator><name>pClient</name><operator>-&gt;</operator><name>iId</name></name><operator>==</operator><call><name>lsmCheckpointId</name><argument_list>(<argument><expr><name><name>pDb</name><operator>-&gt;</operator><name>pShmhdr</name><operator>-&gt;</operator><name>aSnap1</name></name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call>
+        <operator>&amp;&amp;</operator> <name><name>pDb</name><operator>-&gt;</operator><name>pClient</name><operator>-&gt;</operator><name>iId</name></name><operator>==</operator><call><name>lsmCheckpointId</name><argument_list>(<argument><expr><name><name>pDb</name><operator>-&gt;</operator><name>pShmhdr</name><operator>-&gt;</operator><name>aSnap2</name></name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call>
+  <operator>)</operator></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><name>int</name></type> <name>lsmCheckpointLoadWorker</name><parameter_list>(<parameter><decl><type><name>lsm_db</name> <modifier>*</modifier></type><name>pDb</name></decl></parameter>)</parameter_list><block>{<block_content>
+  <decl_stmt><decl><type><name>int</name></type> <name>rc</name></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>ShmHeader</name> <modifier>*</modifier></type><name>pShm</name> <init>= <expr><name><name>pDb</name><operator>-&gt;</operator><name>pShmhdr</name></name></expr></init></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>int</name></type> <name>nInt1</name></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>int</name></type> <name>nInt2</name></decl>;</decl_stmt>
+
+  <comment type="block">/* Must be holding the WORKER lock to do this. Or DMS2. */</comment>
+  <expr_stmt><expr><call><name>assert</name><argument_list>( 
+      <argument><expr><call><name>lsmShmAssertLock</name><argument_list>(<argument><expr><name>pDb</name></expr></argument>, <argument><expr><name>LSM_LOCK_WORKER</name></expr></argument>, <argument><expr><name>LSM_LOCK_EXCL</name></expr></argument>)</argument_list></call> 
+   <operator>||</operator> <call><name>lsmShmAssertLock</name><argument_list>(<argument><expr><name>pDb</name></expr></argument>, <argument><expr><name>LSM_LOCK_DMS1</name></expr></argument>, <argument><expr><name>LSM_LOCK_EXCL</name></expr></argument>)</argument_list></call></expr></argument> 
+  )</argument_list></call></expr>;</expr_stmt>
+
+  <comment type="block">/* Check that the two snapshots match. If not, repair them. */</comment>
+  <expr_stmt><expr><name>nInt1</name> <operator>=</operator> <name><name>pShm</name><operator>-&gt;</operator><name>aSnap1</name><index>[<expr><name>CKPT_HDR_NCKPT</name></expr>]</index></name></expr>;</expr_stmt>
+  <expr_stmt><expr><name>nInt2</name> <operator>=</operator> <name><name>pShm</name><operator>-&gt;</operator><name>aSnap2</name><index>[<expr><name>CKPT_HDR_NCKPT</name></expr>]</index></name></expr>;</expr_stmt>
+  <if_stmt><if>if<condition>( <expr><name>nInt1</name><operator>!=</operator><name>nInt2</name> <operator>||</operator> <call><name>memcmp</name><argument_list>(<argument><expr><name><name>pShm</name><operator>-&gt;</operator><name>aSnap1</name></name></expr></argument>, <argument><expr><name><name>pShm</name><operator>-&gt;</operator><name>aSnap2</name></name></expr></argument>, <argument><expr><name>nInt2</name><operator>*</operator><sizeof>sizeof<argument_list>(<argument><expr><name>u32</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr> )</condition><block>{<block_content>
+    <if_stmt><if>if<condition>( <expr><call><name>ckptChecksumOk</name><argument_list>(<argument><expr><name><name>pShm</name><operator>-&gt;</operator><name>aSnap1</name></name></expr></argument>)</argument_list></call></expr> )</condition><block>{<block_content>
+      <expr_stmt><expr><call><name>memcpy</name><argument_list>(<argument><expr><name><name>pShm</name><operator>-&gt;</operator><name>aSnap2</name></name></expr></argument>, <argument><expr><name><name>pShm</name><operator>-&gt;</operator><name>aSnap1</name></name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>u32</name></expr></argument>)</argument_list></sizeof><operator>*</operator><name>nInt1</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    </block_content>}</block></if><if type="elseif">else if<condition>( <expr><call><name>ckptChecksumOk</name><argument_list>(<argument><expr><name><name>pShm</name><operator>-&gt;</operator><name>aSnap2</name></name></expr></argument>)</argument_list></call></expr> )</condition><block>{<block_content>
+      <expr_stmt><expr><call><name>memcpy</name><argument_list>(<argument><expr><name><name>pShm</name><operator>-&gt;</operator><name>aSnap1</name></name></expr></argument>, <argument><expr><name><name>pShm</name><operator>-&gt;</operator><name>aSnap2</name></name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>u32</name></expr></argument>)</argument_list></sizeof><operator>*</operator><name>nInt2</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    </block_content>}</block></if><else>else<block>{<block_content>
+      <return>return <expr><name>LSM_PROTOCOL_BKPT</name></expr>;</return>
+    </block_content>}</block></else></if_stmt>
+  </block_content>}</block></if></if_stmt>
+
+  <expr_stmt><expr><name>rc</name> <operator>=</operator> <call><name>lsmCheckpointDeserialize</name><argument_list>(<argument><expr><name>pDb</name></expr></argument>, <argument><expr><literal type="number">1</literal></expr></argument>, <argument><expr><name><name>pShm</name><operator>-&gt;</operator><name>aSnap1</name></name></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>pDb</name><operator>-&gt;</operator><name>pWorker</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <if_stmt><if>if<condition>( <expr><name><name>pDb</name><operator>-&gt;</operator><name>pWorker</name></name></expr> )</condition><block type="pseudo"><block_content> <expr_stmt><expr><name><name>pDb</name><operator>-&gt;</operator><name>pWorker</name><operator>-&gt;</operator><name>pDatabase</name></name> <operator>=</operator> <name><name>pDb</name><operator>-&gt;</operator><name>pDatabase</name></name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+  <if_stmt><if>if<condition>( <expr><name>rc</name><operator>==</operator><name>LSM_OK</name></expr> )</condition><block>{<block_content>
+    <expr_stmt><expr><name>rc</name> <operator>=</operator> <call><name>lsmCheckCompressionId</name><argument_list>(<argument><expr><name>pDb</name></expr></argument>, <argument><expr><name><name>pDb</name><operator>-&gt;</operator><name>pWorker</name><operator>-&gt;</operator><name>iCmpId</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  </block_content>}</block></if></if_stmt>
+
+<cpp:if>#<cpp:directive>if</cpp:directive> <expr><literal type="number">0</literal></expr></cpp:if>
+  assert( rc!=LSM_OK || lsmFsIntegrityCheck(pDb) );
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+  <return>return <expr><name>rc</name></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><name>int</name></type> <name>lsmCheckpointDeserialize</name><parameter_list>(
+  <parameter><decl><type><name>lsm_db</name> <modifier>*</modifier></type><name>pDb</name></decl></parameter>, 
+  <parameter><decl><type><name>int</name></type> <name>bInclFreelist</name></decl></parameter>,              <comment type="block">/* If true, deserialize free-list */</comment>
+  <parameter><decl><type><name>u32</name> <modifier>*</modifier></type><name>aCkpt</name></decl></parameter>, 
+  <parameter><decl><type><name>Snapshot</name> <modifier>*</modifier><modifier>*</modifier></type><name>ppSnap</name></decl></parameter>
+)</parameter_list><block>{<block_content>
+  <decl_stmt><decl><type><name>int</name></type> <name>rc</name> <init>= <expr><name>LSM_OK</name></expr></init></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>Snapshot</name> <modifier>*</modifier></type><name>pNew</name></decl>;</decl_stmt>
+
+  <expr_stmt><expr><name>pNew</name> <operator>=</operator> <operator>(</operator><name>Snapshot</name> <operator>*</operator><operator>)</operator><call><name>lsmMallocZeroRc</name><argument_list>(<argument><expr><name><name>pDb</name><operator>-&gt;</operator><name>pEnv</name></name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>Snapshot</name></expr></argument>)</argument_list></sizeof></expr></argument>, <argument><expr><operator>&amp;</operator><name>rc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <if_stmt><if>if<condition>( <expr><name>rc</name><operator>==</operator><name>LSM_OK</name></expr> )</condition><block>{<block_content>
+    <decl_stmt><decl><type><name>Level</name> <modifier>*</modifier></type><name>pLvl</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>int</name></type> <name>nFree</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>int</name></type> <name>i</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>int</name></type> <name>nLevel</name> <init>= <expr><operator>(</operator><name>int</name><operator>)</operator><name><name>aCkpt</name><index>[<expr><name>CKPT_HDR_NLEVEL</name></expr>]</index></name></expr></init></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>int</name></type> <name>iIn</name> <init>= <expr><name>CKPT_HDR_SIZE</name> <operator>+</operator> <name>CKPT_APPENDLIST_SIZE</name> <operator>+</operator> <name>CKPT_LOGPTR_SIZE</name></expr></init></decl>;</decl_stmt>
+
+    <expr_stmt><expr><name><name>pNew</name><operator>-&gt;</operator><name>iId</name></name> <operator>=</operator> <call><name>lsmCheckpointId</name><argument_list>(<argument><expr><name>aCkpt</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>pNew</name><operator>-&gt;</operator><name>nBlock</name></name> <operator>=</operator> <name><name>aCkpt</name><index>[<expr><name>CKPT_HDR_NBLOCK</name></expr>]</index></name></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>pNew</name><operator>-&gt;</operator><name>nWrite</name></name> <operator>=</operator> <name><name>aCkpt</name><index>[<expr><name>CKPT_HDR_NWRITE</name></expr>]</index></name></expr>;</expr_stmt>
+    <expr_stmt><expr><name>rc</name> <operator>=</operator> <call><name>ckptLoadLevels</name><argument_list>(<argument><expr><name>pDb</name></expr></argument>, <argument><expr><name>aCkpt</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>iIn</name></expr></argument>, <argument><expr><name>nLevel</name></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>pNew</name><operator>-&gt;</operator><name>pLevel</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>pNew</name><operator>-&gt;</operator><name>iLogOff</name></name> <operator>=</operator> <call><name>lsmCheckpointLogOffset</name><argument_list>(<argument><expr><name>aCkpt</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>pNew</name><operator>-&gt;</operator><name>iCmpId</name></name> <operator>=</operator> <name><name>aCkpt</name><index>[<expr><name>CKPT_HDR_CMPID</name></expr>]</index></name></expr>;</expr_stmt>
+
+    <comment type="block">/* Make a copy of the append-list */</comment>
+    <for>for<control>(<init><expr><name>i</name><operator>=</operator><literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name><operator>&lt;</operator><name>LSM_APPLIST_SZ</name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control><block>{<block_content>
+      <decl_stmt><decl><type><name>u32</name> <modifier>*</modifier></type><name>a</name> <init>= <expr><operator>&amp;</operator><name><name>aCkpt</name><index>[<expr><name>CKPT_HDR_SIZE</name> <operator>+</operator> <name>CKPT_LOGPTR_SIZE</name> <operator>+</operator> <name>i</name><operator>*</operator><literal type="number">2</literal></expr>]</index></name></expr></init></decl>;</decl_stmt>
+      <expr_stmt><expr><name><name>pNew</name><operator>-&gt;</operator><name>aiAppend</name><index>[<expr><name>i</name></expr>]</index></name> <operator>=</operator> <call><name>ckptRead64</name><argument_list>(<argument><expr><name>a</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    </block_content>}</block></for>
+
+    <comment type="block">/* Read the block-redirect list */</comment>
+    <expr_stmt><expr><name><name>pNew</name><operator>-&gt;</operator><name>redirect</name><operator>.</operator><name>n</name></name> <operator>=</operator> <name><name>aCkpt</name><index>[<expr><name>iIn</name><operator>++</operator></expr>]</index></name></expr>;</expr_stmt>
+    <if_stmt><if>if<condition>( <expr><name><name>pNew</name><operator>-&gt;</operator><name>redirect</name><operator>.</operator><name>n</name></name></expr> )</condition><block>{<block_content>
+      <expr_stmt><expr><name><name>pNew</name><operator>-&gt;</operator><name>redirect</name><operator>.</operator><name>a</name></name> <operator>=</operator> <call><name>lsmMallocZeroRc</name><argument_list>(<argument><expr><name><name>pDb</name><operator>-&gt;</operator><name>pEnv</name></name></expr></argument>, 
+          <argument><expr><operator>(</operator><sizeof>sizeof<argument_list>(<argument><expr>struct <name>RedirectEntry</name></expr></argument>)</argument_list></sizeof> <operator>*</operator> <name>LSM_MAX_BLOCK_REDIRECTS</name><operator>)</operator></expr></argument>, <argument><expr><operator>&amp;</operator><name>rc</name></expr></argument>
+      )</argument_list></call></expr>;</expr_stmt>
+      <if_stmt><if>if<condition>( <expr><name>rc</name><operator>==</operator><name>LSM_OK</name></expr> )</condition><block>{<block_content>
+        <for>for<control>(<init><expr><name>i</name><operator>=</operator><literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name><operator>&lt;</operator><name><name>pNew</name><operator>-&gt;</operator><name>redirect</name><operator>.</operator><name>n</name></name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control><block>{<block_content>
+          <expr_stmt><expr><name><name>pNew</name><operator>-&gt;</operator><name>redirect</name><operator>.</operator><name>a</name><index>[<expr><name>i</name></expr>]</index></name><operator>.</operator><name>iFrom</name> <operator>=</operator> <name><name>aCkpt</name><index>[<expr><name>iIn</name><operator>++</operator></expr>]</index></name></expr>;</expr_stmt>
+          <expr_stmt><expr><name><name>pNew</name><operator>-&gt;</operator><name>redirect</name><operator>.</operator><name>a</name><index>[<expr><name>i</name></expr>]</index></name><operator>.</operator><name>iTo</name> <operator>=</operator> <name><name>aCkpt</name><index>[<expr><name>iIn</name><operator>++</operator></expr>]</index></name></expr>;</expr_stmt>
+        </block_content>}</block></for>
+      </block_content>}</block></if></if_stmt>
+      <for>for<control>(<init><expr><name>pLvl</name><operator>=</operator><name><name>pNew</name><operator>-&gt;</operator><name>pLevel</name></name></expr>;</init> <condition><expr><name><name>pLvl</name><operator>-&gt;</operator><name>pNext</name></name></expr>;</condition> <incr><expr><name>pLvl</name><operator>=</operator><name><name>pLvl</name><operator>-&gt;</operator><name>pNext</name></name></expr></incr>)</control><block type="pseudo"><block_content><empty_stmt>;</empty_stmt></block_content></block></for>
+      <if_stmt><if>if<condition>( <expr><name><name>pLvl</name><operator>-&gt;</operator><name>nRight</name></name></expr> )</condition><block>{<block_content>
+        <expr_stmt><expr><name><name>pLvl</name><operator>-&gt;</operator><name>aRhs</name><index>[<expr><name><name>pLvl</name><operator>-&gt;</operator><name>nRight</name></name><operator>-</operator><literal type="number">1</literal></expr>]</index></name><operator>.</operator><name>pRedirect</name> <operator>=</operator> <operator>&amp;</operator><name><name>pNew</name><operator>-&gt;</operator><name>redirect</name></name></expr>;</expr_stmt>
+      </block_content>}</block></if><else>else<block>{<block_content>
+        <expr_stmt><expr><name><name>pLvl</name><operator>-&gt;</operator><name>lhs</name><operator>.</operator><name>pRedirect</name></name> <operator>=</operator> <operator>&amp;</operator><name><name>pNew</name><operator>-&gt;</operator><name>redirect</name></name></expr>;</expr_stmt>
+      </block_content>}</block></else></if_stmt>
+    </block_content>}</block></if></if_stmt>
+
+    <comment type="block">/* Copy the free-list */</comment>
+    <if_stmt><if>if<condition>( <expr><name>rc</name><operator>==</operator><name>LSM_OK</name> <operator>&amp;&amp;</operator> <name>bInclFreelist</name></expr> )</condition><block>{<block_content>
+      <expr_stmt><expr><name>nFree</name> <operator>=</operator> <name><name>aCkpt</name><index>[<expr><name>iIn</name><operator>++</operator></expr>]</index></name></expr>;</expr_stmt>
+      <if_stmt><if>if<condition>( <expr><name>nFree</name></expr> )</condition><block>{<block_content>
+        <expr_stmt><expr><name><name>pNew</name><operator>-&gt;</operator><name>freelist</name><operator>.</operator><name>aEntry</name></name> <operator>=</operator> <operator>(</operator><name>FreelistEntry</name> <operator>*</operator><operator>)</operator><call><name>lsmMallocZeroRc</name><argument_list>(
+            <argument><expr><name><name>pDb</name><operator>-&gt;</operator><name>pEnv</name></name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>FreelistEntry</name></expr></argument>)</argument_list></sizeof><operator>*</operator><name>nFree</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>rc</name></expr></argument>
+        )</argument_list></call></expr>;</expr_stmt>
+        <if_stmt><if>if<condition>( <expr><name>rc</name><operator>==</operator><name>LSM_OK</name></expr> )</condition><block>{<block_content>
+          <decl_stmt><decl><type><name>int</name></type> <name>j</name></decl>;</decl_stmt>
+          <for>for<control>(<init><expr><name>j</name><operator>=</operator><literal type="number">0</literal></expr>;</init> <condition><expr><name>j</name><operator>&lt;</operator><name>nFree</name></expr>;</condition> <incr><expr><name>j</name><operator>++</operator></expr></incr>)</control><block>{<block_content>
+            <decl_stmt><decl><type><name>FreelistEntry</name> <modifier>*</modifier></type><name>p</name> <init>= <expr><operator>&amp;</operator><name><name>pNew</name><operator>-&gt;</operator><name>freelist</name><operator>.</operator><name>aEntry</name><index>[<expr><name>j</name></expr>]</index></name></expr></init></decl>;</decl_stmt>
+            <expr_stmt><expr><name><name>p</name><operator>-&gt;</operator><name>iBlk</name></name> <operator>=</operator> <name><name>aCkpt</name><index>[<expr><name>iIn</name><operator>++</operator></expr>]</index></name></expr>;</expr_stmt>
+            <expr_stmt><expr><name><name>p</name><operator>-&gt;</operator><name>iId</name></name> <operator>=</operator> <operator>(</operator><operator>(</operator><name>i64</name><operator>)</operator><operator>(</operator><name><name>aCkpt</name><index>[<expr><name>iIn</name></expr>]</index></name><operator>)</operator><operator>&lt;&lt;</operator><literal type="number">32</literal><operator>)</operator> <operator>+</operator> <name><name>aCkpt</name><index>[<expr><name>iIn</name><operator>+</operator><literal type="number">1</literal></expr>]</index></name></expr>;</expr_stmt>
+            <expr_stmt><expr><name>iIn</name> <operator>+=</operator> <literal type="number">2</literal></expr>;</expr_stmt>
+          </block_content>}</block></for>
+          <expr_stmt><expr><name><name>pNew</name><operator>-&gt;</operator><name>freelist</name><operator>.</operator><name>nEntry</name></name> <operator>=</operator> <name><name>pNew</name><operator>-&gt;</operator><name>freelist</name><operator>.</operator><name>nAlloc</name></name> <operator>=</operator> <name>nFree</name></expr>;</expr_stmt>
+        </block_content>}</block></if></if_stmt>
+      </block_content>}</block></if></if_stmt>
+    </block_content>}</block></if></if_stmt>
+  </block_content>}</block></if></if_stmt>
+
+  <if_stmt><if>if<condition>( <expr><name>rc</name><operator>!=</operator><name>LSM_OK</name></expr> )</condition><block>{<block_content>
+    <expr_stmt><expr><call><name>lsmFreeSnapshot</name><argument_list>(<argument><expr><name><name>pDb</name><operator>-&gt;</operator><name>pEnv</name></name></expr></argument>, <argument><expr><name>pNew</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><name>pNew</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+  </block_content>}</block></if></if_stmt>
+
+  <expr_stmt><expr><operator>*</operator><name>ppSnap</name> <operator>=</operator> <name>pNew</name></expr>;</expr_stmt>
+  <return>return <expr><name>rc</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+** Connection pDb must be the worker connection in order to call this
+** function. It returns true if the database already contains the maximum
+** number of levels or false otherwise.
+**
+** This is used when flushing the in-memory tree to disk. If the database
+** is already full, then the caller should invoke lsm_work() or similar
+** until it is not full before creating a new level by flushing the in-memory
+** tree to disk. Limiting the number of levels in the database ensures that
+** the records describing them always fit within the checkpoint blob.
+*/</comment>
+<function><type><name>int</name></type> <name>lsmDatabaseFull</name><parameter_list>(<parameter><decl><type><name>lsm_db</name> <modifier>*</modifier></type><name>pDb</name></decl></parameter>)</parameter_list><block>{<block_content>
+  <decl_stmt><decl><type><name>Level</name> <modifier>*</modifier></type><name>p</name></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>int</name></type> <name>nRhs</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+
+  <expr_stmt><expr><call><name>assert</name><argument_list>( <argument><expr><call><name>lsmShmAssertLock</name><argument_list>(<argument><expr><name>pDb</name></expr></argument>, <argument><expr><name>LSM_LOCK_WORKER</name></expr></argument>, <argument><expr><name>LSM_LOCK_EXCL</name></expr></argument>)</argument_list></call></expr></argument> )</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><call><name>assert</name><argument_list>( <argument><expr><name><name>pDb</name><operator>-&gt;</operator><name>pWorker</name></name></expr></argument> )</argument_list></call></expr>;</expr_stmt>
+
+  <for>for<control>(<init><expr><name>p</name><operator>=</operator><name><name>pDb</name><operator>-&gt;</operator><name>pWorker</name><operator>-&gt;</operator><name>pLevel</name></name></expr>;</init> <condition><expr><name>p</name></expr>;</condition> <incr><expr><name>p</name><operator>=</operator><name><name>p</name><operator>-&gt;</operator><name>pNext</name></name></expr></incr>)</control><block>{<block_content>
+    <expr_stmt><expr><name>nRhs</name> <operator>+=</operator> <operator>(</operator><ternary><condition><expr><name><name>p</name><operator>-&gt;</operator><name>nRight</name></name></expr> ?</condition><then> <expr><name><name>p</name><operator>-&gt;</operator><name>nRight</name></name></expr> </then><else>: <expr><literal type="number">1</literal></expr></else></ternary><operator>)</operator></expr>;</expr_stmt>
+  </block_content>}</block></for>
+
+  <return>return <expr><operator>(</operator><name>nRhs</name> <operator>&gt;=</operator> <name>LSM_MAX_RHS_SEGMENTS</name><operator>)</operator></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+** The connection passed as the only argument is currently the worker
+** connection. Some work has been performed on the database by the connection,
+** but no new snapshot has been written into shared memory.
+**
+** This function updates the shared-memory worker and client snapshots with
+** the new snapshot produced by the work performed by pDb.
+**
+** If successful, LSM_OK is returned. Otherwise, if an error occurs, an LSM
+** error code is returned.
+*/</comment>
+<function><type><name>int</name></type> <name>lsmCheckpointSaveWorker</name><parameter_list>(<parameter><decl><type><name>lsm_db</name> <modifier>*</modifier></type><name>pDb</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>bFlush</name></decl></parameter>)</parameter_list><block>{<block_content>
+  <decl_stmt><decl><type><name>Snapshot</name> <modifier>*</modifier></type><name>pSnap</name> <init>= <expr><name><name>pDb</name><operator>-&gt;</operator><name>pWorker</name></name></expr></init></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>ShmHeader</name> <modifier>*</modifier></type><name>pShm</name> <init>= <expr><name><name>pDb</name><operator>-&gt;</operator><name>pShmhdr</name></name></expr></init></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>void</name> <modifier>*</modifier></type><name>p</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>int</name></type> <name>n</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>int</name></type> <name>rc</name></decl>;</decl_stmt>
+
+  <expr_stmt><expr><name><name>pSnap</name><operator>-&gt;</operator><name>iId</name></name><operator>++</operator></expr>;</expr_stmt>
+  <expr_stmt><expr><name>rc</name> <operator>=</operator> <call><name>ckptExportSnapshot</name><argument_list>(<argument><expr><name>pDb</name></expr></argument>, <argument><expr><name>bFlush</name></expr></argument>, <argument><expr><name><name>pSnap</name><operator>-&gt;</operator><name>iId</name></name></expr></argument>, <argument><expr><literal type="number">1</literal></expr></argument>, <argument><expr><operator>&amp;</operator><name>p</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>n</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <if_stmt><if>if<condition>( <expr><name>rc</name><operator>!=</operator><name>LSM_OK</name></expr> )</condition><block type="pseudo"><block_content> <return>return <expr><name>rc</name></expr>;</return></block_content></block></if></if_stmt>
+  <expr_stmt><expr><call><name>assert</name><argument_list>( <argument><expr><call><name>ckptChecksumOk</name><argument_list>(<argument><expr><operator>(</operator><name>u32</name> <operator>*</operator><operator>)</operator><name>p</name></expr></argument>)</argument_list></call></expr></argument> )</argument_list></call></expr>;</expr_stmt>
+
+  <expr_stmt><expr><call><name>assert</name><argument_list>( <argument><expr><name>n</name><operator>&lt;=</operator><name>LSM_META_RW_PAGE_SIZE</name></expr></argument> )</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><call><name>memcpy</name><argument_list>(<argument><expr><name><name>pShm</name><operator>-&gt;</operator><name>aSnap2</name></name></expr></argument>, <argument><expr><name>p</name></expr></argument>, <argument><expr><name>n</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><call><name>lsmShmBarrier</name><argument_list>(<argument><expr><name>pDb</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><call><name>memcpy</name><argument_list>(<argument><expr><name><name>pShm</name><operator>-&gt;</operator><name>aSnap1</name></name></expr></argument>, <argument><expr><name>p</name></expr></argument>, <argument><expr><name>n</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><call><name>lsmFree</name><argument_list>(<argument><expr><name><name>pDb</name><operator>-&gt;</operator><name>pEnv</name></name></expr></argument>, <argument><expr><name>p</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+  <comment type="block">/* assert( lsmFsIntegrityCheck(pDb) ); */</comment>
+  <return>return <expr><name>LSM_OK</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+** This function is used to determine the snapshot-id of the most recently
+** checkpointed snapshot. Variable ShmHeader.iMetaPage indicates which of
+** the two meta-pages said snapshot resides on (if any). 
+**
+** If successful, this function loads the snapshot from the meta-page, 
+** verifies its checksum and sets *piId to the snapshot-id before returning
+** LSM_OK. Or, if the checksum attempt fails, *piId is set to zero and
+** LSM_OK returned. If an error occurs, an LSM error code is returned and
+** the final value of *piId is undefined.
+*/</comment>
+<function><type><name>int</name></type> <name>lsmCheckpointSynced</name><parameter_list>(<parameter><decl><type><name>lsm_db</name> <modifier>*</modifier></type><name>pDb</name></decl></parameter>, <parameter><decl><type><name>i64</name> <modifier>*</modifier></type><name>piId</name></decl></parameter>, <parameter><decl><type><name>i64</name> <modifier>*</modifier></type><name>piLog</name></decl></parameter>, <parameter><decl><type><name>u32</name> <modifier>*</modifier></type><name>pnWrite</name></decl></parameter>)</parameter_list><block>{<block_content>
+  <decl_stmt><decl><type><name>int</name></type> <name>rc</name> <init>= <expr><name>LSM_OK</name></expr></init></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>MetaPage</name> <modifier>*</modifier></type><name>pPg</name></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>u32</name></type> <name>iMeta</name></decl>;</decl_stmt>
+
+  <expr_stmt><expr><name>iMeta</name> <operator>=</operator> <name><name>pDb</name><operator>-&gt;</operator><name>pShmhdr</name><operator>-&gt;</operator><name>iMetaPage</name></name></expr>;</expr_stmt>
+  <if_stmt><if>if<condition>( <expr><name>iMeta</name><operator>==</operator><literal type="number">1</literal> <operator>||</operator> <name>iMeta</name><operator>==</operator><literal type="number">2</literal></expr> )</condition><block>{<block_content>
+    <expr_stmt><expr><name>rc</name> <operator>=</operator> <call><name>lsmFsMetaPageGet</name><argument_list>(<argument><expr><name><name>pDb</name><operator>-&gt;</operator><name>pFS</name></name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><name>iMeta</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>pPg</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <if_stmt><if>if<condition>( <expr><name>rc</name><operator>==</operator><name>LSM_OK</name></expr> )</condition><block>{<block_content>
+      <decl_stmt><decl><type><name>int</name></type> <name>nCkpt</name></decl>;</decl_stmt>
+      <decl_stmt><decl><type><name>int</name></type> <name>nData</name></decl>;</decl_stmt>
+      <decl_stmt><decl><type><name>u8</name> <modifier>*</modifier></type><name>aData</name></decl>;</decl_stmt> 
+
+      <expr_stmt><expr><name>aData</name> <operator>=</operator> <call><name>lsmFsMetaPageData</name><argument_list>(<argument><expr><name>pPg</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>nData</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+      <expr_stmt><expr><call><name>assert</name><argument_list>( <argument><expr><name>nData</name><operator>==</operator><name>LSM_META_RW_PAGE_SIZE</name></expr></argument> )</argument_list></call></expr>;</expr_stmt>
+      <expr_stmt><expr><name>nCkpt</name> <operator>=</operator> <call><name>lsmGetU32</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>aData</name><index>[<expr><name>CKPT_HDR_NCKPT</name><operator>*</operator><sizeof>sizeof<argument_list>(<argument><expr><name>u32</name></expr></argument>)</argument_list></sizeof></expr>]</index></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+      <if_stmt><if>if<condition>( <expr><name>nCkpt</name><operator>&lt;</operator><operator>(</operator><name>LSM_META_RW_PAGE_SIZE</name><operator>/</operator><sizeof>sizeof<argument_list>(<argument><expr><name>u32</name></expr></argument>)</argument_list></sizeof><operator>)</operator></expr> )</condition><block>{<block_content>
+        <decl_stmt><decl><type><name>u32</name> <modifier>*</modifier></type><name>aCopy</name> <init>= <expr><call><name>lsmMallocRc</name><argument_list>(<argument><expr><name><name>pDb</name><operator>-&gt;</operator><name>pEnv</name></name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>u32</name></expr></argument>)</argument_list></sizeof> <operator>*</operator> <name>nCkpt</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>rc</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+        <if_stmt><if>if<condition>( <expr><name>aCopy</name></expr> )</condition><block>{<block_content>
+          <expr_stmt><expr><call><name>memcpy</name><argument_list>(<argument><expr><name>aCopy</name></expr></argument>, <argument><expr><name>aData</name></expr></argument>, <argument><expr><name>nCkpt</name><operator>*</operator><sizeof>sizeof<argument_list>(<argument><expr><name>u32</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+          <expr_stmt><expr><call><name>ckptChangeEndianness</name><argument_list>(<argument><expr><name>aCopy</name></expr></argument>, <argument><expr><name>nCkpt</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+          <if_stmt><if>if<condition>( <expr><call><name>ckptChecksumOk</name><argument_list>(<argument><expr><name>aCopy</name></expr></argument>)</argument_list></call></expr> )</condition><block>{<block_content>
+            <if_stmt><if>if<condition>( <expr><name>piId</name></expr> )</condition><block type="pseudo"><block_content> <expr_stmt><expr><operator>*</operator><name>piId</name> <operator>=</operator> <call><name>lsmCheckpointId</name><argument_list>(<argument><expr><name>aCopy</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+            <if_stmt><if>if<condition>( <expr><name>piLog</name></expr> )</condition><block type="pseudo"><block_content> <expr_stmt><expr><operator>*</operator><name>piLog</name> <operator>=</operator> <operator>(</operator><call><name>lsmCheckpointLogOffset</name><argument_list>(<argument><expr><name>aCopy</name></expr></argument>)</argument_list></call> <operator>&gt;&gt;</operator> <literal type="number">1</literal><operator>)</operator></expr>;</expr_stmt></block_content></block></if></if_stmt>
+            <if_stmt><if>if<condition>( <expr><name>pnWrite</name></expr> )</condition><block type="pseudo"><block_content> <expr_stmt><expr><operator>*</operator><name>pnWrite</name> <operator>=</operator> <name><name>aCopy</name><index>[<expr><name>CKPT_HDR_NWRITE</name></expr>]</index></name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+          </block_content>}</block></if></if_stmt>
+          <expr_stmt><expr><call><name>lsmFree</name><argument_list>(<argument><expr><name><name>pDb</name><operator>-&gt;</operator><name>pEnv</name></name></expr></argument>, <argument><expr><name>aCopy</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        </block_content>}</block></if></if_stmt>
+      </block_content>}</block></if></if_stmt>
+      <expr_stmt><expr><call><name>lsmFsMetaPageRelease</name><argument_list>(<argument><expr><name>pPg</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    </block_content>}</block></if></if_stmt>
+  </block_content>}</block></if></if_stmt>
+
+  <if_stmt><if>if<condition>( <expr><operator>(</operator><name>iMeta</name><operator>!=</operator><literal type="number">1</literal> <operator>&amp;&amp;</operator> <name>iMeta</name><operator>!=</operator><literal type="number">2</literal><operator>)</operator> <operator>||</operator> <name>rc</name><operator>!=</operator><name>LSM_OK</name> <operator>||</operator> <name><name>pDb</name><operator>-&gt;</operator><name>pShmhdr</name><operator>-&gt;</operator><name>iMetaPage</name></name><operator>!=</operator><name>iMeta</name></expr> )</condition><block>{<block_content>
+    <if_stmt><if>if<condition>( <expr><name>piId</name></expr> )</condition><block type="pseudo"><block_content> <expr_stmt><expr><operator>*</operator><name>piId</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt></block_content></block></if></if_stmt>
+    <if_stmt><if>if<condition>( <expr><name>piLog</name></expr> )</condition><block type="pseudo"><block_content> <expr_stmt><expr><operator>*</operator><name>piLog</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt></block_content></block></if></if_stmt>
+    <if_stmt><if>if<condition>( <expr><name>pnWrite</name></expr> )</condition><block type="pseudo"><block_content> <expr_stmt><expr><operator>*</operator><name>pnWrite</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt></block_content></block></if></if_stmt>
+  </block_content>}</block></if></if_stmt>
+  <return>return <expr><name>rc</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+** Return the checkpoint-id of the checkpoint array passed as the first
+** argument to this function. If the second argument is true, then assume
+** that the checkpoint is made up of 32-bit big-endian integers. If it
+** is false, assume that the integers are in machine byte order.
+*/</comment>
+<function><type><name>i64</name></type> <name>lsmCheckpointId</name><parameter_list>(<parameter><decl><type><name>u32</name> <modifier>*</modifier></type><name>aCkpt</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>bDisk</name></decl></parameter>)</parameter_list><block>{<block_content>
+  <decl_stmt><decl><type><name>i64</name></type> <name>iId</name></decl>;</decl_stmt>
+  <if_stmt><if>if<condition>( <expr><name>bDisk</name></expr> )</condition><block>{<block_content>
+    <decl_stmt><decl><type><name>u8</name> <modifier>*</modifier></type><name>aData</name> <init>= <expr><operator>(</operator><name>u8</name> <operator>*</operator><operator>)</operator><name>aCkpt</name></expr></init></decl>;</decl_stmt>
+    <expr_stmt><expr><name>iId</name> <operator>=</operator> <operator>(</operator><operator>(</operator><operator>(</operator><name>i64</name><operator>)</operator><call><name>lsmGetU32</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>aData</name><index>[<expr><name>CKPT_HDR_ID_MSW</name><operator>*</operator><literal type="number">4</literal></expr>]</index></name></expr></argument>)</argument_list></call><operator>)</operator> <operator>&lt;&lt;</operator> <literal type="number">32</literal><operator>)</operator></expr>;</expr_stmt>
+    <expr_stmt><expr><name>iId</name> <operator>+=</operator> <operator>(</operator><operator>(</operator><name>i64</name><operator>)</operator><call><name>lsmGetU32</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>aData</name><index>[<expr><name>CKPT_HDR_ID_LSW</name><operator>*</operator><literal type="number">4</literal></expr>]</index></name></expr></argument>)</argument_list></call><operator>)</operator></expr>;</expr_stmt>
+  </block_content>}</block></if><else>else<block>{<block_content>
+    <expr_stmt><expr><name>iId</name> <operator>=</operator> <operator>(</operator><operator>(</operator><name>i64</name><operator>)</operator><name><name>aCkpt</name><index>[<expr><name>CKPT_HDR_ID_MSW</name></expr>]</index></name> <operator>&lt;&lt;</operator> <literal type="number">32</literal><operator>)</operator> <operator>+</operator> <operator>(</operator><name>i64</name><operator>)</operator><name><name>aCkpt</name><index>[<expr><name>CKPT_HDR_ID_LSW</name></expr>]</index></name></expr>;</expr_stmt>
+  </block_content>}</block></else></if_stmt>
+  <return>return <expr><name>iId</name></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><name>u32</name></type> <name>lsmCheckpointNBlock</name><parameter_list>(<parameter><decl><type><name>u32</name> <modifier>*</modifier></type><name>aCkpt</name></decl></parameter>)</parameter_list><block>{<block_content>
+  <return>return <expr><name><name>aCkpt</name><index>[<expr><name>CKPT_HDR_NBLOCK</name></expr>]</index></name></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><name>u32</name></type> <name>lsmCheckpointNWrite</name><parameter_list>(<parameter><decl><type><name>u32</name> <modifier>*</modifier></type><name>aCkpt</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>bDisk</name></decl></parameter>)</parameter_list><block>{<block_content>
+  <if_stmt><if>if<condition>( <expr><name>bDisk</name></expr> )</condition><block>{<block_content>
+    <return>return <expr><call><name>lsmGetU32</name><argument_list>(<argument><expr><operator>(</operator><name>u8</name> <operator>*</operator><operator>)</operator><operator>&amp;</operator><name><name>aCkpt</name><index>[<expr><name>CKPT_HDR_NWRITE</name></expr>]</index></name></expr></argument>)</argument_list></call></expr>;</return>
+  </block_content>}</block></if><else>else<block>{<block_content>
+    <return>return <expr><name><name>aCkpt</name><index>[<expr><name>CKPT_HDR_NWRITE</name></expr>]</index></name></expr>;</return>
+  </block_content>}</block></else></if_stmt>
+</block_content>}</block></function>
+
+<function><type><name>i64</name></type> <name>lsmCheckpointLogOffset</name><parameter_list>(<parameter><decl><type><name>u32</name> <modifier>*</modifier></type><name>aCkpt</name></decl></parameter>)</parameter_list><block>{<block_content>
+  <return>return <expr><operator>(</operator><operator>(</operator><name>i64</name><operator>)</operator><name><name>aCkpt</name><index>[<expr><name>CKPT_HDR_LO_MSW</name></expr>]</index></name> <operator>&lt;&lt;</operator> <literal type="number">32</literal><operator>)</operator> <operator>+</operator> <operator>(</operator><name>i64</name><operator>)</operator><name><name>aCkpt</name><index>[<expr><name>CKPT_HDR_LO_LSW</name></expr>]</index></name></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><name>int</name></type> <name>lsmCheckpointPgsz</name><parameter_list>(<parameter><decl><type><name>u32</name> <modifier>*</modifier></type><name>aCkpt</name></decl></parameter>)</parameter_list><block>{<block_content> <return>return <expr><operator>(</operator><name>int</name><operator>)</operator><name><name>aCkpt</name><index>[<expr><name>CKPT_HDR_PGSZ</name></expr>]</index></name></expr>;</return> </block_content>}</block></function>
+
+<function><type><name>int</name></type> <name>lsmCheckpointBlksz</name><parameter_list>(<parameter><decl><type><name>u32</name> <modifier>*</modifier></type><name>aCkpt</name></decl></parameter>)</parameter_list><block>{<block_content> <return>return <expr><operator>(</operator><name>int</name><operator>)</operator><name><name>aCkpt</name><index>[<expr><name>CKPT_HDR_BLKSZ</name></expr>]</index></name></expr>;</return> </block_content>}</block></function>
+
+<function><type><name>void</name></type> <name>lsmCheckpointLogoffset</name><parameter_list>(
+  <parameter><decl><type><name>u32</name> <modifier>*</modifier></type><name>aCkpt</name></decl></parameter>,
+  <parameter><decl><type><name>DbLog</name> <modifier>*</modifier></type><name>pLog</name></decl></parameter>
+)</parameter_list><block>{<block_content> 
+  <expr_stmt><expr><name><name>pLog</name><operator>-&gt;</operator><name>aRegion</name><index>[<expr><literal type="number">2</literal></expr>]</index></name><operator>.</operator><name>iStart</name> <operator>=</operator> <operator>(</operator><call><name>lsmCheckpointLogOffset</name><argument_list>(<argument><expr><name>aCkpt</name></expr></argument>)</argument_list></call> <operator>&gt;&gt;</operator> <literal type="number">1</literal><operator>)</operator></expr>;</expr_stmt>
+
+  <expr_stmt><expr><name><name>pLog</name><operator>-&gt;</operator><name>cksum0</name></name> <operator>=</operator> <name><name>aCkpt</name><index>[<expr><name>CKPT_HDR_LO_CKSUM1</name></expr>]</index></name></expr>;</expr_stmt>
+  <expr_stmt><expr><name><name>pLog</name><operator>-&gt;</operator><name>cksum1</name></name> <operator>=</operator> <name><name>aCkpt</name><index>[<expr><name>CKPT_HDR_LO_CKSUM2</name></expr>]</index></name></expr>;</expr_stmt>
+  <expr_stmt><expr><name><name>pLog</name><operator>-&gt;</operator><name>iSnapshotId</name></name> <operator>=</operator> <call><name>lsmCheckpointId</name><argument_list>(<argument><expr><name>aCkpt</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<function><type><name>void</name></type> <name>lsmCheckpointZeroLogoffset</name><parameter_list>(<parameter><decl><type><name>lsm_db</name> <modifier>*</modifier></type><name>pDb</name></decl></parameter>)</parameter_list><block>{<block_content>
+  <decl_stmt><decl><type><name>u32</name></type> <name>nCkpt</name></decl>;</decl_stmt>
+
+  <expr_stmt><expr><name>nCkpt</name> <operator>=</operator> <name><name>pDb</name><operator>-&gt;</operator><name>aSnapshot</name><index>[<expr><name>CKPT_HDR_NCKPT</name></expr>]</index></name></expr>;</expr_stmt>
+  <expr_stmt><expr><call><name>assert</name><argument_list>( <argument><expr><name>nCkpt</name><operator>&gt;</operator><name>CKPT_HDR_NCKPT</name></expr></argument> )</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><call><name>assert</name><argument_list>( <argument><expr><name>nCkpt</name><operator>==</operator><name><name>pDb</name><operator>-&gt;</operator><name>pShmhdr</name><operator>-&gt;</operator><name>aSnap1</name><index>[<expr><name>CKPT_HDR_NCKPT</name></expr>]</index></name></expr></argument> )</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><call><name>assert</name><argument_list>( <argument><expr><literal type="number">0</literal><operator>==</operator><call><name>memcmp</name><argument_list>(<argument><expr><name><name>pDb</name><operator>-&gt;</operator><name>aSnapshot</name></name></expr></argument>, <argument><expr><name><name>pDb</name><operator>-&gt;</operator><name>pShmhdr</name><operator>-&gt;</operator><name>aSnap1</name></name></expr></argument>, <argument><expr><name>nCkpt</name><operator>*</operator><sizeof>sizeof<argument_list>(<argument><expr><name>u32</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr></argument> )</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><call><name>assert</name><argument_list>( <argument><expr><literal type="number">0</literal><operator>==</operator><call><name>memcmp</name><argument_list>(<argument><expr><name><name>pDb</name><operator>-&gt;</operator><name>aSnapshot</name></name></expr></argument>, <argument><expr><name><name>pDb</name><operator>-&gt;</operator><name>pShmhdr</name><operator>-&gt;</operator><name>aSnap2</name></name></expr></argument>, <argument><expr><name>nCkpt</name><operator>*</operator><sizeof>sizeof<argument_list>(<argument><expr><name>u32</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr></argument> )</argument_list></call></expr>;</expr_stmt>
+
+  <expr_stmt><expr><name><name>pDb</name><operator>-&gt;</operator><name>aSnapshot</name><index>[<expr><name>CKPT_HDR_LO_MSW</name></expr>]</index></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+  <expr_stmt><expr><name><name>pDb</name><operator>-&gt;</operator><name>aSnapshot</name><index>[<expr><name>CKPT_HDR_LO_LSW</name></expr>]</index></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+  <expr_stmt><expr><call><name>ckptChecksum</name><argument_list>(<argument><expr><name><name>pDb</name><operator>-&gt;</operator><name>aSnapshot</name></name></expr></argument>, <argument><expr><name>nCkpt</name></expr></argument>, 
+      <argument><expr><operator>&amp;</operator><name><name>pDb</name><operator>-&gt;</operator><name>aSnapshot</name><index>[<expr><name>nCkpt</name><operator>-</operator><literal type="number">2</literal></expr>]</index></name></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>pDb</name><operator>-&gt;</operator><name>aSnapshot</name><index>[<expr><name>nCkpt</name><operator>-</operator><literal type="number">1</literal></expr>]</index></name></expr></argument>
+  )</argument_list></call></expr>;</expr_stmt>
+
+  <expr_stmt><expr><call><name>memcpy</name><argument_list>(<argument><expr><name><name>pDb</name><operator>-&gt;</operator><name>pShmhdr</name><operator>-&gt;</operator><name>aSnap1</name></name></expr></argument>, <argument><expr><name><name>pDb</name><operator>-&gt;</operator><name>aSnapshot</name></name></expr></argument>, <argument><expr><name>nCkpt</name><operator>*</operator><sizeof>sizeof<argument_list>(<argument><expr><name>u32</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><call><name>memcpy</name><argument_list>(<argument><expr><name><name>pDb</name><operator>-&gt;</operator><name>pShmhdr</name><operator>-&gt;</operator><name>aSnap2</name></name></expr></argument>, <argument><expr><name><name>pDb</name><operator>-&gt;</operator><name>aSnapshot</name></name></expr></argument>, <argument><expr><name>nCkpt</name><operator>*</operator><sizeof>sizeof<argument_list>(<argument><expr><name>u32</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+** Set the output variable to the number of KB of data written into the
+** database file since the most recent checkpoint.
+*/</comment>
+<function><type><name>int</name></type> <name>lsmCheckpointSize</name><parameter_list>(<parameter><decl><type><name>lsm_db</name> <modifier>*</modifier></type><name>db</name></decl></parameter>, <parameter><decl><type><name>int</name> <modifier>*</modifier></type><name>pnKB</name></decl></parameter>)</parameter_list><block>{<block_content>
+  <decl_stmt><decl><type><name>int</name></type> <name>rc</name> <init>= <expr><name>LSM_OK</name></expr></init></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>u32</name></type> <name>nSynced</name></decl>;</decl_stmt>
+
+  <comment type="block">/* Set nSynced to the number of pages that had been written when the 
+  ** database was last checkpointed. */</comment>
+  <expr_stmt><expr><name>rc</name> <operator>=</operator> <call><name>lsmCheckpointSynced</name><argument_list>(<argument><expr><name>db</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><operator>&amp;</operator><name>nSynced</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+  <if_stmt><if>if<condition>( <expr><name>rc</name><operator>==</operator><name>LSM_OK</name></expr> )</condition><block>{<block_content>
+    <decl_stmt><decl><type><name>u32</name></type> <name>nPgsz</name> <init>= <expr><name><name>db</name><operator>-&gt;</operator><name>pShmhdr</name><operator>-&gt;</operator><name>aSnap1</name><index>[<expr><name>CKPT_HDR_PGSZ</name></expr>]</index></name></expr></init></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>u32</name></type> <name>nWrite</name> <init>= <expr><name><name>db</name><operator>-&gt;</operator><name>pShmhdr</name><operator>-&gt;</operator><name>aSnap1</name><index>[<expr><name>CKPT_HDR_NWRITE</name></expr>]</index></name></expr></init></decl>;</decl_stmt>
+    <expr_stmt><expr><operator>*</operator><name>pnKB</name> <operator>=</operator> <operator>(</operator><name>int</name><operator>)</operator><operator>(</operator><operator>(</operator> <operator>(</operator><operator>(</operator><name>i64</name><operator>)</operator><operator>(</operator><name>nWrite</name> <operator>-</operator> <name>nSynced</name><operator>)</operator> <operator>*</operator> <name>nPgsz</name><operator>)</operator> <operator>+</operator> <literal type="number">1023</literal><operator>)</operator> <operator>/</operator> <literal type="number">1024</literal><operator>)</operator></expr>;</expr_stmt>
+  </block_content>}</block></if></if_stmt>
+
+  <return>return <expr><name>rc</name></expr>;</return>
+</block_content>}</block></function>
+</unit>

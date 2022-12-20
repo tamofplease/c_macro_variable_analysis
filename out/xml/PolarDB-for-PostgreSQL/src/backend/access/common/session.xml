@@ -1,0 +1,210 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<unit xmlns="http://www.srcML.org/srcML/src" xmlns:cpp="http://www.srcML.org/srcML/cpp" revision="1.0.0" language="C" filename="/cloned_projects/PolarDB-for-PostgreSQL/src/backend/access/common/session.c"><comment type="block">/*-------------------------------------------------------------------------
+ *
+ * session.c
+ *		Encapsulation of user session.
+ *
+ * This is intended to contain data that needs to be shared between backends
+ * performing work for a client session.  In particular such a session is
+ * shared between the leader and worker processes for parallel queries.  At
+ * some later point it might also become useful infrastructure for separating
+ * backends from client connections, e.g. for the purpose of pooling.
+ *
+ * Currently this infrastructure is used to share:
+ * - typemod registry for ephemeral row-types, i.e. BlessTupleDesc etc.
+ *
+ * Portions Copyright (c) 2017-2018, PostgreSQL Global Development Group
+ *
+ * src/backend/access/common/session.c
+ *
+ *-------------------------------------------------------------------------
+ */</comment>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"postgres.h"</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/session.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/lwlock.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/shm_toc.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/memutils.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/typcache.h"</cpp:file></cpp:include>
+
+<comment type="block">/* Magic number for per-session DSM TOC. */</comment>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>SESSION_MAGIC</name></cpp:macro>						<cpp:value>0xabb0fbc9</cpp:value></cpp:define>
+
+<comment type="block">/*
+ * We want to create a DSA area to store shared state that has the same
+ * lifetime as a session.  So far, it's only used to hold the shared record
+ * type registry.  We don't want it to have to create any DSM segments just
+ * yet in common cases, so we'll give it enough space to hold a very small
+ * SharedRecordTypmodRegistry.
+ */</comment>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>SESSION_DSA_SIZE</name></cpp:macro>					<cpp:value>0x30000</cpp:value></cpp:define>
+
+<comment type="block">/*
+ * Magic numbers for state sharing in the per-session DSM area.
+ */</comment>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>SESSION_KEY_DSA</name></cpp:macro>						<cpp:value>UINT64CONST(0xFFFFFFFFFFFF0001)</cpp:value></cpp:define>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>SESSION_KEY_RECORD_TYPMOD_REGISTRY</name></cpp:macro>	<cpp:value>UINT64CONST(0xFFFFFFFFFFFF0002)</cpp:value></cpp:define>
+
+<comment type="block">/* This backend's current session. */</comment>
+<decl_stmt><decl><type><name>Session</name>    <modifier>*</modifier></type><name>CurrentSession</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+
+<comment type="block">/*
+ * Set up CurrentSession to point to an empty Session object.
+ */</comment>
+<function><type><name>void</name></type>
+<name>InitializeSession</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><name>CurrentSession</name> <operator>=</operator> <call><name>MemoryContextAllocZero</name><argument_list>(<argument><expr><name>TopMemoryContext</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>Session</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Initialize the per-session DSM segment if it isn't already initialized, and
+ * return its handle so that worker processes can attach to it.
+ *
+ * Unlike the per-context DSM segment, this segment and its contents are
+ * reused for future parallel queries.
+ *
+ * Return DSM_HANDLE_INVALID if a segment can't be allocated due to lack of
+ * resources.
+ */</comment>
+<function><type><name>dsm_handle</name></type>
+<name>GetSessionDsmHandle</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>shm_toc_estimator</name></type> <name>estimator</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>shm_toc</name>    <modifier>*</modifier></type><name>toc</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>dsm_segment</name> <modifier>*</modifier></type><name>seg</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>size_t</name></type>		<name>typmod_registry_size</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>size_t</name></type>		<name>size</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>void</name>	   <modifier>*</modifier></type><name>dsa_space</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>void</name>	   <modifier>*</modifier></type><name>typmod_registry_space</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>dsa_area</name>   <modifier>*</modifier></type><name>dsa</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>MemoryContext</name></type> <name>old_context</name></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * If we have already created a session-scope DSM segment in this backend,
+	 * return its handle.  The same segment will be used for the rest of this
+	 * backend's lifetime.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>CurrentSession</name><operator>-&gt;</operator><name>segment</name></name> <operator>!=</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><call><name>dsm_segment_handle</name><argument_list>(<argument><expr><name><name>CurrentSession</name><operator>-&gt;</operator><name>segment</name></name></expr></argument>)</argument_list></call></expr>;</return></block_content></block></if></if_stmt>
+
+	<comment type="block">/* Otherwise, prepare to set one up. */</comment>
+	<expr_stmt><expr><name>old_context</name> <operator>=</operator> <call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>TopMemoryContext</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>shm_toc_initialize_estimator</name><argument_list>(<argument><expr><operator>&amp;</operator><name>estimator</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Estimate space for the per-session DSA area. */</comment>
+	<expr_stmt><expr><call><name>shm_toc_estimate_keys</name><argument_list>(<argument><expr><operator>&amp;</operator><name>estimator</name></expr></argument>, <argument><expr><literal type="number">1</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>shm_toc_estimate_chunk</name><argument_list>(<argument><expr><operator>&amp;</operator><name>estimator</name></expr></argument>, <argument><expr><name>SESSION_DSA_SIZE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Estimate space for the per-session record typmod registry. */</comment>
+	<expr_stmt><expr><name>typmod_registry_size</name> <operator>=</operator> <call><name>SharedRecordTypmodRegistryEstimate</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>shm_toc_estimate_keys</name><argument_list>(<argument><expr><operator>&amp;</operator><name>estimator</name></expr></argument>, <argument><expr><literal type="number">1</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>shm_toc_estimate_chunk</name><argument_list>(<argument><expr><operator>&amp;</operator><name>estimator</name></expr></argument>, <argument><expr><name>typmod_registry_size</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Set up segment and TOC. */</comment>
+	<expr_stmt><expr><name>size</name> <operator>=</operator> <call><name>shm_toc_estimate</name><argument_list>(<argument><expr><operator>&amp;</operator><name>estimator</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>seg</name> <operator>=</operator> <call><name>dsm_create</name><argument_list>(<argument><expr><name>size</name></expr></argument>, <argument><expr><name>DSM_CREATE_NULL_IF_MAXSEGMENTS</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><name>seg</name> <operator>==</operator> <name>NULL</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>old_context</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<return>return <expr><name>DSM_HANDLE_INVALID</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+	<expr_stmt><expr><name>toc</name> <operator>=</operator> <call><name>shm_toc_create</name><argument_list>(<argument><expr><name>SESSION_MAGIC</name></expr></argument>,
+						 <argument><expr><call><name>dsm_segment_address</name><argument_list>(<argument><expr><name>seg</name></expr></argument>)</argument_list></call></expr></argument>,
+						 <argument><expr><name>size</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Create per-session DSA area. */</comment>
+	<expr_stmt><expr><name>dsa_space</name> <operator>=</operator> <call><name>shm_toc_allocate</name><argument_list>(<argument><expr><name>toc</name></expr></argument>, <argument><expr><name>SESSION_DSA_SIZE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>dsa</name> <operator>=</operator> <call><name>dsa_create_in_place</name><argument_list>(<argument><expr><name>dsa_space</name></expr></argument>,
+							  <argument><expr><name>SESSION_DSA_SIZE</name></expr></argument>,
+							  <argument><expr><name>LWTRANCHE_SESSION_DSA</name></expr></argument>,
+							  <argument><expr><name>seg</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>shm_toc_insert</name><argument_list>(<argument><expr><name>toc</name></expr></argument>, <argument><expr><name>SESSION_KEY_DSA</name></expr></argument>, <argument><expr><name>dsa_space</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+
+	<comment type="block">/* Create session-scoped shared record typmod registry. */</comment>
+	<expr_stmt><expr><name>typmod_registry_space</name> <operator>=</operator> <call><name>shm_toc_allocate</name><argument_list>(<argument><expr><name>toc</name></expr></argument>, <argument><expr><name>typmod_registry_size</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>SharedRecordTypmodRegistryInit</name><argument_list>(<argument><expr><operator>(</operator><name>SharedRecordTypmodRegistry</name> <operator>*</operator><operator>)</operator>
+								   <name>typmod_registry_space</name></expr></argument>, <argument><expr><name>seg</name></expr></argument>, <argument><expr><name>dsa</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>shm_toc_insert</name><argument_list>(<argument><expr><name>toc</name></expr></argument>, <argument><expr><name>SESSION_KEY_RECORD_TYPMOD_REGISTRY</name></expr></argument>,
+				   <argument><expr><name>typmod_registry_space</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * If we got this far, we can pin the shared memory so it stays mapped for
+	 * the rest of this backend's life.  If we don't make it this far, cleanup
+	 * callbacks for anything we installed above (ie currently
+	 * SharedRecordTypemodRegistry) will run when the DSM segment is detached
+	 * by CurrentResourceOwner so we aren't left with a broken CurrentSession.
+	 */</comment>
+	<expr_stmt><expr><call><name>dsm_pin_mapping</name><argument_list>(<argument><expr><name>seg</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>dsa_pin_mapping</name><argument_list>(<argument><expr><name>dsa</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Make segment and area available via CurrentSession. */</comment>
+	<expr_stmt><expr><name><name>CurrentSession</name><operator>-&gt;</operator><name>segment</name></name> <operator>=</operator> <name>seg</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>CurrentSession</name><operator>-&gt;</operator><name>area</name></name> <operator>=</operator> <name>dsa</name></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>old_context</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<return>return <expr><call><name>dsm_segment_handle</name><argument_list>(<argument><expr><name>seg</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Attach to a per-session DSM segment provided by a parallel leader.
+ */</comment>
+<function><type><name>void</name></type>
+<name>AttachSession</name><parameter_list>(<parameter><decl><type><name>dsm_handle</name></type> <name>handle</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>dsm_segment</name> <modifier>*</modifier></type><name>seg</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>shm_toc</name>    <modifier>*</modifier></type><name>toc</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>void</name>	   <modifier>*</modifier></type><name>dsa_space</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>void</name>	   <modifier>*</modifier></type><name>typmod_registry_space</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>dsa_area</name>   <modifier>*</modifier></type><name>dsa</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>MemoryContext</name></type> <name>old_context</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name>old_context</name> <operator>=</operator> <call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>TopMemoryContext</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Attach to the DSM segment. */</comment>
+	<expr_stmt><expr><name>seg</name> <operator>=</operator> <call><name>dsm_attach</name><argument_list>(<argument><expr><name>handle</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><name>seg</name> <operator>==</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"could not attach to per-session DSM segment"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	<expr_stmt><expr><name>toc</name> <operator>=</operator> <call><name>shm_toc_attach</name><argument_list>(<argument><expr><name>SESSION_MAGIC</name></expr></argument>, <argument><expr><call><name>dsm_segment_address</name><argument_list>(<argument><expr><name>seg</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Attach to the DSA area. */</comment>
+	<expr_stmt><expr><name>dsa_space</name> <operator>=</operator> <call><name>shm_toc_lookup</name><argument_list>(<argument><expr><name>toc</name></expr></argument>, <argument><expr><name>SESSION_KEY_DSA</name></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>dsa</name> <operator>=</operator> <call><name>dsa_attach_in_place</name><argument_list>(<argument><expr><name>dsa_space</name></expr></argument>, <argument><expr><name>seg</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Make them available via the current session. */</comment>
+	<expr_stmt><expr><name><name>CurrentSession</name><operator>-&gt;</operator><name>segment</name></name> <operator>=</operator> <name>seg</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>CurrentSession</name><operator>-&gt;</operator><name>area</name></name> <operator>=</operator> <name>dsa</name></expr>;</expr_stmt>
+
+	<comment type="block">/* Attach to the shared record typmod registry. */</comment>
+	<expr_stmt><expr><name>typmod_registry_space</name> <operator>=</operator>
+		<call><name>shm_toc_lookup</name><argument_list>(<argument><expr><name>toc</name></expr></argument>, <argument><expr><name>SESSION_KEY_RECORD_TYPMOD_REGISTRY</name></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>SharedRecordTypmodRegistryAttach</name><argument_list>(<argument><expr><operator>(</operator><name>SharedRecordTypmodRegistry</name> <operator>*</operator><operator>)</operator>
+									 <name>typmod_registry_space</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Remain attached until end of backend or DetachSession(). */</comment>
+	<expr_stmt><expr><call><name>dsm_pin_mapping</name><argument_list>(<argument><expr><name>seg</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>dsa_pin_mapping</name><argument_list>(<argument><expr><name>dsa</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>old_context</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Detach from the current session DSM segment.  It's not strictly necessary
+ * to do this explicitly since we'll detach automatically at backend exit, but
+ * if we ever reuse parallel workers it will become important for workers to
+ * detach from one session before attaching to another.  Note that this runs
+ * detach hooks.
+ */</comment>
+<function><type><name>void</name></type>
+<name>DetachSession</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<comment type="block">/* Runs detach hooks. */</comment>
+	<expr_stmt><expr><call><name>dsm_detach</name><argument_list>(<argument><expr><name><name>CurrentSession</name><operator>-&gt;</operator><name>segment</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>CurrentSession</name><operator>-&gt;</operator><name>segment</name></name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>dsa_detach</name><argument_list>(<argument><expr><name><name>CurrentSession</name><operator>-&gt;</operator><name>area</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>CurrentSession</name><operator>-&gt;</operator><name>area</name></name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+</block_content>}</block></function>
+</unit>

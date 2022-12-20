@@ -1,0 +1,913 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<unit xmlns="http://www.srcML.org/srcML/src" xmlns:cpp="http://www.srcML.org/srcML/cpp" revision="1.0.0" language="C" filename="/cloned_projects/timescaledb/src/bgw/scheduler.c"><comment type="block">/*
+ * This file and its contents are licensed under the Apache License 2.0.
+ * Please see the included NOTICE for copyright information and
+ * LICENSE-APACHE for a copy of the license.
+ */</comment>
+<comment type="block">/*
+ * This is a scheduler that takes background jobs and schedules them appropriately
+ *
+ * Limitations: For now the jobs are only loaded when the scheduler starts and are not
+ * updated if the jobs table changes
+ *
+ */</comment>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;postgres.h&gt;</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;miscadmin.h&gt;</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;postmaster/bgworker.h&gt;</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;storage/ipc.h&gt;</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;storage/latch.h&gt;</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;storage/lwlock.h&gt;</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;storage/proc.h&gt;</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;storage/shmem.h&gt;</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;utils/acl.h&gt;</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;utils/inval.h&gt;</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;utils/jsonb.h&gt;</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;utils/timestamp.h&gt;</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;utils/snapmgr.h&gt;</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;utils/memutils.h&gt;</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;access/xact.h&gt;</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;pgstat.h&gt;</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;tcop/tcopprot.h&gt;</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;nodes/pg_list.h&gt;</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"compat/compat.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"extension.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"guc.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"job.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"job_stat.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"launcher_interface.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"scheduler.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"timer.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"version.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"worker.h"</cpp:file></cpp:include>
+
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>SCHEDULER_APPNAME</name></cpp:macro> <cpp:value>"TimescaleDB Background Worker Scheduler"</cpp:value></cpp:define>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>START_RETRY_MS</name></cpp:macro> <cpp:value>(1 * INT64CONST(1000))</cpp:value></cpp:define> <comment type="block">/* 1 seconds */</comment>
+
+<function><type><specifier>static</specifier> <name>TimestampTz</name></type>
+<name>least_timestamp</name><parameter_list>(<parameter><decl><type><name>TimestampTz</name></type> <name>left</name></decl></parameter>, <parameter><decl><type><name>TimestampTz</name></type> <name>right</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<return>return <expr><operator>(</operator><ternary><condition><expr><name>left</name> <operator>&lt;</operator> <name>right</name></expr> ?</condition><then> <expr><name>left</name></expr> </then><else>: <expr><name>right</name></expr></else></ternary><operator>)</operator></expr>;</return>
+</block_content>}</block></function>
+
+<expr_stmt><expr><call><name>TS_FUNCTION_INFO_V1</name><argument_list>(<argument><expr><name>ts_bgw_scheduler_main</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+<comment type="block">/*
+ * Global so the invalidate cache message can set. Don't need to protect
+ * access with a lock because it's accessed only by the scheduler process.
+ */</comment>
+<decl_stmt><decl><type><specifier>static</specifier> <name>bool</name></type> <name>jobs_list_needs_update</name></decl>;</decl_stmt>
+
+<comment type="block">/* has to be global to shutdown jobs on exit */</comment>
+<decl_stmt><decl><type><specifier>static</specifier> <name>List</name> <modifier>*</modifier></type><name>scheduled_jobs</name> <init>= <expr><name>NIL</name></expr></init></decl>;</decl_stmt>
+
+<decl_stmt><decl><type><specifier>static</specifier> <name>MemoryContext</name></type> <name>scheduler_mctx</name></decl>;</decl_stmt>
+<decl_stmt><decl><type><specifier>static</specifier> <name>MemoryContext</name></type> <name>scratch_mctx</name></decl>;</decl_stmt>
+
+<comment type="block">/* See the README for a state transition diagram */</comment>
+<typedef>typedef <type><enum>enum <name>JobState</name>
+<block>{
+	<comment type="block">/* terminal state for now. Later we may have path to JOB_STATE_SCHEDULED */</comment>
+	<decl><name>JOB_STATE_DISABLED</name></decl>,
+
+	<comment type="block">/*
+	 * This is the initial state. next states: JOB_STATE_STARTED,
+	 * JOB_STATE_DISABLED. This job is not running and has been scheduled to
+	 * be started at a later time.
+	 */</comment>
+	<decl><name>JOB_STATE_SCHEDULED</name></decl>,
+
+	<comment type="block">/*
+	 * next states: JOB_STATE_TERMINATING, JOB_STATE_SCHEDULED. This job has
+	 * been started by the scheduler and is either running or finished (and
+	 * the finish has not yet been detected by the scheduler).
+	 */</comment>
+	<decl><name>JOB_STATE_STARTED</name></decl>,
+
+	<comment type="block">/*
+	 * next states: JOB_STATE_SCHEDULED. The scheduler has explicitly sent a
+	 * terminate to this job but has not yet detected that it has stopped.
+	 */</comment>
+	<decl><name>JOB_STATE_TERMINATING</name></decl>
+}</block></enum></type> <name>JobState</name>;</typedef>
+
+<typedef>typedef <type><struct>struct <name>ScheduledBgwJob</name>
+<block>{
+	<decl_stmt><decl><type><name>BgwJob</name></type> <name>job</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>TimestampTz</name></type> <name>next_start</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>TimestampTz</name></type> <name>timeout_at</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>JobState</name></type> <name>state</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>BackgroundWorkerHandle</name> <modifier>*</modifier></type><name>handle</name></decl>;</decl_stmt>
+
+	<decl_stmt><decl><type><name>bool</name></type> <name>reserved_worker</name></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * We say "may" here since under normal circumstances the job itself will
+	 * perform the mark_end
+	 */</comment>
+	<decl_stmt><decl><type><name>bool</name></type> <name>may_need_mark_end</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int32</name></type> <name>consecutive_failed_launches</name></decl>;</decl_stmt>
+}</block></struct></type> <name>ScheduledBgwJob</name>;</typedef>
+
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>on_failure_to_start_job</name><parameter_list>(<parameter><decl><type><name>ScheduledBgwJob</name> <modifier>*</modifier></type><name>sjob</name></decl></parameter>)</parameter_list>;</function_decl>
+
+<decl_stmt><decl><type><specifier>static</specifier> <specifier>volatile</specifier> <name>sig_atomic_t</name></type> <name>got_SIGHUP</name> <init>= <expr><name>false</name></expr></init></decl>;</decl_stmt>
+
+<function><type><name>BackgroundWorkerHandle</name> <modifier>*</modifier></type>
+<name>ts_bgw_start_worker</name><parameter_list>(<parameter><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>name</name></decl></parameter>, <parameter><decl><type><specifier>const</specifier> <name>BgwParams</name> <modifier>*</modifier></type><name>bgw_params</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>BackgroundWorker</name></type> <name>worker</name> <init>= <expr><block>{
+		<expr><operator>.</operator><name>bgw_flags</name> <operator>=</operator> <name>BGWORKER_SHMEM_ACCESS</name> <operator>|</operator> <name>BGWORKER_BACKEND_DATABASE_CONNECTION</name></expr>,
+		<expr><operator>.</operator><name>bgw_start_time</name> <operator>=</operator> <name>BgWorkerStart_RecoveryFinished</name></expr>,
+		<expr><operator>.</operator><name>bgw_restart_time</name> <operator>=</operator> <name>BGW_NEVER_RESTART</name></expr>,
+		<expr><operator>.</operator><name>bgw_notify_pid</name> <operator>=</operator> <name>MyProcPid</name></expr>,
+		<expr><operator>.</operator><name>bgw_main_arg</name> <operator>=</operator> <call><name>ObjectIdGetDatum</name><argument_list>(<argument><expr><name>MyDatabaseId</name></expr></argument>)</argument_list></call></expr>,
+	}</block></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>BackgroundWorkerHandle</name> <modifier>*</modifier></type><name>handle</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>strlcpy</name><argument_list>(<argument><expr><name><name>worker</name><operator>.</operator><name>bgw_name</name></name></expr></argument>, <argument><expr><name>name</name></expr></argument>, <argument><expr><name>BGW_MAXLEN</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>strlcpy</name><argument_list>(<argument><expr><name><name>worker</name><operator>.</operator><name>bgw_library_name</name></name></expr></argument>, <argument><expr><call><name>ts_extension_get_so_name</name><argument_list>()</argument_list></call></expr></argument>, <argument><expr><name>BGW_MAXLEN</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>strlcpy</name><argument_list>(<argument><expr><name><name>worker</name><operator>.</operator><name>bgw_function_name</name></name></expr></argument>, <argument><expr><name><name>bgw_params</name><operator>-&gt;</operator><name>bgw_main</name></name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name><name>worker</name><operator>.</operator><name>bgw_function_name</name></name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>memcpy</name><argument_list>(<argument><expr><name><name>worker</name><operator>.</operator><name>bgw_extra</name></name></expr></argument>, <argument><expr><name>bgw_params</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><operator>*</operator><name>bgw_params</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* handle needs to be allocated in long-lived memory context */</comment>
+	<expr_stmt><expr><call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>scheduler_mctx</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>RegisterDynamicBackgroundWorker</name><argument_list>(<argument><expr><operator>&amp;</operator><name>worker</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>handle</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>NOTICE</name></expr></argument>, <argument><expr><literal type="string">"unable to register background worker"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name>handle</name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+	<expr_stmt><expr><call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>scratch_mctx</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<return>return <expr><name>handle</name></expr>;</return>
+</block_content>}</block></function>
+
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>USE_ASSERT_CHECKING</name></cpp:ifdef>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>assert_that_worker_has_stopped</name><parameter_list>(<parameter><decl><type><name>ScheduledBgwJob</name> <modifier>*</modifier></type><name>sjob</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>pid_t</name></type> <name>pid</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>BgwHandleStatus</name></type> <name>status</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>sjob</name><operator>-&gt;</operator><name>reserved_worker</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>status</name> <operator>=</operator> <call><name>GetBackgroundWorkerPid</name><argument_list>(<argument><expr><name><name>sjob</name><operator>-&gt;</operator><name>handle</name></name></expr></argument>, <argument><expr><operator>&amp;</operator><name>pid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>BGWH_STOPPED</name> <operator>==</operator> <name>status</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>mark_job_as_started</name><parameter_list>(<parameter><decl><type><name>ScheduledBgwJob</name> <modifier>*</modifier></type><name>sjob</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><operator>!</operator><name><name>sjob</name><operator>-&gt;</operator><name>may_need_mark_end</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>sjob</name><operator>-&gt;</operator><name>consecutive_failed_launches</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>ts_bgw_job_stat_mark_start</name><argument_list>(<argument><expr><name><name>sjob</name><operator>-&gt;</operator><name>job</name><operator>.</operator><name>fd</name><operator>.</operator><name>id</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>sjob</name><operator>-&gt;</operator><name>may_need_mark_end</name></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>mark_job_as_ended</name><parameter_list>(<parameter><decl><type><name>ScheduledBgwJob</name> <modifier>*</modifier></type><name>sjob</name></decl></parameter>, <parameter><decl><type><name>JobResult</name></type> <name>res</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>sjob</name><operator>-&gt;</operator><name>may_need_mark_end</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>ts_bgw_job_stat_mark_end</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>sjob</name><operator>-&gt;</operator><name>job</name></name></expr></argument>, <argument><expr><name>res</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>sjob</name><operator>-&gt;</operator><name>may_need_mark_end</name></name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>worker_state_cleanup</name><parameter_list>(<parameter><decl><type><name>ScheduledBgwJob</name> <modifier>*</modifier></type><name>sjob</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<comment type="block">/*
+	 * This function needs to be safe wrt failures occurring at any point in
+	 * the job starting process.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>sjob</name><operator>-&gt;</operator><name>handle</name></name> <operator>!=</operator> <name>NULL</name></expr>)</condition>
+	<block>{<block_content>
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>USE_ASSERT_CHECKING</name></cpp:ifdef>
+		<comment type="block">/* Sanity check: worker has stopped (if it was started) */</comment>
+		<expr_stmt><expr><call><name>assert_that_worker_has_stopped</name><argument_list>(<argument><expr><name>sjob</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+		<expr_stmt><expr><call><name>pfree</name><argument_list>(<argument><expr><name><name>sjob</name><operator>-&gt;</operator><name>handle</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>sjob</name><operator>-&gt;</operator><name>handle</name></name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/*
+	 * first cleanup reserved workers before accessing db. Want to minimize
+	 * the possibility of errors before worker is released
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>sjob</name><operator>-&gt;</operator><name>reserved_worker</name></name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>ts_bgw_worker_release</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>sjob</name><operator>-&gt;</operator><name>reserved_worker</name></name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name><name>sjob</name><operator>-&gt;</operator><name>may_need_mark_end</name></name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>BgwJobStat</name> <modifier>*</modifier></type><name>job_stat</name></decl>;</decl_stmt>
+
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>ts_bgw_job_get_share_lock</name><argument_list>(<argument><expr><name><name>sjob</name><operator>-&gt;</operator><name>job</name><operator>.</operator><name>fd</name><operator>.</operator><name>id</name></name></expr></argument>, <argument><expr><name>CurrentMemoryContext</name></expr></argument>)</argument_list></call></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>WARNING</name></expr></argument>,
+				 <argument><expr><literal type="string">"scheduler detected that job %d was deleted after job quit"</literal></expr></argument>,
+				 <argument><expr><name><name>sjob</name><operator>-&gt;</operator><name>job</name><operator>.</operator><name>fd</name><operator>.</operator><name>id</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>ts_bgw_job_cache_invalidate_callback</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><name><name>sjob</name><operator>-&gt;</operator><name>may_need_mark_end</name></name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+			<return>return;</return>
+		</block_content>}</block></if></if_stmt>
+
+		<expr_stmt><expr><name>job_stat</name> <operator>=</operator> <call><name>ts_bgw_job_stat_find</name><argument_list>(<argument><expr><name><name>sjob</name><operator>-&gt;</operator><name>job</name><operator>.</operator><name>fd</name><operator>.</operator><name>id</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>job_stat</name> <operator>!=</operator> <name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>ts_bgw_job_stat_end_was_marked</name><argument_list>(<argument><expr><name>job_stat</name></expr></argument>)</argument_list></call></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/*
+			 * Usually the job process will mark the end, but if the job gets
+			 * a signal (cancel or terminate), it won't be able to so we
+			 * should.
+			 * TODO: Insert a record in the job_errors table informing of this failure
+			 * Currently the SIGTERM case is not handled, there might be other cases as well
+			 */</comment>
+			<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>LOG</name></expr></argument>, <argument><expr><literal type="string">"job %d failed"</literal></expr></argument>, <argument><expr><name><name>sjob</name><operator>-&gt;</operator><name>job</name><operator>.</operator><name>fd</name><operator>.</operator><name>id</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>mark_job_as_ended</name><argument_list>(<argument><expr><name>sjob</name></expr></argument>, <argument><expr><name>JOB_FAILURE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<comment type="block">/* reload updated value */</comment>
+			<expr_stmt><expr><name>job_stat</name> <operator>=</operator> <call><name>ts_bgw_job_stat_find</name><argument_list>(<argument><expr><name><name>sjob</name><operator>-&gt;</operator><name>job</name><operator>.</operator><name>fd</name><operator>.</operator><name>id</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></if>
+		<else>else
+		<block>{<block_content>
+			<expr_stmt><expr><name><name>sjob</name><operator>-&gt;</operator><name>may_need_mark_end</name></name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+		</block_content>}</block></else></if_stmt>
+	</block_content>}</block></if></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/* Set the state of the job.
+ * This function is responsible for setting all of the variables in ScheduledBgwJob
+ * except for the job itself.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>scheduled_bgw_job_transition_state_to</name><parameter_list>(<parameter><decl><type><name>ScheduledBgwJob</name> <modifier>*</modifier></type><name>sjob</name></decl></parameter>, <parameter><decl><type><name>JobState</name></type> <name>new_state</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>USE_ASSERT_CHECKING</name></cpp:ifdef>
+	<decl_stmt><decl><type><name>JobState</name></type> <name>prev_state</name> <init>= <expr><name><name>sjob</name><operator>-&gt;</operator><name>state</name></name></expr></init></decl>;</decl_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+	<decl_stmt><decl><type><name>BgwJobStat</name> <modifier>*</modifier></type><name>job_stat</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Oid</name></type> <name>owner_uid</name></decl>;</decl_stmt>
+
+	<switch>switch <condition>(<expr><name>new_state</name></expr>)</condition>
+	<block>{<block_content>
+		<case>case <expr><name>JOB_STATE_DISABLED</name></expr>:</case>
+			<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>prev_state</name> <operator>==</operator> <name>JOB_STATE_STARTED</name> <operator>||</operator> <name>prev_state</name> <operator>==</operator> <name>JOB_STATE_TERMINATING</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><name><name>sjob</name><operator>-&gt;</operator><name>handle</name></name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+			<break>break;</break>
+		<case>case <expr><name>JOB_STATE_SCHEDULED</name></expr>:</case>
+			<comment type="block">/* prev_state can be any value, including itself */</comment>
+
+			<expr_stmt><expr><call><name>worker_state_cleanup</name><argument_list>(<argument><expr><name>sjob</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+			<expr_stmt><expr><name>job_stat</name> <operator>=</operator> <call><name>ts_bgw_job_stat_find</name><argument_list>(<argument><expr><name><name>sjob</name><operator>-&gt;</operator><name>job</name><operator>.</operator><name>fd</name><operator>.</operator><name>id</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+			<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><operator>!</operator><name><name>sjob</name><operator>-&gt;</operator><name>reserved_worker</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><name><name>sjob</name><operator>-&gt;</operator><name>next_start</name></name> <operator>=</operator>
+				<call><name>ts_bgw_job_stat_next_start</name><argument_list>(<argument><expr><name>job_stat</name></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>sjob</name><operator>-&gt;</operator><name>job</name></name></expr></argument>, <argument><expr><name><name>sjob</name><operator>-&gt;</operator><name>consecutive_failed_launches</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<break>break;</break>
+		<case>case <expr><name>JOB_STATE_STARTED</name></expr>:</case>
+			<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>prev_state</name> <operator>==</operator> <name>JOB_STATE_SCHEDULED</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>sjob</name><operator>-&gt;</operator><name>handle</name></name> <operator>==</operator> <name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><operator>!</operator><name><name>sjob</name><operator>-&gt;</operator><name>reserved_worker</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+			<expr_stmt><expr><call><name>StartTransactionCommand</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+			<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>ts_bgw_job_get_share_lock</name><argument_list>(<argument><expr><name><name>sjob</name><operator>-&gt;</operator><name>job</name><operator>.</operator><name>fd</name><operator>.</operator><name>id</name></name></expr></argument>, <argument><expr><name>CurrentMemoryContext</name></expr></argument>)</argument_list></call></expr>)</condition>
+			<block>{<block_content>
+				<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>WARNING</name></expr></argument>,
+					 <argument><expr><literal type="string">"scheduler detected that job %d was deleted when starting job"</literal></expr></argument>,
+					 <argument><expr><name><name>sjob</name><operator>-&gt;</operator><name>job</name><operator>.</operator><name>fd</name><operator>.</operator><name>id</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<expr_stmt><expr><call><name>ts_bgw_job_cache_invalidate_callback</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+				<expr_stmt><expr><call><name>CommitTransactionCommand</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+				<expr_stmt><expr><call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>scratch_mctx</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<return>return;</return>
+			</block_content>}</block></if></if_stmt>
+
+			<comment type="block">/* If we are unable to reserve a worker go back to the scheduled state */</comment>
+			<expr_stmt><expr><name><name>sjob</name><operator>-&gt;</operator><name>reserved_worker</name></name> <operator>=</operator> <call><name>ts_bgw_worker_reserve</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+			<if_stmt><if>if <condition>(<expr><operator>!</operator><name><name>sjob</name><operator>-&gt;</operator><name>reserved_worker</name></name></expr>)</condition>
+			<block>{<block_content>
+				<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>WARNING</name></expr></argument>,
+					 <argument><expr><literal type="string">"failed to launch job %d \"%s\": out of background workers"</literal></expr></argument>,
+					 <argument><expr><name><name>sjob</name><operator>-&gt;</operator><name>job</name><operator>.</operator><name>fd</name><operator>.</operator><name>id</name></name></expr></argument>,
+					 <argument><expr><call><name>NameStr</name><argument_list>(<argument><expr><name><name>sjob</name><operator>-&gt;</operator><name>job</name><operator>.</operator><name>fd</name><operator>.</operator><name>application_name</name></name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<expr_stmt><expr><name><name>sjob</name><operator>-&gt;</operator><name>consecutive_failed_launches</name></name><operator>++</operator></expr>;</expr_stmt>
+				<expr_stmt><expr><call><name>scheduled_bgw_job_transition_state_to</name><argument_list>(<argument><expr><name>sjob</name></expr></argument>, <argument><expr><name>JOB_STATE_SCHEDULED</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<expr_stmt><expr><call><name>CommitTransactionCommand</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+				<expr_stmt><expr><call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>scratch_mctx</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<return>return;</return>
+			</block_content>}</block></if></if_stmt>
+
+			<comment type="block">/*
+			 * start the job before you can encounter any errors so that they
+			 * are always registered
+			 */</comment>
+			<expr_stmt><expr><call><name>mark_job_as_started</name><argument_list>(<argument><expr><name>sjob</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<if_stmt><if>if <condition>(<expr><call><name>ts_bgw_job_has_timeout</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>sjob</name><operator>-&gt;</operator><name>job</name></name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><name><name>sjob</name><operator>-&gt;</operator><name>timeout_at</name></name> <operator>=</operator>
+					<call><name>ts_bgw_job_timeout_at</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>sjob</name><operator>-&gt;</operator><name>job</name></name></expr></argument>, <argument><expr><call><name>ts_timer_get_current_timestamp</name><argument_list>()</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if>
+			<else>else<block type="pseudo"><block_content>
+				<expr_stmt><expr><name><name>sjob</name><operator>-&gt;</operator><name>timeout_at</name></name> <operator>=</operator> <name>DT_NOEND</name></expr>;</expr_stmt></block_content></block></else></if_stmt>
+
+			<expr_stmt><expr><name>owner_uid</name> <operator>=</operator> <call><name>get_role_oid</name><argument_list>(<argument><expr><call><name>NameStr</name><argument_list>(<argument><expr><name><name>sjob</name><operator>-&gt;</operator><name>job</name><operator>.</operator><name>fd</name><operator>.</operator><name>owner</name></name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>CommitTransactionCommand</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>scratch_mctx</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+			<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>DEBUG1</name></expr></argument>,
+				 <argument><expr><literal type="string">"launching job %d \"%s\""</literal></expr></argument>,
+				 <argument><expr><name><name>sjob</name><operator>-&gt;</operator><name>job</name><operator>.</operator><name>fd</name><operator>.</operator><name>id</name></name></expr></argument>,
+				 <argument><expr><call><name>NameStr</name><argument_list>(<argument><expr><name><name>sjob</name><operator>-&gt;</operator><name>job</name><operator>.</operator><name>fd</name><operator>.</operator><name>application_name</name></name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+			<expr_stmt><expr><name><name>sjob</name><operator>-&gt;</operator><name>handle</name></name> <operator>=</operator> <call><name>ts_bgw_job_start</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>sjob</name><operator>-&gt;</operator><name>job</name></name></expr></argument>, <argument><expr><name>owner_uid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<if_stmt><if>if <condition>(<expr><name><name>sjob</name><operator>-&gt;</operator><name>handle</name></name> <operator>==</operator> <name>NULL</name></expr>)</condition>
+			<block>{<block_content>
+				<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>WARNING</name></expr></argument>,
+					 <argument><expr><literal type="string">"failed to launch job %d \"%s\": failed to start a background worker"</literal></expr></argument>,
+					 <argument><expr><name><name>sjob</name><operator>-&gt;</operator><name>job</name><operator>.</operator><name>fd</name><operator>.</operator><name>id</name></name></expr></argument>,
+					 <argument><expr><call><name>NameStr</name><argument_list>(<argument><expr><name><name>sjob</name><operator>-&gt;</operator><name>job</name><operator>.</operator><name>fd</name><operator>.</operator><name>application_name</name></name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<expr_stmt><expr><call><name>on_failure_to_start_job</name><argument_list>(<argument><expr><name>sjob</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<return>return;</return>
+			</block_content>}</block></if></if_stmt>
+			<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>sjob</name><operator>-&gt;</operator><name>reserved_worker</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<break>break;</break>
+		<case>case <expr><name>JOB_STATE_TERMINATING</name></expr>:</case>
+			<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>prev_state</name> <operator>==</operator> <name>JOB_STATE_STARTED</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>sjob</name><operator>-&gt;</operator><name>handle</name></name> <operator>!=</operator> <name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>sjob</name><operator>-&gt;</operator><name>reserved_worker</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>TerminateBackgroundWorker</name><argument_list>(<argument><expr><name><name>sjob</name><operator>-&gt;</operator><name>handle</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<break>break;</break>
+	</block_content>}</block></switch>
+	<expr_stmt><expr><name><name>sjob</name><operator>-&gt;</operator><name>state</name></name> <operator>=</operator> <name>new_state</name></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>on_failure_to_start_job</name><parameter_list>(<parameter><decl><type><name>ScheduledBgwJob</name> <modifier>*</modifier></type><name>sjob</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>StartTransactionCommand</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>ts_bgw_job_get_share_lock</name><argument_list>(<argument><expr><name><name>sjob</name><operator>-&gt;</operator><name>job</name><operator>.</operator><name>fd</name><operator>.</operator><name>id</name></name></expr></argument>, <argument><expr><name>CurrentMemoryContext</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>WARNING</name></expr></argument>,
+			 <argument><expr><literal type="string">"scheduler detected that job %d was deleted while failing to start"</literal></expr></argument>,
+			 <argument><expr><name><name>sjob</name><operator>-&gt;</operator><name>job</name><operator>.</operator><name>fd</name><operator>.</operator><name>id</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>ts_bgw_job_cache_invalidate_callback</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<else>else
+	<block>{<block_content>
+		<comment type="block">/* restore the original next_start to maintain priority (it is unset during mark_start) */</comment>
+		<if_stmt><if>if <condition>(<expr><name><name>sjob</name><operator>-&gt;</operator><name>next_start</name></name> <operator>!=</operator> <name>DT_NOBEGIN</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>ts_bgw_job_stat_set_next_start</name><argument_list>(<argument><expr><name><name>sjob</name><operator>-&gt;</operator><name>job</name><operator>.</operator><name>fd</name><operator>.</operator><name>id</name></name></expr></argument>, <argument><expr><name><name>sjob</name><operator>-&gt;</operator><name>next_start</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+		<expr_stmt><expr><call><name>mark_job_as_ended</name><argument_list>(<argument><expr><name>sjob</name></expr></argument>, <argument><expr><name>JOB_FAILURE_TO_START</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></else></if_stmt>
+	<expr_stmt><expr><call><name>scheduled_bgw_job_transition_state_to</name><argument_list>(<argument><expr><name>sjob</name></expr></argument>, <argument><expr><name>JOB_STATE_SCHEDULED</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>CommitTransactionCommand</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>scratch_mctx</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<function><type><specifier>static</specifier> <specifier>inline</specifier> <name>void</name></type>
+<name>bgw_scheduler_on_postmaster_death</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<comment type="block">/*
+	 * Don't call exit hooks cause we want to bail out quickly. We don't care
+	 * about cleaning up shared memory in this case anyway since it's
+	 * potentially corrupt.
+	 */</comment>
+	<expr_stmt><expr><call><name>on_exit_reset</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>FATAL</name></expr></argument>,
+			<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_ADMIN_SHUTDOWN</name></expr></argument>)</argument_list></call><operator>,</operator>
+			 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"postmaster exited while TimescaleDB scheduler was working"</literal></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * This function starts a job.
+ * To correctly count crashes we need to mark the start of a job in a separate
+ * txn before we kick off the actual job. Thus this function cannot be run
+ * from within a transaction.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>scheduled_ts_bgw_job_start</name><parameter_list>(<parameter><decl><type><name>ScheduledBgwJob</name> <modifier>*</modifier></type><name>sjob</name></decl></parameter>,
+						   <parameter><decl><type><name>register_background_worker_callback_type</name></type> <name>bgw_register</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>pid_t</name></type> <name>pid</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>BgwHandleStatus</name></type> <name>status</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>scheduled_bgw_job_transition_state_to</name><argument_list>(<argument><expr><name>sjob</name></expr></argument>, <argument><expr><name>JOB_STATE_STARTED</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name><name>sjob</name><operator>-&gt;</operator><name>state</name></name> <operator>!=</operator> <name>JOB_STATE_STARTED</name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return;</return></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>sjob</name><operator>-&gt;</operator><name>handle</name></name> <operator>!=</operator> <name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><name>bgw_register</name> <operator>!=</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>bgw_register</name><argument_list>(<argument><expr><name><name>sjob</name><operator>-&gt;</operator><name>handle</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><name>status</name> <operator>=</operator> <call><name>WaitForBackgroundWorkerStartup</name><argument_list>(<argument><expr><name><name>sjob</name><operator>-&gt;</operator><name>handle</name></name></expr></argument>, <argument><expr><operator>&amp;</operator><name>pid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<switch>switch <condition>(<expr><name>status</name></expr>)</condition>
+	<block>{<block_content>
+		<case>case <expr><name>BGWH_POSTMASTER_DIED</name></expr>:</case>
+			<expr_stmt><expr><call><name>bgw_scheduler_on_postmaster_death</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+			<break>break;</break>
+		<case>case <expr><name>BGWH_STARTED</name></expr>:</case>
+			<comment type="block">/* all good */</comment>
+			<break>break;</break>
+		<case>case <expr><name>BGWH_STOPPED</name></expr>:</case>
+			<expr_stmt><expr><call><name>StartTransactionCommand</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>scheduled_bgw_job_transition_state_to</name><argument_list>(<argument><expr><name>sjob</name></expr></argument>, <argument><expr><name>JOB_STATE_SCHEDULED</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>CommitTransactionCommand</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>scratch_mctx</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<break>break;</break>
+		<case>case <expr><name>BGWH_NOT_YET_STARTED</name></expr>:</case>
+			<comment type="block">/* should not be possible */</comment>
+			<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"unexpected bgworker state %d"</literal></expr></argument>, <argument><expr><name>status</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<break>break;</break>
+	</block_content>}</block></switch>
+</block_content>}</block></function>
+
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>terminate_and_cleanup_job</name><parameter_list>(<parameter><decl><type><name>ScheduledBgwJob</name> <modifier>*</modifier></type><name>sjob</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<if_stmt><if>if <condition>(<expr><name><name>sjob</name><operator>-&gt;</operator><name>handle</name></name> <operator>!=</operator> <name>NULL</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>TerminateBackgroundWorker</name><argument_list>(<argument><expr><name><name>sjob</name><operator>-&gt;</operator><name>handle</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>WaitForBackgroundWorkerShutdown</name><argument_list>(<argument><expr><name><name>sjob</name><operator>-&gt;</operator><name>handle</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+	<expr_stmt><expr><name><name>sjob</name><operator>-&gt;</operator><name>may_need_mark_end</name></name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>worker_state_cleanup</name><argument_list>(<argument><expr><name>sjob</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ *  Update the given job list with whatever is in the bgw_job table. For overlapping jobs,
+ *  copy over any existing scheduler info from the given jobs list.
+ *  Assume that both lists are ordered by job ID.
+ *  Note that this function call will destroy cur_jobs_list and return a new list.
+ */</comment>
+<function><type><name>List</name> <modifier>*</modifier></type>
+<name>ts_update_scheduled_jobs_list</name><parameter_list>(<parameter><decl><type><name>List</name> <modifier>*</modifier></type><name>cur_jobs_list</name></decl></parameter>, <parameter><decl><type><name>MemoryContext</name></type> <name>mctx</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>List</name> <modifier>*</modifier></type><name>new_jobs</name> <init>= <expr><call><name>ts_bgw_job_get_scheduled</name><argument_list>(<argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>ScheduledBgwJob</name></expr></argument>)</argument_list></sizeof></expr></argument>, <argument><expr><name>mctx</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>ListCell</name> <modifier>*</modifier></type><name>new_ptr</name> <init>= <expr><call><name>list_head</name><argument_list>(<argument><expr><name>new_jobs</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>ListCell</name> <modifier>*</modifier></type><name>cur_ptr</name> <init>= <expr><call><name>list_head</name><argument_list>(<argument><expr><name>cur_jobs_list</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<while>while <condition>(<expr><name>cur_ptr</name> <operator>!=</operator> <name>NULL</name> <operator>&amp;&amp;</operator> <name>new_ptr</name> <operator>!=</operator> <name>NULL</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>ScheduledBgwJob</name> <modifier>*</modifier></type><name>new_sjob</name> <init>= <expr><call><name>lfirst</name><argument_list>(<argument><expr><name>new_ptr</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>ScheduledBgwJob</name> <modifier>*</modifier></type><name>cur_sjob</name> <init>= <expr><call><name>lfirst</name><argument_list>(<argument><expr><name>cur_ptr</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name><name>cur_sjob</name><operator>-&gt;</operator><name>job</name><operator>.</operator><name>fd</name><operator>.</operator><name>id</name></name> <operator>&lt;</operator> <name><name>new_sjob</name><operator>-&gt;</operator><name>job</name><operator>.</operator><name>fd</name><operator>.</operator><name>id</name></name></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/*
+			 * We don't need cur_sjob anymore. Make sure to clean up the job
+			 * state. Then keep advancing cur pointer until we catch up.
+			 */</comment>
+			<expr_stmt><expr><call><name>terminate_and_cleanup_job</name><argument_list>(<argument><expr><name>cur_sjob</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+			<expr_stmt><expr><name>cur_ptr</name> <operator>=</operator> <call><name>lnext_compat</name><argument_list>(<argument><expr><name>cur_jobs_list</name></expr></argument>, <argument><expr><name>cur_ptr</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<continue>continue;</continue>
+		</block_content>}</block></if></if_stmt>
+		<if_stmt><if>if <condition>(<expr><name><name>cur_sjob</name><operator>-&gt;</operator><name>job</name><operator>.</operator><name>fd</name><operator>.</operator><name>id</name></name> <operator>==</operator> <name><name>new_sjob</name><operator>-&gt;</operator><name>job</name><operator>.</operator><name>fd</name><operator>.</operator><name>id</name></name></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/*
+			 * Then this job already exists. Copy over any state and advance
+			 * both pointers.
+			 */</comment>
+			<expr_stmt><expr><name><name>cur_sjob</name><operator>-&gt;</operator><name>job</name></name> <operator>=</operator> <name><name>new_sjob</name><operator>-&gt;</operator><name>job</name></name></expr>;</expr_stmt>
+			<expr_stmt><expr><operator>*</operator><name>new_sjob</name> <operator>=</operator> <operator>*</operator><name>cur_sjob</name></expr>;</expr_stmt>
+
+			<comment type="block">/* reload the scheduling information from the job_stats */</comment>
+			<if_stmt><if>if <condition>(<expr><name><name>cur_sjob</name><operator>-&gt;</operator><name>state</name></name> <operator>==</operator> <name>JOB_STATE_SCHEDULED</name></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><call><name>scheduled_bgw_job_transition_state_to</name><argument_list>(<argument><expr><name>new_sjob</name></expr></argument>, <argument><expr><name>JOB_STATE_SCHEDULED</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+			<expr_stmt><expr><name>cur_ptr</name> <operator>=</operator> <call><name>lnext_compat</name><argument_list>(<argument><expr><name>cur_jobs_list</name></expr></argument>, <argument><expr><name>cur_ptr</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><name>new_ptr</name> <operator>=</operator> <call><name>lnext_compat</name><argument_list>(<argument><expr><name>new_jobs</name></expr></argument>, <argument><expr><name>new_ptr</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></if>
+		<if type="elseif">else if <condition>(<expr><name><name>cur_sjob</name><operator>-&gt;</operator><name>job</name><operator>.</operator><name>fd</name><operator>.</operator><name>id</name></name> <operator>&gt;</operator> <name><name>new_sjob</name><operator>-&gt;</operator><name>job</name><operator>.</operator><name>fd</name><operator>.</operator><name>id</name></name></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><call><name>scheduled_bgw_job_transition_state_to</name><argument_list>(<argument><expr><name>new_sjob</name></expr></argument>, <argument><expr><name>JOB_STATE_SCHEDULED</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>DEBUG1</name></expr></argument>,
+				 <argument><expr><literal type="string">"sjob %d was new, its fixed_schedule is %d"</literal></expr></argument>,
+				 <argument><expr><name><name>new_sjob</name><operator>-&gt;</operator><name>job</name><operator>.</operator><name>fd</name><operator>.</operator><name>id</name></name></expr></argument>,
+				 <argument><expr><name><name>new_sjob</name><operator>-&gt;</operator><name>job</name><operator>.</operator><name>fd</name><operator>.</operator><name>fixed_schedule</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+			<comment type="block">/* Advance the new_job list until we catch up to cur_list */</comment>
+			<expr_stmt><expr><name>new_ptr</name> <operator>=</operator> <call><name>lnext_compat</name><argument_list>(<argument><expr><name>new_jobs</name></expr></argument>, <argument><expr><name>new_ptr</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+	</block_content>}</block></while>
+
+	<comment type="block">/* If there's more stuff in cur_list, clean it all up */</comment>
+	<if_stmt><if>if <condition>(<expr><name>cur_ptr</name> <operator>!=</operator> <name>NULL</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>ListCell</name> <modifier>*</modifier></type><name>ptr</name></decl>;</decl_stmt>
+
+		<macro><name>for_each_cell_compat</name> <argument_list>(<argument>ptr</argument>, <argument>cur_jobs_list</argument>, <argument>cur_ptr</argument>)</argument_list></macro>
+			<expr_stmt><expr><call><name>terminate_and_cleanup_job</name><argument_list>(<argument><expr><call><name>lfirst</name><argument_list>(<argument><expr><name>ptr</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>new_ptr</name> <operator>!=</operator> <name>NULL</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* Then there are more new jobs. Initialize all of them. */</comment>
+		<decl_stmt><decl><type><name>ListCell</name> <modifier>*</modifier></type><name>ptr</name></decl>;</decl_stmt>
+
+		<macro><name>for_each_cell_compat</name> <argument_list>(<argument>ptr</argument>, <argument>new_jobs</argument>, <argument>new_ptr</argument>)</argument_list></macro>
+			<expr_stmt><expr><call><name>scheduled_bgw_job_transition_state_to</name><argument_list>(<argument><expr><call><name>lfirst</name><argument_list>(<argument><expr><name>ptr</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>JOB_STATE_SCHEDULED</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/* Free the old list */</comment>
+	<expr_stmt><expr><call><name>list_free_deep</name><argument_list>(<argument><expr><name>cur_jobs_list</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<return>return <expr><name>new_jobs</name></expr>;</return>
+</block_content>}</block></function>
+
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>TS_DEBUG</name></cpp:ifdef>
+
+<comment type="block">/* Only used by test code */</comment>
+<function><type><name>void</name></type>
+<name>ts_populate_scheduled_job_tuple</name><parameter_list>(<parameter><decl><type><name>ScheduledBgwJob</name> <modifier>*</modifier></type><name>sjob</name></decl></parameter>, <parameter><decl><type><name>Datum</name> <modifier>*</modifier></type><name>values</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<if_stmt><if>if <condition>(<expr><name>sjob</name> <operator>==</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return;</return></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><name><name>values</name><index>[<expr><literal type="number">0</literal></expr>]</index></name> <operator>=</operator> <call><name>Int32GetDatum</name><argument_list>(<argument><expr><name><name>sjob</name><operator>-&gt;</operator><name>job</name><operator>.</operator><name>fd</name><operator>.</operator><name>id</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>values</name><index>[<expr><literal type="number">1</literal></expr>]</index></name> <operator>=</operator> <call><name>NameGetDatum</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>sjob</name><operator>-&gt;</operator><name>job</name><operator>.</operator><name>fd</name><operator>.</operator><name>application_name</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>values</name><index>[<expr><literal type="number">2</literal></expr>]</index></name> <operator>=</operator> <call><name>IntervalPGetDatum</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>sjob</name><operator>-&gt;</operator><name>job</name><operator>.</operator><name>fd</name><operator>.</operator><name>schedule_interval</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>values</name><index>[<expr><literal type="number">3</literal></expr>]</index></name> <operator>=</operator> <call><name>IntervalPGetDatum</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>sjob</name><operator>-&gt;</operator><name>job</name><operator>.</operator><name>fd</name><operator>.</operator><name>max_runtime</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>values</name><index>[<expr><literal type="number">4</literal></expr>]</index></name> <operator>=</operator> <call><name>Int32GetDatum</name><argument_list>(<argument><expr><name><name>sjob</name><operator>-&gt;</operator><name>job</name><operator>.</operator><name>fd</name><operator>.</operator><name>max_retries</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>values</name><index>[<expr><literal type="number">5</literal></expr>]</index></name> <operator>=</operator> <call><name>IntervalPGetDatum</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>sjob</name><operator>-&gt;</operator><name>job</name><operator>.</operator><name>fd</name><operator>.</operator><name>retry_period</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>values</name><index>[<expr><literal type="number">6</literal></expr>]</index></name> <operator>=</operator> <call><name>TimestampTzGetDatum</name><argument_list>(<argument><expr><name><name>sjob</name><operator>-&gt;</operator><name>next_start</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>values</name><index>[<expr><literal type="number">7</literal></expr>]</index></name> <operator>=</operator> <call><name>TimestampTzGetDatum</name><argument_list>(<argument><expr><name><name>sjob</name><operator>-&gt;</operator><name>timeout_at</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>values</name><index>[<expr><literal type="number">8</literal></expr>]</index></name> <operator>=</operator> <call><name>BoolGetDatum</name><argument_list>(<argument><expr><name><name>sjob</name><operator>-&gt;</operator><name>reserved_worker</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>values</name><index>[<expr><literal type="number">9</literal></expr>]</index></name> <operator>=</operator> <call><name>BoolGetDatum</name><argument_list>(<argument><expr><name><name>sjob</name><operator>-&gt;</operator><name>may_need_mark_end</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+<function><type><specifier>static</specifier> <name>int</name></type>
+<cpp:if>#<cpp:directive>if</cpp:directive> <expr><name>PG13_LT</name></expr></cpp:if>
+<name>cmp_next_start</name><parameter_list>(<parameter><decl><type><specifier>const</specifier> <name>void</name> <modifier>*</modifier></type><name>left</name></decl></parameter>, <parameter><decl><type><specifier>const</specifier> <name>void</name> <modifier>*</modifier></type><name>right</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><specifier>const</specifier> <name>ListCell</name> <modifier>*</modifier></type><name>left_cell</name> <init>= <expr><operator>*</operator><operator>(</operator><operator>(</operator><name>ListCell</name> <operator>*</operator><operator>*</operator><operator>)</operator> <name>left</name><operator>)</operator></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><specifier>const</specifier> <name>ListCell</name> <modifier>*</modifier></type><name>right_cell</name> <init>= <expr><operator>*</operator><operator>(</operator><operator>(</operator><name>ListCell</name> <operator>*</operator><operator>*</operator><operator>)</operator> <name>right</name><operator>)</operator></expr></init></decl>;</decl_stmt>
+<cpp:else>#<cpp:directive>else</cpp:directive></cpp:else>
+<macro><name>cmp_next_start</name><argument_list>(<argument>const ListCell *left_cell</argument>, <argument>const ListCell *right_cell</argument>)</argument_list></macro>
+<block>{<block_content>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+	<decl_stmt><decl><type><name>ScheduledBgwJob</name> <modifier>*</modifier></type><name>left_sjob</name> <init>= <expr><call><name>lfirst</name><argument_list>(<argument><expr><name>left_cell</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>ScheduledBgwJob</name> <modifier>*</modifier></type><name>right_sjob</name> <init>= <expr><call><name>lfirst</name><argument_list>(<argument><expr><name>right_cell</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name><name>left_sjob</name><operator>-&gt;</operator><name>next_start</name></name> <operator>&lt;</operator> <name><name>right_sjob</name><operator>-&gt;</operator><name>next_start</name></name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><operator>-</operator><literal type="number">1</literal></expr>;</return></block_content></block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name><name>left_sjob</name><operator>-&gt;</operator><name>next_start</name></name> <operator>&gt;</operator> <name><name>right_sjob</name><operator>-&gt;</operator><name>next_start</name></name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><literal type="number">1</literal></expr>;</return></block_content></block></if></if_stmt>
+
+	<return>return <expr><literal type="number">0</literal></expr>;</return>
+</block_content>}</block>
+
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>start_scheduled_jobs</name><parameter_list>(<parameter><decl><type><name>register_background_worker_callback_type</name></type> <name>bgw_register</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>List</name> <modifier>*</modifier></type><name>ordered_scheduled_jobs</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>ListCell</name> <modifier>*</modifier></type><name>lc</name></decl>;</decl_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>CurrentMemoryContext</name> <operator>==</operator> <name>scratch_mctx</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Order jobs by increasing next_start */</comment>
+<cpp:if>#<cpp:directive>if</cpp:directive> <expr><name>PG13_LT</name></expr></cpp:if>
+	<expr_stmt><expr><name>ordered_scheduled_jobs</name> <operator>=</operator> <call><name>list_qsort</name><argument_list>(<argument><expr><name>scheduled_jobs</name></expr></argument>, <argument><expr><name>cmp_next_start</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+<cpp:else>#<cpp:directive>else</cpp:directive></cpp:else>
+	<comment type="block">/* PG13 does in-place sort */</comment>
+	<expr_stmt><expr><name>ordered_scheduled_jobs</name> <operator>=</operator> <name>scheduled_jobs</name></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>list_sort</name><argument_list>(<argument><expr><name>ordered_scheduled_jobs</name></expr></argument>, <argument><expr><name>cmp_next_start</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+	<macro><name>foreach</name> <argument_list>(<argument>lc</argument>, <argument>ordered_scheduled_jobs</argument>)</argument_list></macro>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>ScheduledBgwJob</name> <modifier>*</modifier></type><name>sjob</name> <init>= <expr><call><name>lfirst</name><argument_list>(<argument><expr><name>lc</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name><name>sjob</name><operator>-&gt;</operator><name>state</name></name> <operator>==</operator> <name>JOB_STATE_SCHEDULED</name> <operator>&amp;&amp;</operator>
+			<name><name>sjob</name><operator>-&gt;</operator><name>next_start</name></name> <operator>&lt;=</operator> <call><name>ts_timer_get_current_timestamp</name><argument_list>()</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>scheduled_ts_bgw_job_start</name><argument_list>(<argument><expr><name>sjob</name></expr></argument>, <argument><expr><name>bgw_register</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	</block_content>}</block>
+
+<cpp:if>#<cpp:directive>if</cpp:directive> <expr><name>PG13_LT</name></expr></cpp:if>
+	<expr_stmt><expr><call><name>list_free</name><argument_list>(<argument><expr><name>ordered_scheduled_jobs</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+</block_content>}</block></function>
+
+<comment type="block">/* Returns the earliest time the scheduler should start a job that is waiting to be started */</comment>
+<function><type><specifier>static</specifier> <name>TimestampTz</name></type>
+<name>earliest_wakeup_to_start_next_job</name><parameter_list>()</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>ListCell</name> <modifier>*</modifier></type><name>lc</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>TimestampTz</name></type> <name>earliest</name> <init>= <expr><name>DT_NOEND</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>TimestampTz</name></type> <name>now</name> <init>= <expr><call><name>ts_timer_get_current_timestamp</name><argument_list>()</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<macro><name>foreach</name> <argument_list>(<argument>lc</argument>, <argument>scheduled_jobs</argument>)</argument_list></macro>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>ScheduledBgwJob</name> <modifier>*</modifier></type><name>sjob</name> <init>= <expr><call><name>lfirst</name><argument_list>(<argument><expr><name>lc</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name><name>sjob</name><operator>-&gt;</operator><name>state</name></name> <operator>==</operator> <name>JOB_STATE_SCHEDULED</name></expr>)</condition>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>TimestampTz</name></type> <name>start</name> <init>= <expr><name><name>sjob</name><operator>-&gt;</operator><name>next_start</name></name></expr></init></decl>;</decl_stmt>
+			<comment type="block">/* if the start is less than now, this means we tried and failed to start it already, so
+			 * use the retry period */</comment>
+			<if_stmt><if>if <condition>(<expr><name>start</name> <operator>&lt;</operator> <name>now</name></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><name>start</name> <operator>=</operator> <call><name>TimestampTzPlusMilliseconds</name><argument_list>(<argument><expr><name>now</name></expr></argument>, <argument><expr><name>START_RETRY_MS</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+			<expr_stmt><expr><name>earliest</name> <operator>=</operator> <call><name>least_timestamp</name><argument_list>(<argument><expr><name>earliest</name></expr></argument>, <argument><expr><name>start</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+	</block_content>}</block>
+	<return>return <expr><name>earliest</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/* Returns the earliest time the scheduler needs to kill a job according to its timeout  */</comment>
+<function><type><specifier>static</specifier> <name>TimestampTz</name></type>
+<name>earliest_job_timeout</name><parameter_list>()</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>ListCell</name> <modifier>*</modifier></type><name>lc</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>TimestampTz</name></type> <name>earliest</name> <init>= <expr><name>DT_NOEND</name></expr></init></decl>;</decl_stmt>
+
+	<macro><name>foreach</name> <argument_list>(<argument>lc</argument>, <argument>scheduled_jobs</argument>)</argument_list></macro>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>ScheduledBgwJob</name> <modifier>*</modifier></type><name>sjob</name> <init>= <expr><call><name>lfirst</name><argument_list>(<argument><expr><name>lc</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name><name>sjob</name><operator>-&gt;</operator><name>state</name></name> <operator>==</operator> <name>JOB_STATE_STARTED</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><name>earliest</name> <operator>=</operator> <call><name>least_timestamp</name><argument_list>(<argument><expr><name>earliest</name></expr></argument>, <argument><expr><name><name>sjob</name><operator>-&gt;</operator><name>timeout_at</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	</block_content>}</block>
+	<return>return <expr><name>earliest</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/* Special exit function only used in shmem_exit_callback.
+ * Do not call the normal cleanup function (worker_state_cleanup), because
+ * 1) we do not wait for the BGW to terminate,
+ * 2) we cannot access the database at this time, so we should not be
+ *    trying to update the bgw_stat table.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>terminate_all_jobs_and_release_workers</name><parameter_list>()</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>ListCell</name> <modifier>*</modifier></type><name>lc</name></decl>;</decl_stmt>
+
+	<macro><name>foreach</name> <argument_list>(<argument>lc</argument>, <argument>scheduled_jobs</argument>)</argument_list></macro>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>ScheduledBgwJob</name> <modifier>*</modifier></type><name>sjob</name> <init>= <expr><call><name>lfirst</name><argument_list>(<argument><expr><name>lc</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+		<comment type="block">/*
+		 * Clean up the background workers. Don't worry about state of the
+		 * sjobs, because this callback might have interrupted a state
+		 * transition.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><name><name>sjob</name><operator>-&gt;</operator><name>handle</name></name> <operator>!=</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>TerminateBackgroundWorker</name><argument_list>(<argument><expr><name><name>sjob</name><operator>-&gt;</operator><name>handle</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name><name>sjob</name><operator>-&gt;</operator><name>reserved_worker</name></name></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><call><name>ts_bgw_worker_release</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><name><name>sjob</name><operator>-&gt;</operator><name>reserved_worker</name></name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+	</block_content>}</block>
+</block_content>}</block></function>
+
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>wait_for_all_jobs_to_shutdown</name><parameter_list>()</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>ListCell</name> <modifier>*</modifier></type><name>lc</name></decl>;</decl_stmt>
+
+	<macro><name>foreach</name> <argument_list>(<argument>lc</argument>, <argument>scheduled_jobs</argument>)</argument_list></macro>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>ScheduledBgwJob</name> <modifier>*</modifier></type><name>sjob</name> <init>= <expr><call><name>lfirst</name><argument_list>(<argument><expr><name>lc</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name><name>sjob</name><operator>-&gt;</operator><name>state</name></name> <operator>==</operator> <name>JOB_STATE_STARTED</name> <operator>||</operator> <name><name>sjob</name><operator>-&gt;</operator><name>state</name></name> <operator>==</operator> <name>JOB_STATE_TERMINATING</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>WaitForBackgroundWorkerShutdown</name><argument_list>(<argument><expr><name><name>sjob</name><operator>-&gt;</operator><name>handle</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	</block_content>}</block>
+</block_content>}</block></function>
+
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>check_for_stopped_and_timed_out_jobs</name><parameter_list>()</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>ListCell</name> <modifier>*</modifier></type><name>lc</name></decl>;</decl_stmt>
+
+	<macro><name>foreach</name> <argument_list>(<argument>lc</argument>, <argument>scheduled_jobs</argument>)</argument_list></macro>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>BgwHandleStatus</name></type> <name>status</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>pid_t</name></type> <name>pid</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>ScheduledBgwJob</name> <modifier>*</modifier></type><name>sjob</name> <init>= <expr><call><name>lfirst</name><argument_list>(<argument><expr><name>lc</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>TimestampTz</name></type> <name>now</name> <init>= <expr><call><name>ts_timer_get_current_timestamp</name><argument_list>()</argument_list></call></expr></init></decl>;</decl_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name><name>sjob</name><operator>-&gt;</operator><name>state</name></name> <operator>!=</operator> <name>JOB_STATE_STARTED</name> <operator>&amp;&amp;</operator> <name><name>sjob</name><operator>-&gt;</operator><name>state</name></name> <operator>!=</operator> <name>JOB_STATE_TERMINATING</name></expr>)</condition><block type="pseudo"><block_content>
+			<continue>continue;</continue></block_content></block></if></if_stmt>
+
+		<expr_stmt><expr><name>status</name> <operator>=</operator> <call><name>GetBackgroundWorkerPid</name><argument_list>(<argument><expr><name><name>sjob</name><operator>-&gt;</operator><name>handle</name></name></expr></argument>, <argument><expr><operator>&amp;</operator><name>pid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<switch>switch <condition>(<expr><name>status</name></expr>)</condition>
+		<block>{<block_content>
+			<case>case <expr><name>BGWH_POSTMASTER_DIED</name></expr>:</case>
+				<expr_stmt><expr><call><name>bgw_scheduler_on_postmaster_death</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+				<break>break;</break>
+			<case>case <expr><name>BGWH_NOT_YET_STARTED</name></expr>:</case>
+				<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"unexpected bgworker state %d"</literal></expr></argument>, <argument><expr><name>status</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<break>break;</break>
+			<case>case <expr><name>BGWH_STARTED</name></expr>:</case>
+				<comment type="block">/* still running */</comment>
+				<if_stmt><if>if <condition>(<expr><name><name>sjob</name><operator>-&gt;</operator><name>state</name></name> <operator>==</operator> <name>JOB_STATE_STARTED</name> <operator>&amp;&amp;</operator> <name>now</name> <operator>&gt;=</operator> <name><name>sjob</name><operator>-&gt;</operator><name>timeout_at</name></name></expr>)</condition>
+				<block>{<block_content>
+					<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>WARNING</name></expr></argument>,
+						 <argument><expr><literal type="string">"terminating background worker \"%s\" due to timeout"</literal></expr></argument>,
+						 <argument><expr><call><name>NameStr</name><argument_list>(<argument><expr><name><name>sjob</name><operator>-&gt;</operator><name>job</name><operator>.</operator><name>fd</name><operator>.</operator><name>application_name</name></name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+					<expr_stmt><expr><call><name>scheduled_bgw_job_transition_state_to</name><argument_list>(<argument><expr><name>sjob</name></expr></argument>, <argument><expr><name>JOB_STATE_TERMINATING</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+					<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>sjob</name><operator>-&gt;</operator><name>state</name></name> <operator>!=</operator> <name>JOB_STATE_STARTED</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				</block_content>}</block></if></if_stmt>
+				<break>break;</break>
+			<case>case <expr><name>BGWH_STOPPED</name></expr>:</case>
+				<expr_stmt><expr><call><name>StartTransactionCommand</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+				<expr_stmt><expr><call><name>scheduled_bgw_job_transition_state_to</name><argument_list>(<argument><expr><name>sjob</name></expr></argument>, <argument><expr><name>JOB_STATE_SCHEDULED</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<expr_stmt><expr><call><name>CommitTransactionCommand</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+				<expr_stmt><expr><call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>scratch_mctx</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>sjob</name><operator>-&gt;</operator><name>state</name></name> <operator>!=</operator> <name>JOB_STATE_STARTED</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<break>break;</break>
+		</block_content>}</block></switch>
+	</block_content>}</block>
+</block_content>}</block></function>
+
+<comment type="block">/* This is the guts of the scheduler which runs the main loop.
+ * The parameter ttl_ms gives a maximum time to run the loop (after which
+ * the loop will exit). This functionality is used to ease testing.
+ * In production, ttl_ms should be &lt; 0 to signal that the loop should
+ * run forever (or until the process gets a signal).
+ *
+ * The scheduler uses 2 memory contexts for its operation: scheduler_mctx
+ * for long-lived objects and scratch_mctx for short-lived objects.
+ * After every iteration of the scheduling main loop scratch_mctx gets
+ * reset. Special care needs to be taken in regards to memory contexts
+ * since StartTransactionCommand creates and switches to a transaction
+ * memory context which gets deleted on CommitTransactionCommand which
+ * switches CurrentMemoryContext back to TopMemoryContext. So operations
+ * wrapped in Start/CommitTransactionCommit will not happen in scratch_mctx
+ * but will get freed on CommitTransactionCommand.
+ */</comment>
+<function><type><name>void</name></type>
+<name>ts_bgw_scheduler_process</name><parameter_list>(<parameter><decl><type><name>int32</name></type> <name>run_for_interval_ms</name></decl></parameter>,
+						 <parameter><decl><type><name>register_background_worker_callback_type</name></type> <name>bgw_register</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>TimestampTz</name></type> <name>start</name> <init>= <expr><call><name>ts_timer_get_current_timestamp</name><argument_list>()</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>TimestampTz</name></type> <name>quit_time</name> <init>= <expr><name>DT_NOEND</name></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>pgstat_report_activity</name><argument_list>(<argument><expr><name>STATE_RUNNING</name></expr></argument>, <argument><expr><name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* txn to read the list of jobs from the DB */</comment>
+	<expr_stmt><expr><call><name>StartTransactionCommand</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>scheduled_jobs</name> <operator>=</operator> <call><name>ts_update_scheduled_jobs_list</name><argument_list>(<argument><expr><name>scheduled_jobs</name></expr></argument>, <argument><expr><name>scheduler_mctx</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>CommitTransactionCommand</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>scratch_mctx</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>jobs_list_needs_update</name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>run_for_interval_ms</name> <operator>&gt;</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name>quit_time</name> <operator>=</operator> <call><name>TimestampTzPlusMilliseconds</name><argument_list>(<argument><expr><name>start</name></expr></argument>, <argument><expr><name>run_for_interval_ms</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>DEBUG1</name></expr></argument>, <argument><expr><operator>(</operator><call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"database scheduler starting for database %u"</literal></expr></argument>, <argument><expr><name>MyDatabaseId</name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * on SIGTERM the process will usually die from the CHECK_FOR_INTERRUPTS
+	 * in the die() called from the sigterm handler. Child reaping is then
+	 * handled in the before_shmem_exit,
+	 * bgw_scheduler_before_shmem_exit_callback.
+	 */</comment>
+	<while>while <condition>(<expr><name>quit_time</name> <operator>&gt;</operator> <call><name>ts_timer_get_current_timestamp</name><argument_list>()</argument_list></call> <operator>&amp;&amp;</operator> <operator>!</operator><name>ProcDiePending</name> <operator>&amp;&amp;</operator> <operator>!</operator><name>ts_shutdown_bgw</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>TimestampTz</name></type> <name>next_wakeup</name> <init>= <expr><name>quit_time</name></expr></init></decl>;</decl_stmt>
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>CurrentMemoryContext</name> <operator>==</operator> <name>scratch_mctx</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/* start jobs, and then check when to next wake up */</comment>
+		<expr_stmt><expr><call><name>start_scheduled_jobs</name><argument_list>(<argument><expr><name>bgw_register</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name>next_wakeup</name> <operator>=</operator> <call><name>least_timestamp</name><argument_list>(<argument><expr><name>next_wakeup</name></expr></argument>, <argument><expr><call><name>earliest_wakeup_to_start_next_job</name><argument_list>()</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name>next_wakeup</name> <operator>=</operator> <call><name>least_timestamp</name><argument_list>(<argument><expr><name>next_wakeup</name></expr></argument>, <argument><expr><call><name>earliest_job_timeout</name><argument_list>()</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><call><name>pgstat_report_activity</name><argument_list>(<argument><expr><name>STATE_IDLE</name></expr></argument>, <argument><expr><name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>ts_timer_wait</name><argument_list>(<argument><expr><name>next_wakeup</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>pgstat_report_activity</name><argument_list>(<argument><expr><name>STATE_RUNNING</name></expr></argument>, <argument><expr><name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><call><name>CHECK_FOR_INTERRUPTS</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name>got_SIGHUP</name></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><name>got_SIGHUP</name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>ProcessConfigFile</name><argument_list>(<argument><expr><name>PGC_SIGHUP</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+
+		<comment type="block">/*
+		 * Process any cache invalidation message that indicates we need to
+		 * update the jobs list
+		 */</comment>
+		<expr_stmt><expr><call><name>AcceptInvalidationMessages</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name>jobs_list_needs_update</name></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><call><name>StartTransactionCommand</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>CurrentMemoryContext</name> <operator>==</operator> <name>CurTransactionContext</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><name>scheduled_jobs</name> <operator>=</operator> <call><name>ts_update_scheduled_jobs_list</name><argument_list>(<argument><expr><name>scheduled_jobs</name></expr></argument>, <argument><expr><name>scheduler_mctx</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>CommitTransactionCommand</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>scratch_mctx</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><name>jobs_list_needs_update</name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+
+		<expr_stmt><expr><call><name>check_for_stopped_and_timed_out_jobs</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><call><name>MemoryContextReset</name><argument_list>(<argument><expr><name>scratch_mctx</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></while>
+
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>TS_DEBUG</name></cpp:ifdef>
+	<if_stmt><if>if <condition>(<expr><name>ts_shutdown_bgw</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>WARNING</name></expr></argument>, <argument><expr><literal type="string">"bgw scheduler stopped due to shutdown_bgw guc"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+	<expr_stmt><expr><call><name>CHECK_FOR_INTERRUPTS</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>wait_for_all_jobs_to_shutdown</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>check_for_stopped_and_timed_out_jobs</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>bgw_scheduler_before_shmem_exit_callback</name><parameter_list>(<parameter><decl><type><name>int</name></type> <name>code</name></decl></parameter>, <parameter><decl><type><name>Datum</name></type> <name>arg</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>terminate_all_jobs_and_release_workers</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<function><type><name>void</name></type>
+<name>ts_bgw_scheduler_setup_callbacks</name><parameter_list>()</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>before_shmem_exit</name><argument_list>(<argument><expr><name>bgw_scheduler_before_shmem_exit_callback</name></expr></argument>, <argument><expr><call><name>PointerGetDatum</name><argument_list>(<argument><expr><name>NULL</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/* some of the scheduler mock code calls functions from this file without going through
+ * the main loop so we need a way to setup the memory contexts
+ */</comment>
+<function><type><name>void</name></type>
+<name>ts_bgw_scheduler_setup_mctx</name><parameter_list>()</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><name>scheduler_mctx</name> <operator>=</operator> <call><name>AllocSetContextCreate</name><argument_list>(<argument><expr><name>TopMemoryContext</name></expr></argument>, <argument><expr><literal type="string">"Scheduler"</literal></expr></argument>, <argument><expr><name>ALLOCSET_DEFAULT_SIZES</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>scratch_mctx</name> <operator>=</operator>
+		<call><name>AllocSetContextCreate</name><argument_list>(<argument><expr><name>scheduler_mctx</name></expr></argument>, <argument><expr><literal type="string">"SchedulerScratch"</literal></expr></argument>, <argument><expr><name>ALLOCSET_DEFAULT_SIZES</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>scratch_mctx</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>handle_sighup</name><parameter_list>(<parameter><decl><type><name>SIGNAL_ARGS</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<comment type="block">/* based on av_sighup_handler */</comment>
+	<decl_stmt><decl><type><name>int</name></type> <name>save_errno</name> <init>= <expr><name>errno</name></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name>got_SIGHUP</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>SetLatch</name><argument_list>(<argument><expr><name>MyLatch</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>errno</name> <operator>=</operator> <name>save_errno</name></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Register SIGTERM and SIGHUP handlers for bgw_scheduler.
+ * This function _must_ be called with signals blocked, i.e., after calling
+ * BackgroundWorkerBlockSignals
+ */</comment>
+<function><type><name>void</name></type>
+<name>ts_bgw_scheduler_register_signal_handlers</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<comment type="block">/*
+	 * do not use the default `bgworker_die` sigterm handler because it does
+	 * not respect critical sections
+	 */</comment>
+	<expr_stmt><expr><call><name>pqsignal</name><argument_list>(<argument><expr><name>SIGTERM</name></expr></argument>, <argument><expr><name>die</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>pqsignal</name><argument_list>(<argument><expr><name>SIGHUP</name></expr></argument>, <argument><expr><name>handle_sighup</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Some SIGHUPS may already have been dropped, so we must load the file here */</comment>
+	<expr_stmt><expr><name>got_SIGHUP</name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>ProcessConfigFile</name><argument_list>(<argument><expr><name>PGC_SIGHUP</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<function><type><name>Datum</name></type>
+<name>ts_bgw_scheduler_main</name><parameter_list>(<parameter><decl><type><name>PG_FUNCTION_ARGS</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>BackgroundWorkerBlockSignals</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+	<comment type="block">/* Setup any signal handlers here */</comment>
+	<expr_stmt><expr><call><name>ts_bgw_scheduler_register_signal_handlers</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>BackgroundWorkerUnblockSignals</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>ts_bgw_scheduler_setup_callbacks</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>pgstat_report_appname</name><argument_list>(<argument><expr><name>SCHEDULER_APPNAME</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>ts_bgw_scheduler_setup_mctx</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>ts_bgw_scheduler_process</name><argument_list>(<argument><expr><operator>-</operator><literal type="number">1</literal></expr></argument>, <argument><expr><name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>scheduled_jobs</name> <operator>==</operator> <name>NIL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>TopMemoryContext</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>MemoryContextDelete</name><argument_list>(<argument><expr><name>scheduler_mctx</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>PG_RETURN_VOID</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function><empty_stmt>;</empty_stmt>
+
+<function><type><name>void</name></type>
+<name>ts_bgw_job_cache_invalidate_callback</name><parameter_list>()</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><name>jobs_list_needs_update</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+</block_content>}</block></function></block_content></block></function>
+</unit>

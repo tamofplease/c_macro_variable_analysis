@@ -1,0 +1,729 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<unit xmlns="http://www.srcML.org/srcML/src" xmlns:cpp="http://www.srcML.org/srcML/cpp" revision="1.0.0" language="C" filename="/cloned_projects/RedisGraph/deps/GraphBLAS/Source/GB_AxB_saxpy3.c"><comment type="line">//------------------------------------------------------------------------------</comment>
+<comment type="line">// GB_AxB_saxpy3: compute C=A*B, C&lt;M&gt;=A*B, or C&lt;!M&gt;=A*B in parallel</comment>
+<comment type="line">//------------------------------------------------------------------------------</comment>
+
+<comment type="line">// SuiteSparse:GraphBLAS, Timothy A. Davis, (c) 2017-2022, All Rights Reserved.</comment>
+<comment type="line">// SPDX-License-Identifier: Apache-2.0</comment>
+
+<comment type="line">//------------------------------------------------------------------------------</comment>
+
+<comment type="line">// GB_AxB_saxpy3 computes C=A*B, C&lt;M&gt;=A*B, or C&lt;!M&gt;=A*B in parallel.  If the</comment>
+<comment type="line">// mask matrix M has too many entries compared to the work to compute A*B, then</comment>
+<comment type="line">// it is not applied.  Instead, M is ignored and C=A*B is computed.  The mask</comment>
+<comment type="line">// is applied later, in GB_mxm.</comment>
+
+<comment type="line">// C is sparse or hypersparse.  M, A, and B can have any format.</comment>
+<comment type="line">// The accum operator is not handled, and C is not modified in-place.  Instead,</comment>
+<comment type="line">// C is constructed in a static header.</comment>
+
+<comment type="line">// For simplicity, this discussion and all comments in this code assume that</comment>
+<comment type="line">// all matrices are in CSC format, but the algorithm is CSR/CSC agnostic.</comment>
+
+<comment type="line">// The matrix B is split into two kinds of tasks: coarse and fine.  A coarse</comment>
+<comment type="line">// task computes C(:,j1:j2) = A*B(:,j1:j2), for a unique set of vectors j1:j2.</comment>
+<comment type="line">// Those vectors are not shared with any other tasks.  A fine task works with a</comment>
+<comment type="line">// team of other fine tasks to compute C(:,j) for a single vector j.  Each fine</comment>
+<comment type="line">// task computes A*B(k1:k2,j) for a unique range k1:k2, and sums its results</comment>
+<comment type="line">// into C(:,j) via atomic operations.</comment>
+
+<comment type="line">// Each coarse or fine task uses either Gustavson's method [1] or the Hash</comment>
+<comment type="line">// method [2].  There are 4 kinds of tasks:</comment>
+
+<comment type="line">//      fine Gustavson task</comment>
+<comment type="line">//      fine hash task</comment>
+<comment type="line">//      coarse Gustason task</comment>
+<comment type="line">//      coarse hash task</comment>
+
+<comment type="line">// Each of the 4 kinds tasks are then subdivided into 3 variants, for C=A*B,</comment>
+<comment type="line">// C&lt;M&gt;=A*B, and C&lt;!M&gt;=A*B, giving a total of 12 different types of tasks.</comment>
+
+<comment type="line">// Fine tasks are used when there would otherwise be too much work for a single</comment>
+<comment type="line">// task to compute the single vector C(:,j).  Fine tasks share all of their</comment>
+<comment type="line">// workspace with the team of fine tasks computing C(:,j).  Coarse tasks are</comment>
+<comment type="line">// prefered since they require less synchronization, but fine tasks allow for</comment>
+<comment type="line">// better parallelization when B has only a few vectors.  If B consists of a</comment>
+<comment type="line">// single vector (for GrB_mxv if A is in CSC format and not transposed, or</comment>
+<comment type="line">// for GrB_vxm if A is in CSR format and not transpose), then the only way to</comment>
+<comment type="line">// get parallelism is via fine tasks.  If a single thread is used for this</comment>
+<comment type="line">// case, a single-vector coarse task is used.</comment>
+
+<comment type="line">// To select between the Hash method or Gustavson's method for each task, the</comment>
+<comment type="line">// hash table size is first found.  The hash table size for a hash task depends</comment>
+<comment type="line">// on the maximum flop count for any vector in that task (which is just one</comment>
+<comment type="line">// vector for the fine tasks).  It is set to twice the smallest power of 2 that</comment>
+<comment type="line">// is greater than the flop count to compute that vector (plus the # of entries</comment>
+<comment type="line">// in M(:,j) for tasks that compute C&lt;M&gt;=A*B or C&lt;!M&gt;=A*B).  This size ensures</comment>
+<comment type="line">// the results will fit in the hash table, and with ideally only a modest</comment>
+<comment type="line">// number of collisions.  If the hash table size exceeds a threshold (currently</comment>
+<comment type="line">// m/16 if C is m-by-n), then Gustavson's method is used instead, and the hash</comment>
+<comment type="line">// table size is set to m, to serve as the gather/scatter workspace for</comment>
+<comment type="line">// Gustavson's method.</comment>
+
+<comment type="line">// The workspace allocated depends on the type of task.  Let s be the hash</comment>
+<comment type="line">// table size for the task, and C is m-by-n (assuming all matrices are CSC; if</comment>
+<comment type="line">// CSR, then m is replaced with n).</comment>
+<comment type="line">//</comment>
+<comment type="line">//      fine Gustavson task (shared):   int8_t  Hf [m] ; ctype Hx [m] ;</comment>
+<comment type="line">//      fine hash task (shared):        int64_t Hf [s] ; ctype Hx [s] ;</comment>
+<comment type="line">//      coarse Gustavson task:          int64_t Hf [m] ; ctype Hx [m] ;</comment>
+<comment type="line">//      coarse hash task:               int64_t Hf [s] ; ctype Hx [s] ;</comment>
+<comment type="line">//                                      int64_t Hi [s] ; </comment>
+<comment type="line">//</comment>
+<comment type="line">// Note that the Hi array is needed only for the coarse hash task.  Additional</comment>
+<comment type="line">// workspace is allocated to construct the list of tasks, but this is freed</comment>
+<comment type="line">// before C is constructed.</comment>
+
+<comment type="line">// References:</comment>
+
+<comment type="line">// [1] Fred G. Gustavson. 1978. Two Fast Algorithms for Sparse Matrices:</comment>
+<comment type="line">// Multiplication and Permuted Transposition. ACM Trans. Math. Softw.  4, 3</comment>
+<comment type="line">// (Sept. 1978), 250â269. DOI:https://doi.org/10.1145/355791.355796</comment>
+
+<comment type="line">// [2] Yusuke Nagasaka, Satoshi Matsuoka, Ariful Azad, and Aydin Buluc. 2018.</comment>
+<comment type="line">// High-Performance Sparse Matrix-Matrix Products on Intel KNL and Multicore</comment>
+<comment type="line">// Architectures. In Proc. 47th Intl. Conf. on Parallel Processing (ICPP '18).</comment>
+<comment type="line">// Association for Computing Machinery, New York, NY, USA, Article 34, 1â10.</comment>
+<comment type="line">// DOI:https://doi.org/10.1145/3229710.3229720</comment>
+
+<comment type="line">//------------------------------------------------------------------------------</comment>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"GB_mxm.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"GB_AxB_saxpy_generic.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"GB_control.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"GB_AxB__include1.h"</cpp:file></cpp:include>
+<cpp:ifndef>#<cpp:directive>ifndef</cpp:directive> <name>GBCUDA_DEV</name></cpp:ifndef>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"GB_AxB__include2.h"</cpp:file></cpp:include>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"GB_unused.h"</cpp:file></cpp:include>
+
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>GB_FREE_WORKSPACE</name></cpp:macro>                           \
+<cpp:value>{                                                   \
+    GB_FREE_WORK (&amp;SaxpyTasks, SaxpyTasks_size) ;   \
+    GB_FREE_WORK (&amp;Hi_all, Hi_all_size) ;           \
+    GB_FREE_WORK (&amp;Hf_all, Hf_all_size) ;           \
+    GB_FREE_WORK (&amp;Hx_all, Hx_all_size) ;           \
+}</cpp:value></cpp:define>
+
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>GB_FREE_ALL</name></cpp:macro>             \
+<cpp:value>{                               \
+    GB_FREE_WORKSPACE ;         \
+    GB_phybix_free (C) ;        \
+}</cpp:value></cpp:define>
+
+<comment type="line">//------------------------------------------------------------------------------</comment>
+<comment type="line">// GB_AxB_saxpy3: compute C=A*B, C&lt;M&gt;=A*B, or C&lt;!M&gt;=A*B in parallel</comment>
+<comment type="line">//------------------------------------------------------------------------------</comment>
+
+<function><type><name>GrB_Info</name></type> <name>GB_AxB_saxpy3</name>              <comment type="line">// C = A*B using Gustavson+Hash</comment>
+<parameter_list>(
+    <parameter><decl><type><name>GrB_Matrix</name></type> <name>C</name></decl></parameter>,                   <comment type="line">// output, static header, not in-place</comment>
+    <parameter><decl><type><specifier>const</specifier> <name>bool</name></type> <name>C_iso</name></decl></parameter>,               <comment type="line">// true if C is iso</comment>
+    <parameter><decl><type><specifier>const</specifier> <name>GB_void</name> <modifier>*</modifier></type><name>cscalar</name></decl></parameter>,         <comment type="line">// iso value of C</comment>
+    <parameter><decl><type><name>int</name></type> <name>C_sparsity</name></decl></parameter>,                 <comment type="line">// construct C as sparse or hypersparse</comment>
+    <parameter><decl><type><specifier>const</specifier> <name>GrB_Matrix</name></type> <name>M_input</name></decl></parameter>,       <comment type="line">// optional mask matrix</comment>
+    <parameter><decl><type><specifier>const</specifier> <name>bool</name></type> <name>Mask_comp_input</name></decl></parameter>,     <comment type="line">// if true, use !M</comment>
+    <parameter><decl><type><specifier>const</specifier> <name>bool</name></type> <name>Mask_struct</name></decl></parameter>,         <comment type="line">// if true, use the only structure of M</comment>
+    <parameter><decl><type><specifier>const</specifier> <name>GrB_Matrix</name></type> <name>A</name></decl></parameter>,             <comment type="line">// input matrix A</comment>
+    <parameter><decl><type><specifier>const</specifier> <name>GrB_Matrix</name></type> <name>B</name></decl></parameter>,             <comment type="line">// input matrix B</comment>
+    <parameter><decl><type><specifier>const</specifier> <name>GrB_Semiring</name></type> <name>semiring</name></decl></parameter>,    <comment type="line">// semiring that defines C=A*B</comment>
+    <parameter><decl><type><specifier>const</specifier> <name>bool</name></type> <name>flipxy</name></decl></parameter>,              <comment type="line">// if true, do z=fmult(b,a) vs fmult(a,b)</comment>
+    <parameter><decl><type><name>bool</name> <modifier>*</modifier></type><name>mask_applied</name></decl></parameter>,             <comment type="line">// if true, then mask was applied</comment>
+    <parameter><decl><type><name>GrB_Desc_Value</name></type> <name>AxB_method</name></decl></parameter>,      <comment type="line">// Default, Gustavson, or Hash</comment>
+    <parameter><decl><type><specifier>const</specifier> <name>int</name></type> <name>do_sort</name></decl></parameter>,              <comment type="line">// if nonzero, try to sort in saxpy3</comment>
+    <parameter><decl><type><name>GB_Context</name></type> <name>Context</name></decl></parameter>
+)</parameter_list>
+<block>{<block_content>
+
+    <cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>GB_TIMING</name></cpp:ifdef>
+    <decl_stmt><decl><type><name>double</name></type> <name>ttt</name> <init>= <expr><call><name>omp_get_wtime</name> <argument_list>( )</argument_list></call></expr></init></decl> ;</decl_stmt>
+    <cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+    <comment type="line">//--------------------------------------------------------------------------</comment>
+    <comment type="line">// check inputs</comment>
+    <comment type="line">//--------------------------------------------------------------------------</comment>
+
+    <decl_stmt><decl><type><name>GrB_Info</name></type> <name>info</name></decl> ;</decl_stmt>
+
+    <decl_stmt><decl><type><name>GrB_Matrix</name></type> <name>M</name> <init>= <expr><name>M_input</name></expr></init></decl> ;</decl_stmt>        <comment type="line">// use the mask M, until deciding otherwise</comment>
+    <decl_stmt><decl><type><name>bool</name></type> <name>Mask_comp</name> <init>= <expr><name>Mask_comp_input</name></expr></init></decl> ;</decl_stmt>
+
+    <expr_stmt><expr><operator>(</operator><operator>*</operator><name>mask_applied</name><operator>)</operator> <operator>=</operator> <name>false</name></expr> ;</expr_stmt>
+    <decl_stmt><decl><type><name>bool</name></type> <name>apply_mask</name> <init>= <expr><name>false</name></expr></init></decl> ;</decl_stmt>
+
+    <expr_stmt><expr><call><name>ASSERT</name> <argument_list>(<argument><expr><name>C</name> <operator>!=</operator> <name>NULL</name> <operator>&amp;&amp;</operator> <operator>(</operator><name><name>C</name><operator>-&gt;</operator><name>static_header</name></name> <operator>||</operator> <name>GBNSTATIC</name><operator>)</operator></expr></argument>)</argument_list></call></expr> ;</expr_stmt>
+
+    <expr_stmt><expr><call><name>ASSERT_MATRIX_OK_OR_NULL</name> <argument_list>(<argument><expr><name>M</name></expr></argument>, <argument><expr><literal type="string">"M for saxpy3 A*B"</literal></expr></argument>, <argument><expr><name>GB0</name></expr></argument>)</argument_list></call></expr> ;</expr_stmt>
+    <expr_stmt><expr><call><name>ASSERT</name> <argument_list>(<argument><expr><operator>!</operator><call><name>GB_PENDING</name> <argument_list>(<argument><expr><name>M</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr> ;</expr_stmt>
+    <expr_stmt><expr><call><name>ASSERT</name> <argument_list>(<argument><expr><call><name>GB_JUMBLED_OK</name> <argument_list>(<argument><expr><name>M</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr> ;</expr_stmt>
+    <expr_stmt><expr><call><name>ASSERT</name> <argument_list>(<argument><expr><operator>!</operator><call><name>GB_ZOMBIES</name> <argument_list>(<argument><expr><name>M</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr> ;</expr_stmt>
+
+    <expr_stmt><expr><call><name>ASSERT_MATRIX_OK</name> <argument_list>(<argument><expr><name>A</name></expr></argument>, <argument><expr><literal type="string">"A for saxpy3 A*B"</literal></expr></argument>, <argument><expr><name>GB0</name></expr></argument>)</argument_list></call></expr> ;</expr_stmt>
+    <expr_stmt><expr><call><name>ASSERT</name> <argument_list>(<argument><expr><operator>!</operator><call><name>GB_PENDING</name> <argument_list>(<argument><expr><name>A</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr> ;</expr_stmt>
+    <expr_stmt><expr><call><name>ASSERT</name> <argument_list>(<argument><expr><call><name>GB_JUMBLED_OK</name> <argument_list>(<argument><expr><name>A</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr> ;</expr_stmt>
+    <expr_stmt><expr><call><name>ASSERT</name> <argument_list>(<argument><expr><operator>!</operator><call><name>GB_ZOMBIES</name> <argument_list>(<argument><expr><name>A</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr> ;</expr_stmt>
+
+    <expr_stmt><expr><call><name>ASSERT_MATRIX_OK</name> <argument_list>(<argument><expr><name>B</name></expr></argument>, <argument><expr><literal type="string">"B for saxpy3 A*B"</literal></expr></argument>, <argument><expr><name>GB0</name></expr></argument>)</argument_list></call></expr> ;</expr_stmt>
+    <expr_stmt><expr><call><name>ASSERT</name> <argument_list>(<argument><expr><operator>!</operator><call><name>GB_PENDING</name> <argument_list>(<argument><expr><name>B</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr> ;</expr_stmt>
+    <expr_stmt><expr><call><name>ASSERT</name> <argument_list>(<argument><expr><call><name>GB_JUMBLED_OK</name> <argument_list>(<argument><expr><name>B</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr> ;</expr_stmt>
+    <expr_stmt><expr><call><name>ASSERT</name> <argument_list>(<argument><expr><operator>!</operator><call><name>GB_ZOMBIES</name> <argument_list>(<argument><expr><name>B</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr> ;</expr_stmt>
+
+    <expr_stmt><expr><call><name>ASSERT_SEMIRING_OK</name> <argument_list>(<argument><expr><name>semiring</name></expr></argument>, <argument><expr><literal type="string">"semiring for saxpy3 A*B"</literal></expr></argument>, <argument><expr><name>GB0</name></expr></argument>)</argument_list></call></expr> ;</expr_stmt>
+    <expr_stmt><expr><call><name>ASSERT</name> <argument_list>(<argument><expr><name><name>A</name><operator>-&gt;</operator><name>vdim</name></name> <operator>==</operator> <name><name>B</name><operator>-&gt;</operator><name>vlen</name></name></expr></argument>)</argument_list></call></expr> ;</expr_stmt>
+
+    <expr_stmt><expr><call><name>ASSERT</name> <argument_list>(<argument><expr><name>C_sparsity</name> <operator>==</operator> <name>GxB_HYPERSPARSE</name> <operator>||</operator> <name>C_sparsity</name> <operator>==</operator> <name>GxB_SPARSE</name></expr></argument>)</argument_list></call></expr> ;</expr_stmt>
+
+    <comment type="line">//--------------------------------------------------------------------------</comment>
+    <comment type="line">// determine the # of threads to use</comment>
+    <comment type="line">//--------------------------------------------------------------------------</comment>
+
+    <expr_stmt><expr><call><name>GB_GET_NTHREADS_MAX</name> <argument_list>(<argument><expr><name>nthreads_max</name></expr></argument>, <argument><expr><name>chunk</name></expr></argument>, <argument><expr><name>Context</name></expr></argument>)</argument_list></call></expr> ;</expr_stmt>
+
+    <comment type="line">//--------------------------------------------------------------------------</comment>
+    <comment type="line">// define workspace</comment>
+    <comment type="line">//--------------------------------------------------------------------------</comment>
+
+    <decl_stmt><decl><type><name>int64_t</name> <modifier>*</modifier><specifier>restrict</specifier></type> <name>Hi_all</name> <init>= <expr><name>NULL</name></expr></init></decl> ;</decl_stmt> <decl_stmt><decl><type><name>size_t</name></type> <name>Hi_all_size</name> <init>= <expr><literal type="number">0</literal></expr></init></decl> ;</decl_stmt>
+    <decl_stmt><decl><type><name>int64_t</name> <modifier>*</modifier><specifier>restrict</specifier></type> <name>Hf_all</name> <init>= <expr><name>NULL</name></expr></init></decl> ;</decl_stmt> <decl_stmt><decl><type><name>size_t</name></type> <name>Hf_all_size</name> <init>= <expr><literal type="number">0</literal></expr></init></decl> ;</decl_stmt>
+    <decl_stmt><decl><type><name>GB_void</name> <modifier>*</modifier><specifier>restrict</specifier></type> <name>Hx_all</name> <init>= <expr><name>NULL</name></expr></init></decl> ;</decl_stmt> <decl_stmt><decl><type><name>size_t</name></type> <name>Hx_all_size</name> <init>= <expr><literal type="number">0</literal></expr></init></decl> ;</decl_stmt>
+    <decl_stmt><decl><type><name>GB_saxpy3task_struct</name> <modifier>*</modifier></type><name>SaxpyTasks</name> <init>= <expr><name>NULL</name></expr></init></decl> ;</decl_stmt> <decl_stmt><decl><type><name>size_t</name></type> <name>SaxpyTasks_size</name> <init>= <expr><literal type="number">0</literal></expr></init></decl> ;</decl_stmt>
+
+    <comment type="line">//--------------------------------------------------------------------------</comment>
+    <comment type="line">// construct the hyper hashes for M and A</comment>
+    <comment type="line">//--------------------------------------------------------------------------</comment>
+
+    <expr_stmt><expr><call><name>GB_OK</name> <argument_list>(<argument><expr><call><name>GB_hyper_hash_build</name> <argument_list>(<argument><expr><name>M</name></expr></argument>, <argument><expr><name>Context</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr> ;</expr_stmt>    <comment type="line">// does nothing if M is NULL</comment>
+    <expr_stmt><expr><call><name>GB_OK</name> <argument_list>(<argument><expr><call><name>GB_hyper_hash_build</name> <argument_list>(<argument><expr><name>A</name></expr></argument>, <argument><expr><name>Context</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr> ;</expr_stmt>
+
+    <comment type="line">//--------------------------------------------------------------------------</comment>
+    <comment type="line">// get the semiring operators</comment>
+    <comment type="line">//--------------------------------------------------------------------------</comment>
+
+    <decl_stmt><decl><type><name>GrB_BinaryOp</name></type> <name>mult</name> <init>= <expr><name><name>semiring</name><operator>-&gt;</operator><name>multiply</name></name></expr></init></decl> ;</decl_stmt>
+    <decl_stmt><decl><type><name>GrB_Monoid</name></type> <name>add</name> <init>= <expr><name><name>semiring</name><operator>-&gt;</operator><name>add</name></name></expr></init></decl> ;</decl_stmt>
+    <expr_stmt><expr><call><name>ASSERT</name> <argument_list>(<argument><expr><name><name>mult</name><operator>-&gt;</operator><name>ztype</name></name> <operator>==</operator> <name><name>add</name><operator>-&gt;</operator><name>op</name><operator>-&gt;</operator><name>ztype</name></name></expr></argument>)</argument_list></call></expr> ;</expr_stmt>
+    <decl_stmt><decl><type><name>bool</name></type> <name>A_is_pattern</name></decl>, <decl><type ref="prev"/><name>B_is_pattern</name></decl> ;</decl_stmt>
+    <expr_stmt><expr><call><name>GB_binop_pattern</name> <argument_list>(<argument><expr><operator>&amp;</operator><name>A_is_pattern</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>B_is_pattern</name></expr></argument>, <argument><expr><name>flipxy</name></expr></argument>, <argument><expr><name><name>mult</name><operator>-&gt;</operator><name>opcode</name></name></expr></argument>)</argument_list></call></expr> ;</expr_stmt>
+
+    <decl_stmt><decl><type><name>GB_Opcode</name></type> <name>mult_binop_code</name></decl>, <decl><type ref="prev"/><name>add_binop_code</name></decl> ;</decl_stmt>
+    <decl_stmt><decl><type><name>GB_Type_code</name></type> <name>xcode</name></decl>, <decl><type ref="prev"/><name>ycode</name></decl>, <decl><type ref="prev"/><name>zcode</name></decl> ;</decl_stmt>
+    <decl_stmt><decl><type><name>bool</name></type> <name>builtin_semiring</name> <init>= <expr><call><name>GB_AxB_semiring_builtin</name> <argument_list>(<argument><expr><name>A</name></expr></argument>, <argument><expr><name>A_is_pattern</name></expr></argument>, <argument><expr><name>B</name></expr></argument>,
+        <argument><expr><name>B_is_pattern</name></expr></argument>, <argument><expr><name>semiring</name></expr></argument>, <argument><expr><name>flipxy</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>mult_binop_code</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>add_binop_code</name></expr></argument>,
+        <argument><expr><operator>&amp;</operator><name>xcode</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>ycode</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>zcode</name></expr></argument>)</argument_list></call></expr></init></decl> ;</decl_stmt>
+
+    <comment type="line">//--------------------------------------------------------------------------</comment>
+    <comment type="line">// get A, and B</comment>
+    <comment type="line">//--------------------------------------------------------------------------</comment>
+
+    <decl_stmt><decl><type><specifier>const</specifier> <name>int64_t</name> <modifier>*</modifier><specifier>restrict</specifier></type> <name>Ap</name> <init>= <expr><name><name>A</name><operator>-&gt;</operator><name>p</name></name></expr></init></decl> ;</decl_stmt>
+    <decl_stmt><decl><type><specifier>const</specifier> <name>int64_t</name> <modifier>*</modifier><specifier>restrict</specifier></type> <name>Ah</name> <init>= <expr><name><name>A</name><operator>-&gt;</operator><name>h</name></name></expr></init></decl> ;</decl_stmt>
+    <decl_stmt><decl><type><specifier>const</specifier> <name>int64_t</name></type> <name>avlen</name> <init>= <expr><name><name>A</name><operator>-&gt;</operator><name>vlen</name></name></expr></init></decl> ;</decl_stmt>
+    <decl_stmt><decl><type><specifier>const</specifier> <name>int64_t</name></type> <name>anvec</name> <init>= <expr><name><name>A</name><operator>-&gt;</operator><name>nvec</name></name></expr></init></decl> ;</decl_stmt>
+    <decl_stmt><decl><type><specifier>const</specifier> <name>bool</name></type> <name>A_is_hyper</name> <init>= <expr><call><name>GB_IS_HYPERSPARSE</name> <argument_list>(<argument><expr><name>A</name></expr></argument>)</argument_list></call></expr></init></decl> ;</decl_stmt>
+
+    <decl_stmt><decl><type><specifier>const</specifier> <name>int64_t</name> <modifier>*</modifier><specifier>restrict</specifier></type> <name>Bp</name> <init>= <expr><name><name>B</name><operator>-&gt;</operator><name>p</name></name></expr></init></decl> ;</decl_stmt>
+    <decl_stmt><decl><type><specifier>const</specifier> <name>int64_t</name> <modifier>*</modifier><specifier>restrict</specifier></type> <name>Bh</name> <init>= <expr><name><name>B</name><operator>-&gt;</operator><name>h</name></name></expr></init></decl> ;</decl_stmt>
+    <decl_stmt><decl><type><specifier>const</specifier> <name>int8_t</name>  <modifier>*</modifier><specifier>restrict</specifier></type> <name>Bb</name> <init>= <expr><name><name>B</name><operator>-&gt;</operator><name>b</name></name></expr></init></decl> ;</decl_stmt>
+    <decl_stmt><decl><type><specifier>const</specifier> <name>int64_t</name> <modifier>*</modifier><specifier>restrict</specifier></type> <name>Bi</name> <init>= <expr><name><name>B</name><operator>-&gt;</operator><name>i</name></name></expr></init></decl> ;</decl_stmt>
+    <decl_stmt><decl><type><specifier>const</specifier> <name>int64_t</name></type> <name>bvdim</name> <init>= <expr><name><name>B</name><operator>-&gt;</operator><name>vdim</name></name></expr></init></decl> ;</decl_stmt>
+    <decl_stmt><decl><type><specifier>const</specifier> <name>int64_t</name></type> <name>bnz</name> <init>= <expr><call><name>GB_nnz_held</name> <argument_list>(<argument><expr><name>B</name></expr></argument>)</argument_list></call></expr></init></decl> ;</decl_stmt>
+    <decl_stmt><decl><type><specifier>const</specifier> <name>int64_t</name></type> <name>bnvec</name> <init>= <expr><name><name>B</name><operator>-&gt;</operator><name>nvec</name></name></expr></init></decl> ;</decl_stmt>
+    <decl_stmt><decl><type><specifier>const</specifier> <name>int64_t</name></type> <name>bvlen</name> <init>= <expr><name><name>B</name><operator>-&gt;</operator><name>vlen</name></name></expr></init></decl> ;</decl_stmt>
+    <decl_stmt><decl><type><specifier>const</specifier> <name>bool</name></type> <name>B_is_hyper</name> <init>= <expr><call><name>GB_IS_HYPERSPARSE</name> <argument_list>(<argument><expr><name>B</name></expr></argument>)</argument_list></call></expr></init></decl> ;</decl_stmt>
+
+    <comment type="line">//--------------------------------------------------------------------------</comment>
+    <comment type="line">// allocate C (just C-&gt;p and C-&gt;h, but not C-&gt;i or C-&gt;x)</comment>
+    <comment type="line">//--------------------------------------------------------------------------</comment>
+
+    <decl_stmt><decl><type><name>GrB_Type</name></type> <name>ctype</name> <init>= <expr><name><name>add</name><operator>-&gt;</operator><name>op</name><operator>-&gt;</operator><name>ztype</name></name></expr></init></decl> ;</decl_stmt>
+    <decl_stmt><decl><type><name>size_t</name></type> <name>csize</name> <init>= <expr><name><name>ctype</name><operator>-&gt;</operator><name>size</name></name></expr></init></decl> ;</decl_stmt>
+    <decl_stmt><decl><type><name>int64_t</name></type> <name>cvlen</name> <init>= <expr><name>avlen</name></expr></init></decl> ;</decl_stmt>
+    <decl_stmt><decl><type><name>int64_t</name></type> <name>cvdim</name> <init>= <expr><name>bvdim</name></expr></init></decl> ;</decl_stmt>
+    <decl_stmt><decl><type><name>int64_t</name></type> <name>cnvec</name> <init>= <expr><name>bnvec</name></expr></init></decl> ;</decl_stmt>
+
+    <expr_stmt><expr><name>info</name> <operator>=</operator> <call><name>GB_new</name> <argument_list>(<argument><expr><operator>&amp;</operator><name>C</name></expr></argument>, <comment type="line">// sparse or hyper, existing header</comment>
+        <argument><expr><name>ctype</name></expr></argument>, <argument><expr><name>cvlen</name></expr></argument>, <argument><expr><name>cvdim</name></expr></argument>, <argument><expr><name>GB_Ap_malloc</name></expr></argument>, <argument><expr><name>true</name></expr></argument>,
+        <argument><expr><name>C_sparsity</name></expr></argument>, <argument><expr><name><name>B</name><operator>-&gt;</operator><name>hyper_switch</name></name></expr></argument>, <argument><expr><name>cnvec</name></expr></argument>, <argument><expr><name>Context</name></expr></argument>)</argument_list></call></expr> ;</expr_stmt>
+    <if_stmt><if>if <condition>(<expr><name>info</name> <operator>!=</operator> <name>GrB_SUCCESS</name></expr>)</condition>
+    <block>{<block_content> 
+        <comment type="line">// out of memory</comment>
+        <expr_stmt><expr><name>GB_FREE_ALL</name></expr> ;</expr_stmt>
+        <return>return <expr><operator>(</operator><name>info</name><operator>)</operator></expr> ;</return>
+    </block_content>}</block></if></if_stmt>
+
+    <expr_stmt><expr><name><name>C</name><operator>-&gt;</operator><name>iso</name></name> <operator>=</operator> <name>C_iso</name></expr> ;</expr_stmt>    <comment type="line">// OK</comment>
+
+    <decl_stmt><decl><type><name>int64_t</name> <modifier>*</modifier><specifier>restrict</specifier></type> <name>Cp</name> <init>= <expr><name><name>C</name><operator>-&gt;</operator><name>p</name></name></expr></init></decl> ;</decl_stmt>
+    <decl_stmt><decl><type><name>int64_t</name> <modifier>*</modifier><specifier>restrict</specifier></type> <name>Ch</name> <init>= <expr><name><name>C</name><operator>-&gt;</operator><name>h</name></name></expr></init></decl> ;</decl_stmt>
+    <if_stmt><if>if <condition>(<expr><name>B_is_hyper</name></expr>)</condition>
+    <block>{<block_content> 
+        <comment type="line">// B and C are both hypersparse</comment>
+        <expr_stmt><expr><call><name>ASSERT</name> <argument_list>(<argument><expr><name>C_sparsity</name> <operator>==</operator> <name>GxB_HYPERSPARSE</name></expr></argument>)</argument_list></call></expr> ;</expr_stmt>
+        <decl_stmt><decl><type><name>int</name></type> <name>nth</name> <init>= <expr><call><name>GB_nthreads</name> <argument_list>(<argument><expr><name>cnvec</name></expr></argument>, <argument><expr><name>chunk</name></expr></argument>, <argument><expr><name>nthreads_max</name></expr></argument>)</argument_list></call></expr></init></decl> ;</decl_stmt>
+        <expr_stmt><expr><call><name>GB_memcpy</name> <argument_list>(<argument><expr><name>Ch</name></expr></argument>, <argument><expr><name>Bh</name></expr></argument>, <argument><expr><name>cnvec</name> <operator>*</operator> <sizeof>sizeof <argument_list>(<argument><expr><name>int64_t</name></expr></argument>)</argument_list></sizeof></expr></argument>, <argument><expr><name>nth</name></expr></argument>)</argument_list></call></expr> ;</expr_stmt>
+        <expr_stmt><expr><name><name>C</name><operator>-&gt;</operator><name>nvec</name></name> <operator>=</operator> <name>bnvec</name></expr> ;</expr_stmt>
+    </block_content>}</block></if>
+    <else>else
+    <block>{<block_content> 
+        <comment type="line">// B is sparse, bitmap, or full; C is sparse</comment>
+        <expr_stmt><expr><call><name>ASSERT</name> <argument_list>(<argument><expr><name>C_sparsity</name> <operator>==</operator> <name>GxB_SPARSE</name></expr></argument>)</argument_list></call></expr> ;</expr_stmt>
+    </block_content>}</block></else></if_stmt>
+
+    <cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>GB_TIMING</name></cpp:ifdef>
+    <expr_stmt><expr><name>ttt</name> <operator>=</operator> <call><name>omp_get_wtime</name> <argument_list>( )</argument_list></call> <operator>-</operator> <name>ttt</name></expr> ;</expr_stmt>
+    <expr_stmt><expr><call><name>GB_Global_timing_add</name> <argument_list>(<argument><expr><literal type="number">3</literal></expr></argument>, <argument><expr><name>ttt</name></expr></argument>)</argument_list></call></expr> ;</expr_stmt>
+    <expr_stmt><expr><name>ttt</name> <operator>=</operator> <call><name>omp_get_wtime</name> <argument_list>( )</argument_list></call></expr> ;</expr_stmt>
+    <cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+    <comment type="line">//==========================================================================</comment>
+    <comment type="line">// phase0: create parallel tasks and allocate workspace</comment>
+    <comment type="line">//==========================================================================</comment>
+
+    <decl_stmt><decl><type><name>int</name></type> <name>nthreads</name></decl>, <decl><type ref="prev"/><name>ntasks</name></decl>, <decl><type ref="prev"/><name>nfine</name></decl> ;</decl_stmt>
+    <decl_stmt><decl><type><name>bool</name></type> <name>M_in_place</name> <init>= <expr><name>false</name></expr></init></decl> ;</decl_stmt>
+
+    <if_stmt><if>if <condition>(<expr><name>nthreads_max</name> <operator>==</operator> <literal type="number">1</literal> <operator>&amp;&amp;</operator> <name>M</name> <operator>==</operator> <name>NULL</name> <operator>&amp;&amp;</operator> <operator>(</operator><name>AxB_method</name> <operator>!=</operator> <name>GxB_AxB_HASH</name><operator>)</operator> <operator>&amp;&amp;</operator>
+        <call><name>GB_IMIN</name> <argument_list>(<argument><expr><call><name>GB_nnz</name> <argument_list>(<argument><expr><name>A</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><call><name>GB_nnz</name> <argument_list>(<argument><expr><name>B</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call> <operator>&gt;</operator> <name>cvlen</name><operator>/</operator><literal type="number">16</literal></expr>)</condition>
+    <block>{<block_content> 
+        <comment type="line">// Skip the flopcount analysis if only a single thread is being used,</comment>
+        <comment type="line">// no mask is present, the Hash method is not explicitly selected, and</comment>
+        <comment type="line">// the problem is not extremely sparse.  In this case, use a single</comment>
+        <comment type="line">// coarse Gustavson task only.  In this case, the flop count analysis</comment>
+        <comment type="line">// is not needed.</comment>
+        <expr_stmt><expr><call><name>GBURBLE</name> <argument_list>(<argument><expr><literal type="string">"(single-threaded Gustavson) "</literal></expr></argument>)</argument_list></call></expr> ;</expr_stmt>
+        <expr_stmt><expr><name>info</name> <operator>=</operator> <call><name>GB_AxB_saxpy3_slice_quick</name> <argument_list>(<argument><expr><name>C</name></expr></argument>, <argument><expr><name>A</name></expr></argument>, <argument><expr><name>B</name></expr></argument>,
+            <argument><expr><operator>&amp;</operator><name>SaxpyTasks</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>SaxpyTasks_size</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>ntasks</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>nfine</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>nthreads</name></expr></argument>,
+            <argument><expr><name>Context</name></expr></argument>)</argument_list></call></expr> ;</expr_stmt>
+    </block_content>}</block></if>
+    <else>else
+    <block>{<block_content> 
+        <comment type="line">// Do the flopcount analysis and create a set of well-balanced tasks in</comment>
+        <comment type="line">// the general case.  This may select a single task for a single thread</comment>
+        <comment type="line">// anyway, but this decision would be based on the analysis.</comment>
+        <expr_stmt><expr><name>info</name> <operator>=</operator> <call><name>GB_AxB_saxpy3_slice_balanced</name> <argument_list>(<argument><expr><name>C</name></expr></argument>, <argument><expr><name>M</name></expr></argument>, <argument><expr><name>Mask_comp</name></expr></argument>, <argument><expr><name>A</name></expr></argument>, <argument><expr><name>B</name></expr></argument>, <argument><expr><name>AxB_method</name></expr></argument>,
+            <argument><expr><operator>&amp;</operator><name>SaxpyTasks</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>SaxpyTasks_size</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>apply_mask</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>M_in_place</name></expr></argument>,
+            <argument><expr><operator>&amp;</operator><name>ntasks</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>nfine</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>nthreads</name></expr></argument>, <argument><expr><name>Context</name></expr></argument>)</argument_list></call></expr> ;</expr_stmt>
+    </block_content>}</block></else></if_stmt>
+
+    <cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>GB_TIMING</name></cpp:ifdef>
+    <expr_stmt><expr><name>ttt</name> <operator>=</operator> <call><name>omp_get_wtime</name> <argument_list>( )</argument_list></call> <operator>-</operator> <name>ttt</name></expr> ;</expr_stmt>
+    <expr_stmt><expr><call><name>GB_Global_timing_add</name> <argument_list>(<argument><expr><literal type="number">4</literal></expr></argument>, <argument><expr><name>ttt</name></expr></argument>)</argument_list></call></expr> ;</expr_stmt>
+    <expr_stmt><expr><name>ttt</name> <operator>=</operator> <call><name>omp_get_wtime</name> <argument_list>( )</argument_list></call></expr> ;</expr_stmt>
+    <cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+    <if_stmt><if>if <condition>(<expr><name>info</name> <operator>==</operator> <name>GrB_NO_VALUE</name></expr>)</condition>
+    <block>{<block_content> 
+        <comment type="line">// The mask is present but has been discarded; need to discard the</comment>
+        <comment type="line">// analysis so far and redo it without the mask.  This may result in</comment>
+        <comment type="line">// GB_bitmap_AxB_saxpy being called instead of GB_AxB_saxpy3.</comment>
+        <expr_stmt><expr><call><name>ASSERT</name> <argument_list>(<argument><expr><name>M</name> <operator>!=</operator> <name>NULL</name> <operator>&amp;&amp;</operator> <operator>!</operator><name>apply_mask</name></expr></argument>)</argument_list></call></expr> ;</expr_stmt>
+        <expr_stmt><expr><name>GB_FREE_ALL</name></expr> ;</expr_stmt>
+        <return>return <expr><operator>(</operator><name>GrB_NO_VALUE</name><operator>)</operator></expr> ;</return>
+    </block_content>}</block></if>
+    <if type="elseif">else if <condition>(<expr><name>info</name> <operator>!=</operator> <name>GrB_SUCCESS</name></expr>)</condition>
+    <block>{<block_content> 
+        <comment type="line">// out of memory</comment>
+        <expr_stmt><expr><name>GB_FREE_ALL</name></expr> ;</expr_stmt>
+        <return>return <expr><operator>(</operator><name>info</name><operator>)</operator></expr> ;</return>
+    </block_content>}</block></if></if_stmt>
+
+    <if_stmt><if>if <condition>(<expr><operator>!</operator><name>apply_mask</name></expr>)</condition>
+    <block>{<block_content> 
+        <comment type="line">// disable the mask, if present.</comment>
+        <expr_stmt><expr><name>M</name> <operator>=</operator> <name>NULL</name></expr> ;</expr_stmt>
+        <expr_stmt><expr><name>Mask_comp</name> <operator>=</operator> <name>false</name></expr> ;</expr_stmt>
+    </block_content>}</block></if></if_stmt>
+
+    <if_stmt><if>if <condition>(<expr><name>do_sort</name></expr>)</condition><block type="pseudo"><block_content> <expr_stmt><expr><call><name>GBURBLE</name> <argument_list>(<argument><expr><literal type="string">"sort "</literal></expr></argument>)</argument_list></call></expr> ;</expr_stmt></block_content></block></if></if_stmt>
+
+    <comment type="line">//--------------------------------------------------------------------------</comment>
+    <comment type="line">// allocate the hash tables</comment>
+    <comment type="line">//--------------------------------------------------------------------------</comment>
+
+    <comment type="line">// If Gustavson's method is used (coarse tasks):</comment>
+    <comment type="line">//</comment>
+    <comment type="line">//      hash_size is cvlen.</comment>
+    <comment type="line">//      Hi is not allocated.</comment>
+    <comment type="line">//      Hf and Hx are both of size hash_size.</comment>
+    <comment type="line">//</comment>
+    <comment type="line">//      (Hf [i] == mark) is true if i is in the hash table.</comment>
+    <comment type="line">//      Hx [i] is the value of C(i,j) during the numeric phase.</comment>
+    <comment type="line">//</comment>
+    <comment type="line">//      Gustavson's method is used if the hash_size for the Hash method</comment>
+    <comment type="line">//      is a significant fraction of cvlen. </comment>
+    <comment type="line">//</comment>
+    <comment type="line">// If the Hash method is used (coarse tasks):</comment>
+    <comment type="line">//</comment>
+    <comment type="line">//      hash_size is 2 times the smallest power of 2 that is larger than</comment>
+    <comment type="line">//      the # of flops required for any column C(:,j) being computed.  This</comment>
+    <comment type="line">//      ensures that all entries have space in the hash table, and that the</comment>
+    <comment type="line">//      hash occupancy will never be more than 50%.  It is always smaller</comment>
+    <comment type="line">//      than cvlen (otherwise, Gustavson's method is used).</comment>
+    <comment type="line">//</comment>
+    <comment type="line">//      A hash function is used for the ith entry:</comment>
+    <comment type="line">//          hash = GB_HASHF (i, hash_bits) ; in range 0 to hash_size-1</comment>
+    <comment type="line">//      If a collision occurs, linear probing is used:</comment>
+    <comment type="line">//          GB_REHASH (hash, i, hash_bits)</comment>
+    <comment type="line">//      which is:</comment>
+    <comment type="line">//          hash = (hash + 1) &amp; (hash_size-1)</comment>
+    <comment type="line">//      where hash_bits = hash_size - 1</comment>
+    <comment type="line">//</comment>
+    <comment type="line">//      (Hf [hash] == mark) is true if the position is occupied.</comment>
+    <comment type="line">//      i = Hi [hash] gives the row index i that occupies that position.</comment>
+    <comment type="line">//      Hx [hash] is the value of C(i,j) during the numeric phase.</comment>
+    <comment type="line">//</comment>
+    <comment type="line">// For both coarse methods:</comment>
+    <comment type="line">//</comment>
+    <comment type="line">//      Hf starts out all zero (via calloc), and mark starts out as 1.  To</comment>
+    <comment type="line">//      clear Hf, mark is incremented, so that all entries in Hf are not</comment>
+    <comment type="line">//      equal to mark.</comment>
+
+    <comment type="line">// add some padding to the end of each hash table, to avoid false</comment>
+    <comment type="line">// sharing of cache lines between the hash tables.  But only add the</comment>
+    <comment type="line">// padding if there is more than one team.</comment>
+    <decl_stmt><decl><type><name>size_t</name></type> <name>hx_pad</name> <init>= <expr><literal type="number">0</literal></expr></init></decl> ;</decl_stmt>
+    <decl_stmt><decl><type><name>size_t</name></type> <name>hi_pad</name> <init>= <expr><literal type="number">0</literal></expr></init></decl> ;</decl_stmt>
+    <for>for <control>(<init><decl><type><name>int</name></type> <name>taskid</name> <init>= <expr><literal type="number">1</literal></expr></init></decl> ;</init> <condition><expr><name>taskid</name> <operator>&lt;</operator> <name>ntasks</name></expr> ;</condition> <incr><expr><name>taskid</name><operator>++</operator></expr></incr>)</control>
+    <block>{<block_content>
+        <if_stmt><if>if <condition>(<expr><name>taskid</name> <operator>==</operator> <name><name>SaxpyTasks</name> <index>[<expr><name>taskid</name></expr>]</index></name><operator>.</operator><name>leader</name></expr>)</condition>
+        <block>{<block_content> 
+            <expr_stmt><expr><name>hx_pad</name> <operator>=</operator> <call><name>GB_ICEIL</name> <argument_list>(<argument><expr><literal type="number">64</literal></expr></argument>, <argument><expr><name>csize</name></expr></argument>)</argument_list></call></expr> ;</expr_stmt>
+            <expr_stmt><expr><name>hi_pad</name> <operator>=</operator> <literal type="number">64</literal> <operator>/</operator> <sizeof>sizeof <argument_list>(<argument><expr><name>int64_t</name></expr></argument>)</argument_list></sizeof></expr> ;</expr_stmt>
+            <break>break ;</break>
+        </block_content>}</block></if></if_stmt>
+    </block_content>}</block></for>
+
+    <decl_stmt><decl><type><name>size_t</name></type> <name>Hi_size_total</name> <init>= <expr><literal type="number">0</literal></expr></init></decl> ;</decl_stmt>
+    <decl_stmt><decl><type><name>size_t</name></type> <name>Hf_size_total</name> <init>= <expr><literal type="number">0</literal></expr></init></decl> ;</decl_stmt>
+    <decl_stmt><decl><type><name>size_t</name></type> <name>Hx_size_total</name> <init>= <expr><literal type="number">0</literal></expr></init></decl> ;</decl_stmt>
+
+    <comment type="line">//--------------------------------------------------------------------------</comment>
+    <comment type="line">// determine the total size of all hash tables</comment>
+    <comment type="line">//--------------------------------------------------------------------------</comment>
+
+    <decl_stmt><decl><type><name>int</name></type> <name>nfine_hash</name> <init>= <expr><literal type="number">0</literal></expr></init></decl> ;</decl_stmt>
+    <decl_stmt><decl><type><name>int</name></type> <name>nfine_gus</name> <init>= <expr><literal type="number">0</literal></expr></init></decl> ;</decl_stmt>
+    <decl_stmt><decl><type><name>int</name></type> <name>ncoarse_hash</name> <init>= <expr><literal type="number">0</literal></expr></init></decl> ;</decl_stmt>
+    <decl_stmt><decl><type><name>int</name></type> <name>ncoarse_1hash</name> <init>= <expr><literal type="number">0</literal></expr></init></decl> ;</decl_stmt>
+    <decl_stmt><decl><type><name>int</name></type> <name>ncoarse_gus</name> <init>= <expr><literal type="number">0</literal></expr></init></decl> ;</decl_stmt>
+
+    <for>for <control>(<init><decl><type><name>int</name></type> <name>taskid</name> <init>= <expr><literal type="number">0</literal></expr></init></decl> ;</init> <condition><expr><name>taskid</name> <operator>&lt;</operator> <name>ntasks</name></expr> ;</condition> <incr><expr><name>taskid</name><operator>++</operator></expr></incr>)</control>
+    <block>{<block_content>
+
+        <comment type="line">// get the task type and its hash size</comment>
+        <decl_stmt><decl><type><name>int64_t</name></type> <name>hash_size</name> <init>= <expr><name><name>SaxpyTasks</name> <index>[<expr><name>taskid</name></expr>]</index></name><operator>.</operator><name>hsize</name></expr></init></decl> ;</decl_stmt>
+        <decl_stmt><decl><type><name>int64_t</name></type> <name>k</name> <init>= <expr><name><name>SaxpyTasks</name> <index>[<expr><name>taskid</name></expr>]</index></name><operator>.</operator><name>vector</name></expr></init></decl> ;</decl_stmt>
+        <decl_stmt><decl><type><name>bool</name></type> <name>is_fine</name> <init>= <expr><operator>(</operator><name>k</name> <operator>&gt;=</operator> <literal type="number">0</literal><operator>)</operator></expr></init></decl> ;</decl_stmt>
+        <decl_stmt><decl><type><name>bool</name></type> <name>use_Gustavson</name> <init>= <expr><operator>(</operator><name>hash_size</name> <operator>==</operator> <name>cvlen</name><operator>)</operator></expr></init></decl> ;</decl_stmt>
+
+        <if_stmt><if>if <condition>(<expr><name>is_fine</name></expr>)</condition>
+        <block>{<block_content>
+            <comment type="line">// fine task</comment>
+            <if_stmt><if>if <condition>(<expr><name>use_Gustavson</name></expr>)</condition>
+            <block>{<block_content> 
+                <comment type="line">// fine Gustavson task</comment>
+                <expr_stmt><expr><name>nfine_gus</name><operator>++</operator></expr> ;</expr_stmt>
+            </block_content>}</block></if>
+            <else>else
+            <block>{<block_content> 
+                <comment type="line">// fine hash task</comment>
+                <expr_stmt><expr><name>nfine_hash</name><operator>++</operator></expr> ;</expr_stmt>
+            </block_content>}</block></else></if_stmt>
+        </block_content>}</block></if>
+        <else>else
+        <block>{<block_content>
+            <comment type="line">// coarse task</comment>
+            <if_stmt><if>if <condition>(<expr><name>use_Gustavson</name></expr>)</condition>
+            <block>{<block_content> 
+                <comment type="line">// coarse Gustavson task</comment>
+                <expr_stmt><expr><name>ncoarse_gus</name><operator>++</operator></expr> ;</expr_stmt>
+            </block_content>}</block></if>
+            <else>else
+            <block>{<block_content> 
+                <comment type="line">// coarse hash task</comment>
+                <expr_stmt><expr><name>ncoarse_hash</name><operator>++</operator></expr> ;</expr_stmt>
+            </block_content>}</block></else></if_stmt>
+        </block_content>}</block></else></if_stmt>
+
+        <if_stmt><if>if <condition>(<expr><name>taskid</name> <operator>!=</operator> <name><name>SaxpyTasks</name> <index>[<expr><name>taskid</name></expr>]</index></name><operator>.</operator><name>leader</name></expr>)</condition>
+        <block>{<block_content> 
+            <comment type="line">// allocate a single shared hash table for all fine</comment>
+            <comment type="line">// tasks that compute a single C(:,j)</comment>
+            <continue>continue ;</continue>
+        </block_content>}</block></if></if_stmt>
+
+        <decl_stmt><decl><type><name>int64_t</name></type> <name>hi_size</name> <init>= <expr><call><name>GB_IMAX</name> <argument_list>(<argument><expr><name>hash_size</name></expr></argument>, <argument><expr><literal type="number">8</literal></expr></argument>)</argument_list></call></expr></init></decl> ;</decl_stmt>
+        <decl_stmt><decl><type><name>int64_t</name></type> <name>hx_size</name> <init>= <expr><name>hi_size</name></expr></init></decl> ;</decl_stmt>
+        <if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>GB_IS_POWER_OF_TWO</name> <argument_list>(<argument><expr><name>hi_size</name></expr></argument>)</argument_list></call></expr>)</condition>
+        <block>{<block_content> 
+            <expr_stmt><expr><name>hi_size</name> <operator>+=</operator> <name>hi_pad</name></expr> ;</expr_stmt>
+            <expr_stmt><expr><name>hx_size</name> <operator>+=</operator> <name>hx_pad</name></expr> ;</expr_stmt>
+        </block_content>}</block></if></if_stmt>
+        <if_stmt><if>if <condition>(<expr><name>is_fine</name> <operator>&amp;&amp;</operator> <name>use_Gustavson</name></expr>)</condition>
+        <block>{<block_content> 
+            <comment type="line">// Hf is int8_t for the fine Gustavson tasks, but round up</comment>
+            <comment type="line">// to the nearest number of int64_t values.</comment>
+            <decl_stmt><decl><type><name>int64_t</name></type> <name>hi_size2</name> <init>= <expr><call><name>GB_IMAX</name> <argument_list>(<argument><expr><name>hi_size</name></expr></argument>, <argument><expr><literal type="number">64</literal></expr></argument>)</argument_list></call></expr></init></decl> ;</decl_stmt>
+            <expr_stmt><expr><name>Hf_size_total</name> <operator>+=</operator> <call><name>GB_ICEIL</name> <argument_list>(<argument><expr><name>hi_size2</name></expr></argument>, <argument><expr><sizeof>sizeof <argument_list>(<argument><expr><name>int64_t</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr> ;</expr_stmt>
+        </block_content>}</block></if>
+        <else>else
+        <block>{<block_content> 
+            <comment type="line">// Hf is int64_t for all other methods</comment>
+            <expr_stmt><expr><name>Hf_size_total</name> <operator>+=</operator> <name>hi_size</name></expr> ;</expr_stmt>
+        </block_content>}</block></else></if_stmt>
+        <if_stmt><if>if <condition>(<expr><operator>!</operator><name>is_fine</name> <operator>&amp;&amp;</operator> <operator>!</operator><name>use_Gustavson</name></expr>)</condition>
+        <block>{<block_content> 
+            <comment type="line">// only coarse hash tasks need Hi</comment>
+            <expr_stmt><expr><name>Hi_size_total</name> <operator>+=</operator> <name>hi_size</name></expr> ;</expr_stmt>
+        </block_content>}</block></if></if_stmt>
+        <comment type="line">// all tasks use an Hx array of size hash_size</comment>
+        <if_stmt><if>if <condition>(<expr><operator>!</operator><name>C_iso</name></expr>)</condition>
+        <block>{<block_content> 
+            <comment type="line">// except that the ANY_PAIR semiring does not use Hx</comment>
+            <expr_stmt><expr><name>Hx_size_total</name> <operator>+=</operator> <name>hx_size</name></expr> ;</expr_stmt>
+        </block_content>}</block></if></if_stmt>
+    </block_content>}</block></for>
+
+    <expr_stmt><expr><call><name>GBURBLE</name> <argument_list>(<argument><expr><literal type="string">"(nthreads %d"</literal></expr></argument>, <argument><expr><name>nthreads</name></expr></argument>)</argument_list></call></expr> ;</expr_stmt>
+    <if_stmt><if>if <condition>(<expr><name>ncoarse_gus</name>  <operator>&gt;</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content> <expr_stmt><expr><call><name>GBURBLE</name> <argument_list>(<argument><expr><literal type="string">" coarse: %d"</literal></expr></argument>,      <argument><expr><name>ncoarse_gus</name></expr></argument>)</argument_list></call></expr> ;</expr_stmt></block_content></block></if></if_stmt>
+    <if_stmt><if>if <condition>(<expr><name>ncoarse_hash</name> <operator>&gt;</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content> <expr_stmt><expr><call><name>GBURBLE</name> <argument_list>(<argument><expr><literal type="string">" coarse hash: %d"</literal></expr></argument>, <argument><expr><name>ncoarse_hash</name></expr></argument>)</argument_list></call></expr> ;</expr_stmt></block_content></block></if></if_stmt>
+    <if_stmt><if>if <condition>(<expr><name>nfine_gus</name>    <operator>&gt;</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content> <expr_stmt><expr><call><name>GBURBLE</name> <argument_list>(<argument><expr><literal type="string">" fine: %d"</literal></expr></argument>,        <argument><expr><name>nfine_gus</name></expr></argument>)</argument_list></call></expr> ;</expr_stmt></block_content></block></if></if_stmt>
+    <if_stmt><if>if <condition>(<expr><name>nfine_hash</name>   <operator>&gt;</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content> <expr_stmt><expr><call><name>GBURBLE</name> <argument_list>(<argument><expr><literal type="string">" fine hash: %d"</literal></expr></argument>,   <argument><expr><name>nfine_hash</name></expr></argument>)</argument_list></call></expr> ;</expr_stmt></block_content></block></if></if_stmt>
+    <expr_stmt><expr><call><name>GBURBLE</name> <argument_list>(<argument><expr><literal type="string">") "</literal></expr></argument>)</argument_list></call></expr> ;</expr_stmt>
+
+    <comment type="line">//--------------------------------------------------------------------------</comment>
+    <comment type="line">// allocate space for all hash tables</comment>
+    <comment type="line">//--------------------------------------------------------------------------</comment>
+
+    <if_stmt><if>if <condition>(<expr><name>Hi_size_total</name> <operator>&gt;</operator> <literal type="number">0</literal></expr>)</condition>
+    <block>{<block_content> 
+        <expr_stmt><expr><name>Hi_all</name> <operator>=</operator> <call><name>GB_MALLOC_WORK</name> <argument_list>(<argument><expr><name>Hi_size_total</name></expr></argument>, <argument><expr><name>int64_t</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>Hi_all_size</name></expr></argument>)</argument_list></call></expr> ;</expr_stmt>
+    </block_content>}</block></if></if_stmt>
+    <if_stmt><if>if <condition>(<expr><name>Hf_size_total</name> <operator>&gt;</operator> <literal type="number">0</literal></expr>)</condition>
+    <block>{<block_content> 
+        <comment type="line">// Hf must be calloc'd to initialize all entries as empty </comment>
+        <expr_stmt><expr><name>Hf_all</name> <operator>=</operator> <call><name>GB_CALLOC_WORK</name> <argument_list>(<argument><expr><name>Hf_size_total</name></expr></argument>, <argument><expr><name>int64_t</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>Hf_all_size</name></expr></argument>)</argument_list></call></expr> ;</expr_stmt>
+    </block_content>}</block></if></if_stmt>
+    <if_stmt><if>if <condition>(<expr><name>Hx_size_total</name> <operator>&gt;</operator> <literal type="number">0</literal></expr>)</condition>
+    <block>{<block_content> 
+        <expr_stmt><expr><name>Hx_all</name> <operator>=</operator> <call><name>GB_MALLOC_WORK</name> <argument_list>(<argument><expr><name>Hx_size_total</name> <operator>*</operator> <name>csize</name></expr></argument>, <argument><expr><name>GB_void</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>Hx_all_size</name></expr></argument>)</argument_list></call></expr> ;</expr_stmt>
+    </block_content>}</block></if></if_stmt>
+
+    <if_stmt><if>if <condition>(<expr><operator>(</operator><name>Hi_size_total</name> <operator>&gt;</operator> <literal type="number">0</literal> <operator>&amp;&amp;</operator> <name>Hi_all</name> <operator>==</operator> <name>NULL</name><operator>)</operator> <operator>||</operator>
+        <operator>(</operator><name>Hf_size_total</name> <operator>&gt;</operator> <literal type="number">0</literal> <operator>&amp;&amp;</operator> <name>Hf_all</name> <operator>==</operator> <name>NULL</name><operator>)</operator> <operator>||</operator> 
+        <operator>(</operator><name>Hx_size_total</name> <operator>&gt;</operator> <literal type="number">0</literal> <operator>&amp;&amp;</operator> <name>Hx_all</name> <operator>==</operator> <name>NULL</name><operator>)</operator></expr>)</condition>
+    <block>{<block_content> 
+        <comment type="line">// out of memory</comment>
+        <expr_stmt><expr><name>GB_FREE_ALL</name></expr> ;</expr_stmt>
+        <return>return <expr><operator>(</operator><name>GrB_OUT_OF_MEMORY</name><operator>)</operator></expr> ;</return>
+    </block_content>}</block></if></if_stmt>
+
+    <comment type="line">//--------------------------------------------------------------------------</comment>
+    <comment type="line">// split the space into separate hash tables</comment>
+    <comment type="line">//--------------------------------------------------------------------------</comment>
+
+    <decl_stmt><decl><type><name>int64_t</name> <modifier>*</modifier><specifier>restrict</specifier></type> <name>Hi_part</name> <init>= <expr><name>Hi_all</name></expr></init></decl> ;</decl_stmt>
+    <decl_stmt><decl><type><name>int64_t</name> <modifier>*</modifier><specifier>restrict</specifier></type> <name>Hf_part</name> <init>= <expr><name>Hf_all</name></expr></init></decl> ;</decl_stmt>
+    <decl_stmt><decl><type><name>GB_void</name> <modifier>*</modifier><specifier>restrict</specifier></type> <name>Hx_part</name> <init>= <expr><name>Hx_all</name></expr></init></decl> ;</decl_stmt>
+
+    <for>for <control>(<init><decl><type><name>int</name></type> <name>taskid</name> <init>= <expr><literal type="number">0</literal></expr></init></decl> ;</init> <condition><expr><name>taskid</name> <operator>&lt;</operator> <name>ntasks</name></expr> ;</condition> <incr><expr><name>taskid</name><operator>++</operator></expr></incr>)</control>
+    <block>{<block_content>
+
+        <if_stmt><if>if <condition>(<expr><name>taskid</name> <operator>!=</operator> <name><name>SaxpyTasks</name> <index>[<expr><name>taskid</name></expr>]</index></name><operator>.</operator><name>leader</name></expr>)</condition>
+        <block>{<block_content> 
+            <comment type="line">// allocate a single hash table for all fine</comment>
+            <comment type="line">// tasks that compute a single C(:,j)</comment>
+            <continue>continue ;</continue>
+        </block_content>}</block></if></if_stmt>
+
+        <decl_stmt><decl><type><name>int64_t</name></type> <name>hash_size</name> <init>= <expr><name><name>SaxpyTasks</name> <index>[<expr><name>taskid</name></expr>]</index></name><operator>.</operator><name>hsize</name></expr></init></decl> ;</decl_stmt>
+        <decl_stmt><decl><type><name>int64_t</name></type> <name>k</name> <init>= <expr><name><name>SaxpyTasks</name> <index>[<expr><name>taskid</name></expr>]</index></name><operator>.</operator><name>vector</name></expr></init></decl> ;</decl_stmt>
+        <decl_stmt><decl><type><name>bool</name></type> <name>is_fine</name> <init>= <expr><operator>(</operator><name>k</name> <operator>&gt;=</operator> <literal type="number">0</literal><operator>)</operator></expr></init></decl> ;</decl_stmt>
+        <decl_stmt><decl><type><name>bool</name></type> <name>use_Gustavson</name> <init>= <expr><operator>(</operator><name>hash_size</name> <operator>==</operator> <name>cvlen</name><operator>)</operator></expr></init></decl> ;</decl_stmt>
+
+        <expr_stmt><expr><name><name>SaxpyTasks</name> <index>[<expr><name>taskid</name></expr>]</index></name><operator>.</operator><name>Hi</name> <operator>=</operator> <name>Hi_part</name></expr> ;</expr_stmt>
+        <expr_stmt><expr><name><name>SaxpyTasks</name> <index>[<expr><name>taskid</name></expr>]</index></name><operator>.</operator><name>Hf</name> <operator>=</operator> <operator>(</operator><name>GB_void</name> <operator>*</operator><operator>)</operator> <name>Hf_part</name></expr> ;</expr_stmt>
+        <expr_stmt><expr><name><name>SaxpyTasks</name> <index>[<expr><name>taskid</name></expr>]</index></name><operator>.</operator><name>Hx</name> <operator>=</operator> <name>Hx_part</name></expr> ;</expr_stmt>
+
+        <decl_stmt><decl><type><name>int64_t</name></type> <name>hi_size</name> <init>= <expr><call><name>GB_IMAX</name> <argument_list>(<argument><expr><name>hash_size</name></expr></argument>, <argument><expr><literal type="number">8</literal></expr></argument>)</argument_list></call></expr></init></decl> ;</decl_stmt>
+        <decl_stmt><decl><type><name>int64_t</name></type> <name>hx_size</name> <init>= <expr><name>hi_size</name></expr></init></decl> ;</decl_stmt>
+        <if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>GB_IS_POWER_OF_TWO</name> <argument_list>(<argument><expr><name>hi_size</name></expr></argument>)</argument_list></call></expr>)</condition>
+        <block>{<block_content> 
+            <expr_stmt><expr><name>hi_size</name> <operator>+=</operator> <name>hi_pad</name></expr> ;</expr_stmt>
+            <expr_stmt><expr><name>hx_size</name> <operator>+=</operator> <name>hx_pad</name></expr> ;</expr_stmt>
+        </block_content>}</block></if></if_stmt>
+        <if_stmt><if>if <condition>(<expr><name>is_fine</name> <operator>&amp;&amp;</operator> <name>use_Gustavson</name></expr>)</condition>
+        <block>{<block_content> 
+            <comment type="line">// Hf is int8_t for the fine Gustavson tasks, but round up</comment>
+            <comment type="line">// to the nearest number of int64_t values.</comment>
+            <decl_stmt><decl><type><name>int64_t</name></type> <name>hi_size2</name> <init>= <expr><call><name>GB_IMAX</name> <argument_list>(<argument><expr><name>hi_size</name></expr></argument>, <argument><expr><literal type="number">64</literal></expr></argument>)</argument_list></call></expr></init></decl> ;</decl_stmt>
+            <expr_stmt><expr><name>Hf_part</name> <operator>+=</operator> <call><name>GB_ICEIL</name> <argument_list>(<argument><expr><name>hi_size2</name></expr></argument>, <argument><expr><sizeof>sizeof <argument_list>(<argument><expr><name>int64_t</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr> ;</expr_stmt>
+        </block_content>}</block></if>
+        <else>else
+        <block>{<block_content> 
+            <comment type="line">// Hf is int64_t for all other methods</comment>
+            <expr_stmt><expr><name>Hf_part</name> <operator>+=</operator> <name>hi_size</name></expr> ;</expr_stmt>
+        </block_content>}</block></else></if_stmt>
+        <if_stmt><if>if <condition>(<expr><operator>!</operator><name>is_fine</name> <operator>&amp;&amp;</operator> <operator>!</operator><name>use_Gustavson</name></expr>)</condition>
+        <block>{<block_content> 
+            <comment type="line">// only coarse hash tasks need Hi</comment>
+            <expr_stmt><expr><name>Hi_part</name> <operator>+=</operator> <name>hi_size</name></expr> ;</expr_stmt>
+        </block_content>}</block></if></if_stmt>
+        <comment type="line">// all tasks use an Hx array of size hash_size</comment>
+        <if_stmt><if>if <condition>(<expr><operator>!</operator><name>C_iso</name></expr>)</condition>
+        <block>{<block_content> 
+            <comment type="line">// except that the ANY_PAIR iso semiring does not use Hx</comment>
+            <expr_stmt><expr><name>Hx_part</name> <operator>+=</operator> <name>hx_size</name> <operator>*</operator> <name>csize</name></expr> ;</expr_stmt>
+        </block_content>}</block></if></if_stmt>
+    </block_content>}</block></for>
+
+    <comment type="line">// assign shared hash tables to fine task teams</comment>
+    <for>for <control>(<init><decl><type><name>int</name></type> <name>taskid</name> <init>= <expr><literal type="number">0</literal></expr></init></decl> ;</init> <condition><expr><name>taskid</name> <operator>&lt;</operator> <name>nfine</name></expr> ;</condition> <incr><expr><name>taskid</name><operator>++</operator></expr></incr>)</control>
+    <block>{<block_content>
+        <decl_stmt><decl><type><name>int</name></type> <name>leader</name> <init>= <expr><name><name>SaxpyTasks</name> <index>[<expr><name>taskid</name></expr>]</index></name><operator>.</operator><name>leader</name></expr></init></decl> ;</decl_stmt>
+        <expr_stmt><expr><call><name>ASSERT</name> <argument_list>(<argument><expr><name><name>SaxpyTasks</name> <index>[<expr><name>leader</name></expr>]</index></name><operator>.</operator><name>vector</name> <operator>&gt;=</operator> <literal type="number">0</literal></expr></argument>)</argument_list></call></expr> ;</expr_stmt>
+        <if_stmt><if>if <condition>(<expr><name>taskid</name> <operator>!=</operator> <name>leader</name></expr>)</condition>
+        <block>{<block_content> 
+            <comment type="line">// this fine task (Gustavson or hash) shares its hash table</comment>
+            <comment type="line">// with all other tasks in its team, for a single vector C(:,j).</comment>
+            <expr_stmt><expr><call><name>ASSERT</name> <argument_list>(<argument><expr><name><name>SaxpyTasks</name> <index>[<expr><name>taskid</name></expr>]</index></name><operator>.</operator><name>vector</name> <operator>==</operator> <name><name>SaxpyTasks</name> <index>[<expr><name>leader</name></expr>]</index></name><operator>.</operator><name>vector</name></expr></argument>)</argument_list></call></expr> ;</expr_stmt>
+            <expr_stmt><expr><name><name>SaxpyTasks</name> <index>[<expr><name>taskid</name></expr>]</index></name><operator>.</operator><name>Hf</name> <operator>=</operator> <name><name>SaxpyTasks</name> <index>[<expr><name>leader</name></expr>]</index></name><operator>.</operator><name>Hf</name></expr> ;</expr_stmt>
+            <expr_stmt><expr><name><name>SaxpyTasks</name> <index>[<expr><name>taskid</name></expr>]</index></name><operator>.</operator><name>Hx</name> <operator>=</operator> <name><name>SaxpyTasks</name> <index>[<expr><name>leader</name></expr>]</index></name><operator>.</operator><name>Hx</name></expr> ;</expr_stmt>
+        </block_content>}</block></if></if_stmt>
+    </block_content>}</block></for>
+
+    <comment type="line">//==========================================================================</comment>
+    <comment type="line">// phase1: symbolic analysis</comment>
+    <comment type="line">//==========================================================================</comment>
+
+    <comment type="line">// TODO constructing the tasks (the work above) can take a lot of time.</comment>
+    <comment type="line">// See the web graph, where it takes a total of 3.03 sec for 64 trials, vs</comment>
+    <comment type="line">// a total of 5.9 second for phase 7 (the numerical work below).</comment>
+    <comment type="line">// Figure out a faster method.</comment>
+
+    <cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>GB_TIMING</name></cpp:ifdef>
+    <expr_stmt><expr><name>ttt</name> <operator>=</operator> <call><name>omp_get_wtime</name> <argument_list>( )</argument_list></call> <operator>-</operator> <name>ttt</name></expr> ;</expr_stmt>
+    <expr_stmt><expr><call><name>GB_Global_timing_add</name> <argument_list>(<argument><expr><literal type="number">5</literal></expr></argument>, <argument><expr><name>ttt</name></expr></argument>)</argument_list></call></expr> ;</expr_stmt>
+    <expr_stmt><expr><name>ttt</name> <operator>=</operator> <call><name>omp_get_wtime</name> <argument_list>( )</argument_list></call></expr> ;</expr_stmt>
+    <cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+    <expr_stmt><expr><call><name>GB_AxB_saxpy3_symbolic</name> <argument_list>(<argument><expr><name>C</name></expr></argument>, <argument><expr><name>M</name></expr></argument>, <argument><expr><name>Mask_comp</name></expr></argument>, <argument><expr><name>Mask_struct</name></expr></argument>, <argument><expr><name>M_in_place</name></expr></argument>,
+        <argument><expr><name>A</name></expr></argument>, <argument><expr><name>B</name></expr></argument>, <argument><expr><name>SaxpyTasks</name></expr></argument>, <argument><expr><name>ntasks</name></expr></argument>, <argument><expr><name>nfine</name></expr></argument>, <argument><expr><name>nthreads</name></expr></argument>)</argument_list></call></expr> ;</expr_stmt>
+
+<comment type="line">// the above phase takes 1.6 seconds for 64 trials of the web graph.</comment>
+
+    <cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>GB_TIMING</name></cpp:ifdef>
+    <expr_stmt><expr><name>ttt</name> <operator>=</operator> <call><name>omp_get_wtime</name> <argument_list>( )</argument_list></call> <operator>-</operator> <name>ttt</name></expr> ;</expr_stmt>
+    <expr_stmt><expr><call><name>GB_Global_timing_add</name> <argument_list>(<argument><expr><literal type="number">6</literal></expr></argument>, <argument><expr><name>ttt</name></expr></argument>)</argument_list></call></expr> ;</expr_stmt>
+    <expr_stmt><expr><name>ttt</name> <operator>=</operator> <call><name>omp_get_wtime</name> <argument_list>( )</argument_list></call></expr> ;</expr_stmt>
+    <cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+    <comment type="line">//==========================================================================</comment>
+    <comment type="line">// C = A*B, via saxpy3 method, phases 2 to 5</comment>
+    <comment type="line">//==========================================================================</comment>
+
+    <if_stmt><if>if <condition>(<expr><name>C_iso</name></expr>)</condition>
+    <block>{<block_content>
+
+        <comment type="line">//----------------------------------------------------------------------</comment>
+        <comment type="line">// C is iso; compute the pattern of C&lt;#&gt;=A*B with the any_pair semiring</comment>
+        <comment type="line">//----------------------------------------------------------------------</comment>
+
+        <expr_stmt><expr><call><name>GBURBLE</name> <argument_list>(<argument><expr><literal type="string">"(iso sparse saxpy) "</literal></expr></argument>)</argument_list></call></expr> ;</expr_stmt>
+        <expr_stmt><expr><name>info</name> <operator>=</operator> <call><call><name>GB</name> <argument_list>(<argument><expr><name>_Asaxpy3B__any_pair_iso</name></expr></argument>)</argument_list></call> <argument_list>(<argument><expr><name>C</name></expr></argument>, <argument><expr><name>M</name></expr></argument>, <argument><expr><name>Mask_comp</name></expr></argument>, <argument><expr><name>Mask_struct</name></expr></argument>,
+            <argument><expr><name>M_in_place</name></expr></argument>, <argument><expr><name>A</name></expr></argument>, <argument><expr><name>B</name></expr></argument>, <argument><expr><name>SaxpyTasks</name></expr></argument>, <argument><expr><name>ntasks</name></expr></argument>, <argument><expr><name>nfine</name></expr></argument>,
+            <argument><expr><name>nthreads</name></expr></argument>, <argument><expr><name>do_sort</name></expr></argument>, <argument><expr><name>Context</name></expr></argument>)</argument_list></call></expr> ;</expr_stmt>
+        <if_stmt><if>if <condition>(<expr><name>info</name> <operator>==</operator> <name>GrB_SUCCESS</name></expr>)</condition>
+        <block>{<block_content> 
+            <expr_stmt><expr><call><name>memcpy</name> <argument_list>(<argument><expr><name><name>C</name><operator>-&gt;</operator><name>x</name></name></expr></argument>, <argument><expr><name>cscalar</name></expr></argument>, <argument><expr><name>csize</name></expr></argument>)</argument_list></call></expr> ;</expr_stmt>
+        </block_content>}</block></if></if_stmt>
+
+    </block_content>}</block></if>
+    <else>else
+    <block>{<block_content>
+
+        <comment type="line">//----------------------------------------------------------------------</comment>
+        <comment type="line">// C is non-iso</comment>
+        <comment type="line">//----------------------------------------------------------------------</comment>
+
+        <expr_stmt><expr><call><name>GBURBLE</name> <argument_list>(<argument><expr><literal type="string">"(sparse saxpy) "</literal></expr></argument>)</argument_list></call></expr> ;</expr_stmt>
+        <decl_stmt><decl><type><name>bool</name></type> <name>done</name> <init>= <expr><name>false</name></expr></init></decl> ;</decl_stmt>
+
+        <cpp:ifndef>#<cpp:directive>ifndef</cpp:directive> <name>GBCUDA_DEV</name></cpp:ifndef>
+
+            <comment type="line">//------------------------------------------------------------------</comment>
+            <comment type="line">// define the worker for the switch factory</comment>
+            <comment type="line">//------------------------------------------------------------------</comment>
+
+            <cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>GB_Asaxpy3B</name><parameter_list>(<parameter><type><name>add</name></type></parameter>,<parameter><type><name>mult</name></type></parameter>,<parameter><type><name>xname</name></type></parameter>)</parameter_list></cpp:macro> \
+                <cpp:value>GB (_Asaxpy3B_ ## add ## mult ## xname)</cpp:value></cpp:define>
+
+            <cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>GB_AxB_WORKER</name><parameter_list>(<parameter><type><name>add</name></type></parameter>,<parameter><type><name>mult</name></type></parameter>,<parameter><type><name>xname</name></type></parameter>)</parameter_list></cpp:macro>                           \
+            <cpp:value>{                                                               \
+                info = GB_Asaxpy3B (add,mult,xname) (C, M, Mask_comp,       \
+                    Mask_struct, M_in_place, A, B,                          \
+                    SaxpyTasks, ntasks, nfine, nthreads,                    \
+                    do_sort, Context) ;                                     \
+                done = (info != GrB_NO_VALUE) ;                             \
+            }                                                               \
+            break ;</cpp:value></cpp:define>
+
+            <comment type="line">//------------------------------------------------------------------</comment>
+            <comment type="line">// launch the switch factory</comment>
+            <comment type="line">//------------------------------------------------------------------</comment>
+
+            <if_stmt><if>if <condition>(<expr><name>builtin_semiring</name></expr>)</condition>
+            <block>{<block_content> 
+                <cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"GB_AxB_factory.c"</cpp:file></cpp:include>
+            </block_content>}</block></if></if_stmt>
+
+        <cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+        <comment type="line">//----------------------------------------------------------------------</comment>
+        <comment type="line">// generic saxpy3 method</comment>
+        <comment type="line">//----------------------------------------------------------------------</comment>
+
+        <if_stmt><if>if <condition>(<expr><operator>!</operator><name>done</name></expr>)</condition>
+        <block>{<block_content> 
+            <expr_stmt><expr><name>info</name> <operator>=</operator> <call><name>GB_AxB_saxpy_generic</name> <argument_list>(<argument><expr><name>C</name></expr></argument>, <argument><expr><name>M</name></expr></argument>, <argument><expr><name>Mask_comp</name></expr></argument>, <argument><expr><name>Mask_struct</name></expr></argument>,
+                <argument><expr><name>M_in_place</name></expr></argument>, <argument><expr><name>A</name></expr></argument>, <argument><expr><name>A_is_pattern</name></expr></argument>, <argument><expr><name>B</name></expr></argument>, <argument><expr><name>B_is_pattern</name></expr></argument>, <argument><expr><name>semiring</name></expr></argument>,
+                <argument><expr><name>flipxy</name></expr></argument>, <argument><expr><name>GB_SAXPY_METHOD_3</name></expr></argument>,
+                <argument><expr><name>SaxpyTasks</name></expr></argument>, <argument><expr><name>ntasks</name></expr></argument>, <argument><expr><name>nfine</name></expr></argument>, <argument><expr><name>nthreads</name></expr></argument>, <argument><expr><name>do_sort</name></expr></argument>,
+                <argument><expr><name>Context</name></expr></argument>)</argument_list></call></expr> ;</expr_stmt>
+        </block_content>}</block></if></if_stmt>
+    </block_content>}</block></else></if_stmt>
+
+    <if_stmt><if>if <condition>(<expr><name>info</name> <operator>!=</operator> <name>GrB_SUCCESS</name></expr>)</condition>
+    <block>{<block_content> 
+        <comment type="line">// out of memory</comment>
+        <expr_stmt><expr><name>GB_FREE_ALL</name></expr> ;</expr_stmt>
+        <return>return <expr><operator>(</operator><name>GrB_OUT_OF_MEMORY</name><operator>)</operator></expr> ;</return>
+    </block_content>}</block></if></if_stmt>
+
+    <comment type="line">//--------------------------------------------------------------------------</comment>
+    <comment type="line">// prune empty vectors, free workspace, and return result</comment>
+    <comment type="line">//--------------------------------------------------------------------------</comment>
+
+    <cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>GB_TIMING</name></cpp:ifdef>
+    <expr_stmt><expr><name>ttt</name> <operator>=</operator> <call><name>omp_get_wtime</name> <argument_list>( )</argument_list></call> <operator>-</operator> <name>ttt</name></expr> ;</expr_stmt>
+    <expr_stmt><expr><call><name>GB_Global_timing_add</name> <argument_list>(<argument><expr><literal type="number">7</literal></expr></argument>, <argument><expr><name>ttt</name></expr></argument>)</argument_list></call></expr> ;</expr_stmt>
+    <expr_stmt><expr><name>ttt</name> <operator>=</operator> <call><name>omp_get_wtime</name> <argument_list>( )</argument_list></call></expr> ;</expr_stmt>
+    <cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+    <expr_stmt><expr><name><name>C</name><operator>-&gt;</operator><name>magic</name></name> <operator>=</operator> <name>GB_MAGIC</name></expr> ;</expr_stmt>
+    <expr_stmt><expr><name>GB_FREE_WORKSPACE</name></expr> ;</expr_stmt>
+    <expr_stmt><expr><call><name>GB_OK</name> <argument_list>(<argument><expr><call><name>GB_hypermatrix_prune</name> <argument_list>(<argument><expr><name>C</name></expr></argument>, <argument><expr><name>Context</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr> ;</expr_stmt>
+    <expr_stmt><expr><call><name>ASSERT_MATRIX_OK</name> <argument_list>(<argument><expr><name>C</name></expr></argument>, <argument><expr><literal type="string">"saxpy3: output"</literal></expr></argument>, <argument><expr><name>GB0</name></expr></argument>)</argument_list></call></expr> ;</expr_stmt>
+    <expr_stmt><expr><call><name>ASSERT</name> <argument_list>(<argument><expr><operator>!</operator><call><name>GB_ZOMBIES</name> <argument_list>(<argument><expr><name>C</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr> ;</expr_stmt>
+    <expr_stmt><expr><call><name>ASSERT</name> <argument_list>(<argument><expr><operator>!</operator><call><name>GB_PENDING</name> <argument_list>(<argument><expr><name>C</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr> ;</expr_stmt>
+    <expr_stmt><expr><operator>(</operator><operator>*</operator><name>mask_applied</name><operator>)</operator> <operator>=</operator> <name>apply_mask</name></expr> ;</expr_stmt>
+
+    <cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>GB_TIMING</name></cpp:ifdef>
+    <expr_stmt><expr><name>ttt</name> <operator>=</operator> <call><name>omp_get_wtime</name> <argument_list>( )</argument_list></call> <operator>-</operator> <name>ttt</name></expr> ;</expr_stmt>
+    <expr_stmt><expr><call><name>GB_Global_timing_add</name> <argument_list>(<argument><expr><literal type="number">8</literal></expr></argument>, <argument><expr><name>ttt</name></expr></argument>)</argument_list></call></expr> ;</expr_stmt>
+    <cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+    <return>return <expr><operator>(</operator><name>info</name><operator>)</operator></expr> ;</return>
+</block_content>}</block></function>
+
+</unit>

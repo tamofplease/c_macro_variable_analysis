@@ -1,0 +1,1014 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<unit xmlns="http://www.srcML.org/srcML/src" xmlns:cpp="http://www.srcML.org/srcML/cpp" revision="1.0.0" language="C" filename="/cloned_projects/citus/src/backend/distributed/executor/local_executor.c"><comment type="block">/*
+ * local_executor.c
+ *
+ * The scope of the local execution is locally executing the queries on the
+ * shards. In other words, local execution does not deal with any local tables
+ * that are not on shards on the node that the query is being executed. In that
+ * sense, the local executor is only triggered if the node has both the metadata
+ * and the shards (e.g., only Citus MX worker nodes).
+ *
+ * The goal of the local execution is to skip the unnecessary network round-trip
+ * happening on the node itself. Instead, identify the locally executable tasks
+ * and simply call PostgreSQL's planner and executor.
+ *
+ * The local executor is an extension of the adaptive executor. So, the executor
+ * uses adaptive executor's custom scan nodes.
+ *
+ * One thing to note is that Citus MX is only supported with replication factor
+ * to be equal to 1, so keep that in mind while continuing the comments below.
+ *
+ * On the high level, there are 3 slightly different ways of utilizing local
+ * execution:
+ *
+ * (1) Execution of local single shard queries of a distributed table
+ *
+ *      This is the simplest case. The executor kicks at the start of the adaptive
+ *      executor, and since the query is only a single task the execution finishes
+ *      without going to the network at all.
+ *
+ *      Even if there is a transaction block (or recursively planned CTEs), as
+ *      long as the queries hit the shards on the same node, the local execution
+ *      will kick in.
+ *
+ * (2) Execution of local single queries and remote multi-shard queries
+ *
+ *      The rule is simple. If a transaction block starts with a local query
+ *      execution,
+ *      all the other queries in the same transaction block that touch any local
+ *      shard have to use the local execution. Although this sounds restrictive,
+ *      we prefer to implement it in this way, otherwise we'd end-up with as
+ *      complex scenarios as we have in the connection managements due to foreign
+ *      keys.
+ *
+ *      See the following example:
+ *      BEGIN;
+ *          -- assume that the query is executed locally
+ *          SELECT count(*) FROM test WHERE key = 1;
+ *
+ *          -- at this point, all the shards that reside on the
+ *          -- node is executed locally one-by-one. After those finishes
+ *          -- the remaining tasks are handled by adaptive executor
+ *          SELECT count(*) FROM test;
+ *
+ *
+ * (3) Modifications of reference tables
+ *
+ *		Modifications to reference tables have to be executed on all nodes. So,
+ *      after the local execution, the adaptive executor keeps continuing the
+ *      execution on the other nodes.
+ *
+ *		Note that for read-only queries, after the local execution, there is no
+ *      need to kick in adaptive executor.
+ *
+ * (4) Execution of multi shards local queries and
+ *     remote multi-shard queries within a transaction block
+ *
+ *      We prefer local execution when we are inside a transaction block, because not using
+ *      local execution might create some limitations for other commands in the transaction
+ *      block. To simplify things, whenever we are inside a transaction block, we prefer local
+ *      execution if possible.
+ *
+ *  There are also a few limitations/trade-offs that are worth mentioning.
+ *  - The local execution on multiple shards might be slow because the execution
+ *  has to happen one task at a time (e.g., no parallelism).
+ *  - Related with the previous item, COPY command cannot be mixed with local
+ *  execution in a transaction. The implication of that is any part of INSERT..SELECT
+ *  via coordinator cannot happen via the local execution.
+ */</comment>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"postgres.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"miscadmin.h"</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/pg_version_constants.h"</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/adaptive_executor.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/commands/utility_hook.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/citus_custom_scan.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/citus_ruleutils.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/query_utils.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/deparse_shard_query.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/listutils.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/local_executor.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/local_plan_cache.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/coordinator_protocol.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/metadata_cache.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/multi_executor.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/multi_server_executor.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/relation_access_tracking.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/remote_commands.h"</cpp:file></cpp:include> <comment type="block">/* to access LogRemoteCommands */</comment>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/transaction_management.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/version_compat.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/worker_protocol.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"executor/tstoreReceiver.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"executor/tuptable.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"optimizer/optimizer.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"nodes/params.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/snapmgr.h"</cpp:file></cpp:include>
+
+<comment type="block">/* controlled via a GUC */</comment>
+<decl_stmt><decl><type><name>bool</name></type> <name>EnableLocalExecution</name> <init>= <expr><name>true</name></expr></init></decl>;</decl_stmt>
+<decl_stmt><decl><type><name>bool</name></type> <name>LogLocalCommands</name> <init>= <expr><name>false</name></expr></init></decl>;</decl_stmt>
+
+<comment type="block">/* global variable that tracks whether the local execution is on a shard */</comment>
+<decl_stmt><decl><type><name>uint64</name></type> <name>LocalExecutorShardId</name> <init>= <expr><name>INVALID_SHARD_ID</name></expr></init></decl>;</decl_stmt>
+
+<decl_stmt><decl><type><specifier>static</specifier> <name>LocalExecutionStatus</name></type> <name>CurrentLocalExecutionStatus</name> <init>= <expr><name>LOCAL_EXECUTION_OPTIONAL</name></expr></init></decl>;</decl_stmt>
+
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>SplitLocalAndRemotePlacements</name><parameter_list>(<parameter><decl><type><name>List</name> <modifier>*</modifier></type><name>taskPlacementList</name></decl></parameter>,
+										  <parameter><decl><type><name>List</name> <modifier>*</modifier><modifier>*</modifier></type><name>localTaskPlacementList</name></decl></parameter>,
+										  <parameter><decl><type><name>List</name> <modifier>*</modifier><modifier>*</modifier></type><name>remoteTaskPlacementList</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>uint64</name></type> <name>LocallyExecuteTaskPlan</name><parameter_list>(<parameter><decl><type><name>PlannedStmt</name> <modifier>*</modifier></type><name>taskPlan</name></decl></parameter>, <parameter><decl><type><name>char</name> <modifier>*</modifier></type><name>queryString</name></decl></parameter>,
+									 <parameter><decl><type><name>TupleDestination</name> <modifier>*</modifier></type><name>tupleDest</name></decl></parameter>, <parameter><decl><type><name>Task</name> <modifier>*</modifier></type><name>task</name></decl></parameter>,
+									 <parameter><decl><type><name>ParamListInfo</name></type> <name>paramListInfo</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>uint64</name></type> <name>ExecuteTaskPlan</name><parameter_list>(<parameter><decl><type><name>PlannedStmt</name> <modifier>*</modifier></type><name>taskPlan</name></decl></parameter>, <parameter><decl><type><name>char</name> <modifier>*</modifier></type><name>queryString</name></decl></parameter>,
+							  <parameter><decl><type><name>TupleDestination</name> <modifier>*</modifier></type><name>tupleDest</name></decl></parameter>, <parameter><decl><type><name>Task</name> <modifier>*</modifier></type><name>task</name></decl></parameter>,
+							  <parameter><decl><type><name>ParamListInfo</name></type> <name>paramListInfo</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>RecordNonDistTableAccessesForTask</name><parameter_list>(<parameter><decl><type><name>Task</name> <modifier>*</modifier></type><name>task</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>LogLocalCommand</name><parameter_list>(<parameter><decl><type><name>Task</name> <modifier>*</modifier></type><name>task</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>uint64</name></type> <name>LocallyPlanAndExecuteMultipleQueries</name><parameter_list>(<parameter><decl><type><name>List</name> <modifier>*</modifier></type><name>queryStrings</name></decl></parameter>,
+												   <parameter><decl><type><name>TupleDestination</name> <modifier>*</modifier></type><name>tupleDest</name></decl></parameter>,
+												   <parameter><decl><type><name>Task</name> <modifier>*</modifier></type><name>task</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>LocallyExecuteUtilityTask</name><parameter_list>(<parameter><decl><type><name>Task</name> <modifier>*</modifier></type><name>task</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>ExecuteUdfTaskQuery</name><parameter_list>(<parameter><decl><type><name>Query</name> <modifier>*</modifier></type><name>localUdfCommandQuery</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>EnsureTransitionPossible</name><parameter_list>(<parameter><decl><type><name>LocalExecutionStatus</name></type> <name>from</name></decl></parameter>,
+									 <parameter><decl><type><name>LocalExecutionStatus</name></type> <name>to</name></decl></parameter>)</parameter_list>;</function_decl>
+
+
+<comment type="block">/*
+ * GetCurrentLocalExecutionStatus returns the current local execution status.
+ */</comment>
+<function><type><name>LocalExecutionStatus</name></type>
+<name>GetCurrentLocalExecutionStatus</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<return>return <expr><name>CurrentLocalExecutionStatus</name></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * ExecuteLocalTaskList executes the given tasks locally.
+ *
+ * The function goes over the task list and executes them locally.
+ * The returning tuples (if any) is stored in the tupleStoreState.
+ *
+ * The function returns totalRowsProcessed.
+ */</comment>
+<function><type><name>uint64</name></type>
+<name>ExecuteLocalTaskList</name><parameter_list>(<parameter><decl><type><name>List</name> <modifier>*</modifier></type><name>taskList</name></decl></parameter>, <parameter><decl><type><name>TupleDestination</name> <modifier>*</modifier></type><name>defaultTupleDest</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<if_stmt><if>if <condition>(<expr><call><name>list_length</name><argument_list>(<argument><expr><name>taskList</name></expr></argument>)</argument_list></call> <operator>==</operator> <literal type="number">0</literal></expr>)</condition>
+	<block>{<block_content>
+		<return>return <expr><literal type="number">0</literal></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+	<decl_stmt><decl><type><name>DistributedPlan</name> <modifier>*</modifier></type><name>distributedPlan</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>ParamListInfo</name></type> <name>paramListInfo</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type> <name>isUtilityCommand</name> <init>= <expr><name>false</name></expr></init></decl>;</decl_stmt>
+	<return>return <expr><call><name>ExecuteLocalTaskListExtended</name><argument_list>(<argument><expr><name>taskList</name></expr></argument>, <argument><expr><name>paramListInfo</name></expr></argument>, <argument><expr><name>distributedPlan</name></expr></argument>,
+										<argument><expr><name>defaultTupleDest</name></expr></argument>, <argument><expr><name>isUtilityCommand</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * ExecuteLocalUtilityTaskList executes the given tasks locally.
+ *
+ * The function returns totalRowsProcessed.
+ */</comment>
+<function><type><name>uint64</name></type>
+<name>ExecuteLocalUtilityTaskList</name><parameter_list>(<parameter><decl><type><name>List</name> <modifier>*</modifier></type><name>utilityTaskList</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<if_stmt><if>if <condition>(<expr><call><name>list_length</name><argument_list>(<argument><expr><name>utilityTaskList</name></expr></argument>)</argument_list></call> <operator>==</operator> <literal type="number">0</literal></expr>)</condition>
+	<block>{<block_content>
+		<return>return <expr><literal type="number">0</literal></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+	<decl_stmt><decl><type><name>DistributedPlan</name> <modifier>*</modifier></type><name>distributedPlan</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>ParamListInfo</name></type> <name>paramListInfo</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>TupleDestination</name> <modifier>*</modifier></type><name>defaultTupleDest</name> <init>= <expr><call><name>CreateTupleDestNone</name><argument_list>()</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type> <name>isUtilityCommand</name> <init>= <expr><name>true</name></expr></init></decl>;</decl_stmt>
+	<return>return <expr><call><name>ExecuteLocalTaskListExtended</name><argument_list>(<argument><expr><name>utilityTaskList</name></expr></argument>, <argument><expr><name>paramListInfo</name></expr></argument>, <argument><expr><name>distributedPlan</name></expr></argument>,
+										<argument><expr><name>defaultTupleDest</name></expr></argument>, <argument><expr><name>isUtilityCommand</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * ExecuteLocalTaskListExtended executes the given tasks locally.
+ *
+ * The function goes over the task list and executes them locally.
+ * The returning tuples (if any) is stored in the tupleStoreState.
+ *
+ * It uses a cached plan if distributedPlan is found in cache.
+ *
+ * The function returns totalRowsProcessed.
+ */</comment>
+<function><type><name>uint64</name></type>
+<name>ExecuteLocalTaskListExtended</name><parameter_list>(<parameter><decl><type><name>List</name> <modifier>*</modifier></type><name>taskList</name></decl></parameter>,
+							 <parameter><decl><type><name>ParamListInfo</name></type> <name>orig_paramListInfo</name></decl></parameter>,
+							 <parameter><decl><type><name>DistributedPlan</name> <modifier>*</modifier></type><name>distributedPlan</name></decl></parameter>,
+							 <parameter><decl><type><name>TupleDestination</name> <modifier>*</modifier></type><name>defaultTupleDest</name></decl></parameter>,
+							 <parameter><decl><type><name>bool</name></type> <name>isUtilityCommand</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>ParamListInfo</name></type> <name>paramListInfo</name> <init>= <expr><call><name>copyParamList</name><argument_list>(<argument><expr><name>orig_paramListInfo</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>uint64</name></type> <name>totalRowsProcessed</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type> <name>numParams</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Oid</name> <modifier>*</modifier></type><name>parameterTypes</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>paramListInfo</name> <operator>!=</operator> <name>NULL</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* not used anywhere, so declare here */</comment>
+		<decl_stmt><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier><modifier>*</modifier></type><name>parameterValues</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+
+		<expr_stmt><expr><call><name>ExtractParametersForLocalExecution</name><argument_list>(<argument><expr><name>paramListInfo</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>parameterTypes</name></expr></argument>,
+										   <argument><expr><operator>&amp;</operator><name>parameterValues</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><name>numParams</name> <operator>=</operator> <name><name>paramListInfo</name><operator>-&gt;</operator><name>numParams</name></name></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>taskList</name> <operator>!=</operator> <name>NIL</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>bool</name></type> <name>isRemote</name> <init>= <expr><name>false</name></expr></init></decl>;</decl_stmt>
+		<expr_stmt><expr><call><name>EnsureTaskExecutionAllowed</name><argument_list>(<argument><expr><name>isRemote</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/*
+	 * Use a new memory context that gets reset after every task to free
+	 * the deparsed query string and query plan.
+	 */</comment>
+	<decl_stmt><decl><type><name>MemoryContext</name></type> <name>loopContext</name> <init>= <expr><call><name>AllocSetContextCreate</name><argument_list>(<argument><expr><name>CurrentMemoryContext</name></expr></argument>,
+													  <argument><expr><literal type="string">"ExecuteLocalTaskListExtended"</literal></expr></argument>,
+													  <argument><expr><name>ALLOCSET_DEFAULT_SIZES</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<decl_stmt><decl><type><name>Task</name> <modifier>*</modifier></type><name>task</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+	<macro><name>foreach_ptr</name><argument_list>(<argument>task</argument>, <argument>taskList</argument>)</argument_list></macro>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>MemoryContext</name></type> <name>oldContext</name> <init>= <expr><call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>loopContext</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+		<decl_stmt><decl><type><name>TupleDestination</name> <modifier>*</modifier></type><name>tupleDest</name> <init>= <expr><ternary><condition><expr><name><name>task</name><operator>-&gt;</operator><name>tupleDest</name></name></expr> ?</condition><then>
+									  <expr><name><name>task</name><operator>-&gt;</operator><name>tupleDest</name></name></expr> </then><else>:
+									  <expr><name>defaultTupleDest</name></expr></else></ternary></expr></init></decl>;</decl_stmt>
+
+		<comment type="block">/*
+		 * If we have a valid shard id, a distributed table will be accessed
+		 * during execution. Record it to apply the restrictions related to
+		 * local execution.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><name><name>task</name><operator>-&gt;</operator><name>anchorShardId</name></name> <operator>!=</operator> <name>INVALID_SHARD_ID</name></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><call><name>SetLocalExecutionStatus</name><argument_list>(<argument><expr><name>LOCAL_EXECUTION_REQUIRED</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>ReadOnlyTask</name><argument_list>(<argument><expr><name><name>task</name><operator>-&gt;</operator><name>taskType</name></name></expr></argument>)</argument_list></call></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/*
+			 * Any modification on the local execution should enable 2PC. If remote
+			 * queries are also ReadOnly, our 2PC logic is smart enough to skip sending
+			 * PREPARE to those connections.
+			 */</comment>
+			<expr_stmt><expr><call><name>Use2PCForCoordinatedTransaction</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+
+		<expr_stmt><expr><call><name>LogLocalCommand</name><argument_list>(<argument><expr><name>task</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name>isUtilityCommand</name></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><call><name>LocallyExecuteUtilityTask</name><argument_list>(<argument><expr><name>task</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+			<expr_stmt><expr><call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>oldContext</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>MemoryContextReset</name><argument_list>(<argument><expr><name>loopContext</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<continue>continue;</continue>
+		</block_content>}</block></if></if_stmt>
+
+		<decl_stmt><decl><type><name>PlannedStmt</name> <modifier>*</modifier></type><name>localPlan</name> <init>= <expr><call><name>GetCachedLocalPlan</name><argument_list>(<argument><expr><name>task</name></expr></argument>, <argument><expr><name>distributedPlan</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+		<comment type="block">/*
+		 * If the plan is already cached, don't need to re-plan, just
+		 * acquire necessary locks.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><name>localPlan</name> <operator>!=</operator> <name>NULL</name></expr>)</condition>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>Query</name> <modifier>*</modifier></type><name>jobQuery</name> <init>= <expr><name><name>distributedPlan</name><operator>-&gt;</operator><name>workerJob</name><operator>-&gt;</operator><name>jobQuery</name></name></expr></init></decl>;</decl_stmt>
+			<decl_stmt><decl><type><name>LOCKMODE</name></type> <name>lockMode</name> <init>= <expr><call><name>GetQueryLockMode</name><argument_list>(<argument><expr><name>jobQuery</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+			<decl_stmt><decl><type><name>Oid</name></type> <name>relationId</name> <init>= <expr><name>InvalidOid</name></expr></init></decl>;</decl_stmt>
+			<macro><name>foreach_oid</name><argument_list>(<argument>relationId</argument>, <argument>localPlan-&gt;relationOids</argument>)</argument_list></macro>
+			<block>{<block_content>
+				<expr_stmt><expr><call><name>LockRelationOid</name><argument_list>(<argument><expr><name>relationId</name></expr></argument>, <argument><expr><name>lockMode</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			</block_content>}</block>
+		</block_content>}</block></if>
+		<else>else
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>int</name></type> <name>taskNumParams</name> <init>= <expr><name>numParams</name></expr></init></decl>;</decl_stmt>
+			<decl_stmt><decl><type><name>Oid</name> <modifier>*</modifier></type><name>taskParameterTypes</name> <init>= <expr><name>parameterTypes</name></expr></init></decl>;</decl_stmt>
+
+			<if_stmt><if>if <condition>(<expr><name><name>task</name><operator>-&gt;</operator><name>parametersInQueryStringResolved</name></name></expr>)</condition>
+			<block>{<block_content>
+				<comment type="block">/*
+				 * Parameters were removed from the query string so do not pass them
+				 * here. Otherwise, we might see errors when passing custom types,
+				 * since their OIDs were set to 0 and their type is normally
+				 * inferred from
+				 */</comment>
+				<expr_stmt><expr><name>taskNumParams</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+				<expr_stmt><expr><name>taskParameterTypes</name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+			</block_content>}</block></if></if_stmt>
+
+			<comment type="block">/*
+			 * for concatenated strings, we set queryStringList so that we can access
+			 * each query string.
+			 */</comment>
+			<if_stmt><if>if <condition>(<expr><call><name>GetTaskQueryType</name><argument_list>(<argument><expr><name>task</name></expr></argument>)</argument_list></call> <operator>==</operator> <name>TASK_QUERY_TEXT_LIST</name></expr>)</condition>
+			<block>{<block_content>
+				<decl_stmt><decl><type><name>List</name> <modifier>*</modifier></type><name>queryStringList</name> <init>= <expr><name><name>task</name><operator>-&gt;</operator><name>taskQuery</name><operator>.</operator><name>data</name><operator>.</operator><name>queryStringList</name></name></expr></init></decl>;</decl_stmt>
+				<expr_stmt><expr><name>totalRowsProcessed</name> <operator>+=</operator>
+					<call><name>LocallyPlanAndExecuteMultipleQueries</name><argument_list>(<argument><expr><name>queryStringList</name></expr></argument>, <argument><expr><name>tupleDest</name></expr></argument>,
+														 <argument><expr><name>task</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+				<expr_stmt><expr><call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>oldContext</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<expr_stmt><expr><call><name>MemoryContextReset</name><argument_list>(<argument><expr><name>loopContext</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<continue>continue;</continue>
+			</block_content>}</block></if></if_stmt>
+
+			<decl_stmt><decl><type><name>Query</name> <modifier>*</modifier></type><name>shardQuery</name> <init>= <expr><call><name>ParseQueryString</name><argument_list>(<argument><expr><call><name>TaskQueryString</name><argument_list>(<argument><expr><name>task</name></expr></argument>)</argument_list></call></expr></argument>,
+												 <argument><expr><name>taskParameterTypes</name></expr></argument>,
+												 <argument><expr><name>taskNumParams</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+
+			<decl_stmt><decl><type><name>int</name></type> <name>cursorOptions</name> <init>= <expr><name>CURSOR_OPT_PARALLEL_OK</name></expr></init></decl>;</decl_stmt>
+
+			<comment type="block">/*
+			 * Altough the shardQuery is local to this node, we prefer planner()
+			 * over standard_planner(). The primary reason for that is Citus itself
+			 * is not very tolarent standard_planner() calls that doesn't go through
+			 * distributed_planner() because of the way that restriction hooks are
+			 * implemented. So, let planner to call distributed_planner() which
+			 * eventually calls standard_planner().
+			 */</comment>
+			<expr_stmt><expr><name>localPlan</name> <operator>=</operator> <call><name>planner</name><argument_list>(<argument><expr><name>shardQuery</name></expr></argument>, <argument><expr><name>NULL</name></expr></argument>, <argument><expr><name>cursorOptions</name></expr></argument>, <argument><expr><name>paramListInfo</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></else></if_stmt>
+
+		<decl_stmt><decl><type><name>char</name> <modifier>*</modifier></type><name>shardQueryString</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+		<if_stmt><if>if <condition>(<expr><call><name>GetTaskQueryType</name><argument_list>(<argument><expr><name>task</name></expr></argument>)</argument_list></call> <operator>==</operator> <name>TASK_QUERY_TEXT</name></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><name>shardQueryString</name> <operator>=</operator> <call><name>TaskQueryString</name><argument_list>(<argument><expr><name>task</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></if>
+		<else>else
+		<block>{<block_content>
+			<comment type="block">/* avoid the overhead of deparsing when using local execution */</comment>
+			<expr_stmt><expr><name>shardQueryString</name> <operator>=</operator> <literal type="string">"&lt;optimized out by local execution&gt;"</literal></expr>;</expr_stmt>
+		</block_content>}</block></else></if_stmt>
+
+		<expr_stmt><expr><name>totalRowsProcessed</name> <operator>+=</operator>
+			<call><name>LocallyExecuteTaskPlan</name><argument_list>(<argument><expr><name>localPlan</name></expr></argument>, <argument><expr><name>shardQueryString</name></expr></argument>,
+								   <argument><expr><name>tupleDest</name></expr></argument>, <argument><expr><name>task</name></expr></argument>, <argument><expr><name>paramListInfo</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>oldContext</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>MemoryContextReset</name><argument_list>(<argument><expr><name>loopContext</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block>
+
+	<return>return <expr><name>totalRowsProcessed</name></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * LocallyPlanAndExecuteMultipleQueries plans and executes the given query strings
+ * one by one.
+ */</comment>
+<function><type><specifier>static</specifier> <name>uint64</name></type>
+<name>LocallyPlanAndExecuteMultipleQueries</name><parameter_list>(<parameter><decl><type><name>List</name> <modifier>*</modifier></type><name>queryStrings</name></decl></parameter>, <parameter><decl><type><name>TupleDestination</name> <modifier>*</modifier></type><name>tupleDest</name></decl></parameter>,
+									 <parameter><decl><type><name>Task</name> <modifier>*</modifier></type><name>task</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>char</name> <modifier>*</modifier></type><name>queryString</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>uint64</name></type> <name>totalProcessedRows</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+	<macro><name>foreach_ptr</name><argument_list>(<argument>queryString</argument>, <argument>queryStrings</argument>)</argument_list></macro>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>Query</name> <modifier>*</modifier></type><name>shardQuery</name> <init>= <expr><call><name>ParseQueryString</name><argument_list>(<argument><expr><name>queryString</name></expr></argument>,
+											 <argument><expr><name>NULL</name></expr></argument>,
+											 <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>int</name></type> <name>cursorOptions</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>ParamListInfo</name></type> <name>paramListInfo</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>PlannedStmt</name> <modifier>*</modifier></type><name>localPlan</name> <init>= <expr><call><name>planner</name><argument_list>(<argument><expr><name>shardQuery</name></expr></argument>, <argument><expr><name>NULL</name></expr></argument>, <argument><expr><name>cursorOptions</name></expr></argument>,
+										 <argument><expr><name>paramListInfo</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+		<expr_stmt><expr><name>totalProcessedRows</name> <operator>+=</operator> <call><name>LocallyExecuteTaskPlan</name><argument_list>(<argument><expr><name>localPlan</name></expr></argument>, <argument><expr><name>queryString</name></expr></argument>,
+													 <argument><expr><name>tupleDest</name></expr></argument>, <argument><expr><name>task</name></expr></argument>,
+													 <argument><expr><name>paramListInfo</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block>
+	<return>return <expr><name>totalProcessedRows</name></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * ExtractParametersForLocalExecution extracts parameter types and values
+ * from the given ParamListInfo structure, and fills parameter type and
+ * value arrays. It does not change the oid of custom types, because the
+ * query will be run locally.
+ */</comment>
+<function><type><name>void</name></type>
+<name>ExtractParametersForLocalExecution</name><parameter_list>(<parameter><decl><type><name>ParamListInfo</name></type> <name>paramListInfo</name></decl></parameter>, <parameter><decl><type><name>Oid</name> <modifier>*</modifier><modifier>*</modifier></type><name>parameterTypes</name></decl></parameter>,
+								   <parameter><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier><modifier>*</modifier><modifier>*</modifier></type><name>parameterValues</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>ExtractParametersFromParamList</name><argument_list>(<argument><expr><name>paramListInfo</name></expr></argument>, <argument><expr><name>parameterTypes</name></expr></argument>,
+								   <argument><expr><name>parameterValues</name></expr></argument>, <argument><expr><name>true</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * LocallyExecuteUtilityTask runs a utility command via local execution.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>LocallyExecuteUtilityTask</name><parameter_list>(<parameter><decl><type><name>Task</name> <modifier>*</modifier></type><name>task</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<comment type="block">/* keep the parity with multi-node clusters */</comment>
+	<expr_stmt><expr><call><name>RecordNonDistTableAccessesForTask</name><argument_list>(<argument><expr><name>task</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * If we roll back to a savepoint, we may no longer be in a query on
+	 * a shard. Reset the value as we go back up the stack.
+	 */</comment>
+	<decl_stmt><decl><type><name>uint64</name></type> <name>prevLocalExecutorShardId</name> <init>= <expr><name>LocalExecutorShardId</name></expr></init></decl>;</decl_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name><name>task</name><operator>-&gt;</operator><name>anchorShardId</name></name> <operator>!=</operator> <name>INVALID_SHARD_ID</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name>LocalExecutorShardId</name> <operator>=</operator> <name><name>task</name><operator>-&gt;</operator><name>anchorShardId</name></name></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>PG_TRY</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>ExecuteUtilityCommand</name><argument_list>(<argument><expr><call><name>TaskQueryString</name><argument_list>(<argument><expr><name>task</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block>
+	<expr_stmt><expr><call><name>PG_CATCH</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+	<block>{<block_content>
+		<expr_stmt><expr><name>LocalExecutorShardId</name> <operator>=</operator> <name>prevLocalExecutorShardId</name></expr>;</expr_stmt>
+
+		<expr_stmt><expr><call><name>PG_RE_THROW</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block>
+	<expr_stmt><expr><call><name>PG_END_TRY</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>LocalExecutorShardId</name> <operator>=</operator> <name>prevLocalExecutorShardId</name></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * ExecuteUtilityCommand executes the given task query in the current
+ * session.
+ */</comment>
+<function><type><name>void</name></type>
+<name>ExecuteUtilityCommand</name><parameter_list>(<parameter><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>taskQueryCommand</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>List</name> <modifier>*</modifier></type><name>parseTreeList</name> <init>= <expr><call><name>pg_parse_query</name><argument_list>(<argument><expr><name>taskQueryCommand</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>RawStmt</name> <modifier>*</modifier></type><name>taskRawStmt</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+
+	<macro><name>foreach_ptr</name><argument_list>(<argument>taskRawStmt</argument>, <argument>parseTreeList</argument>)</argument_list></macro>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>Node</name> <modifier>*</modifier></type><name>taskRawParseTree</name> <init>= <expr><name><name>taskRawStmt</name><operator>-&gt;</operator><name>stmt</name></name></expr></init></decl>;</decl_stmt>
+
+		<comment type="block">/*
+		 * The query passed to this function would mostly be a utility
+		 * command. However, some utility commands trigger udf calls
+		 * (e.g alter_columnar_table_set()). In that case, we execute
+		 * the query with the udf call in below conditional block.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><call><name>IsA</name><argument_list>(<argument><expr><name>taskRawParseTree</name></expr></argument>, <argument><expr><name>SelectStmt</name></expr></argument>)</argument_list></call></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/* we have no external parameters to rewrite the UDF call RawStmt */</comment>
+			<decl_stmt><decl><type><name>Query</name> <modifier>*</modifier></type><name>udfTaskQuery</name> <init>=
+				<expr><call><name>RewriteRawQueryStmt</name><argument_list>(<argument><expr><name>taskRawStmt</name></expr></argument>, <argument><expr><name>taskQueryCommand</name></expr></argument>, <argument><expr><name>NULL</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+			<expr_stmt><expr><call><name>ExecuteUdfTaskQuery</name><argument_list>(<argument><expr><name>udfTaskQuery</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></if>
+		<else>else
+		<block>{<block_content>
+			<comment type="block">/*
+			 * It is a regular utility command we should execute it via
+			 * process utility.
+			 */</comment>
+			<expr_stmt><expr><call><name>ProcessUtilityParseTree</name><argument_list>(<argument><expr><name>taskRawParseTree</name></expr></argument>, <argument><expr><name>taskQueryCommand</name></expr></argument>,
+									<argument><expr><name>PROCESS_UTILITY_QUERY</name></expr></argument>, <argument><expr><name>NULL</name></expr></argument>, <argument><expr><name>None_Receiver</name></expr></argument>,
+									<argument><expr><name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></else></if_stmt>
+	</block_content>}</block>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * ExecuteUdfTaskQuery executes the given udf command. A udf command
+ * is simply a "SELECT udf_call()" query and so it cannot be executed
+ * via process utility.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>ExecuteUdfTaskQuery</name><parameter_list>(<parameter><decl><type><name>Query</name> <modifier>*</modifier></type><name>udfTaskQuery</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<comment type="block">/* we do not expect any results */</comment>
+	<expr_stmt><expr><call><name>ExecuteQueryIntoDestReceiver</name><argument_list>(<argument><expr><name>udfTaskQuery</name></expr></argument>, <argument><expr><name>NULL</name></expr></argument>, <argument><expr><name>None_Receiver</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * LogLocalCommand logs commands executed locally on this node. Although we're
+ * talking about local execution, the function relies on citus.log_remote_commands
+ * GUC. This makes sense because the local execution is still on a shard of a
+ * distributed table, meaning it is part of distributed execution.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>LogLocalCommand</name><parameter_list>(<parameter><decl><type><name>Task</name> <modifier>*</modifier></type><name>task</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><operator>(</operator><name>LogRemoteCommands</name> <operator>||</operator> <name>LogLocalCommands</name><operator>)</operator></expr>)</condition>
+	<block>{<block_content>
+		<return>return;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<decl_stmt><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>command</name> <init>= <expr><call><name>TaskQueryString</name><argument_list>(<argument><expr><name>task</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>CommandMatchesLogGrepPattern</name><argument_list>(<argument><expr><name>command</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<return>return;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>NOTICE</name></expr></argument>, <argument><expr><operator>(</operator><call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"executing the command locally: %s"</literal></expr></argument>,
+							<argument><expr><name>command</name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * ExtractLocalAndRemoteTasks gets a taskList and generates two
+ * task lists namely localTaskList and remoteTaskList. The function goes
+ * over the input taskList and puts the tasks that are local to the node
+ * into localTaskList and the remaining to the remoteTaskList. Either of
+ * the lists could be NIL depending on the input taskList.
+ *
+ * One slightly different case is modifications to replicated tables
+ * (e.g., reference tables) where a single task ends in two separate tasks
+ * and the local task is added to localTaskList and the remaning ones to
+ * the remoteTaskList.
+ */</comment>
+<function><type><name>void</name></type>
+<name>ExtractLocalAndRemoteTasks</name><parameter_list>(<parameter><decl><type><name>bool</name></type> <name>readOnly</name></decl></parameter>, <parameter><decl><type><name>List</name> <modifier>*</modifier></type><name>taskList</name></decl></parameter>, <parameter><decl><type><name>List</name> <modifier>*</modifier><modifier>*</modifier></type><name>localTaskList</name></decl></parameter>,
+						   <parameter><decl><type><name>List</name> <modifier>*</modifier><modifier>*</modifier></type><name>remoteTaskList</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><operator>*</operator><name>remoteTaskList</name> <operator>=</operator> <name>NIL</name></expr>;</expr_stmt>
+	<expr_stmt><expr><operator>*</operator><name>localTaskList</name> <operator>=</operator> <name>NIL</name></expr>;</expr_stmt>
+
+	<decl_stmt><decl><type><name>Task</name> <modifier>*</modifier></type><name>task</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+	<macro><name>foreach_ptr</name><argument_list>(<argument>task</argument>, <argument>taskList</argument>)</argument_list></macro>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>List</name> <modifier>*</modifier></type><name>localTaskPlacementList</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>List</name> <modifier>*</modifier></type><name>remoteTaskPlacementList</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+
+		<expr_stmt><expr><call><name>SplitLocalAndRemotePlacements</name><argument_list>(
+			<argument><expr><name><name>task</name><operator>-&gt;</operator><name>taskPlacementList</name></name></expr></argument>, <argument><expr><operator>&amp;</operator><name>localTaskPlacementList</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>remoteTaskPlacementList</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/* either the local or the remote should be non-nil */</comment>
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><operator>!</operator><operator>(</operator><name>localTaskPlacementList</name> <operator>==</operator> <name>NIL</name> <operator>&amp;&amp;</operator> <name>remoteTaskPlacementList</name> <operator>==</operator> <name>NIL</name><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name>localTaskPlacementList</name> <operator>==</operator> <name>NIL</name></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><operator>*</operator><name>remoteTaskList</name> <operator>=</operator> <call><name>lappend</name><argument_list>(<argument><expr><operator>*</operator><name>remoteTaskList</name></expr></argument>, <argument><expr><name>task</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></if>
+		<if type="elseif">else if <condition>(<expr><name>remoteTaskPlacementList</name> <operator>==</operator> <name>NIL</name></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><operator>*</operator><name>localTaskList</name> <operator>=</operator> <call><name>lappend</name><argument_list>(<argument><expr><operator>*</operator><name>localTaskList</name></expr></argument>, <argument><expr><name>task</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></if>
+		<else>else
+		<block>{<block_content>
+			<comment type="block">/*
+			 * At this point, we're dealing with a task that has placements on both
+			 * local and remote nodes.
+			 */</comment>
+			<decl_stmt><decl><type><name>Task</name> <modifier>*</modifier></type><name>localTask</name> <init>= <expr><call><name>copyObject</name><argument_list>(<argument><expr><name>task</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+			<expr_stmt><expr><name><name>localTask</name><operator>-&gt;</operator><name>partiallyLocalOrRemote</name></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+
+			<expr_stmt><expr><name><name>localTask</name><operator>-&gt;</operator><name>taskPlacementList</name></name> <operator>=</operator> <name>localTaskPlacementList</name></expr>;</expr_stmt>
+			<expr_stmt><expr><operator>*</operator><name>localTaskList</name> <operator>=</operator> <call><name>lappend</name><argument_list>(<argument><expr><operator>*</operator><name>localTaskList</name></expr></argument>, <argument><expr><name>localTask</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+			<if_stmt><if>if <condition>(<expr><name>readOnly</name></expr>)</condition>
+			<block>{<block_content>
+				<comment type="block">/* read-only tasks should only be executed on the local machine */</comment>
+			</block_content>}</block></if>
+			<else>else
+			<block>{<block_content>
+				<comment type="block">/* since shard replication factor &gt; 1, we should have at least 1 remote task */</comment>
+				<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>remoteTaskPlacementList</name> <operator>!=</operator> <name>NIL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<decl_stmt><decl><type><name>Task</name> <modifier>*</modifier></type><name>remoteTask</name> <init>= <expr><call><name>copyObject</name><argument_list>(<argument><expr><name>task</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+				<expr_stmt><expr><name><name>remoteTask</name><operator>-&gt;</operator><name>partiallyLocalOrRemote</name></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+				<expr_stmt><expr><name><name>remoteTask</name><operator>-&gt;</operator><name>taskPlacementList</name></name> <operator>=</operator> <name>remoteTaskPlacementList</name></expr>;</expr_stmt>
+
+				<expr_stmt><expr><operator>*</operator><name>remoteTaskList</name> <operator>=</operator> <call><name>lappend</name><argument_list>(<argument><expr><operator>*</operator><name>remoteTaskList</name></expr></argument>, <argument><expr><name>remoteTask</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			</block_content>}</block></else></if_stmt>
+		</block_content>}</block></else></if_stmt>
+	</block_content>}</block>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * SplitLocalAndRemotePlacements is a helper function which iterates over the
+ * input taskPlacementList and puts the placements into corresponding list of
+ * either localTaskPlacementList or remoteTaskPlacementList.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>SplitLocalAndRemotePlacements</name><parameter_list>(<parameter><decl><type><name>List</name> <modifier>*</modifier></type><name>taskPlacementList</name></decl></parameter>, <parameter><decl><type><name>List</name> <modifier>*</modifier><modifier>*</modifier></type><name>localTaskPlacementList</name></decl></parameter>,
+							  <parameter><decl><type><name>List</name> <modifier>*</modifier><modifier>*</modifier></type><name>remoteTaskPlacementList</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>int32</name></type> <name>localGroupId</name> <init>= <expr><call><name>GetLocalGroupId</name><argument_list>()</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><operator>*</operator><name>localTaskPlacementList</name> <operator>=</operator> <name>NIL</name></expr>;</expr_stmt>
+	<expr_stmt><expr><operator>*</operator><name>remoteTaskPlacementList</name> <operator>=</operator> <name>NIL</name></expr>;</expr_stmt>
+
+	<decl_stmt><decl><type><name>ShardPlacement</name> <modifier>*</modifier></type><name>taskPlacement</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+	<macro><name>foreach_ptr</name><argument_list>(<argument>taskPlacement</argument>, <argument>taskPlacementList</argument>)</argument_list></macro>
+	<block>{<block_content>
+		<if_stmt><if>if <condition>(<expr><name><name>taskPlacement</name><operator>-&gt;</operator><name>groupId</name></name> <operator>==</operator> <name>localGroupId</name></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><operator>*</operator><name>localTaskPlacementList</name> <operator>=</operator> <call><name>lappend</name><argument_list>(<argument><expr><operator>*</operator><name>localTaskPlacementList</name></expr></argument>, <argument><expr><name>taskPlacement</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></if>
+		<else>else
+		<block>{<block_content>
+			<expr_stmt><expr><operator>*</operator><name>remoteTaskPlacementList</name> <operator>=</operator> <call><name>lappend</name><argument_list>(<argument><expr><operator>*</operator><name>remoteTaskPlacementList</name></expr></argument>, <argument><expr><name>taskPlacement</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></else></if_stmt>
+	</block_content>}</block>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * ExecuteLocalTaskPlan gets a planned statement which can be executed locally.
+ * The function simply follows the steps to have a local execution, sets the
+ * tupleStore if necessary. The function returns the number of rows affected in
+ * case of DML.
+ */</comment>
+<function><type><specifier>static</specifier> <name>uint64</name></type>
+<name>LocallyExecuteTaskPlan</name><parameter_list>(<parameter><decl><type><name>PlannedStmt</name> <modifier>*</modifier></type><name>taskPlan</name></decl></parameter>, <parameter><decl><type><name>char</name> <modifier>*</modifier></type><name>queryString</name></decl></parameter>,
+					   <parameter><decl><type><name>TupleDestination</name> <modifier>*</modifier></type><name>tupleDest</name></decl></parameter>, <parameter><decl><type><name>Task</name> <modifier>*</modifier></type><name>task</name></decl></parameter>,
+					   <parameter><decl><type><name>ParamListInfo</name></type> <name>paramListInfo</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><specifier>volatile</specifier> <name>uint64</name></type> <name>processedRows</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * If we roll back to a savepoint, we may no longer be in a query on
+	 * a shard. Reset the value as we go back up the stack.
+	 */</comment>
+	<decl_stmt><decl><type><name>uint64</name></type> <name>prevLocalExecutorShardId</name> <init>= <expr><name>LocalExecutorShardId</name></expr></init></decl>;</decl_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name><name>task</name><operator>-&gt;</operator><name>anchorShardId</name></name> <operator>!=</operator> <name>INVALID_SHARD_ID</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name>LocalExecutorShardId</name> <operator>=</operator> <name><name>task</name><operator>-&gt;</operator><name>anchorShardId</name></name></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>PG_TRY</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+	<block>{<block_content>
+		<expr_stmt><expr><name>processedRows</name> <operator>=</operator> <call><name>ExecuteTaskPlan</name><argument_list>(<argument><expr><name>taskPlan</name></expr></argument>, <argument><expr><name>queryString</name></expr></argument>, <argument><expr><name>tupleDest</name></expr></argument>, <argument><expr><name>task</name></expr></argument>,
+										<argument><expr><name>paramListInfo</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block>
+	<expr_stmt><expr><call><name>PG_CATCH</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+	<block>{<block_content>
+		<expr_stmt><expr><name>LocalExecutorShardId</name> <operator>=</operator> <name>prevLocalExecutorShardId</name></expr>;</expr_stmt>
+
+		<expr_stmt><expr><call><name>PG_RE_THROW</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block>
+	<expr_stmt><expr><call><name>PG_END_TRY</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>LocalExecutorShardId</name> <operator>=</operator> <name>prevLocalExecutorShardId</name></expr>;</expr_stmt>
+
+	<return>return <expr><name>processedRows</name></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * ExecuteTaskPlan executes the given planned statement and writes the results
+ * to tupleDest.
+ */</comment>
+<function><type><specifier>static</specifier> <name>uint64</name></type>
+<name>ExecuteTaskPlan</name><parameter_list>(<parameter><decl><type><name>PlannedStmt</name> <modifier>*</modifier></type><name>taskPlan</name></decl></parameter>, <parameter><decl><type><name>char</name> <modifier>*</modifier></type><name>queryString</name></decl></parameter>,
+				<parameter><decl><type><name>TupleDestination</name> <modifier>*</modifier></type><name>tupleDest</name></decl></parameter>, <parameter><decl><type><name>Task</name> <modifier>*</modifier></type><name>task</name></decl></parameter>,
+				<parameter><decl><type><name>ParamListInfo</name></type> <name>paramListInfo</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>ScanDirection</name></type> <name>scanDirection</name> <init>= <expr><name>ForwardScanDirection</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>QueryEnvironment</name> <modifier>*</modifier></type><name>queryEnv</name> <init>= <expr><call><name>create_queryEnv</name><argument_list>()</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type> <name>eflags</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>uint64</name></type> <name>totalRowsProcessed</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>RecordNonDistTableAccessesForTask</name><argument_list>(<argument><expr><name>task</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<decl_stmt><decl><type><name>MemoryContext</name></type> <name>localContext</name> <init>= <expr><call><name>AllocSetContextCreate</name><argument_list>(<argument><expr><name>CurrentMemoryContext</name></expr></argument>,
+													   <argument><expr><literal type="string">"ExecuteTaskPlan"</literal></expr></argument>,
+													   <argument><expr><name>ALLOCSET_DEFAULT_SIZES</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<decl_stmt><decl><type><name>MemoryContext</name></type> <name>oldContext</name> <init>= <expr><call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>localContext</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * Some tuple destinations look at task-&gt;taskPlacementList to determine
+	 * where the result came from using the placement index. Since a local
+	 * task can only ever have 1 placement, we set the index to 0.
+	 */</comment>
+	<decl_stmt><decl><type><name>int</name></type> <name>localPlacementIndex</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * Use the tupleStore provided by the scanState because it is shared across
+	 * the other task executions and the adaptive executor.
+	 *
+	 * Also note that as long as the tupleDest is provided, local execution always
+	 * stores the tuples. This is also valid for partiallyLocalOrRemote tasks
+	 * as well.
+	 */</comment>
+	<decl_stmt><decl><type><name>DestReceiver</name> <modifier>*</modifier></type><name>destReceiver</name> <init>= <expr><ternary><condition><expr><name>tupleDest</name></expr> ?</condition><then>
+								 <expr><call><name>CreateTupleDestDestReceiver</name><argument_list>(<argument><expr><name>tupleDest</name></expr></argument>, <argument><expr><name>task</name></expr></argument>,
+															 <argument><expr><name>localPlacementIndex</name></expr></argument>)</argument_list></call></expr> </then><else>:
+								 <expr><call><name>CreateDestReceiver</name><argument_list>(<argument><expr><name>DestNone</name></expr></argument>)</argument_list></call></expr></else></ternary></expr></init></decl>;</decl_stmt>
+
+	<comment type="block">/* Create a QueryDesc for the query */</comment>
+	<decl_stmt><decl><type><name>QueryDesc</name> <modifier>*</modifier></type><name>queryDesc</name> <init>= <expr><call><name>CreateQueryDesc</name><argument_list>(<argument><expr><name>taskPlan</name></expr></argument>, <argument><expr><name>queryString</name></expr></argument>,
+										   <argument><expr><call><name>GetActiveSnapshot</name><argument_list>()</argument_list></call></expr></argument>, <argument><expr><name>InvalidSnapshot</name></expr></argument>,
+										   <argument><expr><name>destReceiver</name></expr></argument>, <argument><expr><name>paramListInfo</name></expr></argument>,
+										   <argument><expr><name>queryEnv</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>ExecutorStart</name><argument_list>(<argument><expr><name>queryDesc</name></expr></argument>, <argument><expr><name>eflags</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>ExecutorRun</name><argument_list>(<argument><expr><name>queryDesc</name></expr></argument>, <argument><expr><name>scanDirection</name></expr></argument>, <argument><expr><literal type="number">0L</literal></expr></argument>, <argument><expr><name>true</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * We'll set the executorState-&gt;es_processed later, for now only remember
+	 * the count.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>taskPlan</name><operator>-&gt;</operator><name>commandType</name></name> <operator>!=</operator> <name>CMD_SELECT</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name>totalRowsProcessed</name> <operator>=</operator> <name><name>queryDesc</name><operator>-&gt;</operator><name>estate</name><operator>-&gt;</operator><name>es_processed</name></name></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>ExecutorFinish</name><argument_list>(<argument><expr><name>queryDesc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>ExecutorEnd</name><argument_list>(<argument><expr><name>queryDesc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>FreeQueryDesc</name><argument_list>(<argument><expr><name>queryDesc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>oldContext</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>MemoryContextDelete</name><argument_list>(<argument><expr><name>localContext</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<return>return <expr><name>totalRowsProcessed</name></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * RecordNonDistTableAccessesForTask records relation accesses for the non-distributed
+ * relations that given task will access (if any).
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>RecordNonDistTableAccessesForTask</name><parameter_list>(<parameter><decl><type><name>Task</name> <modifier>*</modifier></type><name>task</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>List</name> <modifier>*</modifier></type><name>taskPlacementList</name> <init>= <expr><name><name>task</name><operator>-&gt;</operator><name>taskPlacementList</name></name></expr></init></decl>;</decl_stmt>
+	<if_stmt><if>if <condition>(<expr><call><name>list_length</name><argument_list>(<argument><expr><name>taskPlacementList</name></expr></argument>)</argument_list></call> <operator>==</operator> <literal type="number">0</literal></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/*
+		 * We should never get here, but prefer to throw an error over crashing
+		 * if we're wrong.
+		 */</comment>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><operator>(</operator><call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"shard "</literal> <name>UINT64_FORMAT</name> <literal type="string">" does not have any shard "</literal>
+													  <literal type="string">"placements"</literal></expr></argument>,
+							   <argument><expr><name><name>task</name><operator>-&gt;</operator><name>anchorShardId</name></name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/*
+	 * We use only the first placement to find the relation accesses. It is
+	 * sufficient as PlacementAccessListForTask iterates relationShardList
+	 * field of the task and generates accesses per relation in the task.
+	 * As we are only interested in relations, not the placements, we can
+	 * skip rest of the placements.
+	 * Also, here we don't need to iterate relationShardList field of task
+	 * to mark each accessed relation because PlacementAccessListForTask
+	 * already computes and returns relations that task accesses.
+	 */</comment>
+	<decl_stmt><decl><type><name>ShardPlacement</name> <modifier>*</modifier></type><name>taskPlacement</name> <init>= <expr><call><name>linitial</name><argument_list>(<argument><expr><name>taskPlacementList</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>List</name> <modifier>*</modifier></type><name>placementAccessList</name> <init>= <expr><call><name>PlacementAccessListForTask</name><argument_list>(<argument><expr><name>task</name></expr></argument>, <argument><expr><name>taskPlacement</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<decl_stmt><decl><type><name>ShardPlacementAccess</name> <modifier>*</modifier></type><name>placementAccess</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+	<macro><name>foreach_ptr</name><argument_list>(<argument>placementAccess</argument>, <argument>placementAccessList</argument>)</argument_list></macro>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>uint64</name></type> <name>placementAccessShardId</name> <init>= <expr><name><name>placementAccess</name><operator>-&gt;</operator><name>placement</name><operator>-&gt;</operator><name>shardId</name></name></expr></init></decl>;</decl_stmt>
+		<if_stmt><if>if <condition>(<expr><name>placementAccessShardId</name> <operator>==</operator> <name>INVALID_SHARD_ID</name></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/*
+			 * When a SELECT prunes down to 0 shard, we still may pass through
+			 * the local executor. In that case, we don't need to record any
+			 * relation access as we don't actually access any shard placement.
+			 */</comment>
+			<continue>continue;</continue>
+		</block_content>}</block></if></if_stmt>
+
+		<decl_stmt><decl><type><name>Oid</name></type> <name>accessedRelationId</name> <init>= <expr><call><name>RelationIdForShard</name><argument_list>(<argument><expr><name>placementAccessShardId</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>ShardPlacementAccessType</name></type> <name>shardPlacementAccessType</name> <init>= <expr><name><name>placementAccess</name><operator>-&gt;</operator><name>accessType</name></name></expr></init></decl>;</decl_stmt>
+		<expr_stmt><expr><call><name>RecordRelationAccessIfNonDistTable</name><argument_list>(<argument><expr><name>accessedRelationId</name></expr></argument>, <argument><expr><name>shardPlacementAccessType</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * SetLocalExecutionStatus sets the local execution status to
+ * the given status, it errors if the transition is not possible from the
+ * current status.
+ */</comment>
+<function><type><name>void</name></type>
+<name>SetLocalExecutionStatus</name><parameter_list>(<parameter><decl><type><name>LocalExecutionStatus</name></type> <name>newStatus</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>EnsureTransitionPossible</name><argument_list>(<argument><expr><call><name>GetCurrentLocalExecutionStatus</name><argument_list>()</argument_list></call></expr></argument>, <argument><expr><name>newStatus</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>CurrentLocalExecutionStatus</name> <operator>=</operator> <name>newStatus</name></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * EnsureTransitionPossible errors if we cannot switch to the 'to' status
+ * from the 'from' status.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>EnsureTransitionPossible</name><parameter_list>(<parameter><decl><type><name>LocalExecutionStatus</name></type> <name>from</name></decl></parameter>, <parameter><decl><type><name>LocalExecutionStatus</name></type>
+						 <name>to</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<if_stmt><if>if <condition>(<expr><name>from</name> <operator>==</operator> <name>LOCAL_EXECUTION_REQUIRED</name> <operator>&amp;&amp;</operator> <name>to</name> <operator>==</operator> <name>LOCAL_EXECUTION_DISABLED</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errmsg</name><argument_list>(
+					 <argument><expr><literal type="string">"cannot switch local execution status from local execution required "</literal>
+					 <literal type="string">"to local execution disabled since it can cause "</literal>
+					 <literal type="string">"visibility problems in the current transaction"</literal></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+	<if_stmt><if>if <condition>(<expr><name>from</name> <operator>==</operator> <name>LOCAL_EXECUTION_DISABLED</name> <operator>&amp;&amp;</operator> <name>to</name> <operator>==</operator> <name>LOCAL_EXECUTION_REQUIRED</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errmsg</name><argument_list>(
+					 <argument><expr><literal type="string">"cannot switch local execution status from local execution disabled "</literal>
+					 <literal type="string">"to local execution enabled since it can cause "</literal>
+					 <literal type="string">"visibility problems in the current transaction"</literal></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ *  ShouldExecuteTasksLocally gets a task list and returns true if the
+ *  any of the tasks should be executed locally. This function does not
+ *  guarantee that any task have to be executed locally.
+ */</comment>
+<function><type><name>bool</name></type>
+<name>ShouldExecuteTasksLocally</name><parameter_list>(<parameter><decl><type><name>List</name> <modifier>*</modifier></type><name>taskList</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><name>EnableLocalExecution</name></expr>)</condition>
+	<block>{<block_content>
+		<return>return <expr><name>false</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><call><name>GetCurrentLocalExecutionStatus</name><argument_list>()</argument_list></call> <operator>==</operator> <name>LOCAL_EXECUTION_DISABLED</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/*
+		 * if the current transaction accessed the local node over a connection
+		 * then we can't use local execution because of visibility problems.
+		 */</comment>
+		<return>return <expr><name>false</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><call><name>GetCurrentLocalExecutionStatus</name><argument_list>()</argument_list></call> <operator>==</operator> <name>LOCAL_EXECUTION_REQUIRED</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/*
+		 * If we already used local execution for a previous command
+		 * we should stick to it for read-your-writes policy, this can be a
+		 * case when we are inside a transaction block. Such as:
+		 *
+		 * BEGIN;
+		 * some-command; -- executed via local execution
+		 * another-command; -- this should be executed via local execution for visibility
+		 * COMMIT;
+		 *
+		 * We may need to use local execution even if we are not inside a transaction block,
+		 * however the state will go back to LOCAL_EXECUTION_OPTIONAL at the end of transaction.
+		 */</comment>
+		<return>return <expr><name>true</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<decl_stmt><decl><type><name>bool</name></type> <name>singleTask</name> <init>= <expr><operator>(</operator><call><name>list_length</name><argument_list>(<argument><expr><name>taskList</name></expr></argument>)</argument_list></call> <operator>==</operator> <literal type="number">1</literal><operator>)</operator></expr></init></decl>;</decl_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>singleTask</name> <operator>&amp;&amp;</operator> <call><name>TaskAccessesLocalNode</name><argument_list>(<argument><expr><operator>(</operator><name>Task</name> <operator>*</operator><operator>)</operator> <call><name>linitial</name><argument_list>(<argument><expr><name>taskList</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/*
+		 * This is the valuable time to use the local execution. We are likely
+		 * to avoid any network round-trips by simply executing the command
+		 * within this session.
+		 *
+		 * We cannot avoid network round trips if the task is not a read only
+		 * task and accesses multiple placements. For example, modifications to
+		 * distributed tables (with replication factor == 1) would avoid network
+		 * round-trips. However, modifications to reference tables still needs
+		 * to go to over the network to do the modification on the other placements.
+		 * Still, we'll be avoding the network round trip for this node.
+		 *
+		 * Note that we shouldn't use local execution if any distributed execution
+		 * has happened because that'd break transaction visibility rules and
+		 * many other things.
+		 */</comment>
+		<return>return <expr><name>true</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><name>singleTask</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/*
+		 * For multi-task executions, we prefer to use connections for parallelism,
+		 * except for two cases. First, when in a multi-statement transaction since
+		 * there could be other commands that require local execution. Second, the
+		 * task list already requires sequential execution. In that case, connection
+		 * establishment becomes an unnecessary operation.
+		 */</comment>
+
+		<return>return <expr><operator>(</operator><call><name>IsMultiStatementTransaction</name><argument_list>()</argument_list></call> <operator>||</operator> <call><name>ShouldRunTasksSequentially</name><argument_list>(<argument><expr><name>taskList</name></expr></argument>)</argument_list></call><operator>)</operator> <operator>&amp;&amp;</operator>
+			   <call><name>AnyTaskAccessesLocalNode</name><argument_list>(<argument><expr><name>taskList</name></expr></argument>)</argument_list></call></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<return>return <expr><name>false</name></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * AnyTaskAccessesLocalNode returns true if a task within the task list accesses
+ * to the local node.
+ */</comment>
+<function><type><name>bool</name></type>
+<name>AnyTaskAccessesLocalNode</name><parameter_list>(<parameter><decl><type><name>List</name> <modifier>*</modifier></type><name>taskList</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>Task</name> <modifier>*</modifier></type><name>task</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+
+	<macro><name>foreach_ptr</name><argument_list>(<argument>task</argument>, <argument>taskList</argument>)</argument_list></macro>
+	<block>{<block_content>
+		<if_stmt><if>if <condition>(<expr><call><name>TaskAccessesLocalNode</name><argument_list>(<argument><expr><name>task</name></expr></argument>)</argument_list></call></expr>)</condition>
+		<block>{<block_content>
+			<return>return <expr><name>true</name></expr>;</return>
+		</block_content>}</block></if></if_stmt>
+	</block_content>}</block>
+
+	<return>return <expr><name>false</name></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * TaskAccessesLocalNode returns true if any placements of the task reside on
+ * the node that we're executing the query.
+ */</comment>
+<function><type><name>bool</name></type>
+<name>TaskAccessesLocalNode</name><parameter_list>(<parameter><decl><type><name>Task</name> <modifier>*</modifier></type><name>task</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>int32</name></type> <name>localGroupId</name> <init>= <expr><call><name>GetLocalGroupId</name><argument_list>()</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<decl_stmt><decl><type><name>ShardPlacement</name> <modifier>*</modifier></type><name>taskPlacement</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+	<macro><name>foreach_ptr</name><argument_list>(<argument>taskPlacement</argument>, <argument>task-&gt;taskPlacementList</argument>)</argument_list></macro>
+	<block>{<block_content>
+		<if_stmt><if>if <condition>(<expr><name><name>taskPlacement</name><operator>-&gt;</operator><name>groupId</name></name> <operator>==</operator> <name>localGroupId</name></expr>)</condition>
+		<block>{<block_content>
+			<return>return <expr><name>true</name></expr>;</return>
+		</block_content>}</block></if></if_stmt>
+	</block_content>}</block>
+
+	<return>return <expr><name>false</name></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * EnsureCompatibleLocalExecutionState makes sure that the tasks won't have
+ * any visibility problems because of local execution.
+ */</comment>
+<function><type><name>void</name></type>
+<name>EnsureCompatibleLocalExecutionState</name><parameter_list>(<parameter><decl><type><name>List</name> <modifier>*</modifier></type><name>taskList</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<comment type="block">/*
+	 * We have LOCAL_EXECUTION_REQUIRED check here to avoid unnecessarily
+	 * iterating the task list in AnyTaskAccessesLocalNode.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><call><name>GetCurrentLocalExecutionStatus</name><argument_list>()</argument_list></call> <operator>==</operator> <name>LOCAL_EXECUTION_REQUIRED</name> <operator>&amp;&amp;</operator>
+		<call><name>AnyTaskAccessesLocalNode</name><argument_list>(<argument><expr><name>taskList</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>ErrorIfTransactionAccessedPlacementsLocally</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * ErrorIfTransactionAccessedPlacementsLocally errors out if a local query
+ * on any shard has already been executed in the same transaction.
+ *
+ * This check is required because Citus currently hasn't implemented local
+ * execution infrastructure for all the commands/executors. As we implement
+ * local execution for the command/executor that this function call exists,
+ * we should simply  remove the check.
+ */</comment>
+<function><type><name>void</name></type>
+<name>ErrorIfTransactionAccessedPlacementsLocally</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<if_stmt><if>if <condition>(<expr><call><name>GetCurrentLocalExecutionStatus</name><argument_list>()</argument_list></call> <operator>==</operator> <name>LOCAL_EXECUTION_REQUIRED</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"cannot execute command because a local execution has "</literal>
+						<literal type="string">"accessed a placement in the transaction"</literal></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errhint</name><argument_list>(<argument><expr><literal type="string">"Try re-running the transaction with "</literal>
+						 <literal type="string">"\"SET LOCAL citus.enable_local_execution TO OFF;\""</literal></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errdetail</name><argument_list>(<argument><expr><literal type="string">"Some parallel commands cannot be executed if a "</literal>
+						   <literal type="string">"previous command has already been executed locally"</literal></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * DisableLocalExecution is simply a C interface for setting the following:
+ *      SET LOCAL citus.enable_local_execution TO off;
+ */</comment>
+<function><type><name>void</name></type>
+<name>DisableLocalExecution</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>set_config_option</name><argument_list>(<argument><expr><literal type="string">"citus.enable_local_execution"</literal></expr></argument>, <argument><expr><literal type="string">"off"</literal></expr></argument>,
+					  <argument><expr><operator>(</operator><ternary><condition><expr><call><name>superuser</name><argument_list>()</argument_list></call></expr> ?</condition><then> <expr><name>PGC_SUSET</name></expr> </then><else>: <expr><name>PGC_USERSET</name></expr></else></ternary><operator>)</operator></expr></argument>, <argument><expr><name>PGC_S_SESSION</name></expr></argument>,
+					  <argument><expr><name>GUC_ACTION_LOCAL</name></expr></argument>, <argument><expr><name>true</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+</unit>

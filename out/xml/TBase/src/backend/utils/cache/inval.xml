@@ -1,0 +1,1691 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<unit xmlns="http://www.srcML.org/srcML/src" xmlns:cpp="http://www.srcML.org/srcML/cpp" revision="1.0.0" language="C" filename="/cloned_projects/TBase/src/backend/utils/cache/inval.c"><comment type="block">/*
+ * Tencent is pleased to support the open source community by making TBase available.  
+ * 
+ * Copyright (C) 2019 THL A29 Limited, a Tencent company.  All rights reserved.
+ * 
+ * TBase is licensed under the BSD 3-Clause License, except for the third-party component listed below. 
+ * 
+ * A copy of the BSD 3-Clause License is included in this file.
+ * 
+ * Other dependencies and licenses:
+ * 
+ * Open Source Software Licensed Under the PostgreSQL License: 
+ * --------------------------------------------------------------------
+ * 1. Postgres-XL XL9_5_STABLE
+ * Portions Copyright (c) 2015-2016, 2ndQuadrant Ltd
+ * Portions Copyright (c) 2012-2015, TransLattice, Inc.
+ * Portions Copyright (c) 2010-2017, Postgres-XC Development Group
+ * Portions Copyright (c) 1996-2015, The PostgreSQL Global Development Group
+ * Portions Copyright (c) 1994, The Regents of the University of California
+ * 
+ * Terms of the PostgreSQL License: 
+ * --------------------------------------------------------------------
+ * Permission to use, copy, modify, and distribute this software and its
+ * documentation for any purpose, without fee, and without a written agreement
+ * is hereby granted, provided that the above copyright notice and this
+ * paragraph and the following two paragraphs appear in all copies.
+ * 
+ * IN NO EVENT SHALL THE UNIVERSITY OF CALIFORNIA BE LIABLE TO ANY PARTY FOR
+ * DIRECT, INDIRECT, SPECIAL, INCIDENTAL, OR CONSEQUENTIAL DAMAGES, INCLUDING
+ * LOST PROFITS, ARISING OUT OF THE USE OF THIS SOFTWARE AND ITS
+ * DOCUMENTATION, EVEN IF THE UNIVERSITY OF CALIFORNIA HAS BEEN ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ * 
+ * THE UNIVERSITY OF CALIFORNIA SPECIFICALLY DISCLAIMS ANY WARRANTIES,
+ * INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY
+ * AND FITNESS FOR A PARTICULAR PURPOSE.  THE SOFTWARE PROVIDED HEREUNDER IS
+ * ON AN "AS IS" BASIS, AND THE UNIVERSITY OF CALIFORNIA HAS NO OBLIGATIONS TO
+ * PROVIDE MAINTENANCE, SUPPORT, UPDATES, ENHANCEMENTS, OR MODIFICATIONS.
+ * 
+ * 
+ * Terms of the BSD 3-Clause License:
+ * --------------------------------------------------------------------
+ * Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following conditions are met:
+ * 
+ * 1. Redistributions of source code must retain the above copyright notice, this list of conditions and the following disclaimer.
+ * 
+ * 2. Redistributions in binary form must reproduce the above copyright notice, this list of conditions and the following disclaimer in the documentation 
+ * and/or other materials provided with the distribution.
+ * 
+ * 3. Neither the name of THL A29 Limited nor the names of its contributors may be used to endorse or promote products derived from this software without 
+ * specific prior written permission.
+ * 
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, 
+ * THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS 
+ * BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE 
+ * GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT 
+ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH 
+ * DAMAGE.
+ * 
+ */</comment>
+<comment type="block">/*-------------------------------------------------------------------------
+ *
+ * inval.c
+ *      POSTGRES cache invalidation dispatcher code.
+ *
+ *    This is subtle stuff, so pay attention:
+ *
+ *    When a tuple is updated or deleted, our standard time qualification rules
+ *    consider that it is *still valid* so long as we are in the same command,
+ *    ie, until the next CommandCounterIncrement() or transaction commit.
+ *    (See utils/time/tqual.c, and note that system catalogs are generally
+ *    scanned under the most current snapshot available, rather than the
+ *    transaction snapshot.)    At the command boundary, the old tuple stops
+ *    being valid and the new version, if any, becomes valid.  Therefore,
+ *    we cannot simply flush a tuple from the system caches during heap_update()
+ *    or heap_delete().  The tuple is still good at that point; what's more,
+ *    even if we did flush it, it might be reloaded into the caches by a later
+ *    request in the same command.  So the correct behavior is to keep a list
+ *    of outdated (updated/deleted) tuples and then do the required cache
+ *    flushes at the next command boundary.  We must also keep track of
+ *    inserted tuples so that we can flush "negative" cache entries that match
+ *    the new tuples; again, that mustn't happen until end of command.
+ *
+ *    Once we have finished the command, we still need to remember inserted
+ *    tuples (including new versions of updated tuples), so that we can flush
+ *    them from the caches if we abort the transaction.  Similarly, we'd better
+ *    be able to flush "negative" cache entries that may have been loaded in
+ *    place of deleted tuples, so we still need the deleted ones too.
+ *
+ *    If we successfully complete the transaction, we have to broadcast all
+ *    these invalidation events to other backends (via the SI message queue)
+ *    so that they can flush obsolete entries from their caches.  Note we have
+ *    to record the transaction commit before sending SI messages, otherwise
+ *    the other backends won't see our updated tuples as good.
+ *
+ *    When a subtransaction aborts, we can process and discard any events
+ *    it has queued.  When a subtransaction commits, we just add its events
+ *    to the pending lists of the parent transaction.
+ *
+ *    In short, we need to remember until xact end every insert or delete
+ *    of a tuple that might be in the system caches.  Updates are treated as
+ *    two events, delete + insert, for simplicity.  (If the update doesn't
+ *    change the tuple hash value, catcache.c optimizes this into one event.)
+ *
+ *    We do not need to register EVERY tuple operation in this way, just those
+ *    on tuples in relations that have associated catcaches.  We do, however,
+ *    have to register every operation on every tuple that *could* be in a
+ *    catcache, whether or not it currently is in our cache.  Also, if the
+ *    tuple is in a relation that has multiple catcaches, we need to register
+ *    an invalidation message for each such catcache.  catcache.c's
+ *    PrepareToInvalidateCacheTuple() routine provides the knowledge of which
+ *    catcaches may need invalidation for a given tuple.
+ *
+ *    Also, whenever we see an operation on a pg_class, pg_attribute, or
+ *    pg_index tuple, we register a relcache flush operation for the relation
+ *    described by that tuple (as specified in CacheInvalidateHeapTuple()).
+ *
+ *    We keep the relcache flush requests in lists separate from the catcache
+ *    tuple flush requests.  This allows us to issue all the pending catcache
+ *    flushes before we issue relcache flushes, which saves us from loading
+ *    a catcache tuple during relcache load only to flush it again right away.
+ *    Also, we avoid queuing multiple relcache flush requests for the same
+ *    relation, since a relcache flush is relatively expensive to do.
+ *    (XXX is it worth testing likewise for duplicate catcache flush entries?
+ *    Probably not.)
+ *
+ *    If a relcache flush is issued for a system relation that we preload
+ *    from the relcache init file, we must also delete the init file so that
+ *    it will be rebuilt during the next backend restart.  The actual work of
+ *    manipulating the init file is in relcache.c, but we keep track of the
+ *    need for it here.
+ *
+ *    The request lists proper are kept in CurTransactionContext of their
+ *    creating (sub)transaction, since they can be forgotten on abort of that
+ *    transaction but must be kept till top-level commit otherwise.  For
+ *    simplicity we keep the controlling list-of-lists in TopTransactionContext.
+ *
+ *    Currently, inval messages are sent without regard for the possibility
+ *    that the object described by the catalog tuple might be a session-local
+ *    object such as a temporary table.  This is because (1) this code has
+ *    no practical way to tell the difference, and (2) it is not certain that
+ *    other backends don't have catalog cache or even relcache entries for
+ *    such tables, anyway; there is nothing that prevents that.  It might be
+ *    worth trying to avoid sending such inval traffic in the future, if those
+ *    problems can be overcome cheaply.
+ *
+ *
+ * Portions Copyright (c) 2012-2014, TransLattice, Inc.
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1994, Regents of the University of California
+ *
+ * IDENTIFICATION
+ *      src/backend/utils/cache/inval.c
+ *
+ *-------------------------------------------------------------------------
+ */</comment>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"postgres.h"</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;limits.h&gt;</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/htup_details.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/xact.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/catalog.h"</cpp:file></cpp:include>
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>_MLS_</name></cpp:ifdef>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/pg_mls.h"</cpp:file></cpp:include>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"miscadmin.h"</cpp:file></cpp:include>
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>XCP</name></cpp:ifdef>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/pgxc_class.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"pgxc/pgxc.h"</cpp:file></cpp:include>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/sinval.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/smgr.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/catcache.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/inval.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/memdebug.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/memutils.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/rel.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/relmapper.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/snapmgr.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/syscache.h"</cpp:file></cpp:include>
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>_MLS_</name></cpp:ifdef>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/mls.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/relcrypt.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/relcryptcache.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"pgxc/poolmgr.h"</cpp:file></cpp:include>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+
+<comment type="block">/*
+ * To minimize palloc traffic, we keep pending requests in successively-
+ * larger chunks (a slightly more sophisticated version of an expansible
+ * array).  All request types can be stored as SharedInvalidationMessage
+ * records.  The ordering of requests within a list is never significant.
+ */</comment>
+<typedef>typedef <type><struct>struct <name>InvalidationChunk</name>
+<block>{
+    <decl_stmt><decl><type><name><name>struct</name> <name>InvalidationChunk</name></name> <modifier>*</modifier></type><name>next</name></decl>;</decl_stmt> <comment type="block">/* list link */</comment>
+    <decl_stmt><decl><type><name>int</name></type>            <name>nitems</name></decl>;</decl_stmt>            <comment type="block">/* # items currently stored in chunk */</comment>
+    <decl_stmt><decl><type><name>int</name></type>            <name>maxitems</name></decl>;</decl_stmt>        <comment type="block">/* size of allocated array in this chunk */</comment>
+    <decl_stmt><decl><type><name>SharedInvalidationMessage</name></type> <name><name>msgs</name><index>[<expr><name>FLEXIBLE_ARRAY_MEMBER</name></expr>]</index></name></decl>;</decl_stmt>
+}</block></struct></type> <name>InvalidationChunk</name>;</typedef>
+
+<typedef>typedef <type><struct>struct <name>InvalidationListHeader</name>
+<block>{
+    <decl_stmt><decl><type><name>InvalidationChunk</name> <modifier>*</modifier></type><name>cclist</name></decl>;</decl_stmt>    <comment type="block">/* list of chunks holding catcache msgs */</comment>
+    <decl_stmt><decl><type><name>InvalidationChunk</name> <modifier>*</modifier></type><name>rclist</name></decl>;</decl_stmt>    <comment type="block">/* list of chunks holding relcache msgs */</comment>
+}</block></struct></type> <name>InvalidationListHeader</name>;</typedef>
+
+<comment type="block">/*----------------
+ * Invalidation info is divided into two lists:
+ *    1) events so far in current command, not yet reflected to caches.
+ *    2) events in previous commands of current transaction; these have
+ *       been reflected to local caches, and must be either broadcast to
+ *       other backends or rolled back from local cache when we commit
+ *       or abort the transaction.
+ * Actually, we need two such lists for each level of nested transaction,
+ * so that we can discard events from an aborted subtransaction.  When
+ * a subtransaction commits, we append its lists to the parent's lists.
+ *
+ * The relcache-file-invalidated flag can just be a simple boolean,
+ * since we only act on it at transaction commit; we don't care which
+ * command of the transaction set it.
+ *----------------
+ */</comment>
+
+<typedef>typedef <type><struct>struct <name>TransInvalidationInfo</name>
+<block>{
+    <comment type="block">/* Back link to parent transaction's info */</comment>
+    <decl_stmt><decl><type><name><name>struct</name> <name>TransInvalidationInfo</name></name> <modifier>*</modifier></type><name>parent</name></decl>;</decl_stmt>
+
+    <comment type="block">/* Subtransaction nesting depth */</comment>
+    <decl_stmt><decl><type><name>int</name></type>            <name>my_level</name></decl>;</decl_stmt>
+
+    <comment type="block">/* head of current-command event list */</comment>
+    <decl_stmt><decl><type><name>InvalidationListHeader</name></type> <name>CurrentCmdInvalidMsgs</name></decl>;</decl_stmt>
+
+    <comment type="block">/* head of previous-commands event list */</comment>
+    <decl_stmt><decl><type><name>InvalidationListHeader</name></type> <name>PriorCmdInvalidMsgs</name></decl>;</decl_stmt>
+
+    <comment type="block">/* init file must be invalidated? */</comment>
+    <decl_stmt><decl><type><name>bool</name></type>        <name>RelcacheInitFileInval</name></decl>;</decl_stmt>
+}</block></struct></type> <name>TransInvalidationInfo</name>;</typedef>
+
+<decl_stmt><decl><type><specifier>static</specifier> <name>TransInvalidationInfo</name> <modifier>*</modifier></type><name>transInvalInfo</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+
+<decl_stmt><decl><type><specifier>static</specifier> <name>SharedInvalidationMessage</name> <modifier>*</modifier></type><name>SharedInvalidMessagesArray</name></decl>;</decl_stmt>
+<decl_stmt><decl><type><specifier>static</specifier> <name>int</name></type>    <name>numSharedInvalidMessagesArray</name></decl>;</decl_stmt>
+<decl_stmt><decl><type><specifier>static</specifier> <name>int</name></type>    <name>maxSharedInvalidMessagesArray</name></decl>;</decl_stmt>
+
+
+<comment type="block">/*
+ * Dynamically-registered callback functions.  Current implementation
+ * assumes there won't be enough of these to justify a dynamically resizable
+ * array; it'd be easy to improve that if needed.
+ *
+ * To avoid searching in CallSyscacheCallbacks, all callbacks for a given
+ * syscache are linked into a list pointed to by syscache_callback_links[id].
+ * The link values are syscache_callback_list[] index plus 1, or 0 for none.
+ */</comment>
+
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>MAX_SYSCACHE_CALLBACKS</name></cpp:macro> <cpp:value>64</cpp:value></cpp:define>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>MAX_RELCACHE_CALLBACKS</name></cpp:macro> <cpp:value>10</cpp:value></cpp:define>
+
+<struct><specifier>static</specifier> struct <name>SYSCACHECALLBACK</name>
+<block>{
+    <decl_stmt><decl><type><name>int16</name></type>        <name>id</name></decl>;</decl_stmt>                <comment type="block">/* cache number */</comment>
+    <decl_stmt><decl><type><name>int16</name></type>        <name>link</name></decl>;</decl_stmt>            <comment type="block">/* next callback index+1 for same cache */</comment>
+    <decl_stmt><decl><type><name>SyscacheCallbackFunction</name></type> <name>function</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>Datum</name></type>        <name>arg</name></decl>;</decl_stmt>
+}</block>            <decl><name><name>syscache_callback_list</name><index>[<expr><name>MAX_SYSCACHE_CALLBACKS</name></expr>]</index></name></decl>;</struct>
+
+<decl_stmt><decl><type><specifier>static</specifier> <name>int16</name></type> <name><name>syscache_callback_links</name><index>[<expr><name>SysCacheSize</name></expr>]</index></name></decl>;</decl_stmt>
+
+<decl_stmt><decl><type><specifier>static</specifier> <name>int</name></type>    <name>syscache_callback_count</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+
+<struct><specifier>static</specifier> struct <name>RELCACHECALLBACK</name>
+<block>{
+    <decl_stmt><decl><type><name>RelcacheCallbackFunction</name></type> <name>function</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>Datum</name></type>        <name>arg</name></decl>;</decl_stmt>
+}</block>            <decl><name><name>relcache_callback_list</name><index>[<expr><name>MAX_RELCACHE_CALLBACKS</name></expr>]</index></name></decl>;</struct>
+
+<decl_stmt><decl><type><specifier>static</specifier> <name>int</name></type>    <name>relcache_callback_count</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+
+<comment type="block">/* ----------------------------------------------------------------
+ *                Invalidation list support functions
+ *
+ * These three routines encapsulate processing of the "chunked"
+ * representation of what is logically just a list of messages.
+ * ----------------------------------------------------------------
+ */</comment>
+
+<comment type="block">/*
+ * AddInvalidationMessage
+ *        Add an invalidation message to a list (of chunks).
+ *
+ * Note that we do not pay any great attention to maintaining the original
+ * ordering of the messages.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>AddInvalidationMessage</name><parameter_list>(<parameter><decl><type><name>InvalidationChunk</name> <modifier>*</modifier><modifier>*</modifier></type><name>listHdr</name></decl></parameter>,
+                       <parameter><decl><type><name>SharedInvalidationMessage</name> <modifier>*</modifier></type><name>msg</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <decl_stmt><decl><type><name>InvalidationChunk</name> <modifier>*</modifier></type><name>chunk</name> <init>= <expr><operator>*</operator><name>listHdr</name></expr></init></decl>;</decl_stmt>
+
+    <if_stmt><if>if <condition>(<expr><name>chunk</name> <operator>==</operator> <name>NULL</name></expr>)</condition>
+    <block>{<block_content>
+        <comment type="block">/* First time through; create initial chunk */</comment>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>FIRSTCHUNKSIZE</name></cpp:macro> <cpp:value>32</cpp:value></cpp:define>
+        <expr_stmt><expr><name>chunk</name> <operator>=</operator> <operator>(</operator><name>InvalidationChunk</name> <operator>*</operator><operator>)</operator>
+            <call><name>MemoryContextAlloc</name><argument_list>(<argument><expr><name>CurTransactionContext</name></expr></argument>,
+                               <argument><expr><call><name>offsetof</name><argument_list>(<argument><expr><name>InvalidationChunk</name></expr></argument>, <argument><expr><name>msgs</name></expr></argument>)</argument_list></call> <operator>+</operator>
+                               <name>FIRSTCHUNKSIZE</name> <operator>*</operator> <sizeof>sizeof<argument_list>(<argument><expr><name>SharedInvalidationMessage</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <expr_stmt><expr><name><name>chunk</name><operator>-&gt;</operator><name>nitems</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+        <expr_stmt><expr><name><name>chunk</name><operator>-&gt;</operator><name>maxitems</name></name> <operator>=</operator> <name>FIRSTCHUNKSIZE</name></expr>;</expr_stmt>
+        <expr_stmt><expr><name><name>chunk</name><operator>-&gt;</operator><name>next</name></name> <operator>=</operator> <operator>*</operator><name>listHdr</name></expr>;</expr_stmt>
+        <expr_stmt><expr><operator>*</operator><name>listHdr</name> <operator>=</operator> <name>chunk</name></expr>;</expr_stmt>
+    </block_content>}</block></if>
+    <if type="elseif">else if <condition>(<expr><name><name>chunk</name><operator>-&gt;</operator><name>nitems</name></name> <operator>&gt;=</operator> <name><name>chunk</name><operator>-&gt;</operator><name>maxitems</name></name></expr>)</condition>
+    <block>{<block_content>
+        <comment type="block">/* Need another chunk; double size of last chunk */</comment>
+        <decl_stmt><decl><type><name>int</name></type>            <name>chunksize</name> <init>= <expr><literal type="number">2</literal> <operator>*</operator> <name><name>chunk</name><operator>-&gt;</operator><name>maxitems</name></name></expr></init></decl>;</decl_stmt>
+
+        <expr_stmt><expr><name>chunk</name> <operator>=</operator> <operator>(</operator><name>InvalidationChunk</name> <operator>*</operator><operator>)</operator>
+            <call><name>MemoryContextAlloc</name><argument_list>(<argument><expr><name>CurTransactionContext</name></expr></argument>,
+                               <argument><expr><call><name>offsetof</name><argument_list>(<argument><expr><name>InvalidationChunk</name></expr></argument>, <argument><expr><name>msgs</name></expr></argument>)</argument_list></call> <operator>+</operator>
+                               <name>chunksize</name> <operator>*</operator> <sizeof>sizeof<argument_list>(<argument><expr><name>SharedInvalidationMessage</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <expr_stmt><expr><name><name>chunk</name><operator>-&gt;</operator><name>nitems</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+        <expr_stmt><expr><name><name>chunk</name><operator>-&gt;</operator><name>maxitems</name></name> <operator>=</operator> <name>chunksize</name></expr>;</expr_stmt>
+        <expr_stmt><expr><name><name>chunk</name><operator>-&gt;</operator><name>next</name></name> <operator>=</operator> <operator>*</operator><name>listHdr</name></expr>;</expr_stmt>
+        <expr_stmt><expr><operator>*</operator><name>listHdr</name> <operator>=</operator> <name>chunk</name></expr>;</expr_stmt>
+    </block_content>}</block></if></if_stmt>
+    <comment type="block">/* Okay, add message to current chunk */</comment>
+    <expr_stmt><expr><name><name>chunk</name><operator>-&gt;</operator><name>msgs</name><index>[<expr><name><name>chunk</name><operator>-&gt;</operator><name>nitems</name></name></expr>]</index></name> <operator>=</operator> <operator>*</operator><name>msg</name></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>chunk</name><operator>-&gt;</operator><name>nitems</name></name><operator>++</operator></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Append one list of invalidation message chunks to another, resetting
+ * the source chunk-list pointer to NULL.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>AppendInvalidationMessageList</name><parameter_list>(<parameter><decl><type><name>InvalidationChunk</name> <modifier>*</modifier><modifier>*</modifier></type><name>destHdr</name></decl></parameter>,
+                              <parameter><decl><type><name>InvalidationChunk</name> <modifier>*</modifier><modifier>*</modifier></type><name>srcHdr</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <decl_stmt><decl><type><name>InvalidationChunk</name> <modifier>*</modifier></type><name>chunk</name> <init>= <expr><operator>*</operator><name>srcHdr</name></expr></init></decl>;</decl_stmt>
+
+    <if_stmt><if>if <condition>(<expr><name>chunk</name> <operator>==</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+        <return>return;</return></block_content></block></if></if_stmt>                    <comment type="block">/* nothing to do */</comment>
+
+    <while>while <condition>(<expr><name><name>chunk</name><operator>-&gt;</operator><name>next</name></name> <operator>!=</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+        <expr_stmt><expr><name>chunk</name> <operator>=</operator> <name><name>chunk</name><operator>-&gt;</operator><name>next</name></name></expr>;</expr_stmt></block_content></block></while>
+
+    <expr_stmt><expr><name><name>chunk</name><operator>-&gt;</operator><name>next</name></name> <operator>=</operator> <operator>*</operator><name>destHdr</name></expr>;</expr_stmt>
+
+    <expr_stmt><expr><operator>*</operator><name>destHdr</name> <operator>=</operator> <operator>*</operator><name>srcHdr</name></expr>;</expr_stmt>
+
+    <expr_stmt><expr><operator>*</operator><name>srcHdr</name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Process a list of invalidation messages.
+ *
+ * This is a macro that executes the given code fragment for each message in
+ * a message chunk list.  The fragment should refer to the message as *msg.
+ */</comment>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>ProcessMessageList</name><parameter_list>(<parameter><type><name>listHdr</name></type></parameter>, <parameter><type><name>codeFragment</name></type></parameter>)</parameter_list></cpp:macro> \
+    <cpp:value>do { \
+        InvalidationChunk *_chunk; \
+        for (_chunk = (listHdr); _chunk != NULL; _chunk = _chunk-&gt;next) \
+        { \
+            int        _cindex; \
+            for (_cindex = 0; _cindex &lt; _chunk-&gt;nitems; _cindex++) \
+            { \
+                SharedInvalidationMessage *msg = &amp;_chunk-&gt;msgs[_cindex]; \
+                codeFragment; \
+            } \
+        } \
+    } while (0)</cpp:value></cpp:define>
+
+<comment type="block">/*
+ * Process a list of invalidation messages group-wise.
+ *
+ * As above, but the code fragment can handle an array of messages.
+ * The fragment should refer to the messages as msgs[], with n entries.
+ */</comment>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>ProcessMessageListMulti</name><parameter_list>(<parameter><type><name>listHdr</name></type></parameter>, <parameter><type><name>codeFragment</name></type></parameter>)</parameter_list></cpp:macro> \
+    <cpp:value>do { \
+        InvalidationChunk *_chunk; \
+        for (_chunk = (listHdr); _chunk != NULL; _chunk = _chunk-&gt;next) \
+        { \
+            SharedInvalidationMessage *msgs = _chunk-&gt;msgs; \
+            int        n = _chunk-&gt;nitems; \
+            codeFragment; \
+        } \
+    } while (0)</cpp:value></cpp:define>
+
+
+<comment type="block">/* ----------------------------------------------------------------
+ *                Invalidation set support functions
+ *
+ * These routines understand about the division of a logical invalidation
+ * list into separate physical lists for catcache and relcache entries.
+ * ----------------------------------------------------------------
+ */</comment>
+
+<comment type="block">/*
+ * Add a catcache inval entry
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>AddCatcacheInvalidationMessage</name><parameter_list>(<parameter><decl><type><name>InvalidationListHeader</name> <modifier>*</modifier></type><name>hdr</name></decl></parameter>,
+                               <parameter><decl><type><name>int</name></type> <name>id</name></decl></parameter>, <parameter><decl><type><name>uint32</name></type> <name>hashValue</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>dbId</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <decl_stmt><decl><type><name>SharedInvalidationMessage</name></type> <name>msg</name></decl>;</decl_stmt>
+
+    <expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>id</name> <operator>&lt;</operator> <name>CHAR_MAX</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>msg</name><operator>.</operator><name>cc</name><operator>.</operator><name>id</name></name> <operator>=</operator> <operator>(</operator><name>int8</name><operator>)</operator> <name>id</name></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>msg</name><operator>.</operator><name>cc</name><operator>.</operator><name>dbId</name></name> <operator>=</operator> <name>dbId</name></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>msg</name><operator>.</operator><name>cc</name><operator>.</operator><name>hashValue</name></name> <operator>=</operator> <name>hashValue</name></expr>;</expr_stmt>
+
+    <comment type="block">/*
+     * Define padding bytes in SharedInvalidationMessage structs to be
+     * defined. Otherwise the sinvaladt.c ringbuffer, which is accessed by
+     * multiple processes, will cause spurious valgrind warnings about
+     * undefined memory being used. That's because valgrind remembers the
+     * undefined bytes from the last local process's store, not realizing that
+     * another process has written since, filling the previously uninitialized
+     * bytes
+     */</comment>
+    <expr_stmt><expr><call><name>VALGRIND_MAKE_MEM_DEFINED</name><argument_list>(<argument><expr><operator>&amp;</operator><name>msg</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>msg</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+    <expr_stmt><expr><call><name>AddInvalidationMessage</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>hdr</name><operator>-&gt;</operator><name>cclist</name></name></expr></argument>, <argument><expr><operator>&amp;</operator><name>msg</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Add a whole-catalog inval entry
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>AddCatalogInvalidationMessage</name><parameter_list>(<parameter><decl><type><name>InvalidationListHeader</name> <modifier>*</modifier></type><name>hdr</name></decl></parameter>,
+                              <parameter><decl><type><name>Oid</name></type> <name>dbId</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>catId</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <decl_stmt><decl><type><name>SharedInvalidationMessage</name></type> <name>msg</name></decl>;</decl_stmt>
+
+    <expr_stmt><expr><name><name>msg</name><operator>.</operator><name>cat</name><operator>.</operator><name>id</name></name> <operator>=</operator> <name>SHAREDINVALCATALOG_ID</name></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>msg</name><operator>.</operator><name>cat</name><operator>.</operator><name>dbId</name></name> <operator>=</operator> <name>dbId</name></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>msg</name><operator>.</operator><name>cat</name><operator>.</operator><name>catId</name></name> <operator>=</operator> <name>catId</name></expr>;</expr_stmt>
+    <comment type="block">/* check AddCatcacheInvalidationMessage() for an explanation */</comment>
+    <expr_stmt><expr><call><name>VALGRIND_MAKE_MEM_DEFINED</name><argument_list>(<argument><expr><operator>&amp;</operator><name>msg</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>msg</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+    <expr_stmt><expr><call><name>AddInvalidationMessage</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>hdr</name><operator>-&gt;</operator><name>cclist</name></name></expr></argument>, <argument><expr><operator>&amp;</operator><name>msg</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Add a relcache inval entry
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>AddRelcacheInvalidationMessage</name><parameter_list>(<parameter><decl><type><name>InvalidationListHeader</name> <modifier>*</modifier></type><name>hdr</name></decl></parameter>,
+                               <parameter><decl><type><name>Oid</name></type> <name>dbId</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>relId</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <decl_stmt><decl><type><name>SharedInvalidationMessage</name></type> <name>msg</name></decl>;</decl_stmt>
+
+    <comment type="block">/*
+     * Don't add a duplicate item. We assume dbId need not be checked because
+     * it will never change. InvalidOid for relId means all relations so we
+     * don't need to add individual ones when it is present.
+     */</comment>
+    <macro><name>ProcessMessageList</name><argument_list>(<argument>hdr-&gt;rclist</argument>,
+                       <argument>if (msg-&gt;rc.id == SHAREDINVALRELCACHE_ID &amp;&amp;
+                           (msg-&gt;rc.relId == relId ||
+                            msg-&gt;rc.relId == InvalidOid))
+                       return</argument>)</argument_list></macro><empty_stmt>;</empty_stmt>
+
+    <comment type="block">/* OK, add the item */</comment>
+    <expr_stmt><expr><name><name>msg</name><operator>.</operator><name>rc</name><operator>.</operator><name>id</name></name> <operator>=</operator> <name>SHAREDINVALRELCACHE_ID</name></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>msg</name><operator>.</operator><name>rc</name><operator>.</operator><name>dbId</name></name> <operator>=</operator> <name>dbId</name></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>msg</name><operator>.</operator><name>rc</name><operator>.</operator><name>relId</name></name> <operator>=</operator> <name>relId</name></expr>;</expr_stmt>
+    <comment type="block">/* check AddCatcacheInvalidationMessage() for an explanation */</comment>
+    <expr_stmt><expr><call><name>VALGRIND_MAKE_MEM_DEFINED</name><argument_list>(<argument><expr><operator>&amp;</operator><name>msg</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>msg</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+    <expr_stmt><expr><call><name>AddInvalidationMessage</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>hdr</name><operator>-&gt;</operator><name>rclist</name></name></expr></argument>, <argument><expr><operator>&amp;</operator><name>msg</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Add a snapshot inval entry
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>AddSnapshotInvalidationMessage</name><parameter_list>(<parameter><decl><type><name>InvalidationListHeader</name> <modifier>*</modifier></type><name>hdr</name></decl></parameter>,
+                               <parameter><decl><type><name>Oid</name></type> <name>dbId</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>relId</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <decl_stmt><decl><type><name>SharedInvalidationMessage</name></type> <name>msg</name></decl>;</decl_stmt>
+
+    <comment type="block">/* Don't add a duplicate item */</comment>
+    <comment type="block">/* We assume dbId need not be checked because it will never change */</comment>
+    <macro><name>ProcessMessageList</name><argument_list>(<argument>hdr-&gt;rclist</argument>,
+                       <argument>if (msg-&gt;sn.id == SHAREDINVALSNAPSHOT_ID &amp;&amp;
+                           msg-&gt;sn.relId == relId)
+                       return</argument>)</argument_list></macro><empty_stmt>;</empty_stmt>
+
+    <comment type="block">/* OK, add the item */</comment>
+    <expr_stmt><expr><name><name>msg</name><operator>.</operator><name>sn</name><operator>.</operator><name>id</name></name> <operator>=</operator> <name>SHAREDINVALSNAPSHOT_ID</name></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>msg</name><operator>.</operator><name>sn</name><operator>.</operator><name>dbId</name></name> <operator>=</operator> <name>dbId</name></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>msg</name><operator>.</operator><name>sn</name><operator>.</operator><name>relId</name></name> <operator>=</operator> <name>relId</name></expr>;</expr_stmt>
+    <comment type="block">/* check AddCatcacheInvalidationMessage() for an explanation */</comment>
+    <expr_stmt><expr><call><name>VALGRIND_MAKE_MEM_DEFINED</name><argument_list>(<argument><expr><operator>&amp;</operator><name>msg</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>msg</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+    <expr_stmt><expr><call><name>AddInvalidationMessage</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>hdr</name><operator>-&gt;</operator><name>rclist</name></name></expr></argument>, <argument><expr><operator>&amp;</operator><name>msg</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Append one list of invalidation messages to another, resetting
+ * the source list to empty.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>AppendInvalidationMessages</name><parameter_list>(<parameter><decl><type><name>InvalidationListHeader</name> <modifier>*</modifier></type><name>dest</name></decl></parameter>,
+                           <parameter><decl><type><name>InvalidationListHeader</name> <modifier>*</modifier></type><name>src</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <expr_stmt><expr><call><name>AppendInvalidationMessageList</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>dest</name><operator>-&gt;</operator><name>cclist</name></name></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>src</name><operator>-&gt;</operator><name>cclist</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><call><name>AppendInvalidationMessageList</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>dest</name><operator>-&gt;</operator><name>rclist</name></name></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>src</name><operator>-&gt;</operator><name>rclist</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Execute the given function for all the messages in an invalidation list.
+ * The list is not altered.
+ *
+ * catcache entries are processed first, for reasons mentioned above.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>ProcessInvalidationMessages</name><parameter_list>(<parameter><decl><type><name>InvalidationListHeader</name> <modifier>*</modifier></type><name>hdr</name></decl></parameter>,
+                            <parameter><function_decl><type><name>void</name></type> (<modifier>*</modifier><name>func</name>) <parameter_list>(<parameter><decl><type><name>SharedInvalidationMessage</name> <modifier>*</modifier></type><name>msg</name></decl></parameter>)</parameter_list></function_decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <expr_stmt><expr><call><name>ProcessMessageList</name><argument_list>(<argument><expr><name><name>hdr</name><operator>-&gt;</operator><name>cclist</name></name></expr></argument>, <argument><expr><call><name>func</name><argument_list>(<argument><expr><name>msg</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><call><name>ProcessMessageList</name><argument_list>(<argument><expr><name><name>hdr</name><operator>-&gt;</operator><name>rclist</name></name></expr></argument>, <argument><expr><call><name>func</name><argument_list>(<argument><expr><name>msg</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * As above, but the function is able to process an array of messages
+ * rather than just one at a time.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>ProcessInvalidationMessagesMulti</name><parameter_list>(<parameter><decl><type><name>InvalidationListHeader</name> <modifier>*</modifier></type><name>hdr</name></decl></parameter>,
+                                 <parameter><function_decl><type><name>void</name></type> (<modifier>*</modifier><name>func</name>) <parameter_list>(<parameter><decl><type><specifier>const</specifier> <name>SharedInvalidationMessage</name> <modifier>*</modifier></type><name>msgs</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>n</name></decl></parameter>)</parameter_list></function_decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <expr_stmt><expr><call><name>ProcessMessageListMulti</name><argument_list>(<argument><expr><name><name>hdr</name><operator>-&gt;</operator><name>cclist</name></name></expr></argument>, <argument><expr><call><name>func</name><argument_list>(<argument><expr><name>msgs</name></expr></argument>, <argument><expr><name>n</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><call><name>ProcessMessageListMulti</name><argument_list>(<argument><expr><name><name>hdr</name><operator>-&gt;</operator><name>rclist</name></name></expr></argument>, <argument><expr><call><name>func</name><argument_list>(<argument><expr><name>msgs</name></expr></argument>, <argument><expr><name>n</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/* ----------------------------------------------------------------
+ *                      private support functions
+ * ----------------------------------------------------------------
+ */</comment>
+
+<comment type="block">/*
+ * RegisterCatcacheInvalidation
+ *
+ * Register an invalidation event for a catcache tuple entry.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>RegisterCatcacheInvalidation</name><parameter_list>(<parameter><decl><type><name>int</name></type> <name>cacheId</name></decl></parameter>,
+                             <parameter><decl><type><name>uint32</name></type> <name>hashValue</name></decl></parameter>,
+                             <parameter><decl><type><name>Oid</name></type> <name>dbId</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <expr_stmt><expr><call><name>AddCatcacheInvalidationMessage</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>transInvalInfo</name><operator>-&gt;</operator><name>CurrentCmdInvalidMsgs</name></name></expr></argument>,
+                                   <argument><expr><name>cacheId</name></expr></argument>, <argument><expr><name>hashValue</name></expr></argument>, <argument><expr><name>dbId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * RegisterCatalogInvalidation
+ *
+ * Register an invalidation event for all catcache entries from a catalog.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>RegisterCatalogInvalidation</name><parameter_list>(<parameter><decl><type><name>Oid</name></type> <name>dbId</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>catId</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <expr_stmt><expr><call><name>AddCatalogInvalidationMessage</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>transInvalInfo</name><operator>-&gt;</operator><name>CurrentCmdInvalidMsgs</name></name></expr></argument>,
+                                  <argument><expr><name>dbId</name></expr></argument>, <argument><expr><name>catId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * RegisterRelcacheInvalidation
+ *
+ * As above, but register a relcache invalidation event.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>RegisterRelcacheInvalidation</name><parameter_list>(<parameter><decl><type><name>Oid</name></type> <name>dbId</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>relId</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <expr_stmt><expr><call><name>AddRelcacheInvalidationMessage</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>transInvalInfo</name><operator>-&gt;</operator><name>CurrentCmdInvalidMsgs</name></name></expr></argument>,
+                                   <argument><expr><name>dbId</name></expr></argument>, <argument><expr><name>relId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+    <comment type="block">/*
+     * Most of the time, relcache invalidation is associated with system
+     * catalog updates, but there are a few cases where it isn't.  Quick hack
+     * to ensure that the next CommandCounterIncrement() will think that we
+     * need to do CommandEndInvalidationMessages().
+     */</comment>
+    <expr_stmt><expr><operator>(</operator><name>void</name><operator>)</operator> <call><name>GetCurrentCommandId</name><argument_list>(<argument><expr><name>true</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+    <comment type="block">/*
+     * If the relation being invalidated is one of those cached in the local
+     * relcache init file, mark that we need to zap that file at commit. Same
+     * is true when we are invalidating whole relcache.
+     */</comment>
+    <if_stmt><if>if <condition>(<expr><call><name>OidIsValid</name><argument_list>(<argument><expr><name>dbId</name></expr></argument>)</argument_list></call> <operator>&amp;&amp;</operator>
+        <operator>(</operator><call><name>RelationIdIsInInitFile</name><argument_list>(<argument><expr><name>relId</name></expr></argument>)</argument_list></call> <operator>||</operator> <name>relId</name> <operator>==</operator> <name>InvalidOid</name><operator>)</operator></expr>)</condition><block type="pseudo"><block_content>
+        <expr_stmt><expr><name><name>transInvalInfo</name><operator>-&gt;</operator><name>RelcacheInitFileInval</name></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * RegisterSnapshotInvalidation
+ *
+ * Register an invalidation event for MVCC scans against a given catalog.
+ * Only needed for catalogs that don't have catcaches.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>RegisterSnapshotInvalidation</name><parameter_list>(<parameter><decl><type><name>Oid</name></type> <name>dbId</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>relId</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <expr_stmt><expr><call><name>AddSnapshotInvalidationMessage</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>transInvalInfo</name><operator>-&gt;</operator><name>CurrentCmdInvalidMsgs</name></name></expr></argument>,
+                                   <argument><expr><name>dbId</name></expr></argument>, <argument><expr><name>relId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * LocalExecuteInvalidationMessage
+ *
+ * Process a single invalidation message (which could be of any type).
+ * Only the local caches are flushed; this does not transmit the message
+ * to other backends.
+ */</comment>
+<function><type><name>void</name></type>
+<name>LocalExecuteInvalidationMessage</name><parameter_list>(<parameter><decl><type><name>SharedInvalidationMessage</name> <modifier>*</modifier></type><name>msg</name></decl></parameter>)</parameter_list>
+<block>{<block_content><comment type="line">// #lizard forgives</comment>
+    <if_stmt><if>if <condition>(<expr><name><name>msg</name><operator>-&gt;</operator><name>id</name></name> <operator>&gt;=</operator> <literal type="number">0</literal></expr>)</condition>
+    <block>{<block_content>
+        <if_stmt><if>if <condition>(<expr><name><name>msg</name><operator>-&gt;</operator><name>cc</name><operator>.</operator><name>dbId</name></name> <operator>==</operator> <name>MyDatabaseId</name> <operator>||</operator> <name><name>msg</name><operator>-&gt;</operator><name>cc</name><operator>.</operator><name>dbId</name></name> <operator>==</operator> <name>InvalidOid</name></expr>)</condition>
+        <block>{<block_content>
+            <expr_stmt><expr><call><name>InvalidateCatalogSnapshot</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+            <expr_stmt><expr><call><name>SysCacheInvalidate</name><argument_list>(<argument><expr><name><name>msg</name><operator>-&gt;</operator><name>cc</name><operator>.</operator><name>id</name></name></expr></argument>, <argument><expr><name><name>msg</name><operator>-&gt;</operator><name>cc</name><operator>.</operator><name>hashValue</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+            <expr_stmt><expr><call><name>CallSyscacheCallbacks</name><argument_list>(<argument><expr><name><name>msg</name><operator>-&gt;</operator><name>cc</name><operator>.</operator><name>id</name></name></expr></argument>, <argument><expr><name><name>msg</name><operator>-&gt;</operator><name>cc</name><operator>.</operator><name>hashValue</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        </block_content>}</block></if></if_stmt>
+    </block_content>}</block></if>
+    <if type="elseif">else if <condition>(<expr><name><name>msg</name><operator>-&gt;</operator><name>id</name></name> <operator>==</operator> <name>SHAREDINVALCATALOG_ID</name></expr>)</condition>
+    <block>{<block_content>
+        <if_stmt><if>if <condition>(<expr><name><name>msg</name><operator>-&gt;</operator><name>cat</name><operator>.</operator><name>dbId</name></name> <operator>==</operator> <name>MyDatabaseId</name> <operator>||</operator> <name><name>msg</name><operator>-&gt;</operator><name>cat</name><operator>.</operator><name>dbId</name></name> <operator>==</operator> <name>InvalidOid</name></expr>)</condition>
+        <block>{<block_content>
+            <expr_stmt><expr><call><name>InvalidateCatalogSnapshot</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+            <expr_stmt><expr><call><name>CatalogCacheFlushCatalog</name><argument_list>(<argument><expr><name><name>msg</name><operator>-&gt;</operator><name>cat</name><operator>.</operator><name>catId</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+            <comment type="block">/* CatalogCacheFlushCatalog calls CallSyscacheCallbacks as needed */</comment>
+        </block_content>}</block></if></if_stmt>
+    </block_content>}</block></if>
+    <if type="elseif">else if <condition>(<expr><name><name>msg</name><operator>-&gt;</operator><name>id</name></name> <operator>==</operator> <name>SHAREDINVALRELCACHE_ID</name></expr>)</condition>
+    <block>{<block_content>
+        <if_stmt><if>if <condition>(<expr><name><name>msg</name><operator>-&gt;</operator><name>rc</name><operator>.</operator><name>dbId</name></name> <operator>==</operator> <name>MyDatabaseId</name> <operator>||</operator> <name><name>msg</name><operator>-&gt;</operator><name>rc</name><operator>.</operator><name>dbId</name></name> <operator>==</operator> <name>InvalidOid</name></expr>)</condition>
+        <block>{<block_content>
+            <decl_stmt><decl><type><name>int</name></type>            <name>i</name></decl>;</decl_stmt>
+
+            <if_stmt><if>if <condition>(<expr><name><name>msg</name><operator>-&gt;</operator><name>rc</name><operator>.</operator><name>relId</name></name> <operator>==</operator> <name>InvalidOid</name></expr>)</condition><block type="pseudo"><block_content>
+                <expr_stmt><expr><call><name>RelationCacheInvalidate</name><argument_list>()</argument_list></call></expr>;</expr_stmt></block_content></block></if>
+            <else>else<block type="pseudo"><block_content>
+                <expr_stmt><expr><call><name>RelationCacheInvalidateEntry</name><argument_list>(<argument><expr><name><name>msg</name><operator>-&gt;</operator><name>rc</name><operator>.</operator><name>relId</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></else></if_stmt>
+
+            <for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name>relcache_callback_count</name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control>
+            <block>{<block_content>
+                <decl_stmt><decl><type><name><name>struct</name> <name>RELCACHECALLBACK</name></name> <modifier>*</modifier></type><name>ccitem</name> <init>= <expr><name>relcache_callback_list</name> <operator>+</operator> <name>i</name></expr></init></decl>;</decl_stmt>
+
+                <expr_stmt><expr><call>(<modifier>*</modifier><name><name>ccitem</name><operator>-&gt;</operator><name>function</name></name>) <argument_list>(<argument><expr><name><name>ccitem</name><operator>-&gt;</operator><name>arg</name></name></expr></argument>, <argument><expr><name><name>msg</name><operator>-&gt;</operator><name>rc</name><operator>.</operator><name>relId</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+            </block_content>}</block></for>
+        </block_content>}</block></if></if_stmt>
+    </block_content>}</block></if>
+    <if type="elseif">else if <condition>(<expr><name><name>msg</name><operator>-&gt;</operator><name>id</name></name> <operator>==</operator> <name>SHAREDINVALSMGR_ID</name></expr>)</condition>
+    <block>{<block_content>
+        <comment type="block">/*
+         * We could have smgr entries for relations of other databases, so no
+         * short-circuit test is possible here.
+         */</comment>
+        <decl_stmt><decl><type><name>RelFileNodeBackend</name></type> <name>rnode</name></decl>;</decl_stmt>
+
+        <expr_stmt><expr><name><name>rnode</name><operator>.</operator><name>node</name></name> <operator>=</operator> <name><name>msg</name><operator>-&gt;</operator><name>sm</name><operator>.</operator><name>rnode</name></name></expr>;</expr_stmt>
+        <expr_stmt><expr><name><name>rnode</name><operator>.</operator><name>backend</name></name> <operator>=</operator> <operator>(</operator><name><name>msg</name><operator>-&gt;</operator><name>sm</name><operator>.</operator><name>backend_hi</name></name> <operator>&lt;&lt;</operator> <literal type="number">16</literal><operator>)</operator> <operator>|</operator> <operator>(</operator><name>int</name><operator>)</operator> <name><name>msg</name><operator>-&gt;</operator><name>sm</name><operator>.</operator><name>backend_lo</name></name></expr>;</expr_stmt>
+        <expr_stmt><expr><call><name>smgrclosenode</name><argument_list>(<argument><expr><name>rnode</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    </block_content>}</block></if>
+    <if type="elseif">else if <condition>(<expr><name><name>msg</name><operator>-&gt;</operator><name>id</name></name> <operator>==</operator> <name>SHAREDINVALRELMAP_ID</name></expr>)</condition>
+    <block>{<block_content>
+        <comment type="block">/* We only care about our own database and shared catalogs */</comment>
+        <if_stmt><if>if <condition>(<expr><name><name>msg</name><operator>-&gt;</operator><name>rm</name><operator>.</operator><name>dbId</name></name> <operator>==</operator> <name>InvalidOid</name></expr>)</condition><block type="pseudo"><block_content>
+            <expr_stmt><expr><call><name>RelationMapInvalidate</name><argument_list>(<argument><expr><name>true</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if>
+        <if type="elseif">else if <condition>(<expr><name><name>msg</name><operator>-&gt;</operator><name>rm</name><operator>.</operator><name>dbId</name></name> <operator>==</operator> <name>MyDatabaseId</name></expr>)</condition><block type="pseudo"><block_content>
+            <expr_stmt><expr><call><name>RelationMapInvalidate</name><argument_list>(<argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+    </block_content>}</block></if>
+    <if type="elseif">else if <condition>(<expr><name><name>msg</name><operator>-&gt;</operator><name>id</name></name> <operator>==</operator> <name>SHAREDINVALSNAPSHOT_ID</name></expr>)</condition>
+    <block>{<block_content>
+        <comment type="block">/* We only care about our own database and shared catalogs */</comment>
+        <if_stmt><if>if <condition>(<expr><name><name>msg</name><operator>-&gt;</operator><name>rm</name><operator>.</operator><name>dbId</name></name> <operator>==</operator> <name>InvalidOid</name></expr>)</condition><block type="pseudo"><block_content>
+            <expr_stmt><expr><call><name>InvalidateCatalogSnapshot</name><argument_list>()</argument_list></call></expr>;</expr_stmt></block_content></block></if>
+        <if type="elseif">else if <condition>(<expr><name><name>msg</name><operator>-&gt;</operator><name>rm</name><operator>.</operator><name>dbId</name></name> <operator>==</operator> <name>MyDatabaseId</name></expr>)</condition><block type="pseudo"><block_content>
+            <expr_stmt><expr><call><name>InvalidateCatalogSnapshot</name><argument_list>()</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+    </block_content>}</block></if>
+    <else>else<block type="pseudo"><block_content>
+        <expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>FATAL</name></expr></argument>, <argument><expr><literal type="string">"unrecognized SI message ID: %d"</literal></expr></argument>, <argument><expr><name><name>msg</name><operator>-&gt;</operator><name>id</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></else></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ *        InvalidateSystemCaches
+ *
+ *        This blows away all tuples in the system catalog caches and
+ *        all the cached relation descriptors and smgr cache entries.
+ *        Relation descriptors that have positive refcounts are then rebuilt.
+ *
+ *        We call this when we see a shared-inval-queue overflow signal,
+ *        since that tells us we've lost some shared-inval messages and hence
+ *        don't know what needs to be invalidated.
+ */</comment>
+<function><type><name>void</name></type>
+<name>InvalidateSystemCaches</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <decl_stmt><decl><type><name>int</name></type>            <name>i</name></decl>;</decl_stmt>
+
+    <expr_stmt><expr><call><name>InvalidateCatalogSnapshot</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><call><name>ResetCatalogCaches</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><call><name>RelationCacheInvalidate</name><argument_list>()</argument_list></call></expr>;</expr_stmt>    <comment type="block">/* gets smgr and relmap too */</comment>
+
+    <for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name>syscache_callback_count</name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control>
+    <block>{<block_content>
+        <decl_stmt><decl><type><name><name>struct</name> <name>SYSCACHECALLBACK</name></name> <modifier>*</modifier></type><name>ccitem</name> <init>= <expr><name>syscache_callback_list</name> <operator>+</operator> <name>i</name></expr></init></decl>;</decl_stmt>
+
+        <expr_stmt><expr><call>(<modifier>*</modifier><name><name>ccitem</name><operator>-&gt;</operator><name>function</name></name>) <argument_list>(<argument><expr><name><name>ccitem</name><operator>-&gt;</operator><name>arg</name></name></expr></argument>, <argument><expr><name><name>ccitem</name><operator>-&gt;</operator><name>id</name></name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    </block_content>}</block></for>
+
+    <for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name>relcache_callback_count</name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control>
+    <block>{<block_content>
+        <decl_stmt><decl><type><name><name>struct</name> <name>RELCACHECALLBACK</name></name> <modifier>*</modifier></type><name>ccitem</name> <init>= <expr><name>relcache_callback_list</name> <operator>+</operator> <name>i</name></expr></init></decl>;</decl_stmt>
+
+        <expr_stmt><expr><call>(<modifier>*</modifier><name><name>ccitem</name><operator>-&gt;</operator><name>function</name></name>) <argument_list>(<argument><expr><name><name>ccitem</name><operator>-&gt;</operator><name>arg</name></name></expr></argument>, <argument><expr><name>InvalidOid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    </block_content>}</block></for>
+</block_content>}</block></function>
+
+
+<comment type="block">/* ----------------------------------------------------------------
+ *                      public functions
+ * ----------------------------------------------------------------
+ */</comment>
+
+<comment type="block">/*
+ * AcceptInvalidationMessages
+ *        Read and process invalidation messages from the shared invalidation
+ *        message queue.
+ *
+ * Note:
+ *        This should be called as the first step in processing a transaction.
+ */</comment>
+<function><type><name>void</name></type>
+<name>AcceptInvalidationMessages</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <expr_stmt><expr><call><name>ReceiveSharedInvalidMessages</name><argument_list>(<argument><expr><name>LocalExecuteInvalidationMessage</name></expr></argument>,
+                                 <argument><expr><name>InvalidateSystemCaches</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+    <comment type="block">/*
+     * Test code to force cache flushes anytime a flush could happen.
+     *
+     * If used with CLOBBER_FREED_MEMORY, CLOBBER_CACHE_ALWAYS provides a
+     * fairly thorough test that the system contains no cache-flush hazards.
+     * However, it also makes the system unbelievably slow --- the regression
+     * tests take about 100 times longer than normal.
+     *
+     * If you're a glutton for punishment, try CLOBBER_CACHE_RECURSIVELY. This
+     * slows things by at least a factor of 10000, so I wouldn't suggest
+     * trying to run the entire regression tests that way.  It's useful to try
+     * a few simple tests, to make sure that cache reload isn't subject to
+     * internal cache-flush hazards, but after you've done a few thousand
+     * recursive reloads it's unlikely you'll learn more.
+     */</comment>
+<cpp:if>#<cpp:directive>if</cpp:directive> <expr><call><name>defined</name><argument_list>(<argument><expr><name>CLOBBER_CACHE_ALWAYS</name></expr></argument>)</argument_list></call></expr></cpp:if>
+    <block>{<block_content>
+        <decl_stmt><decl><type><specifier>static</specifier> <name>bool</name></type> <name>in_recursion</name> <init>= <expr><name>false</name></expr></init></decl>;</decl_stmt>
+
+        <if_stmt><if>if <condition>(<expr><operator>!</operator><name>in_recursion</name></expr>)</condition>
+        <block>{<block_content>
+            <expr_stmt><expr><name>in_recursion</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+            <expr_stmt><expr><call><name>InvalidateSystemCaches</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+            <expr_stmt><expr><name>in_recursion</name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+        </block_content>}</block></if></if_stmt>
+    </block_content>}</block>
+<cpp:elif>#<cpp:directive>elif</cpp:directive> <expr><call><name>defined</name><argument_list>(<argument><expr><name>CLOBBER_CACHE_RECURSIVELY</name></expr></argument>)</argument_list></call></expr></cpp:elif>
+    <expr_stmt><expr><call><name>InvalidateSystemCaches</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * PrepareInvalidationState
+ *        Initialize inval lists for the current (sub)transaction.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>PrepareInvalidationState</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <decl_stmt><decl><type><name>TransInvalidationInfo</name> <modifier>*</modifier></type><name>myInfo</name></decl>;</decl_stmt>
+
+    <if_stmt><if>if <condition>(<expr><name>transInvalInfo</name> <operator>!=</operator> <name>NULL</name> <operator>&amp;&amp;</operator>
+        <name><name>transInvalInfo</name><operator>-&gt;</operator><name>my_level</name></name> <operator>==</operator> <call><name>GetCurrentTransactionNestLevel</name><argument_list>()</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+        <return>return;</return></block_content></block></if></if_stmt>
+
+    <expr_stmt><expr><name>myInfo</name> <operator>=</operator> <operator>(</operator><name>TransInvalidationInfo</name> <operator>*</operator><operator>)</operator>
+        <call><name>MemoryContextAllocZero</name><argument_list>(<argument><expr><name>TopTransactionContext</name></expr></argument>,
+                               <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>TransInvalidationInfo</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>myInfo</name><operator>-&gt;</operator><name>parent</name></name> <operator>=</operator> <name>transInvalInfo</name></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>myInfo</name><operator>-&gt;</operator><name>my_level</name></name> <operator>=</operator> <call><name>GetCurrentTransactionNestLevel</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+    <comment type="block">/*
+     * If there's any previous entry, this one should be for a deeper nesting
+     * level.
+     */</comment>
+    <expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>transInvalInfo</name> <operator>==</operator> <name>NULL</name> <operator>||</operator>
+           <name><name>myInfo</name><operator>-&gt;</operator><name>my_level</name></name> <operator>&gt;</operator> <name><name>transInvalInfo</name><operator>-&gt;</operator><name>my_level</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+    <expr_stmt><expr><name>transInvalInfo</name> <operator>=</operator> <name>myInfo</name></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * PostPrepare_Inval
+ *        Clean up after successful PREPARE.
+ *
+ * Here, we want to act as though the transaction aborted, so that we will
+ * undo any syscache changes it made, thereby bringing us into sync with the
+ * outside world, which doesn't believe the transaction committed yet.
+ *
+ * If the prepared transaction is later aborted, there is nothing more to
+ * do; if it commits, we will receive the consequent inval messages just
+ * like everyone else.
+ */</comment>
+<function><type><name>void</name></type>
+<name>PostPrepare_Inval</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <expr_stmt><expr><call><name>AtEOXact_Inval</name><argument_list>(<argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Collect invalidation messages into SharedInvalidMessagesArray array.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>MakeSharedInvalidMessagesArray</name><parameter_list>(<parameter><decl><type><specifier>const</specifier> <name>SharedInvalidationMessage</name> <modifier>*</modifier></type><name>msgs</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>n</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <comment type="block">/*
+     * Initialise array first time through in each commit
+     */</comment>
+    <if_stmt><if>if <condition>(<expr><name>SharedInvalidMessagesArray</name> <operator>==</operator> <name>NULL</name></expr>)</condition>
+    <block>{<block_content>
+        <expr_stmt><expr><name>maxSharedInvalidMessagesArray</name> <operator>=</operator> <name>FIRSTCHUNKSIZE</name></expr>;</expr_stmt>
+        <expr_stmt><expr><name>numSharedInvalidMessagesArray</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+
+        <comment type="block">/*
+         * Although this is being palloc'd we don't actually free it directly.
+         * We're so close to EOXact that we now we're going to lose it anyhow.
+         */</comment>
+        <expr_stmt><expr><name>SharedInvalidMessagesArray</name> <operator>=</operator> <call><name>palloc</name><argument_list>(<argument><expr><name>maxSharedInvalidMessagesArray</name>
+                                            <operator>*</operator> <sizeof>sizeof<argument_list>(<argument><expr><name>SharedInvalidationMessage</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    </block_content>}</block></if></if_stmt>
+
+    <if_stmt><if>if <condition>(<expr><operator>(</operator><name>numSharedInvalidMessagesArray</name> <operator>+</operator> <name>n</name><operator>)</operator> <operator>&gt;</operator> <name>maxSharedInvalidMessagesArray</name></expr>)</condition>
+    <block>{<block_content>
+        <while>while <condition>(<expr><operator>(</operator><name>numSharedInvalidMessagesArray</name> <operator>+</operator> <name>n</name><operator>)</operator> <operator>&gt;</operator> <name>maxSharedInvalidMessagesArray</name></expr>)</condition><block type="pseudo"><block_content>
+            <expr_stmt><expr><name>maxSharedInvalidMessagesArray</name> <operator>*=</operator> <literal type="number">2</literal></expr>;</expr_stmt></block_content></block></while>
+
+        <expr_stmt><expr><name>SharedInvalidMessagesArray</name> <operator>=</operator> <call><name>repalloc</name><argument_list>(<argument><expr><name>SharedInvalidMessagesArray</name></expr></argument>,
+                                              <argument><expr><name>maxSharedInvalidMessagesArray</name>
+                                              <operator>*</operator> <sizeof>sizeof<argument_list>(<argument><expr><name>SharedInvalidationMessage</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    </block_content>}</block></if></if_stmt>
+
+    <comment type="block">/*
+     * Append the next chunk onto the array
+     */</comment>
+    <expr_stmt><expr><call><name>memcpy</name><argument_list>(<argument><expr><name>SharedInvalidMessagesArray</name> <operator>+</operator> <name>numSharedInvalidMessagesArray</name></expr></argument>,
+           <argument><expr><name>msgs</name></expr></argument>, <argument><expr><name>n</name> <operator>*</operator> <sizeof>sizeof<argument_list>(<argument><expr><name>SharedInvalidationMessage</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><name>numSharedInvalidMessagesArray</name> <operator>+=</operator> <name>n</name></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * xactGetCommittedInvalidationMessages() is executed by
+ * RecordTransactionCommit() to add invalidation messages onto the
+ * commit record. This applies only to commit message types, never to
+ * abort records. Must always run before AtEOXact_Inval(), since that
+ * removes the data we need to see.
+ *
+ * Remember that this runs before we have officially committed, so we
+ * must not do anything here to change what might occur *if* we should
+ * fail between here and the actual commit.
+ *
+ * see also xact_redo_commit() and xact_desc_commit()
+ */</comment>
+<function><type><name>int</name></type>
+<name>xactGetCommittedInvalidationMessages</name><parameter_list>(<parameter><decl><type><name>SharedInvalidationMessage</name> <modifier>*</modifier><modifier>*</modifier></type><name>msgs</name></decl></parameter>,
+                                     <parameter><decl><type><name>bool</name> <modifier>*</modifier></type><name>RelcacheInitFileInval</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <decl_stmt><decl><type><name>MemoryContext</name></type> <name>oldcontext</name></decl>;</decl_stmt>
+
+    <comment type="block">/* Quick exit if we haven't done anything with invalidation messages. */</comment>
+    <if_stmt><if>if <condition>(<expr><name>transInvalInfo</name> <operator>==</operator> <name>NULL</name></expr>)</condition>
+    <block>{<block_content>
+        <expr_stmt><expr><operator>*</operator><name>RelcacheInitFileInval</name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+        <expr_stmt><expr><operator>*</operator><name>msgs</name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+        <return>return <expr><literal type="number">0</literal></expr>;</return>
+    </block_content>}</block></if></if_stmt>
+
+    <comment type="block">/* Must be at top of stack */</comment>
+    <expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>transInvalInfo</name><operator>-&gt;</operator><name>my_level</name></name> <operator>==</operator> <literal type="number">1</literal> <operator>&amp;&amp;</operator> <name><name>transInvalInfo</name><operator>-&gt;</operator><name>parent</name></name> <operator>==</operator> <name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+    <comment type="block">/*
+     * Relcache init file invalidation requires processing both before and
+     * after we send the SI messages.  However, we need not do anything unless
+     * we committed.
+     */</comment>
+    <expr_stmt><expr><operator>*</operator><name>RelcacheInitFileInval</name> <operator>=</operator> <name><name>transInvalInfo</name><operator>-&gt;</operator><name>RelcacheInitFileInval</name></name></expr>;</expr_stmt>
+
+    <comment type="block">/*
+     * Walk through TransInvalidationInfo to collect all the messages into a
+     * single contiguous array of invalidation messages. It must be contiguous
+     * so we can copy directly into WAL message. Maintain the order that they
+     * would be processed in by AtEOXact_Inval(), to ensure emulated behaviour
+     * in redo is as similar as possible to original. We want the same bugs,
+     * if any, not new ones.
+     */</comment>
+    <expr_stmt><expr><name>oldcontext</name> <operator>=</operator> <call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>CurTransactionContext</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+    <expr_stmt><expr><call><name>ProcessInvalidationMessagesMulti</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>transInvalInfo</name><operator>-&gt;</operator><name>CurrentCmdInvalidMsgs</name></name></expr></argument>,
+                                     <argument><expr><name>MakeSharedInvalidMessagesArray</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><call><name>ProcessInvalidationMessagesMulti</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>transInvalInfo</name><operator>-&gt;</operator><name>PriorCmdInvalidMsgs</name></name></expr></argument>,
+                                     <argument><expr><name>MakeSharedInvalidMessagesArray</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>oldcontext</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+    <expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><operator>!</operator><operator>(</operator><name>numSharedInvalidMessagesArray</name> <operator>&gt;</operator> <literal type="number">0</literal> <operator>&amp;&amp;</operator>
+             <name>SharedInvalidMessagesArray</name> <operator>==</operator> <name>NULL</name><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+    <expr_stmt><expr><operator>*</operator><name>msgs</name> <operator>=</operator> <name>SharedInvalidMessagesArray</name></expr>;</expr_stmt>
+
+    <return>return <expr><name>numSharedInvalidMessagesArray</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * ProcessCommittedInvalidationMessages is executed by xact_redo_commit() or
+ * standby_redo() to process invalidation messages. Currently that happens
+ * only at end-of-xact.
+ *
+ * Relcache init file invalidation requires processing both
+ * before and after we send the SI messages. See AtEOXact_Inval()
+ */</comment>
+<function><type><name>void</name></type>
+<name>ProcessCommittedInvalidationMessages</name><parameter_list>(<parameter><decl><type><name>SharedInvalidationMessage</name> <modifier>*</modifier></type><name>msgs</name></decl></parameter>,
+                                     <parameter><decl><type><name>int</name></type> <name>nmsgs</name></decl></parameter>, <parameter><decl><type><name>bool</name></type> <name>RelcacheInitFileInval</name></decl></parameter>,
+                                     <parameter><decl><type><name>Oid</name></type> <name>dbid</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>tsid</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <if_stmt><if>if <condition>(<expr><name>nmsgs</name> <operator>&lt;=</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+        <return>return;</return></block_content></block></if></if_stmt>
+
+    <expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><call><name>trace_recovery</name><argument_list>(<argument><expr><name>DEBUG4</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><literal type="string">"replaying commit with %d messages%s"</literal></expr></argument>, <argument><expr><name>nmsgs</name></expr></argument>,
+         <argument><expr><operator>(</operator><ternary><condition><expr><name>RelcacheInitFileInval</name></expr> ?</condition><then> <expr><literal type="string">" and relcache file invalidation"</literal></expr> </then><else>: <expr><literal type="string">""</literal></expr></else></ternary><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+    <if_stmt><if>if <condition>(<expr><name>RelcacheInitFileInval</name></expr>)</condition>
+    <block>{<block_content>
+        <comment type="block">/*
+         * RelationCacheInitFilePreInvalidate requires DatabasePath to be set,
+         * but we should not use SetDatabasePath during recovery, since it is
+         * intended to be used only once by normal backends.  Hence, a quick
+         * hack: set DatabasePath directly then unset after use.
+         */</comment>
+        <expr_stmt><expr><name>DatabasePath</name> <operator>=</operator> <call><name>GetDatabasePath</name><argument_list>(<argument><expr><name>dbid</name></expr></argument>, <argument><expr><name>tsid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><call><name>trace_recovery</name><argument_list>(<argument><expr><name>DEBUG4</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><literal type="string">"removing relcache init file in \"%s\""</literal></expr></argument>,
+             <argument><expr><name>DatabasePath</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <expr_stmt><expr><call><name>RelationCacheInitFilePreInvalidate</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+        <expr_stmt><expr><call><name>pfree</name><argument_list>(<argument><expr><name>DatabasePath</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <expr_stmt><expr><name>DatabasePath</name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+    </block_content>}</block></if></if_stmt>
+
+    <expr_stmt><expr><call><name>SendSharedInvalidMessages</name><argument_list>(<argument><expr><name>msgs</name></expr></argument>, <argument><expr><name>nmsgs</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+    <if_stmt><if>if <condition>(<expr><name>RelcacheInitFileInval</name></expr>)</condition><block type="pseudo"><block_content>
+        <expr_stmt><expr><call><name>RelationCacheInitFilePostInvalidate</name><argument_list>()</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * AtEOXact_Inval
+ *        Process queued-up invalidation messages at end of main transaction.
+ *
+ * If isCommit, we must send out the messages in our PriorCmdInvalidMsgs list
+ * to the shared invalidation message queue.  Note that these will be read
+ * not only by other backends, but also by our own backend at the next
+ * transaction start (via AcceptInvalidationMessages).  This means that
+ * we can skip immediate local processing of anything that's still in
+ * CurrentCmdInvalidMsgs, and just send that list out too.
+ *
+ * If not isCommit, we are aborting, and must locally process the messages
+ * in PriorCmdInvalidMsgs.  No messages need be sent to other backends,
+ * since they'll not have seen our changed tuples anyway.  We can forget
+ * about CurrentCmdInvalidMsgs too, since those changes haven't touched
+ * the caches yet.
+ *
+ * In any case, reset the various lists to empty.  We need not physically
+ * free memory here, since TopTransactionContext is about to be emptied
+ * anyway.
+ *
+ * Note:
+ *        This should be called as the last step in processing a transaction.
+ */</comment>
+<function><type><name>void</name></type>
+<name>AtEOXact_Inval</name><parameter_list>(<parameter><decl><type><name>bool</name></type> <name>isCommit</name></decl></parameter>)</parameter_list>
+<block>{<block_content><comment type="line">// #lizard forgives</comment>
+    <comment type="block">/* Quick exit if no messages */</comment>
+    <if_stmt><if>if <condition>(<expr><name>transInvalInfo</name> <operator>==</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+        <return>return;</return></block_content></block></if></if_stmt>
+
+    <comment type="block">/* Must be at top of stack */</comment>
+    <expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>transInvalInfo</name><operator>-&gt;</operator><name>my_level</name></name> <operator>==</operator> <literal type="number">1</literal> <operator>&amp;&amp;</operator> <name><name>transInvalInfo</name><operator>-&gt;</operator><name>parent</name></name> <operator>==</operator> <name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>XCP</name></cpp:ifdef>
+    <comment type="block">/*
+     * In our code, the distributed session may run on multiple backends, 
+     * and we need to broadcast invalidation messages so they reach other 
+     * backends even * in case of rollback. If the session runs on single 
+     * backend the invalidation messages may be still applied locally. 
+     * So the criteria may be more complex.
+     */</comment>
+    <if_stmt><if>if <condition>(<expr><name>isCommit</name> <operator>||</operator> <name>IS_PGXC_DATANODE</name></expr>)</condition><block type="pseudo"><block_content>
+<cpp:else>#<cpp:directive>else</cpp:directive></cpp:else>
+    <if_stmt><if>if <condition>(<expr><name>isCommit</name></expr>)</condition>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+    <block>{<block_content>
+        <comment type="block">/*
+         * Relcache init file invalidation requires processing both before and
+         * after we send the SI messages.  However, we need not do anything
+         * unless we committed.
+         */</comment>
+        <if_stmt><if>if <condition>(<expr><name><name>transInvalInfo</name><operator>-&gt;</operator><name>RelcacheInitFileInval</name></name></expr>)</condition><block type="pseudo"><block_content>
+            <expr_stmt><expr><call><name>RelationCacheInitFilePreInvalidate</name><argument_list>()</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+        <expr_stmt><expr><call><name>AppendInvalidationMessages</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>transInvalInfo</name><operator>-&gt;</operator><name>PriorCmdInvalidMsgs</name></name></expr></argument>,
+                                   <argument><expr><operator>&amp;</operator><name><name>transInvalInfo</name><operator>-&gt;</operator><name>CurrentCmdInvalidMsgs</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+        <expr_stmt><expr><call><name>ProcessInvalidationMessagesMulti</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>transInvalInfo</name><operator>-&gt;</operator><name>PriorCmdInvalidMsgs</name></name></expr></argument>,
+                                         <argument><expr><name>SendSharedInvalidMessages</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+        <if_stmt><if>if <condition>(<expr><name><name>transInvalInfo</name><operator>-&gt;</operator><name>RelcacheInitFileInval</name></name></expr>)</condition><block type="pseudo"><block_content>
+            <expr_stmt><expr><call><name>RelationCacheInitFilePostInvalidate</name><argument_list>()</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+    </block_content>}</block></if>
+    <else>else
+    <block>{<block_content>
+        <expr_stmt><expr><call><name>ProcessInvalidationMessages</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>transInvalInfo</name><operator>-&gt;</operator><name>PriorCmdInvalidMsgs</name></name></expr></argument>,
+                                    <argument><expr><name>LocalExecuteInvalidationMessage</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    </block_content>}</block></else></if_stmt></block_content></block></if></if_stmt>
+
+    <comment type="block">/* Need not free anything explicitly */</comment>
+    <expr_stmt><expr><name>transInvalInfo</name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+    <expr_stmt><expr><name>SharedInvalidMessagesArray</name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+    <expr_stmt><expr><name>numSharedInvalidMessagesArray</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * AtEOSubXact_Inval
+ *        Process queued-up invalidation messages at end of subtransaction.
+ *
+ * If isCommit, process CurrentCmdInvalidMsgs if any (there probably aren't),
+ * and then attach both CurrentCmdInvalidMsgs and PriorCmdInvalidMsgs to the
+ * parent's PriorCmdInvalidMsgs list.
+ *
+ * If not isCommit, we are aborting, and must locally process the messages
+ * in PriorCmdInvalidMsgs.  No messages need be sent to other backends.
+ * We can forget about CurrentCmdInvalidMsgs too, since those changes haven't
+ * touched the caches yet.
+ *
+ * In any case, pop the transaction stack.  We need not physically free memory
+ * here, since CurTransactionContext is about to be emptied anyway
+ * (if aborting).  Beware of the possibility of aborting the same nesting
+ * level twice, though.
+ */</comment>
+<function><type><name>void</name></type>
+<name>AtEOSubXact_Inval</name><parameter_list>(<parameter><decl><type><name>bool</name></type> <name>isCommit</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <decl_stmt><decl><type><name>int</name></type>            <name>my_level</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>TransInvalidationInfo</name> <modifier>*</modifier></type><name>myInfo</name> <init>= <expr><name>transInvalInfo</name></expr></init></decl>;</decl_stmt>
+
+    <comment type="block">/* Quick exit if no messages. */</comment>
+    <if_stmt><if>if <condition>(<expr><name>myInfo</name> <operator>==</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+        <return>return;</return></block_content></block></if></if_stmt>
+
+    <comment type="block">/* Also bail out quickly if messages are not for this level. */</comment>
+    <expr_stmt><expr><name>my_level</name> <operator>=</operator> <call><name>GetCurrentTransactionNestLevel</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+    <if_stmt><if>if <condition>(<expr><name><name>myInfo</name><operator>-&gt;</operator><name>my_level</name></name> <operator>!=</operator> <name>my_level</name></expr>)</condition>
+    <block>{<block_content>
+        <expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>myInfo</name><operator>-&gt;</operator><name>my_level</name></name> <operator>&lt;</operator> <name>my_level</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <return>return;</return>
+    </block_content>}</block></if></if_stmt>
+
+    <if_stmt><if>if <condition>(<expr><name>isCommit</name></expr>)</condition>
+    <block>{<block_content>
+        <comment type="block">/* If CurrentCmdInvalidMsgs still has anything, fix it */</comment>
+        <expr_stmt><expr><call><name>CommandEndInvalidationMessages</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+        <comment type="block">/*
+         * We create invalidation stack entries lazily, so the parent might
+         * not have one.  Instead of creating one, moving all the data over,
+         * and then freeing our own, we can just adjust the level of our own
+         * entry.
+         */</comment>
+        <if_stmt><if>if <condition>(<expr><name><name>myInfo</name><operator>-&gt;</operator><name>parent</name></name> <operator>==</operator> <name>NULL</name> <operator>||</operator> <name><name>myInfo</name><operator>-&gt;</operator><name>parent</name><operator>-&gt;</operator><name>my_level</name></name> <operator>&lt;</operator> <name>my_level</name> <operator>-</operator> <literal type="number">1</literal></expr>)</condition>
+        <block>{<block_content>
+            <expr_stmt><expr><name><name>myInfo</name><operator>-&gt;</operator><name>my_level</name></name><operator>--</operator></expr>;</expr_stmt>
+            <return>return;</return>
+        </block_content>}</block></if></if_stmt>
+
+        <comment type="block">/* Pass up my inval messages to parent */</comment>
+        <expr_stmt><expr><call><name>AppendInvalidationMessages</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>myInfo</name><operator>-&gt;</operator><name>parent</name><operator>-&gt;</operator><name>PriorCmdInvalidMsgs</name></name></expr></argument>,
+                                   <argument><expr><operator>&amp;</operator><name><name>myInfo</name><operator>-&gt;</operator><name>PriorCmdInvalidMsgs</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+        <comment type="block">/* Pending relcache inval becomes parent's problem too */</comment>
+        <if_stmt><if>if <condition>(<expr><name><name>myInfo</name><operator>-&gt;</operator><name>RelcacheInitFileInval</name></name></expr>)</condition><block type="pseudo"><block_content>
+            <expr_stmt><expr><name><name>myInfo</name><operator>-&gt;</operator><name>parent</name><operator>-&gt;</operator><name>RelcacheInitFileInval</name></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+        <comment type="block">/* Pop the transaction state stack */</comment>
+        <expr_stmt><expr><name>transInvalInfo</name> <operator>=</operator> <name><name>myInfo</name><operator>-&gt;</operator><name>parent</name></name></expr>;</expr_stmt>
+
+        <comment type="block">/* Need not free anything else explicitly */</comment>
+        <expr_stmt><expr><call><name>pfree</name><argument_list>(<argument><expr><name>myInfo</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    </block_content>}</block></if>
+    <else>else
+    <block>{<block_content>
+        <expr_stmt><expr><call><name>ProcessInvalidationMessages</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>myInfo</name><operator>-&gt;</operator><name>PriorCmdInvalidMsgs</name></name></expr></argument>,
+                                    <argument><expr><name>LocalExecuteInvalidationMessage</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+        <comment type="block">/* Pop the transaction state stack */</comment>
+        <expr_stmt><expr><name>transInvalInfo</name> <operator>=</operator> <name><name>myInfo</name><operator>-&gt;</operator><name>parent</name></name></expr>;</expr_stmt>
+
+        <comment type="block">/* Need not free anything else explicitly */</comment>
+        <expr_stmt><expr><call><name>pfree</name><argument_list>(<argument><expr><name>myInfo</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    </block_content>}</block></else></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * CommandEndInvalidationMessages
+ *        Process queued-up invalidation messages at end of one command
+ *        in a transaction.
+ *
+ * Here, we send no messages to the shared queue, since we don't know yet if
+ * we will commit.  We do need to locally process the CurrentCmdInvalidMsgs
+ * list, so as to flush our caches of any entries we have outdated in the
+ * current command.  We then move the current-cmd list over to become part
+ * of the prior-cmds list.
+ *
+ * Note:
+ *        This should be called during CommandCounterIncrement(),
+ *        after we have advanced the command ID.
+ */</comment>
+<function><type><name>void</name></type>
+<name>CommandEndInvalidationMessages</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <comment type="block">/*
+     * You might think this shouldn't be called outside any transaction, but
+     * bootstrap does it, and also ABORT issued when not in a transaction. So
+     * just quietly return if no state to work on.
+     */</comment>
+    <if_stmt><if>if <condition>(<expr><name>transInvalInfo</name> <operator>==</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+        <return>return;</return></block_content></block></if></if_stmt>
+
+    <expr_stmt><expr><call><name>ProcessInvalidationMessages</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>transInvalInfo</name><operator>-&gt;</operator><name>CurrentCmdInvalidMsgs</name></name></expr></argument>,
+                                <argument><expr><name>LocalExecuteInvalidationMessage</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+    <comment type="block">/*
+     * In Postgres-XL, multiple backends can work for a distributed
+     * transaction. When catalog changes are made by one backend, the other
+     * backend participating in the distributed transaction must also see the
+     * changes immediately. So send the messages using shared invalidation
+     *
+     * XXX We could investigate if this can cause performance problems and
+     * check if the messages can be sent only to participating backends
+     */</comment>
+    <if_stmt><if>if <condition>(<expr><name>IS_PGXC_DATANODE</name></expr>)</condition><block type="pseudo"><block_content>
+        <expr_stmt><expr><call><name>ProcessInvalidationMessagesMulti</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>transInvalInfo</name><operator>-&gt;</operator><name>CurrentCmdInvalidMsgs</name></name></expr></argument>,
+            <argument><expr><name>SendSharedInvalidMessages</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+    <expr_stmt><expr><call><name>AppendInvalidationMessages</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>transInvalInfo</name><operator>-&gt;</operator><name>PriorCmdInvalidMsgs</name></name></expr></argument>,
+                               <argument><expr><operator>&amp;</operator><name><name>transInvalInfo</name><operator>-&gt;</operator><name>CurrentCmdInvalidMsgs</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * CacheInvalidateHeapTuple
+ *        Register the given tuple for invalidation at end of command
+ *        (ie, current command is creating or outdating this tuple).
+ *        Also, detect whether a relcache invalidation is implied.
+ *
+ * For an insert or delete, tuple is the target tuple and newtuple is NULL.
+ * For an update, we are called just once, with tuple being the old tuple
+ * version and newtuple the new version.  This allows avoidance of duplicate
+ * effort during an update.
+ */</comment>
+<function><type><name>void</name></type>
+<name>CacheInvalidateHeapTuple</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>relation</name></decl></parameter>,
+                         <parameter><decl><type><name>HeapTuple</name></type> <name>tuple</name></decl></parameter>,
+                         <parameter><decl><type><name>HeapTuple</name></type> <name>newtuple</name></decl></parameter>)</parameter_list>
+<block>{<block_content><comment type="line">// #lizard forgives</comment>
+    <decl_stmt><decl><type><name>Oid</name></type>            <name>tupleRelId</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>Oid</name></type>            <name>databaseId</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>Oid</name></type>            <name>relationId</name></decl>;</decl_stmt>
+
+    <comment type="block">/* Do nothing during bootstrap */</comment>
+    <if_stmt><if>if <condition>(<expr><call><name>IsBootstrapProcessingMode</name><argument_list>()</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+        <return>return;</return></block_content></block></if></if_stmt>
+
+    <comment type="block">/*
+     * We only need to worry about invalidation for tuples that are in system
+     * catalogs; user-relation tuples are never in catcaches and can't affect
+     * the relcache either.
+     */</comment>
+    <if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>IsCatalogRelation</name><argument_list>(<argument><expr><name>relation</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+        <return>return;</return></block_content></block></if></if_stmt>
+
+    <comment type="block">/*
+     * IsCatalogRelation() will return true for TOAST tables of system
+     * catalogs, but we don't care about those, either.
+     */</comment>
+    <if_stmt><if>if <condition>(<expr><call><name>IsToastRelation</name><argument_list>(<argument><expr><name>relation</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+        <return>return;</return></block_content></block></if></if_stmt>
+
+    <comment type="block">/*
+     * If we're not prepared to queue invalidation messages for this
+     * subtransaction level, get ready now.
+     */</comment>
+    <expr_stmt><expr><call><name>PrepareInvalidationState</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+    <comment type="block">/*
+     * First let the catcache do its thing
+     */</comment>
+    <expr_stmt><expr><name>tupleRelId</name> <operator>=</operator> <call><name>RelationGetRelid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <if_stmt><if>if <condition>(<expr><call><name>RelationInvalidatesSnapshotsOnly</name><argument_list>(<argument><expr><name>tupleRelId</name></expr></argument>)</argument_list></call></expr>)</condition>
+    <block>{<block_content>
+        <expr_stmt><expr><name>databaseId</name> <operator>=</operator> <ternary><condition><expr><call><name>IsSharedRelation</name><argument_list>(<argument><expr><name>tupleRelId</name></expr></argument>)</argument_list></call></expr> ?</condition><then> <expr><name>InvalidOid</name></expr> </then><else>: <expr><name>MyDatabaseId</name></expr></else></ternary></expr>;</expr_stmt>
+        <expr_stmt><expr><call><name>RegisterSnapshotInvalidation</name><argument_list>(<argument><expr><name>databaseId</name></expr></argument>, <argument><expr><name>tupleRelId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    </block_content>}</block></if>
+    <else>else<block type="pseudo"><block_content>
+        <expr_stmt><expr><call><name>PrepareToInvalidateCacheTuple</name><argument_list>(<argument><expr><name>relation</name></expr></argument>, <argument><expr><name>tuple</name></expr></argument>, <argument><expr><name>newtuple</name></expr></argument>,
+                                      <argument><expr><name>RegisterCatcacheInvalidation</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></else></if_stmt>
+
+    <comment type="block">/*
+     * Now, is this tuple one of the primary definers of a relcache entry? See
+     * comments in file header for deeper explanation.
+     *
+     * Note we ignore newtuple here; we assume an update cannot move a tuple
+     * from being part of one relcache entry to being part of another.
+     */</comment>
+    <if_stmt><if>if <condition>(<expr><name>tupleRelId</name> <operator>==</operator> <name>RelationRelationId</name></expr>)</condition>
+    <block>{<block_content>
+        <decl_stmt><decl><type><name>Form_pg_class</name></type> <name>classtup</name> <init>= <expr><operator>(</operator><name>Form_pg_class</name><operator>)</operator> <call><name>GETSTRUCT</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+        <expr_stmt><expr><name>relationId</name> <operator>=</operator> <call><name>HeapTupleGetOid</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <if_stmt><if>if <condition>(<expr><name><name>classtup</name><operator>-&gt;</operator><name>relisshared</name></name></expr>)</condition><block type="pseudo"><block_content>
+            <expr_stmt><expr><name>databaseId</name> <operator>=</operator> <name>InvalidOid</name></expr>;</expr_stmt></block_content></block></if>
+        <else>else<block type="pseudo"><block_content>
+            <expr_stmt><expr><name>databaseId</name> <operator>=</operator> <name>MyDatabaseId</name></expr>;</expr_stmt></block_content></block></else></if_stmt>
+
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>_MLS_</name></cpp:ifdef>
+        <if_stmt><if>if <condition>(<expr><name>newtuple</name></expr>)</condition>
+        <block>{<block_content>
+            <comment type="block">/* 
+             * if rnode of relation changed, such as truncate, update relcrypt shmem hash at the same time 
+             */</comment>
+            <expr_stmt><expr><call><name>rel_crypt_relation_check_policy</name><argument_list>(<argument><expr><call><name>HeapTupleGetOid</name><argument_list>(<argument><expr><name>newtuple</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+            <comment type="block">/*
+             * BUT, 'alter table XX set tablespace YY', it updates itself, so we need get the rnode manually. 
+             */</comment>
+            <expr_stmt><expr><call><name>rel_crypt_relat_chk_plcy_wth_rnode</name><argument_list>(<argument><expr><name>newtuple</name></expr></argument>, <argument><expr><name>databaseId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        </block_content>}</block></if>
+        <else>else
+        <block>{<block_content>
+            <comment type="block">/* 
+             * if new interval part being added, we check rnode immediately. 
+             * though those relation would be opened later, and being inserted into shmem at the same time, 
+             * while, we try to this right now and believe its cost is less.
+             * 
+             * simple to say, we bet pg_class being modified much less than access normal tables,
+             * and we can ignore the lag time durning DDL.
+             * 
+             * in detail reason, dozen of backends when first access new added tables, 
+             * they would try to get the exclusive relcrypt shmem hash lock, 
+             * so they maybe staying in line, this is too bad.
+             */</comment>
+            <expr_stmt><expr><call><name>rel_crypt_relation_check_policy</name><argument_list>(<argument><expr><call><name>HeapTupleGetOid</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        </block_content>}</block></else></if_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+    </block_content>}</block></if>
+    <if type="elseif">else if <condition>(<expr><name>tupleRelId</name> <operator>==</operator> <name>AttributeRelationId</name></expr>)</condition>
+    <block>{<block_content>
+        <decl_stmt><decl><type><name>Form_pg_attribute</name></type> <name>atttup</name> <init>= <expr><operator>(</operator><name>Form_pg_attribute</name><operator>)</operator> <call><name>GETSTRUCT</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+        <expr_stmt><expr><name>relationId</name> <operator>=</operator> <name><name>atttup</name><operator>-&gt;</operator><name>attrelid</name></name></expr>;</expr_stmt>
+
+        <comment type="block">/*
+         * KLUGE ALERT: we always send the relcache event with MyDatabaseId,
+         * even if the rel in question is shared (which we can't easily tell).
+         * This essentially means that only backends in this same database
+         * will react to the relcache flush request.  This is in fact
+         * appropriate, since only those backends could see our pg_attribute
+         * change anyway.  It looks a bit ugly though.  (In practice, shared
+         * relations can't have schema changes after bootstrap, so we should
+         * never come here for a shared rel anyway.)
+         */</comment>
+        <expr_stmt><expr><name>databaseId</name> <operator>=</operator> <name>MyDatabaseId</name></expr>;</expr_stmt>
+    </block_content>}</block></if>
+    <if type="elseif">else if <condition>(<expr><name>tupleRelId</name> <operator>==</operator> <name>IndexRelationId</name></expr>)</condition>
+    <block>{<block_content>
+        <decl_stmt><decl><type><name>Form_pg_index</name></type> <name>indextup</name> <init>= <expr><operator>(</operator><name>Form_pg_index</name><operator>)</operator> <call><name>GETSTRUCT</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+        <comment type="block">/*
+         * When a pg_index row is updated, we should send out a relcache inval
+         * for the index relation.  As above, we don't know the shared status
+         * of the index, but in practice it doesn't matter since indexes of
+         * shared catalogs can't have such updates.
+         */</comment>
+        <expr_stmt><expr><name>relationId</name> <operator>=</operator> <name><name>indextup</name><operator>-&gt;</operator><name>indexrelid</name></name></expr>;</expr_stmt>
+        <expr_stmt><expr><name>databaseId</name> <operator>=</operator> <name>MyDatabaseId</name></expr>;</expr_stmt>
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>_MLS_</name></cpp:ifdef>
+        <comment type="block">/*
+         * index maybe created after crypt policy bound on relations,
+         * so, if new index was creating, we should check if table having crypt policy.
+         */</comment>
+        <expr_stmt><expr><call><name>rel_crypt_relation_check_policy</name><argument_list>(<argument><expr><name><name>indextup</name><operator>-&gt;</operator><name>indrelid</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+    </block_content>}</block></if>
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>XCP</name></cpp:ifdef>
+    <if type="elseif">else if <condition>(<expr><name>tupleRelId</name> <operator>==</operator> <name>PgxcClassRelationId</name></expr>)</condition>
+    <block>{<block_content>
+        <decl_stmt><decl><type><name>Form_pgxc_class</name></type> <name>pgxcclasstup</name> <init>= <expr><operator>(</operator><name>Form_pgxc_class</name><operator>)</operator> <call><name>GETSTRUCT</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+        <comment type="block">/*
+         * When distribution key or strategy for a relation is changed, we must
+         * also send out a relcache inval for the relation.
+         */</comment>
+        <expr_stmt><expr><name>relationId</name> <operator>=</operator> <name><name>pgxcclasstup</name><operator>-&gt;</operator><name>pcrelid</name></name></expr>;</expr_stmt>
+        <expr_stmt><expr><name>databaseId</name> <operator>=</operator> <name>MyDatabaseId</name></expr>;</expr_stmt>
+    </block_content>}</block></if>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>_MLS_</name></cpp:ifdef>
+    <if type="elseif">else if<condition>(<expr><name>DataMaskMapRelationId</name> <operator>==</operator> <name>tupleRelId</name></expr>)</condition>
+    <block>{<block_content>
+        <decl_stmt><decl><type><name>Form_pg_data_mask_map</name></type> <name>data_mask_tup</name> <init>= <expr><operator>(</operator><name>Form_pg_data_mask_map</name><operator>)</operator> <call><name>GETSTRUCT</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+        <expr_stmt><expr><name>databaseId</name> <operator>=</operator> <name>MyDatabaseId</name></expr>;</expr_stmt>
+        <expr_stmt><expr><call><name>CacheInvalidateRelcacheAllPatition</name><argument_list>(<argument><expr><name>databaseId</name></expr></argument>, <argument><expr><name><name>data_mask_tup</name><operator>-&gt;</operator><name>relid</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        
+        <expr_stmt><expr><name>relationId</name> <operator>=</operator> <name><name>data_mask_tup</name><operator>-&gt;</operator><name>relid</name></name></expr>;</expr_stmt>
+    </block_content>}</block></if>
+    <if type="elseif">else if <condition>(<expr><name>TransparentCryptPolicyAlgorithmId</name> <operator>==</operator> <name>tupleRelId</name></expr>)</condition>
+    <block>{<block_content>
+        <comment type="block">/* add new crypt key into shmem hash */</comment>
+        <expr_stmt><expr><call><name>crypt_key_info_load_by_tuple</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>, <argument><expr><name><name>relation</name><operator>-&gt;</operator><name>rd_att</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <return>return;</return>
+    </block_content>}</block></if>
+    <if type="elseif">else if <condition>(<expr><name>TransparentCryptPolicyMapRelationId</name> <operator>==</operator> <name>tupleRelId</name></expr>)</condition>
+    <block>{<block_content>
+        <decl_stmt><decl><type><name>Form_pg_transparent_crypt_policy_map</name></type> <name>form_trans_crypt</name> <init>= <expr><operator>(</operator><name>Form_pg_transparent_crypt_policy_map</name><operator>)</operator> <call><name>GETSTRUCT</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+        <comment type="block">/* this should be checking in procedure API, while we need to check it again */</comment>
+        <if_stmt><if>if <condition>(<expr><call><name>IS_SYSTEM_REL</name><argument_list>(<argument><expr><name><name>form_trans_crypt</name><operator>-&gt;</operator><name>relid</name></name></expr></argument>)</argument_list></call></expr>)</condition>
+        <block>{<block_content>
+            <expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"system tables can not bind crypt policy"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        </block_content>}</block></if></if_stmt>
+
+        <expr_stmt><expr><name>databaseId</name> <operator>=</operator> <name>MyDatabaseId</name></expr>;</expr_stmt>
+
+        <comment type="block">/* distinguish column crypt and relfile crypt */</comment>
+        <if_stmt><if>if <condition>(<expr><name>REL_FILE_CRYPT_ATTR_NUM</name> <operator>==</operator> <name><name>form_trans_crypt</name><operator>-&gt;</operator><name>attnum</name></name></expr>)</condition>
+        <block>{<block_content>
+            <comment type="block">/* 
+             * add new rel crypt and its children into shmem hash, 
+             * no wait relcrypt of them being reopened(smgr).
+             */</comment>
+            <expr_stmt><expr><call><name>rel_crypt_create_direct</name><argument_list>(<argument><expr><name><name>form_trans_crypt</name><operator>-&gt;</operator><name>relid</name></name></expr></argument>, <argument><expr><name><name>form_trans_crypt</name><operator>-&gt;</operator><name>algorithm_id</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        </block_content>}</block></if></if_stmt>
+
+        <comment type="block">/* send si for all partitions if exist */</comment>
+        <expr_stmt><expr><call><name>CacheInvalidateRelcacheAllPatition</name><argument_list>(<argument><expr><name>databaseId</name></expr></argument>, <argument><expr><name><name>form_trans_crypt</name><operator>-&gt;</operator><name>relid</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+        <comment type="block">/* send si for this 'parent' relation */</comment>
+        <expr_stmt><expr><name>relationId</name> <operator>=</operator> <name><name>form_trans_crypt</name><operator>-&gt;</operator><name>relid</name></name></expr>;</expr_stmt>
+    </block_content>}</block></if>
+    <if type="elseif">else if<condition>(<expr><name>ClsTableRelationId</name> <operator>==</operator> <name>tupleRelId</name></expr>)</condition>
+    <block>{<block_content>
+        <decl_stmt><decl><type><name>Form_pg_cls_table</name></type> <name>cls_table_tup</name> <init>= <expr><operator>(</operator><name>Form_pg_cls_table</name><operator>)</operator> <call><name>GETSTRUCT</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+        <expr_stmt><expr><name>databaseId</name> <operator>=</operator> <name>MyDatabaseId</name></expr>;</expr_stmt>
+        <expr_stmt><expr><call><name>CacheInvalidateRelcacheAllPatition</name><argument_list>(<argument><expr><name>databaseId</name></expr></argument>, <argument><expr><name><name>cls_table_tup</name><operator>-&gt;</operator><name>relid</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        
+        <expr_stmt><expr><name>relationId</name> <operator>=</operator> <name><name>cls_table_tup</name><operator>-&gt;</operator><name>relid</name></name></expr>;</expr_stmt>
+    </block_content>}</block></if>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>__TBASE__</name></cpp:ifdef>
+    <if type="elseif">else if <condition>(<expr><name>tupleRelId</name> <operator>==</operator> <name>PgPartitionIntervalRelationId</name></expr>)</condition>
+    <block>{<block_content>
+        <decl_stmt><decl><type><name>Form_pg_partition_interval</name></type> <name>part_tup</name> <init>= <expr><operator>(</operator><name>Form_pg_partition_interval</name><operator>)</operator> <call><name>GETSTRUCT</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+        <expr_stmt><expr><name>relationId</name> <operator>=</operator> <name><name>part_tup</name><operator>-&gt;</operator><name>partrelid</name></name></expr>;</expr_stmt>
+        
+        <expr_stmt><expr><name>databaseId</name> <operator>=</operator> <name>MyDatabaseId</name></expr>;</expr_stmt>
+    </block_content>}</block></if>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+    <else>else<block type="pseudo"><block_content>
+        <return>return;</return></block_content></block></else></if_stmt>
+
+    <comment type="block">/*
+     * Yes.  We need to register a relcache invalidation event.
+     */</comment>
+    <expr_stmt><expr><call><name>RegisterRelcacheInvalidation</name><argument_list>(<argument><expr><name>databaseId</name></expr></argument>, <argument><expr><name>relationId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * CacheInvalidateCatalog
+ *        Register invalidation of the whole content of a system catalog.
+ *
+ * This is normally used in VACUUM FULL/CLUSTER, where we haven't so much
+ * changed any tuples as moved them around.  Some uses of catcache entries
+ * expect their TIDs to be correct, so we have to blow away the entries.
+ *
+ * Note: we expect caller to verify that the rel actually is a system
+ * catalog.  If it isn't, no great harm is done, just a wasted sinval message.
+ */</comment>
+<function><type><name>void</name></type>
+<name>CacheInvalidateCatalog</name><parameter_list>(<parameter><decl><type><name>Oid</name></type> <name>catalogId</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <decl_stmt><decl><type><name>Oid</name></type>            <name>databaseId</name></decl>;</decl_stmt>
+
+    <expr_stmt><expr><call><name>PrepareInvalidationState</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+    <if_stmt><if>if <condition>(<expr><call><name>IsSharedRelation</name><argument_list>(<argument><expr><name>catalogId</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+        <expr_stmt><expr><name>databaseId</name> <operator>=</operator> <name>InvalidOid</name></expr>;</expr_stmt></block_content></block></if>
+    <else>else<block type="pseudo"><block_content>
+        <expr_stmt><expr><name>databaseId</name> <operator>=</operator> <name>MyDatabaseId</name></expr>;</expr_stmt></block_content></block></else></if_stmt>
+
+    <expr_stmt><expr><call><name>RegisterCatalogInvalidation</name><argument_list>(<argument><expr><name>databaseId</name></expr></argument>, <argument><expr><name>catalogId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * CacheInvalidateRelcache
+ *        Register invalidation of the specified relation's relcache entry
+ *        at end of command.
+ *
+ * This is used in places that need to force relcache rebuild but aren't
+ * changing any of the tuples recognized as contributors to the relcache
+ * entry by CacheInvalidateHeapTuple.  (An example is dropping an index.)
+ */</comment>
+<function><type><name>void</name></type>
+<name>CacheInvalidateRelcache</name><parameter_list>(<parameter><decl><type><name>Relation</name></type> <name>relation</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <decl_stmt><decl><type><name>Oid</name></type>            <name>databaseId</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>Oid</name></type>            <name>relationId</name></decl>;</decl_stmt>
+
+    <expr_stmt><expr><call><name>PrepareInvalidationState</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+    <expr_stmt><expr><name>relationId</name> <operator>=</operator> <call><name>RelationGetRelid</name><argument_list>(<argument><expr><name>relation</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <if_stmt><if>if <condition>(<expr><name><name>relation</name><operator>-&gt;</operator><name>rd_rel</name><operator>-&gt;</operator><name>relisshared</name></name></expr>)</condition><block type="pseudo"><block_content>
+        <expr_stmt><expr><name>databaseId</name> <operator>=</operator> <name>InvalidOid</name></expr>;</expr_stmt></block_content></block></if>
+    <else>else<block type="pseudo"><block_content>
+        <expr_stmt><expr><name>databaseId</name> <operator>=</operator> <name>MyDatabaseId</name></expr>;</expr_stmt></block_content></block></else></if_stmt>
+
+    <expr_stmt><expr><call><name>RegisterRelcacheInvalidation</name><argument_list>(<argument><expr><name>databaseId</name></expr></argument>, <argument><expr><name>relationId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * CacheInvalidateRelcacheAll
+ *        Register invalidation of the whole relcache at the end of command.
+ *
+ * This is used by alter publication as changes in publications may affect
+ * large number of tables.
+ */</comment>
+<function><type><name>void</name></type>
+<name>CacheInvalidateRelcacheAll</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <expr_stmt><expr><call><name>PrepareInvalidationState</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+    <expr_stmt><expr><call><name>RegisterRelcacheInvalidation</name><argument_list>(<argument><expr><name>InvalidOid</name></expr></argument>, <argument><expr><name>InvalidOid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * CacheInvalidateRelcacheByTuple
+ *        As above, but relation is identified by passing its pg_class tuple.
+ */</comment>
+<function><type><name>void</name></type>
+<name>CacheInvalidateRelcacheByTuple</name><parameter_list>(<parameter><decl><type><name>HeapTuple</name></type> <name>classTuple</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <decl_stmt><decl><type><name>Form_pg_class</name></type> <name>classtup</name> <init>= <expr><operator>(</operator><name>Form_pg_class</name><operator>)</operator> <call><name>GETSTRUCT</name><argument_list>(<argument><expr><name>classTuple</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>Oid</name></type>            <name>databaseId</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>Oid</name></type>            <name>relationId</name></decl>;</decl_stmt>
+
+    <expr_stmt><expr><call><name>PrepareInvalidationState</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+    <expr_stmt><expr><name>relationId</name> <operator>=</operator> <call><name>HeapTupleGetOid</name><argument_list>(<argument><expr><name>classTuple</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <if_stmt><if>if <condition>(<expr><name><name>classtup</name><operator>-&gt;</operator><name>relisshared</name></name></expr>)</condition><block type="pseudo"><block_content>
+        <expr_stmt><expr><name>databaseId</name> <operator>=</operator> <name>InvalidOid</name></expr>;</expr_stmt></block_content></block></if>
+    <else>else<block type="pseudo"><block_content>
+        <expr_stmt><expr><name>databaseId</name> <operator>=</operator> <name>MyDatabaseId</name></expr>;</expr_stmt></block_content></block></else></if_stmt>
+    <expr_stmt><expr><call><name>RegisterRelcacheInvalidation</name><argument_list>(<argument><expr><name>databaseId</name></expr></argument>, <argument><expr><name>relationId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * CacheInvalidateRelcacheByRelid
+ *        As above, but relation is identified by passing its OID.
+ *        This is the least efficient of the three options; use one of
+ *        the above routines if you have a Relation or pg_class tuple.
+ */</comment>
+<function><type><name>void</name></type>
+<name>CacheInvalidateRelcacheByRelid</name><parameter_list>(<parameter><decl><type><name>Oid</name></type> <name>relid</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <decl_stmt><decl><type><name>HeapTuple</name></type>    <name>tup</name></decl>;</decl_stmt>
+
+    <expr_stmt><expr><call><name>PrepareInvalidationState</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+    <expr_stmt><expr><name>tup</name> <operator>=</operator> <call><name>SearchSysCache1</name><argument_list>(<argument><expr><name>RELOID</name></expr></argument>, <argument><expr><call><name>ObjectIdGetDatum</name><argument_list>(<argument><expr><name>relid</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>HeapTupleIsValid</name><argument_list>(<argument><expr><name>tup</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+        <expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"cache lookup failed for relation %u"</literal></expr></argument>, <argument><expr><name>relid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+    <expr_stmt><expr><call><name>CacheInvalidateRelcacheByTuple</name><argument_list>(<argument><expr><name>tup</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><call><name>ReleaseSysCache</name><argument_list>(<argument><expr><name>tup</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * CacheInvalidateSmgr
+ *        Register invalidation of smgr references to a physical relation.
+ *
+ * Sending this type of invalidation msg forces other backends to close open
+ * smgr entries for the rel.  This should be done to flush dangling open-file
+ * references when the physical rel is being dropped or truncated.  Because
+ * these are nontransactional (i.e., not-rollback-able) operations, we just
+ * send the inval message immediately without any queuing.
+ *
+ * Note: in most cases there will have been a relcache flush issued against
+ * the rel at the logical level.  We need a separate smgr-level flush because
+ * it is possible for backends to have open smgr entries for rels they don't
+ * have a relcache entry for, e.g. because the only thing they ever did with
+ * the rel is write out dirty shared buffers.
+ *
+ * Note: because these messages are nontransactional, they won't be captured
+ * in commit/abort WAL entries.  Instead, calls to CacheInvalidateSmgr()
+ * should happen in low-level smgr.c routines, which are executed while
+ * replaying WAL as well as when creating it.
+ *
+ * Note: In order to avoid bloating SharedInvalidationMessage, we store only
+ * three bytes of the backend ID using what would otherwise be padding space.
+ * Thus, the maximum possible backend ID is 2^23-1.
+ */</comment>
+<function><type><name>void</name></type>
+<name>CacheInvalidateSmgr</name><parameter_list>(<parameter><decl><type><name>RelFileNodeBackend</name></type> <name>rnode</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <decl_stmt><decl><type><name>SharedInvalidationMessage</name></type> <name>msg</name></decl>;</decl_stmt>
+
+    <expr_stmt><expr><name><name>msg</name><operator>.</operator><name>sm</name><operator>.</operator><name>id</name></name> <operator>=</operator> <name>SHAREDINVALSMGR_ID</name></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>msg</name><operator>.</operator><name>sm</name><operator>.</operator><name>backend_hi</name></name> <operator>=</operator> <name><name>rnode</name><operator>.</operator><name>backend</name></name> <operator>&gt;&gt;</operator> <literal type="number">16</literal></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>msg</name><operator>.</operator><name>sm</name><operator>.</operator><name>backend_lo</name></name> <operator>=</operator> <name><name>rnode</name><operator>.</operator><name>backend</name></name> <operator>&amp;</operator> <literal type="number">0xffff</literal></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>msg</name><operator>.</operator><name>sm</name><operator>.</operator><name>rnode</name></name> <operator>=</operator> <name><name>rnode</name><operator>.</operator><name>node</name></name></expr>;</expr_stmt>
+    <comment type="block">/* check AddCatcacheInvalidationMessage() for an explanation */</comment>
+    <expr_stmt><expr><call><name>VALGRIND_MAKE_MEM_DEFINED</name><argument_list>(<argument><expr><operator>&amp;</operator><name>msg</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>msg</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+    <expr_stmt><expr><call><name>SendSharedInvalidMessages</name><argument_list>(<argument><expr><operator>&amp;</operator><name>msg</name></expr></argument>, <argument><expr><literal type="number">1</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * CacheInvalidateRelmap
+ *        Register invalidation of the relation mapping for a database,
+ *        or for the shared catalogs if databaseId is zero.
+ *
+ * Sending this type of invalidation msg forces other backends to re-read
+ * the indicated relation mapping file.  It is also necessary to send a
+ * relcache inval for the specific relations whose mapping has been altered,
+ * else the relcache won't get updated with the new filenode data.
+ *
+ * Note: because these messages are nontransactional, they won't be captured
+ * in commit/abort WAL entries.  Instead, calls to CacheInvalidateRelmap()
+ * should happen in low-level relmapper.c routines, which are executed while
+ * replaying WAL as well as when creating it.
+ */</comment>
+<function><type><name>void</name></type>
+<name>CacheInvalidateRelmap</name><parameter_list>(<parameter><decl><type><name>Oid</name></type> <name>databaseId</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <decl_stmt><decl><type><name>SharedInvalidationMessage</name></type> <name>msg</name></decl>;</decl_stmt>
+
+    <expr_stmt><expr><name><name>msg</name><operator>.</operator><name>rm</name><operator>.</operator><name>id</name></name> <operator>=</operator> <name>SHAREDINVALRELMAP_ID</name></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>msg</name><operator>.</operator><name>rm</name><operator>.</operator><name>dbId</name></name> <operator>=</operator> <name>databaseId</name></expr>;</expr_stmt>
+    <comment type="block">/* check AddCatcacheInvalidationMessage() for an explanation */</comment>
+    <expr_stmt><expr><call><name>VALGRIND_MAKE_MEM_DEFINED</name><argument_list>(<argument><expr><operator>&amp;</operator><name>msg</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>msg</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+    <expr_stmt><expr><call><name>SendSharedInvalidMessages</name><argument_list>(<argument><expr><operator>&amp;</operator><name>msg</name></expr></argument>, <argument><expr><literal type="number">1</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * CacheRegisterSyscacheCallback
+ *        Register the specified function to be called for all future
+ *        invalidation events in the specified cache.  The cache ID and the
+ *        hash value of the tuple being invalidated will be passed to the
+ *        function.
+ *
+ * NOTE: Hash value zero will be passed if a cache reset request is received.
+ * In this case the called routines should flush all cached state.
+ * Yes, there's a possibility of a false match to zero, but it doesn't seem
+ * worth troubling over, especially since most of the current callees just
+ * flush all cached state anyway.
+ */</comment>
+<function><type><name>void</name></type>
+<name>CacheRegisterSyscacheCallback</name><parameter_list>(<parameter><decl><type><name>int</name></type> <name>cacheid</name></decl></parameter>,
+                              <parameter><decl><type><name>SyscacheCallbackFunction</name></type> <name>func</name></decl></parameter>,
+                              <parameter><decl><type><name>Datum</name></type> <name>arg</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <if_stmt><if>if <condition>(<expr><name>cacheid</name> <operator>&lt;</operator> <literal type="number">0</literal> <operator>||</operator> <name>cacheid</name> <operator>&gt;=</operator> <name>SysCacheSize</name></expr>)</condition><block type="pseudo"><block_content>
+        <expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>FATAL</name></expr></argument>, <argument><expr><literal type="string">"invalid cache ID: %d"</literal></expr></argument>, <argument><expr><name>cacheid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+    <if_stmt><if>if <condition>(<expr><name>syscache_callback_count</name> <operator>&gt;=</operator> <name>MAX_SYSCACHE_CALLBACKS</name></expr>)</condition><block type="pseudo"><block_content>
+        <expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>FATAL</name></expr></argument>, <argument><expr><literal type="string">"out of syscache_callback_list slots"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+    <if_stmt><if>if <condition>(<expr><name><name>syscache_callback_links</name><index>[<expr><name>cacheid</name></expr>]</index></name> <operator>==</operator> <literal type="number">0</literal></expr>)</condition>
+    <block>{<block_content>
+        <comment type="block">/* first callback for this cache */</comment>
+        <expr_stmt><expr><name><name>syscache_callback_links</name><index>[<expr><name>cacheid</name></expr>]</index></name> <operator>=</operator> <name>syscache_callback_count</name> <operator>+</operator> <literal type="number">1</literal></expr>;</expr_stmt>
+    </block_content>}</block></if>
+    <else>else
+    <block>{<block_content>
+        <comment type="block">/* add to end of chain, so that older callbacks are called first */</comment>
+        <decl_stmt><decl><type><name>int</name></type>            <name>i</name> <init>= <expr><name><name>syscache_callback_links</name><index>[<expr><name>cacheid</name></expr>]</index></name> <operator>-</operator> <literal type="number">1</literal></expr></init></decl>;</decl_stmt>
+
+        <while>while <condition>(<expr><name><name>syscache_callback_list</name><index>[<expr><name>i</name></expr>]</index></name><operator>.</operator><name>link</name> <operator>&gt;</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+            <expr_stmt><expr><name>i</name> <operator>=</operator> <name><name>syscache_callback_list</name><index>[<expr><name>i</name></expr>]</index></name><operator>.</operator><name>link</name> <operator>-</operator> <literal type="number">1</literal></expr>;</expr_stmt></block_content></block></while>
+        <expr_stmt><expr><name><name>syscache_callback_list</name><index>[<expr><name>i</name></expr>]</index></name><operator>.</operator><name>link</name> <operator>=</operator> <name>syscache_callback_count</name> <operator>+</operator> <literal type="number">1</literal></expr>;</expr_stmt>
+    </block_content>}</block></else></if_stmt>
+
+    <expr_stmt><expr><name><name>syscache_callback_list</name><index>[<expr><name>syscache_callback_count</name></expr>]</index></name><operator>.</operator><name>id</name> <operator>=</operator> <name>cacheid</name></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>syscache_callback_list</name><index>[<expr><name>syscache_callback_count</name></expr>]</index></name><operator>.</operator><name>link</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>syscache_callback_list</name><index>[<expr><name>syscache_callback_count</name></expr>]</index></name><operator>.</operator><name>function</name> <operator>=</operator> <name>func</name></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>syscache_callback_list</name><index>[<expr><name>syscache_callback_count</name></expr>]</index></name><operator>.</operator><name>arg</name> <operator>=</operator> <name>arg</name></expr>;</expr_stmt>
+
+    <expr_stmt><expr><operator>++</operator><name>syscache_callback_count</name></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * CacheRegisterRelcacheCallback
+ *        Register the specified function to be called for all future
+ *        relcache invalidation events.  The OID of the relation being
+ *        invalidated will be passed to the function.
+ *
+ * NOTE: InvalidOid will be passed if a cache reset request is received.
+ * In this case the called routines should flush all cached state.
+ */</comment>
+<function><type><name>void</name></type>
+<name>CacheRegisterRelcacheCallback</name><parameter_list>(<parameter><decl><type><name>RelcacheCallbackFunction</name></type> <name>func</name></decl></parameter>,
+                              <parameter><decl><type><name>Datum</name></type> <name>arg</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <if_stmt><if>if <condition>(<expr><name>relcache_callback_count</name> <operator>&gt;=</operator> <name>MAX_RELCACHE_CALLBACKS</name></expr>)</condition><block type="pseudo"><block_content>
+        <expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>FATAL</name></expr></argument>, <argument><expr><literal type="string">"out of relcache_callback_list slots"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+    <expr_stmt><expr><name><name>relcache_callback_list</name><index>[<expr><name>relcache_callback_count</name></expr>]</index></name><operator>.</operator><name>function</name> <operator>=</operator> <name>func</name></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>relcache_callback_list</name><index>[<expr><name>relcache_callback_count</name></expr>]</index></name><operator>.</operator><name>arg</name> <operator>=</operator> <name>arg</name></expr>;</expr_stmt>
+
+    <expr_stmt><expr><operator>++</operator><name>relcache_callback_count</name></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * CallSyscacheCallbacks
+ *
+ * This is exported so that CatalogCacheFlushCatalog can call it, saving
+ * this module from knowing which catcache IDs correspond to which catalogs.
+ */</comment>
+<function><type><name>void</name></type>
+<name>CallSyscacheCallbacks</name><parameter_list>(<parameter><decl><type><name>int</name></type> <name>cacheid</name></decl></parameter>, <parameter><decl><type><name>uint32</name></type> <name>hashvalue</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <decl_stmt><decl><type><name>int</name></type>            <name>i</name></decl>;</decl_stmt>
+
+    <if_stmt><if>if <condition>(<expr><name>cacheid</name> <operator>&lt;</operator> <literal type="number">0</literal> <operator>||</operator> <name>cacheid</name> <operator>&gt;=</operator> <name>SysCacheSize</name></expr>)</condition><block type="pseudo"><block_content>
+        <expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"invalid cache ID: %d"</literal></expr></argument>, <argument><expr><name>cacheid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+    <expr_stmt><expr><name>i</name> <operator>=</operator> <name><name>syscache_callback_links</name><index>[<expr><name>cacheid</name></expr>]</index></name> <operator>-</operator> <literal type="number">1</literal></expr>;</expr_stmt>
+    <while>while <condition>(<expr><name>i</name> <operator>&gt;=</operator> <literal type="number">0</literal></expr>)</condition>
+    <block>{<block_content>
+        <decl_stmt><decl><type><name><name>struct</name> <name>SYSCACHECALLBACK</name></name> <modifier>*</modifier></type><name>ccitem</name> <init>= <expr><name>syscache_callback_list</name> <operator>+</operator> <name>i</name></expr></init></decl>;</decl_stmt>
+
+        <expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>ccitem</name><operator>-&gt;</operator><name>id</name></name> <operator>==</operator> <name>cacheid</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <expr_stmt><expr><call>(<modifier>*</modifier><name><name>ccitem</name><operator>-&gt;</operator><name>function</name></name>) <argument_list>(<argument><expr><name><name>ccitem</name><operator>-&gt;</operator><name>arg</name></name></expr></argument>, <argument><expr><name>cacheid</name></expr></argument>, <argument><expr><name>hashvalue</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <expr_stmt><expr><name>i</name> <operator>=</operator> <name><name>ccitem</name><operator>-&gt;</operator><name>link</name></name> <operator>-</operator> <literal type="number">1</literal></expr>;</expr_stmt>
+    </block_content>}</block></while>
+</block_content>}</block></function>
+
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>_MLS_</name></cpp:ifdef>
+<function><type><name>void</name></type> <name>MlsRegisterRelcacheInvalidation</name><parameter_list>(<parameter><decl><type><name>Oid</name></type> <name>dbId</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>relId</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <return>return <expr><call><name>RegisterRelcacheInvalidation</name><argument_list>(<argument><expr><name>dbId</name></expr></argument>, <argument><expr><name>relId</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+</unit>

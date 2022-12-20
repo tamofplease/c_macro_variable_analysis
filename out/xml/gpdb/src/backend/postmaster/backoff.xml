@@ -1,0 +1,1527 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<unit xmlns="http://www.srcML.org/srcML/src" xmlns:cpp="http://www.srcML.org/srcML/cpp" revision="1.0.0" language="C" filename="/cloned_projects/gpdb/src/backend/postmaster/backoff.c"><comment type="block">/*-------------------------------------------------------------------------
+ *
+ * backoff.c
+ *	  Query Prioritization
+ *
+ * This file contains functions that implement the Query Prioritization
+ * feature. Query prioritization is implemented by employing a
+ * 'backing off' technique where each backend sleeps to let some other
+ * backend use the CPU. A sweeper process identifies backends that are
+ * making active progress and determines what the relative CPU usage
+ * should be.
+ *
+ * BackoffBackendTick() - a CHECK_FOR_INTERRUPTS() call in a backend
+ *						  leads to a backend 'tick'. If enough 'ticks'
+ *						  elapse, then the backend considers a
+ *						  backoff.
+ * BackoffSweeper()		- workhorse for the sweeper process
+ *
+ * Portions Copyright (c) 2009-2010, Greenplum inc.
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
+ *
+ *
+ * IDENTIFICATION
+ *	    src/backend/postmaster/backoff.c
+ *
+ *-------------------------------------------------------------------------
+ */</comment>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"postgres.h"</cpp:file></cpp:include>
+
+<cpp:ifndef>#<cpp:directive>ifndef</cpp:directive> <name>HAVE_GETRUSAGE</name></cpp:ifndef>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"rusagestub.h"</cpp:file></cpp:include>
+<cpp:else>#<cpp:directive>else</cpp:directive></cpp:else>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;sys/time.h&gt;</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;sys/resource.h&gt;</cpp:file></cpp:include>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;sys/time.h&gt;</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;signal.h&gt;</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;math.h&gt;</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/ipc.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"cdb/cdbvars.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"cdb/cdbdisp_query.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"cdb/cdbdispatchresult.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"libpq-fe.h"</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"libpq/pqsignal.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"tcop/tcopprot.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"postmaster/bgworker.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/pmsignal.h"</cpp:file></cpp:include>	<comment type="block">/* PostmasterIsAlive */</comment>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/proc.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/pg_resourcetype.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/builtins.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/resource_manager.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"funcapi.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/xact.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"port/atomics.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"postmaster/backoff.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"pg_trace.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"pgstat.h"</cpp:file></cpp:include>
+
+<decl_stmt><decl><type><specifier>extern</specifier> <name>bool</name></type> <name>gp_debug_resqueue_priority</name></decl>;</decl_stmt>
+
+<comment type="block">/* Enable for more debug info to be logged */</comment>
+<comment type="block">/* #define BACKOFF_DEBUG */</comment>
+
+<comment type="block" format="doxygen">/**
+ * Difference of two timevals in microsecs
+ */</comment>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>TIMEVAL_DIFF_USEC</name><parameter_list>(<parameter><type><name>b</name></type></parameter>, <parameter><type><name>a</name></type></parameter>)</parameter_list></cpp:macro> <cpp:value>((double) (b.tv_sec - a.tv_sec) * 1000000.0 + (b.tv_usec - a.tv_usec))</cpp:value></cpp:define>
+
+<comment type="block">/* In ms */</comment>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>MIN_SLEEP_THRESHOLD</name></cpp:macro>  <cpp:value>5000</cpp:value></cpp:define>
+
+<comment type="block">/* In ms */</comment>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>DEFAULT_SLEEP_TIME</name></cpp:macro> <cpp:value>100.0</cpp:value></cpp:define>
+
+<comment type="block" format="doxygen">/**
+ * A statement id consists of a session id and command count.
+ */</comment>
+<typedef>typedef <type><struct>struct <name>StatementId</name>
+<block>{
+	<decl_stmt><decl><type><name>int</name></type>			<name>sessionId</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>commandCount</name></decl>;</decl_stmt>
+}</block></struct></type>	<name>StatementId</name>;</typedef>
+
+<comment type="block">/* Invalid statement id */</comment>
+<decl_stmt><decl><type><specifier>static</specifier> <specifier>const</specifier> <name><name>struct</name> <name>StatementId</name></name></type> <name>InvalidStatementId</name> <init>= <expr><block>{<expr><literal type="number">0</literal></expr>, <expr><literal type="number">0</literal></expr>}</block></expr></init></decl>;</decl_stmt>
+
+<comment type="block" format="doxygen">/**
+ * This is information that only the current backend ever needs to see.
+ */</comment>
+<typedef>typedef <type><struct>struct <name>BackoffBackendLocalEntry</name>
+<block>{
+	<decl_stmt><decl><type><name>int</name></type>			<name>processId</name></decl>;</decl_stmt>		<comment type="block">/* Process Id of backend */</comment>
+	<decl_stmt><decl><type><name><name>struct</name> <name>rusage</name></name></type> <name>startUsage</name></decl>;</decl_stmt>	<comment type="block">/* Usage when current statement began. To
+								 * account for caching of backends. */</comment>
+	<decl_stmt><decl><type><name><name>struct</name> <name>rusage</name></name></type> <name>lastUsage</name></decl>;</decl_stmt>	<comment type="block">/* Usage statistics when backend process
+								 * performed local backoff action */</comment>
+	<decl_stmt><decl><type><name>double</name></type>		<name>lastSleepTime</name></decl>;</decl_stmt>	<comment type="block">/* Last sleep time when local backing-off
+								 * action was performed */</comment>
+	<decl_stmt><decl><type><name>bool</name></type>		<name>inTick</name></decl>;</decl_stmt>			<comment type="block">/* Is backend currently performing tick? - to
+								 * prevent nested calls */</comment>
+	<decl_stmt><decl><type><name>bool</name></type>		<name>groupingTimeExpired</name></decl>;</decl_stmt>	<comment type="block">/* Should backend try to find better
+										 * leader? */</comment>
+}</block></struct></type>	<name>BackoffBackendLocalEntry</name>;</typedef>
+
+<comment type="block" format="doxygen">/**
+ * There is a backend entry for every backend with a valid backendid on the master and segments.
+ */</comment>
+<typedef>typedef <type><struct>struct <name>BackoffBackendSharedEntry</name>
+<block>{
+	<decl_stmt><decl><type><name><name>struct</name> <name>StatementId</name></name></type> <name>statementId</name></decl>;</decl_stmt>		<comment type="block">/* A statement Id. Can be invalid. */</comment>
+	<decl_stmt><decl><type><name>int</name></type>			<name>groupLeaderIndex</name></decl>;</decl_stmt>		<comment type="block">/* Who is my leader? */</comment>
+	<decl_stmt><decl><type><name>int</name></type>			<name>groupSize</name></decl>;</decl_stmt>		<comment type="block">/* How many in my group ? */</comment>
+	<decl_stmt><decl><type><name>int</name></type>			<name>numFollowers</name></decl>;</decl_stmt>	<comment type="block">/* How many followers do I have? */</comment>
+
+	<comment type="block">/* These fields are written by backend and read by sweeper process */</comment>
+	<decl_stmt><decl><type><name><name>struct</name> <name>timeval</name></name></type> <name>lastCheckTime</name></decl>;</decl_stmt>		<comment type="block">/* Last time the backend process
+										 * performed local back-off action.
+										 * Used to determine inactive
+										 * backends. */</comment>
+
+	<comment type="block">/* These fields are written to by sweeper and read by backend */</comment>
+	<decl_stmt><decl><type><name>bool</name></type>		<name>backoff</name></decl>;</decl_stmt>		<comment type="block">/* If set to false, then no backoff to be
+								 * performed by this backend */</comment>
+	<decl_stmt><decl><type><name>double</name></type>		<name>targetUsage</name></decl>;</decl_stmt>	<comment type="block">/* Current target CPU usage as calculated by
+								 * sweeper */</comment>
+	<decl_stmt><decl><type><name>bool</name></type>		<name>earlyBackoffExit</name></decl>;</decl_stmt>		<comment type="block">/* Sweeper asking backend to stop
+										 * backing off */</comment>
+
+	<comment type="block">/* These fields are written to and read by sweeper */</comment>
+	<decl_stmt><decl><type><name>bool</name></type>		<name>isActive</name></decl>;</decl_stmt>		<comment type="block">/* Sweeper marking backend as active based on
+								 * lastCheckTime */</comment>
+	<decl_stmt><decl><type><name>int</name></type>			<name>numFollowersActive</name></decl>;</decl_stmt>		<comment type="block">/* If backend is a leader, this
+										 * represents number of followers that
+										 * are active */</comment>
+
+	<comment type="block">/* These fields are wrtten by backend during init and by manual adjustment */</comment>
+	<decl_stmt><decl><type><name>int</name></type>			<name>weight</name></decl>;</decl_stmt>			<comment type="block">/* Weight of the statement that this backend
+								 * belongs to */</comment>
+
+}</block></struct></type>	<name>BackoffBackendSharedEntry</name>;</typedef>
+
+<comment type="block" format="doxygen">/**
+ * Local entry for backoff.
+ */</comment>
+<decl_stmt><decl><type><specifier>static</specifier> <name>BackoffBackendLocalEntry</name></type> <name>myLocalEntry</name></decl>;</decl_stmt>
+
+<decl_stmt><decl><type><name>int</name></type> <name>backoffTickCounter</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+
+<comment type="block" format="doxygen">/**
+ * This is the global state of the backoff mechanism. It is a singleton structure - one
+ * per postmaster. It exists on master and segments. All backends with a valid backendid
+ * and entry in the ProcArray have access to this information.
+ */</comment>
+<typedef>typedef <type><struct>struct <name>BackoffState</name>
+<block>{
+	<decl_stmt><decl><type><name>BackoffBackendSharedEntry</name> <modifier>*</modifier></type><name>backendEntries</name></decl>;</decl_stmt>	<comment type="block">/* Indexed by backend ids */</comment>
+	<decl_stmt><decl><type><name>int</name></type>			<name>numEntries</name></decl>;</decl_stmt>
+
+	<decl_stmt><decl><type><name>bool</name></type>		<name>sweeperInProgress</name></decl>;</decl_stmt>		<comment type="block">/* Is the sweeper process working? */</comment>
+	<decl_stmt><decl><type><name>int</name></type>			<name>lastTotalStatementWeight</name></decl>;</decl_stmt>		<comment type="block">/* To keep track of total
+												 * weight */</comment>
+}</block></struct></type>	<name>BackoffState</name>;</typedef>
+
+<comment type="block" format="doxygen">/**
+ * Pointer to singleton struct used by the backoff mechanism.
+ */</comment>
+<decl_stmt><decl><type><name>BackoffState</name> <modifier>*</modifier></type><name>backoffSingleton</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+
+<comment type="block">/* Statement-id related */</comment>
+
+<function_decl><type><specifier>static</specifier> <specifier>inline</specifier> <name>void</name></type> <name>init</name><parameter_list>(<parameter><decl><type><name>StatementId</name> <modifier>*</modifier></type> <name>s</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>sessionId</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>commandCount</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <specifier>inline</specifier> <name>void</name></type> <name>setInvalid</name><parameter_list>(<parameter><decl><type><name>StatementId</name> <modifier>*</modifier></type> <name>s</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <specifier>inline</specifier> <name>bool</name></type> <name>isValid</name><parameter_list>(<parameter><decl><type><specifier>const</specifier> <name>StatementId</name> <modifier>*</modifier></type> <name>s</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <specifier>inline</specifier> <name>bool</name></type> <name>equalStatementId</name><parameter_list>(<parameter><decl><type><specifier>const</specifier> <name>StatementId</name> <modifier>*</modifier></type> <name>s1</name></decl></parameter>, <parameter><decl><type><specifier>const</specifier> <name>StatementId</name> <modifier>*</modifier></type> <name>s2</name></decl></parameter>)</parameter_list>;</function_decl>
+
+<comment type="block">/* Main accessor methods for backoff entries */</comment>
+<function_decl><type><specifier>static</specifier> <specifier>inline</specifier> <specifier>const</specifier> <name>BackoffBackendSharedEntry</name> <modifier>*</modifier></type><name>getBackoffEntryRO</name><parameter_list>(<parameter><decl><type><name>int</name></type> <name>index</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <specifier>inline</specifier> <name>BackoffBackendSharedEntry</name> <modifier>*</modifier></type><name>getBackoffEntryRW</name><parameter_list>(<parameter><decl><type><name>int</name></type> <name>index</name></decl></parameter>)</parameter_list>;</function_decl>
+
+<comment type="block">/* Backend uses these */</comment>
+<function_decl><type><specifier>static</specifier> <specifier>inline</specifier> <name>BackoffBackendLocalEntry</name> <modifier>*</modifier></type><name>myBackoffLocalEntry</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <specifier>inline</specifier> <name>BackoffBackendSharedEntry</name> <modifier>*</modifier></type><name>myBackoffSharedEntry</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <specifier>inline</specifier> <name>void</name></type> <name>SwitchGroupLeader</name><parameter_list>(<parameter><decl><type><name>int</name></type> <name>newLeaderIndex</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <specifier>inline</specifier> <name>bool</name></type> <name>groupingTimeExpired</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <specifier>inline</specifier> <name>void</name></type> <name>findBetterGroupLeader</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <specifier>inline</specifier> <name>bool</name></type> <name>isGroupLeader</name><parameter_list>(<parameter><decl><type><name>int</name></type> <name>index</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <specifier>inline</specifier> <name>void</name></type> <name>BackoffBackend</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>;</function_decl>
+
+<comment type="block">/* Init and exit routines */</comment>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>BackoffStateAtExit</name><parameter_list>(<parameter><decl><type><name>int</name></type> <name>code</name></decl></parameter>, <parameter><decl><type><name>Datum</name></type> <name>arg</name></decl></parameter>)</parameter_list>;</function_decl>
+
+<comment type="block">/* Routines to access global state */</comment>
+<function_decl><type><specifier>static</specifier> <specifier>inline</specifier> <name>double</name></type> <name>numProcsPerSegment</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>;</function_decl>
+
+<comment type="block">/* Sweeper related routines */</comment>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>BackoffSweeper</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>BackoffSweeperLoop</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>;</function_decl>
+<decl_stmt><decl><type><specifier>static</specifier> <specifier>volatile</specifier> <name>bool</name></type> <name>isSweeperProcess</name> <init>= <expr><name>false</name></expr></init></decl>;</decl_stmt>
+
+<comment type="block">/* Resource queue related routines */</comment>
+<function_decl><type><specifier>static</specifier> <name>int</name></type>	<name>BackoffPriorityValueToInt</name><parameter_list>(<parameter><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>priorityVal</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>extern</specifier> <name>List</name> <modifier>*</modifier></type><name>GetResqueueCapabilityEntry</name><parameter_list>(<parameter><decl><type><name>Oid</name></type> <name>queueid</name></decl></parameter>)</parameter_list>;</function_decl>
+
+<function_decl><type><specifier>static</specifier> <name>int</name></type> <name>BackoffDefaultWeight</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>int</name></type> <name>BackoffSuperuserStatementWeight</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>;</function_decl>
+
+<comment type="block">/*
+ * Helper method that verifies setting of default priority guc.
+ */</comment>
+<function_decl><type><name>bool</name></type> <name>gpvars_check_gp_resqueue_priority_default_value</name><parameter_list>(<parameter><decl><type><name>char</name> <modifier>*</modifier><modifier>*</modifier></type><name>newval</name></decl></parameter>,
+													<parameter><decl><type><name>void</name> <modifier>*</modifier><modifier>*</modifier></type><name>extra</name></decl></parameter>,
+													<parameter><decl><type><name>GucSource</name></type> <name>source</name></decl></parameter>)</parameter_list>;</function_decl>
+
+<comment type="block" format="doxygen">/**
+ * Primitives on statement id.
+ */</comment>
+
+<function><type><specifier>static</specifier> <specifier>inline</specifier> <name>void</name></type>
+<name>init</name><parameter_list>(<parameter><decl><type><name>StatementId</name> <modifier>*</modifier></type> <name>s</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>sessionId</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>commandCount</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>s</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>s</name><operator>-&gt;</operator><name>sessionId</name></name> <operator>=</operator> <name>sessionId</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>s</name><operator>-&gt;</operator><name>commandCount</name></name> <operator>=</operator> <name>commandCount</name></expr>;</expr_stmt>
+	<return>return;</return>
+</block_content>}</block></function>
+
+<comment type="block" format="doxygen">/**
+ * Sets a statemend id to be invalid.
+ */</comment>
+<function><type><specifier>static</specifier> <specifier>inline</specifier> <name>void</name></type>
+<name>setInvalid</name><parameter_list>(<parameter><decl><type><name>StatementId</name> <modifier>*</modifier></type> <name>s</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>init</name><argument_list>(<argument><expr><name>s</name></expr></argument>, <argument><expr><name><name>InvalidStatementId</name><operator>.</operator><name>sessionId</name></name></expr></argument>, <argument><expr><name><name>InvalidStatementId</name><operator>.</operator><name>commandCount</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block" format="doxygen">/**
+ * Are two statement ids equal?
+ */</comment>
+<function><type><specifier>static</specifier> <specifier>inline</specifier> <name>bool</name></type>
+<name>equalStatementId</name><parameter_list>(<parameter><decl><type><specifier>const</specifier> <name>StatementId</name> <modifier>*</modifier></type> <name>s1</name></decl></parameter>, <parameter><decl><type><specifier>const</specifier> <name>StatementId</name> <modifier>*</modifier></type> <name>s2</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>s1</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>s2</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<return>return <expr><operator>(</operator><operator>(</operator><name><name>s1</name><operator>-&gt;</operator><name>sessionId</name></name> <operator>==</operator> <name><name>s2</name><operator>-&gt;</operator><name>sessionId</name></name><operator>)</operator>
+			<operator>&amp;&amp;</operator> <operator>(</operator><name><name>s1</name><operator>-&gt;</operator><name>commandCount</name></name> <operator>==</operator> <name><name>s2</name><operator>-&gt;</operator><name>commandCount</name></name><operator>)</operator><operator>)</operator></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block" format="doxygen">/**
+ * Is a StatementId valid?
+ */</comment>
+<function><type><specifier>static</specifier> <specifier>inline</specifier> <name>bool</name></type>
+<name>isValid</name><parameter_list>(<parameter><decl><type><specifier>const</specifier> <name>StatementId</name> <modifier>*</modifier></type> <name>s</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<return>return <expr><operator>!</operator><call><name>equalStatementId</name><argument_list>(<argument><expr><name>s</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>InvalidStatementId</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block" format="doxygen">/**
+ * Access to the local entry for this backend.
+ */</comment>
+
+<function><type><specifier>static</specifier> <specifier>inline</specifier> <name>BackoffBackendLocalEntry</name> <modifier>*</modifier></type>
+<name>myBackoffLocalEntry</name><parameter_list>()</parameter_list>
+<block>{<block_content>
+	<return>return <expr><operator>&amp;</operator><name>myLocalEntry</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block" format="doxygen">/**
+ * Access to the shared entry for this backend.
+ */</comment>
+<function><type><specifier>static</specifier> <specifier>inline</specifier> <name>BackoffBackendSharedEntry</name> <modifier>*</modifier></type>
+<name>myBackoffSharedEntry</name><parameter_list>()</parameter_list>
+<block>{<block_content>
+	<return>return <expr><call><name>getBackoffEntryRW</name><argument_list>(<argument><expr><name>MyBackendId</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block" format="doxygen">/**
+ * A backend is a group leader if it is its own leader.
+ */</comment>
+<function><type><specifier>static</specifier> <specifier>inline</specifier> <name>bool</name></type>
+<name>isGroupLeader</name><parameter_list>(<parameter><decl><type><name>int</name></type> <name>index</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<return>return <expr><operator>(</operator><call><name>getBackoffEntryRO</name><argument_list>(<argument><expr><name>index</name></expr></argument>)</argument_list></call><operator>-&gt;</operator><name>groupLeaderIndex</name> <operator>==</operator> <name>index</name><operator>)</operator></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block" format="doxygen">/**
+ * This method is used by a backend to switch the group leader. It is unique
+ * in that it modifies the numFollowers field in its current group leader and new leader index.
+ * The increments and decrements are done using atomic operations (else we may have race conditions
+ * across processes). However, this code is not thread safe. We do not call these code in multi-threaded
+ * situations.
+ */</comment>
+<function><type><specifier>static</specifier> <specifier>inline</specifier> <name>void</name></type>
+<name>SwitchGroupLeader</name><parameter_list>(<parameter><decl><type><name>int</name></type> <name>newLeaderIndex</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>BackoffBackendSharedEntry</name> <modifier>*</modifier></type><name>myEntry</name> <init>= <expr><call><name>myBackoffSharedEntry</name><argument_list>()</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>BackoffBackendSharedEntry</name> <modifier>*</modifier></type><name>oldLeaderEntry</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>BackoffBackendSharedEntry</name> <modifier>*</modifier></type><name>newLeaderEntry</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name><name>backoffSingleton</name><operator>-&gt;</operator><name>sweeperInProgress</name></name> <operator>==</operator> <name>true</name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return;</return></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>newLeaderIndex</name> <operator>&lt;</operator> <name><name>myEntry</name><operator>-&gt;</operator><name>groupLeaderIndex</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>newLeaderIndex</name> <operator>&gt;=</operator> <literal type="number">0</literal> <operator>&amp;&amp;</operator> <name>newLeaderIndex</name> <operator>&lt;</operator> <name><name>backoffSingleton</name><operator>-&gt;</operator><name>numEntries</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>oldLeaderEntry</name> <operator>=</operator> <operator>&amp;</operator><name><name>backoffSingleton</name><operator>-&gt;</operator><name>backendEntries</name><index>[<expr><name><name>myEntry</name><operator>-&gt;</operator><name>groupLeaderIndex</name></name></expr>]</index></name></expr>;</expr_stmt>
+	<expr_stmt><expr><name>newLeaderEntry</name> <operator>=</operator> <operator>&amp;</operator><name><name>backoffSingleton</name><operator>-&gt;</operator><name>backendEntries</name><index>[<expr><name>newLeaderIndex</name></expr>]</index></name></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>pg_atomic_sub_fetch_u32</name><argument_list>(<argument><expr><operator>(</operator><name>pg_atomic_uint32</name> <operator>*</operator><operator>)</operator> <operator>&amp;</operator><name><name>oldLeaderEntry</name><operator>-&gt;</operator><name>numFollowers</name></name></expr></argument>, <argument><expr><literal type="number">1</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>pg_atomic_add_fetch_u32</name><argument_list>(<argument><expr><operator>(</operator><name>pg_atomic_uint32</name> <operator>*</operator><operator>)</operator> <operator>&amp;</operator><name><name>newLeaderEntry</name><operator>-&gt;</operator><name>numFollowers</name></name></expr></argument>, <argument><expr><literal type="number">1</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>myEntry</name><operator>-&gt;</operator><name>groupLeaderIndex</name></name> <operator>=</operator> <name>newLeaderIndex</name></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Should this backend stop finding a better leader? If the backend has spent enough time working
+ * on the current statement (measured in elapsedTimeForStatement), it marks grouping time expired.
+ */</comment>
+<function><type><specifier>static</specifier> <specifier>inline</specifier> <name>bool</name></type>
+<name>groupingTimeExpired</name><parameter_list>()</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>BackoffBackendLocalEntry</name> <modifier>*</modifier></type><name>le</name> <init>= <expr><call><name>myBackoffLocalEntry</name><argument_list>()</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name><name>le</name><operator>-&gt;</operator><name>groupingTimeExpired</name></name></expr>)</condition>
+	<block>{<block_content>
+		<return>return <expr><name>true</name></expr>;</return>
+	</block_content>}</block></if>
+	<else>else
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>double</name></type>		<name>elapsedTimeForStatement</name> <init>=
+		<expr><call><name>TIMEVAL_DIFF_USEC</name><argument_list>(<argument><expr><name><name>le</name><operator>-&gt;</operator><name>lastUsage</name><operator>.</operator><name>ru_utime</name></name></expr></argument>, <argument><expr><name><name>le</name><operator>-&gt;</operator><name>startUsage</name><operator>.</operator><name>ru_utime</name></name></expr></argument>)</argument_list></call>
+		<operator>+</operator> <call><name>TIMEVAL_DIFF_USEC</name><argument_list>(<argument><expr><name><name>le</name><operator>-&gt;</operator><name>lastUsage</name><operator>.</operator><name>ru_stime</name></name></expr></argument>, <argument><expr><name><name>le</name><operator>-&gt;</operator><name>startUsage</name><operator>.</operator><name>ru_stime</name></name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name>elapsedTimeForStatement</name> <operator>&gt;</operator> <name>gp_resqueue_priority_grouping_timeout</name> <operator>*</operator> <literal type="number">1000.0</literal></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><name><name>le</name><operator>-&gt;</operator><name>groupingTimeExpired</name></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+			<return>return <expr><name>true</name></expr>;</return>
+		</block_content>}</block></if>
+		<else>else
+		<block>{<block_content>
+			<return>return <expr><name>false</name></expr>;</return>
+		</block_content>}</block></else></if_stmt>
+	</block_content>}</block></else></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block" format="doxygen">/**
+ * Executed by a backend to find a better group leader (i.e. one with a lower index), if possible.
+ * This is the only method that can write to groupLeaderIndex.
+ */</comment>
+<function><type><specifier>static</specifier> <specifier>inline</specifier> <name>void</name></type>
+<name>findBetterGroupLeader</name><parameter_list>()</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>int</name></type>			<name>leadersLeaderIndex</name> <init>= <expr><operator>-</operator><literal type="number">1</literal></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>BackoffBackendSharedEntry</name> <modifier>*</modifier></type><name>myEntry</name> <init>= <expr><call><name>myBackoffSharedEntry</name><argument_list>()</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><specifier>const</specifier> <name>BackoffBackendSharedEntry</name> <modifier>*</modifier></type><name>leaderEntry</name> <init>= <expr><call><name>getBackoffEntryRO</name><argument_list>(<argument><expr><name><name>myEntry</name><operator>-&gt;</operator><name>groupLeaderIndex</name></name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>myEntry</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>leadersLeaderIndex</name> <operator>=</operator> <name><name>leaderEntry</name><operator>-&gt;</operator><name>groupLeaderIndex</name></name></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name><name>backoffSingleton</name><operator>-&gt;</operator><name>sweeperInProgress</name></name> <operator>==</operator> <name>true</name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return;</return></block_content></block></if></if_stmt>
+
+	<comment type="block">/* If my leader has a different leader, then jump pointer */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>myEntry</name><operator>-&gt;</operator><name>groupLeaderIndex</name></name> <operator>!=</operator> <name>leadersLeaderIndex</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>SwitchGroupLeader</name><argument_list>(<argument><expr><name>leadersLeaderIndex</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<else>else
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>int</name></type>			<name>i</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+
+		<for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name><name>myEntry</name><operator>-&gt;</operator><name>groupLeaderIndex</name></name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control>
+		<block>{<block_content>
+			<decl_stmt><decl><type><specifier>const</specifier> <name>BackoffBackendSharedEntry</name> <modifier>*</modifier></type><name>other</name> <init>= <expr><call><name>getBackoffEntryRO</name><argument_list>(<argument><expr><name>i</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+			<if_stmt><if>if <condition>(<expr><call><name>equalStatementId</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>other</name><operator>-&gt;</operator><name>statementId</name></name></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>myEntry</name><operator>-&gt;</operator><name>statementId</name></name></expr></argument>)</argument_list></call></expr>)</condition>
+			<block>{<block_content>
+				<comment type="block">/* Found a better leader! */</comment>
+				<break>break;</break>
+			</block_content>}</block></if></if_stmt>
+		</block_content>}</block></for>
+		<if_stmt><if>if <condition>(<expr><name>i</name> <operator>&lt;</operator> <name><name>myEntry</name><operator>-&gt;</operator><name>groupLeaderIndex</name></name></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><call><name>SwitchGroupLeader</name><argument_list>(<argument><expr><name>i</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+	</block_content>}</block></else></if_stmt>
+	<return>return;</return>
+</block_content>}</block></function>
+
+
+<comment type="block" format="doxygen">/**
+ * Read only access to a backend entry.
+ */</comment>
+<function><type><specifier>static</specifier> <specifier>inline</specifier> <specifier>const</specifier> <name>BackoffBackendSharedEntry</name> <modifier>*</modifier></type>
+<name>getBackoffEntryRO</name><parameter_list>(<parameter><decl><type><name>int</name></type> <name>index</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<return>return <expr><operator>(</operator><specifier>const</specifier> <name>BackoffBackendSharedEntry</name> <operator>*</operator><operator>)</operator> <call><name>getBackoffEntryRW</name><argument_list>(<argument><expr><name>index</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block" format="doxygen">/**
+ * Gives write access to a backend entry.
+ */</comment>
+<function><type><specifier>static</specifier> <specifier>inline</specifier> <name>BackoffBackendSharedEntry</name> <modifier>*</modifier></type>
+<name>getBackoffEntryRW</name><parameter_list>(<parameter><decl><type><name>int</name></type> <name>index</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>Gp_role</name> <operator>==</operator> <name>GP_ROLE_DISPATCH</name> <operator>||</operator> <name>Gp_role</name> <operator>==</operator> <name>GP_ROLE_EXECUTE</name> <operator>||</operator> <name>isSweeperProcess</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>index</name> <operator>&gt;=</operator> <literal type="number">0</literal> <operator>&amp;&amp;</operator> <name>index</name> <operator>&lt;</operator> <name><name>backoffSingleton</name><operator>-&gt;</operator><name>numEntries</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<return>return <expr><operator>&amp;</operator><name><name>backoffSingleton</name><operator>-&gt;</operator><name>backendEntries</name><index>[<expr><name>index</name></expr>]</index></name></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block" format="doxygen">/**
+ * This method is called by the backend when it begins working on a new statement.
+ * This initializes the backend entry corresponding to this backend.
+ * After initialization, the backend entry immediately finds its group leader, which
+ * is the first backend entry that has the same statement id with itself.
+ */</comment>
+<function><type><name>void</name></type>
+<name>BackoffBackendEntryInit</name><parameter_list>(<parameter><decl><type><name>int</name></type> <name>sessionid</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>commandcount</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>queueId</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>BackoffBackendSharedEntry</name> <modifier>*</modifier></type><name>mySharedEntry</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>BackoffBackendLocalEntry</name> <modifier>*</modifier></type><name>myLocalEntry</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>sessionid</name> <operator>&gt;</operator> <operator>-</operator><literal type="number">1</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>commandcount</name> <operator>&gt;</operator> <operator>-</operator><literal type="number">1</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>Gp_role</name> <operator>==</operator> <name>GP_ROLE_DISPATCH</name> <operator>||</operator> <name>Gp_role</name> <operator>==</operator> <name>GP_ROLE_EXECUTE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><operator>!</operator><name>isSweeperProcess</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Shared information */</comment>
+	<expr_stmt><expr><name>mySharedEntry</name> <operator>=</operator> <call><name>myBackoffSharedEntry</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name><name>mySharedEntry</name><operator>-&gt;</operator><name>targetUsage</name></name> <operator>=</operator> <literal type="number">1.0</literal> <operator>/</operator> <call><name>numProcsPerSegment</name><argument_list>()</argument_list></call></expr>;</expr_stmt>	<comment type="block">/* Initially, do not
+																 * perform any backoffs */</comment>
+	<expr_stmt><expr><name><name>mySharedEntry</name><operator>-&gt;</operator><name>isActive</name></name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>mySharedEntry</name><operator>-&gt;</operator><name>backoff</name></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>mySharedEntry</name><operator>-&gt;</operator><name>earlyBackoffExit</name></name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><call><name>gettimeofday</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>mySharedEntry</name><operator>-&gt;</operator><name>lastCheckTime</name></name></expr></argument>, <argument><expr><name>NULL</name></expr></argument>)</argument_list></call> <operator>&lt;</operator> <literal type="number">0</literal></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"Unable to execute gettimeofday(). Please disable query prioritization."</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<expr_stmt><expr><name><name>mySharedEntry</name><operator>-&gt;</operator><name>groupLeaderIndex</name></name> <operator>=</operator> <name>MyBackendId</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>mySharedEntry</name><operator>-&gt;</operator><name>weight</name></name> <operator>=</operator> <call><name>ResourceQueueGetPriorityWeight</name><argument_list>(<argument><expr><name>queueId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>mySharedEntry</name><operator>-&gt;</operator><name>groupSize</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>mySharedEntry</name><operator>-&gt;</operator><name>numFollowers</name></name> <operator>=</operator> <literal type="number">1</literal></expr>;</expr_stmt>
+
+	<comment type="block">/* this should happen last or the sweeper may pick up a non-complete entry */</comment>
+	<expr_stmt><expr><call><name>init</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>mySharedEntry</name><operator>-&gt;</operator><name>statementId</name></name></expr></argument>, <argument><expr><name>sessionid</name></expr></argument>, <argument><expr><name>commandcount</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>isValid</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>mySharedEntry</name><operator>-&gt;</operator><name>statementId</name></name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Local information */</comment>
+	<expr_stmt><expr><name>myLocalEntry</name> <operator>=</operator> <call><name>myBackoffLocalEntry</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name><name>myLocalEntry</name><operator>-&gt;</operator><name>processId</name></name> <operator>=</operator> <name>MyProcPid</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>myLocalEntry</name><operator>-&gt;</operator><name>lastSleepTime</name></name> <operator>=</operator> <name>DEFAULT_SLEEP_TIME</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>myLocalEntry</name><operator>-&gt;</operator><name>groupingTimeExpired</name></name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><call><name>getrusage</name><argument_list>(<argument><expr><name>RUSAGE_SELF</name></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>myLocalEntry</name><operator>-&gt;</operator><name>lastUsage</name></name></expr></argument>)</argument_list></call> <operator>&lt;</operator> <literal type="number">0</literal></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"Unable to execute getrusage(). Please disable query prioritization."</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+	<expr_stmt><expr><call><name>memcpy</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>myLocalEntry</name><operator>-&gt;</operator><name>startUsage</name></name></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>myLocalEntry</name><operator>-&gt;</operator><name>lastUsage</name></name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name><name>myLocalEntry</name><operator>-&gt;</operator><name>lastUsage</name></name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>myLocalEntry</name><operator>-&gt;</operator><name>inTick</name></name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+
+	<comment type="block">/* Try to find a better leader for my group */</comment>
+	<expr_stmt><expr><call><name>findBetterGroupLeader</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+	<return>return;</return>
+</block_content>}</block></function>
+
+<comment type="block" format="doxygen">/**
+ * Accessing the number of procs per segment.
+ */</comment>
+<function><type><specifier>static</specifier> <specifier>inline</specifier> <name>double</name></type>
+<name>numProcsPerSegment</name><parameter_list>()</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>gp_enable_resqueue_priority</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>backoffSingleton</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>gp_resqueue_priority_cpucores_per_segment</name> <operator>&gt;</operator> <literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<return>return <expr><name>gp_resqueue_priority_cpucores_per_segment</name></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block" format="doxygen">/**
+ * This method is called once in a while by a backend to determine if it needs
+ * to backoff per its current usage and target usage.
+ */</comment>
+<function><type><specifier>static</specifier> <specifier>inline</specifier> <name>void</name></type>
+<name>BackoffBackend</name><parameter_list>()</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>BackoffBackendLocalEntry</name> <modifier>*</modifier></type><name>le</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>BackoffBackendSharedEntry</name> <modifier>*</modifier></type><name>se</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+
+	<comment type="block">/* Try to achieve target usage! */</comment>
+	<decl_stmt><decl><type><name><name>struct</name> <name>timeval</name></name></type> <name>currentTime</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name><name>struct</name> <name>rusage</name></name></type> <name>currentUsage</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>double</name></type>		<name>thisProcessTime</name> <init>= <expr><literal type="number">0.0</literal></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>double</name></type>		<name>totalTime</name> <init>= <expr><literal type="number">0.0</literal></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>double</name></type>		<name>cpuRatio</name> <init>= <expr><literal type="number">0.0</literal></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>double</name></type>		<name>changeFactor</name> <init>= <expr><literal type="number">1.0</literal></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name>le</name> <operator>=</operator> <call><name>myBackoffLocalEntry</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>le</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>se</name> <operator>=</operator> <call><name>myBackoffSharedEntry</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>se</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>se</name><operator>-&gt;</operator><name>weight</name></name> <operator>&gt;</operator> <literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Provide tracing information */</comment>
+	<expr_stmt><expr><call><name>TRACE_POSTGRESQL_BACKOFF_LOCALCHECK</name><argument_list>(<argument><expr><name>MyBackendId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><call><name>gettimeofday</name><argument_list>(<argument><expr><operator>&amp;</operator><name>currentTime</name></expr></argument>, <argument><expr><name>NULL</name></expr></argument>)</argument_list></call> <operator>&lt;</operator> <literal type="number">0</literal></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"Unable to execute gettimeofday(). Please disable query prioritization."</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><call><name>getrusage</name><argument_list>(<argument><expr><name>RUSAGE_SELF</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>currentUsage</name></expr></argument>)</argument_list></call> <operator>&lt;</operator> <literal type="number">0</literal></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"Unable to execute getrusage(). Please disable query prioritization."</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/* If backoff can be performed by this process */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>se</name><operator>-&gt;</operator><name>backoff</name></name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/*
+		 * How much did the cpu work on behalf of this process - incl user and
+		 * sys time
+		 */</comment>
+		<expr_stmt><expr><name>thisProcessTime</name> <operator>=</operator> <call><name>TIMEVAL_DIFF_USEC</name><argument_list>(<argument><expr><name><name>currentUsage</name><operator>.</operator><name>ru_utime</name></name></expr></argument>, <argument><expr><name><name>le</name><operator>-&gt;</operator><name>lastUsage</name><operator>.</operator><name>ru_utime</name></name></expr></argument>)</argument_list></call>
+			<operator>+</operator> <call><name>TIMEVAL_DIFF_USEC</name><argument_list>(<argument><expr><name><name>currentUsage</name><operator>.</operator><name>ru_stime</name></name></expr></argument>, <argument><expr><name><name>le</name><operator>-&gt;</operator><name>lastUsage</name><operator>.</operator><name>ru_stime</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/*
+		 * Absolute cpu time since the last check. This accounts for multiple
+		 * procs per segment
+		 */</comment>
+		<expr_stmt><expr><name>totalTime</name> <operator>=</operator> <call><name>TIMEVAL_DIFF_USEC</name><argument_list>(<argument><expr><name>currentTime</name></expr></argument>, <argument><expr><name><name>se</name><operator>-&gt;</operator><name>lastCheckTime</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><name>cpuRatio</name> <operator>=</operator> <name>thisProcessTime</name> <operator>/</operator> <name>totalTime</name></expr>;</expr_stmt>
+
+		<expr_stmt><expr><name>cpuRatio</name> <operator>=</operator> <call><name>Min</name><argument_list>(<argument><expr><name>cpuRatio</name></expr></argument>, <argument><expr><literal type="number">1.0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><name>changeFactor</name> <operator>=</operator> <name>cpuRatio</name> <operator>/</operator> <name><name>se</name><operator>-&gt;</operator><name>targetUsage</name></name></expr>;</expr_stmt>
+
+		<expr_stmt><expr><name><name>le</name><operator>-&gt;</operator><name>lastSleepTime</name></name> <operator>*=</operator> <name>changeFactor</name></expr>;</expr_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name><name>le</name><operator>-&gt;</operator><name>lastSleepTime</name></name> <operator>&lt;</operator> <name>DEFAULT_SLEEP_TIME</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><name><name>le</name><operator>-&gt;</operator><name>lastSleepTime</name></name> <operator>=</operator> <name>DEFAULT_SLEEP_TIME</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name>gp_debug_resqueue_priority</name></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>LOG</name></expr></argument>, <argument><expr><literal type="string">"thissession = %d, thisProcTime = %f, totalTime = %f, targetusage = %f, cpuRatio = %f, change factor = %f, sleeptime = %f"</literal></expr></argument>,
+				 <argument><expr><name><name>se</name><operator>-&gt;</operator><name>statementId</name><operator>.</operator><name>sessionId</name></name></expr></argument>, <argument><expr><name>thisProcessTime</name></expr></argument>, <argument><expr><name>totalTime</name></expr></argument>, <argument><expr><name><name>se</name><operator>-&gt;</operator><name>targetUsage</name></name></expr></argument>, <argument><expr><name>cpuRatio</name></expr></argument>, <argument><expr><name>changeFactor</name></expr></argument>, <argument><expr><operator>(</operator><name>double</name><operator>)</operator> <name><name>le</name><operator>-&gt;</operator><name>lastSleepTime</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+
+		<expr_stmt><expr><call><name>memcpy</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>le</name><operator>-&gt;</operator><name>lastUsage</name></name></expr></argument>, <argument><expr><operator>&amp;</operator><name>currentUsage</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>currentUsage</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>memcpy</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>se</name><operator>-&gt;</operator><name>lastCheckTime</name></name></expr></argument>, <argument><expr><operator>&amp;</operator><name>currentTime</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>currentTime</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name><name>le</name><operator>-&gt;</operator><name>lastSleepTime</name></name> <operator>&gt;</operator> <name>MIN_SLEEP_THRESHOLD</name></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/*
+			 * Sleeping happens in chunks so that the backend may exit early
+			 * from its sleep if the sweeper requests it to.
+			 */</comment>
+			<decl_stmt><decl><type><name>int</name></type>			<name>j</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+			<decl_stmt><decl><type><name>long</name></type>		<name>sleepInterval</name> <init>= <expr><operator>(</operator><operator>(</operator><name>long</name><operator>)</operator> <name>gp_resqueue_priority_sweeper_interval</name><operator>)</operator> <operator>*</operator> <literal type="number">1000L</literal></expr></init></decl>;</decl_stmt>
+			<decl_stmt><decl><type><name>int</name></type>			<name>numIterations</name> <init>= <expr><operator>(</operator><name>int</name><operator>)</operator> <operator>(</operator><name><name>le</name><operator>-&gt;</operator><name>lastSleepTime</name></name> <operator>/</operator> <name>sleepInterval</name><operator>)</operator></expr></init></decl>;</decl_stmt>
+			<decl_stmt><decl><type><name>double</name></type>		<name>leftOver</name> <init>= <expr><operator>(</operator><name>double</name><operator>)</operator> <operator>(</operator><operator>(</operator><name>long</name><operator>)</operator> <name><name>le</name><operator>-&gt;</operator><name>lastSleepTime</name></name> <operator>%</operator> <name>sleepInterval</name><operator>)</operator></expr></init></decl>;</decl_stmt>
+
+			<for>for <control>(<init><expr><name>j</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>j</name> <operator>&lt;</operator> <name>numIterations</name></expr>;</condition> <incr><expr><name>j</name><operator>++</operator></expr></incr>)</control>
+			<block>{<block_content>
+				<comment type="block">/* Sleep a chunk */</comment>
+				<expr_stmt><expr><call><name>pg_usleep</name><argument_list>(<argument><expr><name>sleepInterval</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<comment type="block">/* Check for early backoff exit */</comment>
+				<if_stmt><if>if <condition>(<expr><name><name>se</name><operator>-&gt;</operator><name>earlyBackoffExit</name></name></expr>)</condition>
+				<block>{<block_content>
+					<expr_stmt><expr><name><name>le</name><operator>-&gt;</operator><name>lastSleepTime</name></name> <operator>=</operator> <name>DEFAULT_SLEEP_TIME</name></expr>;</expr_stmt>		<comment type="block">/* Minimize sleep time
+																 * since we may need to
+																 * recompute from
+																 * scratch */</comment>
+					<break>break;</break>
+				</block_content>}</block></if></if_stmt>
+			</block_content>}</block></for>
+			<if_stmt><if>if <condition>(<expr><name>j</name> <operator>==</operator> <name>numIterations</name></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><call><name>pg_usleep</name><argument_list>(<argument><expr><name>leftOver</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+		</block_content>}</block></if></if_stmt>
+	</block_content>}</block></if>
+	<else>else
+	<block>{<block_content>
+		<comment type="block">/*
+		 * Even if this backend did not backoff, it should record current
+		 * usage and current time so that subsequent calculations are
+		 * accurate.
+		 */</comment>
+		<expr_stmt><expr><call><name>memcpy</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>le</name><operator>-&gt;</operator><name>lastUsage</name></name></expr></argument>, <argument><expr><operator>&amp;</operator><name>currentUsage</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>currentUsage</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>memcpy</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>se</name><operator>-&gt;</operator><name>lastCheckTime</name></name></expr></argument>, <argument><expr><operator>&amp;</operator><name>currentTime</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>currentTime</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></else></if_stmt>
+
+	<comment type="block">/* Consider finding a better leader for better grouping */</comment>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>groupingTimeExpired</name><argument_list>()</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>findBetterGroupLeader</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * CHECK_FOR_INTERRUPTS() increments a counter, 'backoffTickCounter', on
+ * every call, which we use as a loose measure of progress. Whenever the
+ * counter reaches 'gp_resqueue_priority_local_interval', CHECK_FOR_INTERRUPTS()
+ * calls this function, to perform a backoff action (see BackoffBackend()).
+ */</comment>
+<function><type><name>void</name></type>
+<name>BackoffBackendTickExpired</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>BackoffBackendLocalEntry</name> <modifier>*</modifier></type><name>le</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>BackoffBackendSharedEntry</name> <modifier>*</modifier></type><name>se</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>StatementId</name></type> <name>currentStatementId</name> <init>= <expr><block>{<expr><name>gp_session_id</name></expr>, <expr><name>gp_command_count</name></expr>}</block></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name>backoffTickCounter</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><operator>(</operator><name>Gp_role</name> <operator>==</operator> <name>GP_ROLE_DISPATCH</name> <operator>||</operator> <name>Gp_role</name> <operator>==</operator> <name>GP_ROLE_EXECUTE</name><operator>)</operator>
+		<operator>||</operator> <operator>!</operator><call><name>IsResQueueEnabled</name><argument_list>()</argument_list></call>
+		<operator>||</operator> <operator>!</operator><name>gp_enable_resqueue_priority</name>
+		<operator>||</operator> <operator>!</operator><name>IsUnderPostmaster</name>
+		<operator>||</operator> <operator>(</operator><name>MyBackendId</name> <operator>==</operator> <name>InvalidBackendId</name><operator>)</operator>
+		<operator>||</operator> <name>proc_exit_inprogress</name>
+		<operator>||</operator> <name>ProcDiePending</name>		<comment type="block">/* Proc is dying */</comment>
+		<operator>||</operator> <name>QueryCancelPending</name>	<comment type="block">/* Statement cancellation */</comment>
+		<operator>||</operator> <name>QueryFinishPending</name>	<comment type="block">/* Statement finish requested */</comment>
+		<operator>||</operator> <name>InterruptHoldoffCount</name> <operator>!=</operator> <literal type="number">0</literal>	<comment type="block">/* We're holding off on handling
+										 * interrupts */</comment>
+		<operator>||</operator> <name>CritSectionCount</name> <operator>!=</operator> <literal type="number">0</literal></expr>	<comment type="block">/* In critical section */</comment>
+		)</condition>
+	<block>{<block_content>
+		<comment type="block">/* Do nothing under these circumstances */</comment>
+		<return>return;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><name>backoffSingleton</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* Not initialized yet. Do nothing */</comment>
+		<return>return;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>backoffSingleton</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>le</name> <operator>=</operator> <call><name>myBackoffLocalEntry</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>se</name> <operator>=</operator> <call><name>myBackoffSharedEntry</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>equalStatementId</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>se</name><operator>-&gt;</operator><name>statementId</name></name></expr></argument>, <argument><expr><operator>&amp;</operator><name>currentStatementId</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* This backend's entry has not yet been initialized. Do nothing yet. */</comment>
+		<return>return;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name><name>le</name><operator>-&gt;</operator><name>inTick</name></name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* No nested calls allowed. This may happen during elog calls :( */</comment>
+		<return>return;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<expr_stmt><expr><name><name>le</name><operator>-&gt;</operator><name>inTick</name></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+
+	<comment type="block">/* Perform backoff. */</comment>
+	<expr_stmt><expr><call><name>BackoffBackend</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>se</name><operator>-&gt;</operator><name>earlyBackoffExit</name></name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name><name>le</name><operator>-&gt;</operator><name>inTick</name></name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block" format="doxygen">/**
+ * BackoffSweeper() looks at all the backend structures to determine if any
+ * backends are not making progress. This is done by inspecting the lastchecked
+ * time.  It also calculates the total weight of all 'active' backends to
+ * re-calculate the target CPU usage per backend process. If it finds that a
+ * backend is trying to request more CPU resources than the maximum CPU that it
+ * can get (such a backend is called a 'pegger'), it assigns maxCPU to it.
+ *
+ * For example:
+ * Let Qi be the ith query statement, Ri be the target CPU usage for Qi,
+ * Wi be the statement weight for Qi, W be the total statements weight.
+ * For simplicity, let's assume every statement only has 1 backend per segment.
+ *
+ * Let there be 4 active queries with weights {1,100,10,1000} with K=3 CPUs
+ * available per segment to share. The maximum CPU that a backend can get is
+ * maxCPU = 1.0. The total active statements weight is
+ * W (activeWeight) = 1 + 100 + 10 + 1000 = 1111.
+ * The following algorithm determines that Q4 is pegger, because
+ * K * W4 / W &gt; maxCPU, which is 3000/1111 &gt; 1.0, so we assign R4 = 1.0.
+ * Now K becomes 2.0, W becomes 111.
+ * It restarts from the beginning and determines that Q2 is now a pegger as
+ * well, because K * W2 / W &gt; maxCPU, which is 200/111 &gt; 1.0, we assign
+ * R2 = 1.0. Now there is only 1 CPU left and no peggers left. We continue
+ * to distribute the left 1 CPU to other backends according to their weight,
+ * so we assign the target CPU ratio of R1=1/11 and R3=10/11. The final
+ * target CPU assignments are {0.09,1.0,0.91,1.0}.
+ *
+ * If there are multiple backends within a segment running for the query Qi,
+ * the target CPU ratio Ri for query Qi is divided equally among all the
+ * active backends belonging to the query.
+ */</comment>
+<function><type><name>void</name></type>
+<name>BackoffSweeper</name><parameter_list>()</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>int</name></type>			<name>i</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+
+	<comment type="block">/* The overall weight of active statements */</comment>
+	<decl_stmt><decl><type><specifier>volatile</specifier> <name>double</name></type> <name>activeWeight</name> <init>= <expr><literal type="number">0.0</literal></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>numActiveBackends</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>numActiveStatements</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+
+	<comment type="block">/* The overall weight of active and inactive statements */</comment>
+	<decl_stmt><decl><type><name>int</name></type>			<name>totalStatementWeight</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>numValidBackends</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>numStatements</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+
+	<decl_stmt><decl><type><name><name>struct</name> <name>timeval</name></name></type> <name>currentTime</name></decl>;</decl_stmt>
+
+	<if_stmt><if>if <condition>(<expr><call><name>gettimeofday</name><argument_list>(<argument><expr><operator>&amp;</operator><name>currentTime</name></expr></argument>, <argument><expr><name>NULL</name></expr></argument>)</argument_list></call> <operator>&lt;</operator> <literal type="number">0</literal></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"Unable to execute gettimeofday(). Please disable query prioritization."</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>backoffSingleton</name><operator>-&gt;</operator><name>sweeperInProgress</name></name> <operator>==</operator> <name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name><name>backoffSingleton</name><operator>-&gt;</operator><name>sweeperInProgress</name></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>TRACE_POSTGRESQL_BACKOFF_GLOBALCHECK</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Reset status for all the backend entries */</comment>
+	<for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name><name>backoffSingleton</name><operator>-&gt;</operator><name>numEntries</name></name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>BackoffBackendSharedEntry</name> <modifier>*</modifier></type><name>se</name> <init>= <expr><call><name>getBackoffEntryRW</name><argument_list>(<argument><expr><name>i</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+		<expr_stmt><expr><name><name>se</name><operator>-&gt;</operator><name>isActive</name></name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>se</name><operator>-&gt;</operator><name>numFollowersActive</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>se</name><operator>-&gt;</operator><name>backoff</name></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+	</block_content>}</block></for>
+
+	<comment type="block">/*
+	 * Mark backends that are active. Count of active group members is
+	 * maintained at their group leader.
+	 */</comment>
+	<for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name><name>backoffSingleton</name><operator>-&gt;</operator><name>numEntries</name></name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>BackoffBackendSharedEntry</name> <modifier>*</modifier></type><name>se</name> <init>= <expr><call><name>getBackoffEntryRW</name><argument_list>(<argument><expr><name>i</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+		<if_stmt><if>if <condition>(<expr><call><name>isValid</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>se</name><operator>-&gt;</operator><name>statementId</name></name></expr></argument>)</argument_list></call></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>se</name><operator>-&gt;</operator><name>weight</name></name> <operator>&gt;</operator> <literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<if_stmt><if>if <condition>(<expr><call><name>TIMEVAL_DIFF_USEC</name><argument_list>(<argument><expr><name>currentTime</name></expr></argument>, <argument><expr><name><name>se</name><operator>-&gt;</operator><name>lastCheckTime</name></name></expr></argument>)</argument_list></call>
+				<operator>&lt;</operator> <name>gp_resqueue_priority_inactivity_timeout</name> <operator>*</operator> <literal type="number">1000.0</literal></expr>)</condition>
+			<block>{<block_content>
+				<comment type="block">/*
+				 * This is an active backend. Need to maintain count at group
+				 * leader
+				 */</comment>
+				<decl_stmt><decl><type><name>BackoffBackendSharedEntry</name> <modifier>*</modifier></type><name>gl</name> <init>= <expr><call><name>getBackoffEntryRW</name><argument_list>(<argument><expr><name><name>se</name><operator>-&gt;</operator><name>groupLeaderIndex</name></name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+				<if_stmt><if>if <condition>(<expr><name><name>gl</name><operator>-&gt;</operator><name>numFollowersActive</name></name> <operator>==</operator> <literal type="number">0</literal></expr>)</condition>
+				<block>{<block_content>
+					<expr_stmt><expr><name>activeWeight</name> <operator>+=</operator> <name><name>se</name><operator>-&gt;</operator><name>weight</name></name></expr>;</expr_stmt>
+					<expr_stmt><expr><name>numActiveStatements</name><operator>++</operator></expr>;</expr_stmt>
+				</block_content>}</block></if></if_stmt>
+				<expr_stmt><expr><name><name>gl</name><operator>-&gt;</operator><name>numFollowersActive</name></name><operator>++</operator></expr>;</expr_stmt>
+				<expr_stmt><expr><name>numActiveBackends</name><operator>++</operator></expr>;</expr_stmt>
+				<expr_stmt><expr><name><name>se</name><operator>-&gt;</operator><name>isActive</name></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+			</block_content>}</block></if></if_stmt>
+			<if_stmt><if>if <condition>(<expr><call><name>isGroupLeader</name><argument_list>(<argument><expr><name>i</name></expr></argument>)</argument_list></call></expr>)</condition>
+			<block>{<block_content>
+				<expr_stmt><expr><name>totalStatementWeight</name> <operator>+=</operator> <name><name>se</name><operator>-&gt;</operator><name>weight</name></name></expr>;</expr_stmt>
+				<expr_stmt><expr><name>numStatements</name><operator>++</operator></expr>;</expr_stmt>
+			</block_content>}</block></if></if_stmt>
+			<expr_stmt><expr><name>numValidBackends</name><operator>++</operator></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+	</block_content>}</block></for>
+
+	<comment type="block">/* Sanity checks */</comment>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>numActiveBackends</name> <operator>&lt;=</operator> <name>numValidBackends</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>numValidBackends</name> <operator>&gt;=</operator> <name>numStatements</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block" format="doxygen">/**
+	 * Under certain conditions, we want to avoid backoff. Cases are:
+	 * 1. A statement just entered or exited
+	 * 2. A statement's weight changed due to user intervention via gp_adjust_priority()
+	 * 3. There is no active backend
+	 * 4. There is exactly one statement
+	 * 5. Total number valid of backends &lt;= number of procs per segment
+	 * Case 1 and 2 are approximated by checking if total statement weight changed since last sweeper loop.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>backoffSingleton</name><operator>-&gt;</operator><name>lastTotalStatementWeight</name></name> <operator>!=</operator> <name>totalStatementWeight</name>
+		<operator>||</operator> <name>numActiveBackends</name> <operator>==</operator> <literal type="number">0</literal>
+		<operator>||</operator> <name>numStatements</name> <operator>==</operator> <literal type="number">1</literal>
+		<operator>||</operator> <name>numValidBackends</name> <operator>&lt;=</operator> <call><name>numProcsPerSegment</name><argument_list>()</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* Write to targets */</comment>
+		<for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name><name>backoffSingleton</name><operator>-&gt;</operator><name>numEntries</name></name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>BackoffBackendSharedEntry</name> <modifier>*</modifier></type><name>se</name> <init>= <expr><call><name>getBackoffEntryRW</name><argument_list>(<argument><expr><name>i</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+			<expr_stmt><expr><name><name>se</name><operator>-&gt;</operator><name>backoff</name></name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+			<expr_stmt><expr><name><name>se</name><operator>-&gt;</operator><name>earlyBackoffExit</name></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+			<expr_stmt><expr><name><name>se</name><operator>-&gt;</operator><name>targetUsage</name></name> <operator>=</operator> <literal type="number">1.0</literal></expr>;</expr_stmt>
+		</block_content>}</block></for>
+	</block_content>}</block></if>
+	<else>else
+	<block>{<block_content>
+		<comment type="block" format="doxygen">/**
+		 * There are multiple statements with active backends.
+		 *
+		 * Let 'found' be true if we find a backend is trying to
+		 * request more CPU resources than the maximum CPU that it can
+		 * get. No matter how high the priority of a query process, it
+		 * can utilize at most a single CPU at a time.
+		 */</comment>
+		<decl_stmt><decl><type><name>bool</name></type>		<name>found</name> <init>= <expr><name>true</name></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>int</name></type>			<name>numIterations</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>double</name></type>		<name>CPUAvailable</name> <init>= <expr><call><name>numProcsPerSegment</name><argument_list>()</argument_list></call></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>double</name></type>		<name>maxCPU</name> <init>= <expr><call><name>Min</name><argument_list>(<argument><expr><literal type="number">1.0</literal></expr></argument>, <argument><expr><call><name>numProcsPerSegment</name><argument_list>()</argument_list></call></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>	<comment type="block">/* Maximum CPU that a
+																 * backend can get */</comment>
+
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>maxCPU</name> <operator>&gt;</operator> <literal type="number">0.0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>activeWeight</name> <operator>&gt;</operator> <literal type="number">0.0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name>gp_debug_resqueue_priority</name></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>LOG</name></expr></argument>, <argument><expr><literal type="string">"before allocation: active backends = %d, active weight = %f, cpu available = %f"</literal></expr></argument>, <argument><expr><name>numActiveBackends</name></expr></argument>, <argument><expr><name>activeWeight</name></expr></argument>, <argument><expr><name>CPUAvailable</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+
+		<while>while <condition>(<expr><name>found</name></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><name>found</name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+
+			<comment type="block" format="doxygen">/**
+			 * We try to find one or more backends that deserve maxCPU.
+			 */</comment>
+			<for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name><name>backoffSingleton</name><operator>-&gt;</operator><name>numEntries</name></name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control>
+			<block>{<block_content>
+				<decl_stmt><decl><type><name>BackoffBackendSharedEntry</name> <modifier>*</modifier></type><name>se</name> <init>= <expr><call><name>getBackoffEntryRW</name><argument_list>(<argument><expr><name>i</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+				<if_stmt><if>if <condition>(<expr><name><name>se</name><operator>-&gt;</operator><name>isActive</name></name>
+					<operator>&amp;&amp;</operator> <name><name>se</name><operator>-&gt;</operator><name>backoff</name></name></expr>)</condition>
+				<block>{<block_content>
+					<decl_stmt><decl><type><name>double</name></type>		<name>targetCPU</name> <init>= <expr><literal type="number">0.0</literal></expr></init></decl>;</decl_stmt>
+					<decl_stmt><decl><type><specifier>const</specifier> <name>BackoffBackendSharedEntry</name> <modifier>*</modifier></type><name>gl</name> <init>= <expr><call><name>getBackoffEntryRO</name><argument_list>(<argument><expr><name><name>se</name><operator>-&gt;</operator><name>groupLeaderIndex</name></name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+					<if_stmt><if>if <condition>(<expr><name><name>gl</name><operator>-&gt;</operator><name>numFollowersActive</name></name> <operator>&lt;=</operator> <literal type="number">0</literal></expr>)</condition>
+					<block>{<block_content>
+						<comment type="block">/*
+						 * There is a race condition here:
+						 * Backend A, B belong to the same statement. Backend A remains inactive
+						 * longer than gp_resqueue_priority_inactivity_timeout.
+						 * 
+						 * Timestamp1: backend A's leader is A, backend B's leader is B.
+						 *
+						 * Timestamp2: backend A's numFollowersActive remains zero due to timeout.
+						 *
+						 * Timestamp3: Sweeper calculates leader B's numFollowersActive to 1.
+						 *
+						 * Timestamp4: backend B changes it's leader to A.
+						 *
+						 * Backend process can change the backoff group leader without checking whether
+						 * the leader is an active backend due to performance consideration. This leads
+						 * to a backend could switch to an inactive leader whose numFollowersActive is
+						 * zero. Since backoff sweeper is not an accurate control, we could just skip
+						 * it in the current loop.
+						 */</comment>
+						<expr_stmt><expr><name><name>backoffSingleton</name><operator>-&gt;</operator><name>sweeperInProgress</name></name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+						<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>LOG</name></expr></argument>, <argument><expr><literal type="string">"numFollowersActive underflow!"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+						<return>return;</return>
+					</block_content>}</block></if></if_stmt>
+
+					<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>se</name><operator>-&gt;</operator><name>weight</name></name> <operator>&gt;</operator> <literal type="number">0.0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+					<expr_stmt><expr><name>targetCPU</name> <operator>=</operator> <operator>(</operator><name>CPUAvailable</name><operator>)</operator> <operator>*</operator> <operator>(</operator><name><name>se</name><operator>-&gt;</operator><name>weight</name></name><operator>)</operator> <operator>/</operator> <name>activeWeight</name> <operator>/</operator> <name><name>gl</name><operator>-&gt;</operator><name>numFollowersActive</name></name></expr>;</expr_stmt>
+
+					<comment type="block" format="doxygen">/**
+					 * Some statements may be weighed so heavily that they are allocated the maximum cpu ratio.
+					 */</comment>
+					<if_stmt><if>if <condition>(<expr><name>targetCPU</name> <operator>&gt;=</operator> <name>maxCPU</name></expr>)</condition>
+					<block>{<block_content>
+						<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>numProcsPerSegment</name><argument_list>()</argument_list></call> <operator>&gt;=</operator> <literal type="number">1.0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>	<comment type="block">/* This can only happen
+																 * when there is more
+																 * than one proc */</comment>
+						<expr_stmt><expr><name><name>se</name><operator>-&gt;</operator><name>targetUsage</name></name> <operator>=</operator> <name>maxCPU</name></expr>;</expr_stmt>
+						<expr_stmt><expr><name><name>se</name><operator>-&gt;</operator><name>backoff</name></name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+						<expr_stmt><expr><name>activeWeight</name> <operator>-=</operator> <operator>(</operator><name><name>se</name><operator>-&gt;</operator><name>weight</name></name> <operator>/</operator> <name><name>gl</name><operator>-&gt;</operator><name>numFollowersActive</name></name><operator>)</operator></expr>;</expr_stmt>
+
+						<expr_stmt><expr><name>CPUAvailable</name> <operator>-=</operator> <name>maxCPU</name></expr>;</expr_stmt>
+						<expr_stmt><expr><name>found</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+					</block_content>}</block></if></if_stmt>
+
+					<if_stmt><if>if <condition>(<expr><name>activeWeight</name> <operator>&lt;=</operator> <literal type="number">0.0</literal></expr>)</condition>
+					<block>{<block_content>
+						<comment type="block">/*
+						 * There is a race condition here:
+						 * Backend A,B,C belong to the same statement and have weight of
+						 * 100000.
+						 *
+						 * Timestamp1: backend A's leader is A, backend B's leader is B
+						 * backend C's leader is also B.
+						 *
+						 * Timestamp2: Sweeper calculates the activeWeight to 200000.
+						 *
+						 * Timestamp3: backend B changes it's leader to A.
+						 *
+						 * Timestamp4: Sweeper try to find the backends who deserve maxCPU,
+						 * if backend A, B, C all deserve maxCPU, then activeWeight = 
+						 * 200000 - 100000/1 - 100000/1 - 100000/2 which is less than zero.
+						 *
+						 * We can stop sweeping for such race condition because current
+						 * backoff mechanism dose not ask for accurate control.
+						 */</comment>
+						<expr_stmt><expr><name><name>backoffSingleton</name><operator>-&gt;</operator><name>sweeperInProgress</name></name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+						<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>LOG</name></expr></argument>, <argument><expr><literal type="string">"activeWeight underflow!"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+						<return>return;</return>
+					</block_content>}</block></if></if_stmt>
+				</block_content>}</block></if></if_stmt>
+			</block_content>}</block></for>
+			<expr_stmt><expr><name>numIterations</name><operator>++</operator></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>AssertImply</name><argument_list>(<argument><expr><name>found</name></expr></argument>, <argument><expr><operator>(</operator><name>numIterations</name> <operator>&lt;=</operator> <call><name>floor</name><argument_list>(<argument><expr><call><name>numProcsPerSegment</name><argument_list>()</argument_list></call></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>numIterations</name> <operator>&lt;=</operator> <call><name>ceil</name><argument_list>(<argument><expr><call><name>numProcsPerSegment</name><argument_list>()</argument_list></call></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></while>
+
+		<if_stmt><if>if <condition>(<expr><name>gp_debug_resqueue_priority</name></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>LOG</name></expr></argument>, <argument><expr><literal type="string">"after heavy backends: active backends = %d, active weight = %f, cpu available = %f"</literal></expr></argument>, <argument><expr><name>numActiveBackends</name></expr></argument>, <argument><expr><name>activeWeight</name></expr></argument>, <argument><expr><name>CPUAvailable</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+
+		<comment type="block" format="doxygen">/**
+		 * Distribute whatever is the CPU available among the rest.
+		 */</comment>
+		<for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name><name>backoffSingleton</name><operator>-&gt;</operator><name>numEntries</name></name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>BackoffBackendSharedEntry</name> <modifier>*</modifier></type><name>se</name> <init>= <expr><call><name>getBackoffEntryRW</name><argument_list>(<argument><expr><name>i</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+			<if_stmt><if>if <condition>(<expr><name><name>se</name><operator>-&gt;</operator><name>isActive</name></name>
+				<operator>&amp;&amp;</operator> <name><name>se</name><operator>-&gt;</operator><name>backoff</name></name></expr>)</condition>
+			<block>{<block_content>
+				<decl_stmt><decl><type><specifier>const</specifier> <name>BackoffBackendSharedEntry</name> <modifier>*</modifier></type><name>gl</name> <init>= <expr><call><name>getBackoffEntryRO</name><argument_list>(<argument><expr><name><name>se</name><operator>-&gt;</operator><name>groupLeaderIndex</name></name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+				<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>se</name><operator>-&gt;</operator><name>weight</name></name> <operator>&gt;</operator> <literal type="number">0.0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<expr_stmt><expr><name><name>se</name><operator>-&gt;</operator><name>targetUsage</name></name> <operator>=</operator> <operator>(</operator><name>CPUAvailable</name><operator>)</operator> <operator>*</operator> <operator>(</operator><name><name>se</name><operator>-&gt;</operator><name>weight</name></name><operator>)</operator> <operator>/</operator> <name>activeWeight</name> <operator>/</operator> <name><name>gl</name><operator>-&gt;</operator><name>numFollowersActive</name></name></expr>;</expr_stmt>
+			</block_content>}</block></if></if_stmt>
+		</block_content>}</block></for>
+	</block_content>}</block></else></if_stmt>
+
+
+	<expr_stmt><expr><name><name>backoffSingleton</name><operator>-&gt;</operator><name>lastTotalStatementWeight</name></name> <operator>=</operator> <name>totalStatementWeight</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>backoffSingleton</name><operator>-&gt;</operator><name>sweeperInProgress</name></name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>gp_debug_resqueue_priority</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>StringInfoData</name></type> <name>str</name></decl>;</decl_stmt>
+
+		<expr_stmt><expr><call><name>initStringInfo</name><argument_list>(<argument><expr><operator>&amp;</operator><name>str</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>appendStringInfo</name><argument_list>(<argument><expr><operator>&amp;</operator><name>str</name></expr></argument>, <argument><expr><literal type="string">"num active statements: %d "</literal></expr></argument>, <argument><expr><name>numActiveStatements</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>appendStringInfo</name><argument_list>(<argument><expr><operator>&amp;</operator><name>str</name></expr></argument>, <argument><expr><literal type="string">"num active backends: %d "</literal></expr></argument>, <argument><expr><name>numActiveBackends</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>appendStringInfo</name><argument_list>(<argument><expr><operator>&amp;</operator><name>str</name></expr></argument>, <argument><expr><literal type="string">"targetusages: "</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name>MaxBackends</name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control>
+		<block>{<block_content>
+			<decl_stmt><decl><type><specifier>const</specifier> <name>BackoffBackendSharedEntry</name> <modifier>*</modifier></type><name>se</name> <init>= <expr><call><name>getBackoffEntryRO</name><argument_list>(<argument><expr><name>i</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+			<if_stmt><if>if <condition>(<expr><name><name>se</name><operator>-&gt;</operator><name>isActive</name></name></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><call><name>appendStringInfo</name><argument_list>(<argument><expr><operator>&amp;</operator><name>str</name></expr></argument>, <argument><expr><literal type="string">"(%d,%f)"</literal></expr></argument>, <argument><expr><name>i</name></expr></argument>, <argument><expr><name><name>se</name><operator>-&gt;</operator><name>targetUsage</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+		</block_content>}</block></for>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>LOG</name></expr></argument>, <argument><expr><literal type="string">"%s"</literal></expr></argument>, <argument><expr><operator>(</operator><specifier>const</specifier> <name>char</name> <operator>*</operator><operator>)</operator> <name><name>str</name><operator>.</operator><name>data</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>pfree</name><argument_list>(<argument><expr><name><name>str</name><operator>.</operator><name>data</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+</block_content>}</block></function>
+
+<comment type="block" format="doxygen">/**
+ * Initialize global sate of backoff scheduler. This is called during creation
+ * of shared memory and semaphores.
+ */</comment>
+<function><type><name>void</name></type>
+<name>BackoffStateInit</name><parameter_list>()</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>bool</name></type>		<name>found</name> <init>= <expr><name>false</name></expr></init></decl>;</decl_stmt>
+
+	<comment type="block">/* Create or attach to the shared array */</comment>
+	<expr_stmt><expr><name>backoffSingleton</name> <operator>=</operator> <operator>(</operator><name>BackoffState</name> <operator>*</operator><operator>)</operator> <call><name>ShmemInitStruct</name><argument_list>(<argument><expr><literal type="string">"Backoff Global State"</literal></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>BackoffState</name></expr></argument>)</argument_list></sizeof></expr></argument>, <argument><expr><operator>&amp;</operator><name>found</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><name>found</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>bool</name></type>		<name>ret</name> <init>= <expr><name>false</name></expr></init></decl>;</decl_stmt>
+
+		<comment type="block">/*
+		 * We're the first - initialize.
+		 */</comment>
+		<expr_stmt><expr><call><name>MemSet</name><argument_list>(<argument><expr><name>backoffSingleton</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>BackoffState</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>backoffSingleton</name><operator>-&gt;</operator><name>numEntries</name></name> <operator>=</operator> <name>MaxBackends</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>backoffSingleton</name><operator>-&gt;</operator><name>backendEntries</name></name> <operator>=</operator> <operator>(</operator><name>BackoffBackendSharedEntry</name> <operator>*</operator><operator>)</operator> <call><name>ShmemInitStruct</name><argument_list>(<argument><expr><literal type="string">"Backoff Backend Entries"</literal></expr></argument>, <argument><expr><call><name>mul_size</name><argument_list>(<argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>BackoffBackendSharedEntry</name></expr></argument>)</argument_list></sizeof></expr></argument>, <argument><expr><name><name>backoffSingleton</name><operator>-&gt;</operator><name>numEntries</name></name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><operator>&amp;</operator><name>ret</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>backoffSingleton</name><operator>-&gt;</operator><name>sweeperInProgress</name></name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><operator>!</operator><name>ret</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>on_shmem_exit</name><argument_list>(<argument><expr><name>BackoffStateAtExit</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block" format="doxygen">/**
+ * This backend is done working on a statement.
+ */</comment>
+<function><type><name>void</name></type>
+<name>BackoffBackendEntryExit</name><parameter_list>()</parameter_list>
+<block>{<block_content>
+	<if_stmt><if>if <condition>(<expr><name>MyBackendId</name> <operator>&gt;=</operator> <literal type="number">0</literal>
+		<operator>&amp;&amp;</operator> <operator>(</operator><name>Gp_role</name> <operator>==</operator> <name>GP_ROLE_DISPATCH</name> <operator>||</operator> <name>Gp_role</name> <operator>==</operator> <name>GP_ROLE_EXECUTE</name><operator>)</operator></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>BackoffBackendSharedEntry</name> <modifier>*</modifier></type><name>se</name> <init>= <expr><call><name>myBackoffSharedEntry</name><argument_list>()</argument_list></call></expr></init></decl>;</decl_stmt>
+
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>se</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>setInvalid</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>se</name><operator>-&gt;</operator><name>statementId</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+	<return>return;</return>
+</block_content>}</block></function>
+
+<comment type="block" format="doxygen">/**
+ * Invalidate the statement id corresponding to this backend so that it may
+ * be eliminated from consideration by the sweeper early.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>BackoffStateAtExit</name><parameter_list>(<parameter><decl><type><name>int</name></type> <name>code</name></decl></parameter>, <parameter><decl><type><name>Datum</name></type> <name>arg</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>BackoffBackendEntryExit</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+
+<comment type="block" format="doxygen">/**
+ * An interface to re-weigh an existing session on the master and all backends.
+ * Input:
+ *	session id - what session is statement on?
+ *	command count - what is the command count of statement.
+ *	priority value - text, what should be the new priority of this statement.
+ * Output:
+ *	number of backends whose weights were changed by this call.
+ */</comment>
+<function><type><name>Datum</name></type>
+<name>gp_adjust_priority_value</name><parameter_list>(<parameter><decl><type><name>PG_FUNCTION_ARGS</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>int32</name></type>		<name>session_id</name> <init>= <expr><call><name>PG_GETARG_INT32</name><argument_list>(<argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int32</name></type>		<name>command_count</name> <init>= <expr><call><name>PG_GETARG_INT32</name><argument_list>(<argument><expr><literal type="number">1</literal></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Datum</name></type>		<name>dVal</name> <init>= <expr><call><name>PG_GETARG_DATUM</name><argument_list>(<argument><expr><literal type="number">2</literal></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>priorityVal</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>wt</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name>priorityVal</name> <operator>=</operator> <call><name>TextDatumGetCString</name><argument_list>(<argument><expr><name>dVal</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>wt</name> <operator>=</operator> <call><name>BackoffPriorityValueToInt</name><argument_list>(<argument><expr><name>priorityVal</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>wt</name> <operator>&gt;</operator> <literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>pfree</name><argument_list>(<argument><expr><name>priorityVal</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<return>return <expr><call><name>DirectFunctionCall3</name><argument_list>(<argument><expr><name>gp_adjust_priority_int</name></expr></argument>, <argument><expr><call><name>Int32GetDatum</name><argument_list>(<argument><expr><name>session_id</name></expr></argument>)</argument_list></call></expr></argument>,
+							<argument><expr><call><name>Int32GetDatum</name><argument_list>(<argument><expr><name>command_count</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><call><name>Int32GetDatum</name><argument_list>(<argument><expr><name>wt</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</return>
+
+</block_content>}</block></function>
+
+<comment type="block" format="doxygen">/**
+ * An interface to re-weigh an existing session on the master and all backends.
+ * Input:
+ *	session id - what session is statement on?
+ *	command count - what is the command count of statement.
+ *	weight - int, what should be the new priority of this statement.
+ * Output:
+ *	number of backends whose weights were changed by this call.
+ */</comment>
+<function><type><name>Datum</name></type>
+<name>gp_adjust_priority_int</name><parameter_list>(<parameter><decl><type><name>PG_FUNCTION_ARGS</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>int32</name></type>		<name>session_id</name> <init>= <expr><call><name>PG_GETARG_INT32</name><argument_list>(<argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int32</name></type>		<name>command_count</name> <init>= <expr><call><name>PG_GETARG_INT32</name><argument_list>(<argument><expr><literal type="number">1</literal></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int32</name></type>		<name>wt</name> <init>= <expr><call><name>PG_GETARG_INT32</name><argument_list>(<argument><expr><literal type="number">2</literal></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>numfound</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>StatementId</name></type> <name>sid</name></decl>;</decl_stmt>
+
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><name>gp_enable_resqueue_priority</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"Query prioritization is disabled."</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>superuser</name><argument_list>()</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_INSUFFICIENT_PRIVILEGE</name></expr></argument>)</argument_list></call><operator>,</operator>
+				 <operator>(</operator><call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"only superuser can re-prioritize a query after it has begun execution"</literal></expr></argument>)</argument_list></call><operator>)</operator><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>Gp_role</name> <operator>==</operator> <name>GP_ROLE_UTILITY</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"Query prioritization does not work in utility mode."</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>wt</name> <operator>&lt;=</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"Weight of statement must be greater than 0."</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>init</name><argument_list>(<argument><expr><operator>&amp;</operator><name>sid</name></expr></argument>, <argument><expr><name>session_id</name></expr></argument>, <argument><expr><name>command_count</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>Gp_role</name> <operator>==</operator> <name>GP_ROLE_DISPATCH</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>int</name></type>			<name>i</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>CdbPgResults</name></type> <name>cdb_pgresults</name> <init>= <expr><block>{<expr><name>NULL</name></expr>, <expr><literal type="number">0</literal></expr>}</block></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>char</name></type>		<name><name>cmd</name><index>[<expr><literal type="number">255</literal></expr>]</index></name></decl>;</decl_stmt>
+
+		<comment type="block">/*
+		 * Make sure the session exists before dispatching
+		 */</comment>
+		<for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name><name>backoffSingleton</name><operator>-&gt;</operator><name>numEntries</name></name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>BackoffBackendSharedEntry</name> <modifier>*</modifier></type><name>se</name> <init>= <expr><call><name>getBackoffEntryRW</name><argument_list>(<argument><expr><name>i</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+			<if_stmt><if>if <condition>(<expr><call><name>equalStatementId</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>se</name><operator>-&gt;</operator><name>statementId</name></name></expr></argument>, <argument><expr><operator>&amp;</operator><name>sid</name></expr></argument>)</argument_list></call></expr>)</condition>
+			<block>{<block_content>
+				<if_stmt><if>if <condition>(<expr><name>gp_debug_resqueue_priority</name></expr>)</condition>
+				<block>{<block_content>
+					<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>LOG</name></expr></argument>, <argument><expr><literal type="string">"changing weight of (%d:%d) from %d to %d"</literal></expr></argument>, <argument><expr><name><name>se</name><operator>-&gt;</operator><name>statementId</name><operator>.</operator><name>sessionId</name></name></expr></argument>, <argument><expr><name><name>se</name><operator>-&gt;</operator><name>statementId</name><operator>.</operator><name>commandCount</name></name></expr></argument>, <argument><expr><name><name>se</name><operator>-&gt;</operator><name>weight</name></name></expr></argument>, <argument><expr><name>wt</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				</block_content>}</block></if></if_stmt>
+
+				<expr_stmt><expr><name><name>se</name><operator>-&gt;</operator><name>weight</name></name> <operator>=</operator> <name>wt</name></expr>;</expr_stmt>
+				<expr_stmt><expr><name>numfound</name><operator>++</operator></expr>;</expr_stmt>
+			</block_content>}</block></if></if_stmt>
+		</block_content>}</block></for>
+
+		<if_stmt><if>if <condition>(<expr><name>numfound</name> <operator>==</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"Did not find any backend entries for session %d, command count %d."</literal></expr></argument>, <argument><expr><name>session_id</name></expr></argument>, <argument><expr><name>command_count</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+		<comment type="block">/*
+		 * Ok, it exists, dispatch the command to the segDBs.
+		 */</comment>
+		<expr_stmt><expr><call><name>sprintf</name><argument_list>(<argument><expr><name>cmd</name></expr></argument>, <argument><expr><literal type="string">"select gp_adjust_priority(%d,%d,%d)"</literal></expr></argument>, <argument><expr><name>session_id</name></expr></argument>, <argument><expr><name>command_count</name></expr></argument>, <argument><expr><name>wt</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><call><name>CdbDispatchCommand</name><argument_list>(<argument><expr><name>cmd</name></expr></argument>, <argument><expr><name>DF_WITH_SNAPSHOT</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>cdb_pgresults</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name><name>cdb_pgresults</name><operator>.</operator><name>numResults</name></name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name><name>struct</name> <name>pg_result</name></name> <modifier>*</modifier></type><name>pgresult</name> <init>= <expr><name><name>cdb_pgresults</name><operator>.</operator><name>pg_results</name><index>[<expr><name>i</name></expr>]</index></name></expr></init></decl>;</decl_stmt>
+
+			<if_stmt><if>if <condition>(<expr><call><name>PQresultStatus</name><argument_list>(<argument><expr><name>pgresult</name></expr></argument>)</argument_list></call> <operator>!=</operator> <name>PGRES_TUPLES_OK</name></expr>)</condition>
+			<block>{<block_content>
+				<expr_stmt><expr><call><name>cdbdisp_clearCdbPgResults</name><argument_list>(<argument><expr><operator>&amp;</operator><name>cdb_pgresults</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"gp_adjust_priority: resultStatus not tuples_Ok"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			</block_content>}</block></if>
+			<else>else
+			<block>{<block_content>
+
+				<decl_stmt><decl><type><name>int</name></type>			<name>j</name></decl>;</decl_stmt>
+
+				<for>for <control>(<init><expr><name>j</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>j</name> <operator>&lt;</operator> <call><name>PQntuples</name><argument_list>(<argument><expr><name>pgresult</name></expr></argument>)</argument_list></call></expr>;</condition> <incr><expr><name>j</name><operator>++</operator></expr></incr>)</control>
+				<block>{<block_content>
+					<decl_stmt><decl><type><name>int</name></type>			<name>retvalue</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+
+					<expr_stmt><expr><name>retvalue</name> <operator>=</operator> <call><name>atoi</name><argument_list>(<argument><expr><call><name>PQgetvalue</name><argument_list>(<argument><expr><name>pgresult</name></expr></argument>, <argument><expr><name>j</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+					<expr_stmt><expr><name>numfound</name> <operator>+=</operator> <name>retvalue</name></expr>;</expr_stmt>
+				</block_content>}</block></for>
+			</block_content>}</block></else></if_stmt>
+		</block_content>}</block></for>
+
+		<expr_stmt><expr><call><name>cdbdisp_clearCdbPgResults</name><argument_list>(<argument><expr><operator>&amp;</operator><name>cdb_pgresults</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	</block_content>}</block></if>
+	<else>else	<comment type="block">/* Gp_role == EXECUTE */</comment>
+	<block>{<block_content>
+		<comment type="block">/*
+		 * Find number of backends working on behalf of this session and
+		 * distribute the weight evenly.
+		 */</comment>
+		<decl_stmt><decl><type><name>int</name></type>			<name>i</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>Gp_role</name> <operator>==</operator> <name>GP_ROLE_EXECUTE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name><name>backoffSingleton</name><operator>-&gt;</operator><name>numEntries</name></name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>BackoffBackendSharedEntry</name> <modifier>*</modifier></type><name>se</name> <init>= <expr><call><name>getBackoffEntryRW</name><argument_list>(<argument><expr><name>i</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+			<if_stmt><if>if <condition>(<expr><call><name>equalStatementId</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>se</name><operator>-&gt;</operator><name>statementId</name></name></expr></argument>, <argument><expr><operator>&amp;</operator><name>sid</name></expr></argument>)</argument_list></call></expr>)</condition>
+			<block>{<block_content>
+				<if_stmt><if>if <condition>(<expr><name>gp_debug_resqueue_priority</name></expr>)</condition>
+				<block>{<block_content>
+					<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>LOG</name></expr></argument>, <argument><expr><literal type="string">"changing weight of (%d:%d) from %d to %d"</literal></expr></argument>, <argument><expr><name><name>se</name><operator>-&gt;</operator><name>statementId</name><operator>.</operator><name>sessionId</name></name></expr></argument>, <argument><expr><name><name>se</name><operator>-&gt;</operator><name>statementId</name><operator>.</operator><name>commandCount</name></name></expr></argument>, <argument><expr><name><name>se</name><operator>-&gt;</operator><name>weight</name></name></expr></argument>, <argument><expr><name>wt</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				</block_content>}</block></if></if_stmt>
+				<expr_stmt><expr><name><name>se</name><operator>-&gt;</operator><name>weight</name></name> <operator>=</operator> <name>wt</name></expr>;</expr_stmt>
+				<expr_stmt><expr><name>numfound</name><operator>++</operator></expr>;</expr_stmt>
+			</block_content>}</block></if></if_stmt>
+		</block_content>}</block></for>
+
+		<if_stmt><if>if <condition>(<expr><name>gp_debug_resqueue_priority</name> <operator>&amp;&amp;</operator> <name>numfound</name> <operator>==</operator> <literal type="number">0</literal></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>LOG</name></expr></argument>, <argument><expr><literal type="string">"did not find any matching backends on segments"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+	</block_content>}</block></else></if_stmt>
+
+	<expr_stmt><expr><call><name>PG_RETURN_INT32</name><argument_list>(<argument><expr><name>numfound</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<function><type><name>bool</name></type>
+<name>BackoffSweeperStartRule</name><parameter_list>(<parameter><decl><type><name>Datum</name></type> <name>main_arg</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<if_stmt><if>if <condition>(<expr><call><name>IsResQueueEnabled</name><argument_list>()</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>true</name></expr>;</return></block_content></block></if></if_stmt>
+
+	<return>return <expr><name>false</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block" format="doxygen">/**
+ * This method is called after fork of the sweeper process. It sets up signal
+ * handlers and does initialization that is required by a postgres backend.
+ */</comment>
+<function><type><name>void</name></type>
+<name>BackoffSweeperMain</name><parameter_list>(<parameter><decl><type><name>Datum</name></type> <name>main_arg</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><name>isSweeperProcess</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+
+	<comment type="block">/* We're now ready to receive signals */</comment>
+	<expr_stmt><expr><call><name>BackgroundWorkerUnblockSignals</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* main loop */</comment>
+	<expr_stmt><expr><call><name>BackoffSweeperLoop</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* One iteration done, go away */</comment>
+	<expr_stmt><expr><call><name>proc_exit</name><argument_list>(<argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block" format="doxygen">/**
+ * Main loop of the sweeper process. It wakes up once in a while, marks backends as active
+ * or not and re-calculates CPU usage among active backends.
+ */</comment>
+<function><type><name>void</name></type>
+<name>BackoffSweeperLoop</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<for>for <control>(<init>;</init><condition>;</condition><incr/>)</control>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>int</name></type>		<name>rc</name></decl>;</decl_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name>gp_enable_resqueue_priority</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>BackoffSweeper</name><argument_list>()</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>gp_resqueue_priority_sweeper_interval</name> <operator>&gt;</operator> <literal type="number">0.0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/* Sleep a while. */</comment>
+		<expr_stmt><expr><name>rc</name> <operator>=</operator> <call><name>WaitLatch</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>MyProc</name><operator>-&gt;</operator><name>procLatch</name></name></expr></argument>,
+					   <argument><expr><name>WL_LATCH_SET</name> <operator>|</operator> <name>WL_TIMEOUT</name> <operator>|</operator> <name>WL_POSTMASTER_DEATH</name></expr></argument>,
+					   <argument><expr><name>gp_resqueue_priority_sweeper_interval</name></expr></argument>,
+					   <argument><expr><name>WAIT_EVENT_BACKOFF_MAIN</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>ResetLatch</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>MyProc</name><operator>-&gt;</operator><name>procLatch</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/* emergency bailout if postmaster has died */</comment>
+		<if_stmt><if>if <condition>(<expr><name>rc</name> <operator>&amp;</operator> <name>WL_POSTMASTER_DEATH</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>proc_exit</name><argument_list>(<argument><expr><literal type="number">1</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	</block_content>}</block></for>							<comment type="block">/* end server loop */</comment>
+
+	<return>return;</return>
+</block_content>}</block></function>
+
+<comment type="block" format="doxygen">/**
+ * Set returning function to inspect current state of query prioritization.
+ * Input:
+ *	none
+ * Output:
+ *	Set of (session_id, command_count, priority, weight) for all backends (on the current segment).
+ *	This function is used by jetpack views gp_statement_priorities.
+ */</comment>
+<function><type><name>Datum</name></type>
+<name>gp_list_backend_priorities</name><parameter_list>(<parameter><decl><type><name>PG_FUNCTION_ARGS</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<typedef>typedef <type><struct>struct <name>Context</name>
+	<block>{
+		<decl_stmt><decl><type><name>int</name></type>			<name>currentIndex</name></decl>;</decl_stmt>
+	}</block></struct></type> <name>Context</name>;</typedef>
+
+	<decl_stmt><decl><type><name>FuncCallContext</name> <modifier>*</modifier></type><name>funcctx</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Context</name>    <modifier>*</modifier></type><name>context</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+
+	<if_stmt><if>if <condition>(<expr><call><name>SRF_IS_FIRSTCALL</name><argument_list>()</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>TupleDesc</name></type>	<name>tupdesc</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>MemoryContext</name></type> <name>oldcontext</name></decl>;</decl_stmt>
+
+		<comment type="block">/* create a function context for cross-call persistence */</comment>
+		<expr_stmt><expr><name>funcctx</name> <operator>=</operator> <call><name>SRF_FIRSTCALL_INIT</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/*
+		 * switch to memory context appropriate for multiple function calls
+		 */</comment>
+		<expr_stmt><expr><name>oldcontext</name> <operator>=</operator> <call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name><name>funcctx</name><operator>-&gt;</operator><name>multi_call_memory_ctx</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/* build tupdesc for result tuples */</comment>
+		<comment type="block">/* this had better match gp_distributed_xacts view in system_views.sql */</comment>
+		<expr_stmt><expr><name>tupdesc</name> <operator>=</operator> <call><name>CreateTemplateTupleDesc</name><argument_list>(<argument><expr><literal type="number">4</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>TupleDescInitEntry</name><argument_list>(<argument><expr><name>tupdesc</name></expr></argument>, <argument><expr><operator>(</operator><name>AttrNumber</name><operator>)</operator> <literal type="number">1</literal></expr></argument>, <argument><expr><literal type="string">"session_id"</literal></expr></argument>,
+						   <argument><expr><name>INT4OID</name></expr></argument>, <argument><expr><operator>-</operator><literal type="number">1</literal></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>TupleDescInitEntry</name><argument_list>(<argument><expr><name>tupdesc</name></expr></argument>, <argument><expr><operator>(</operator><name>AttrNumber</name><operator>)</operator> <literal type="number">2</literal></expr></argument>, <argument><expr><literal type="string">"command_count"</literal></expr></argument>,
+						   <argument><expr><name>INT4OID</name></expr></argument>, <argument><expr><operator>-</operator><literal type="number">1</literal></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>TupleDescInitEntry</name><argument_list>(<argument><expr><name>tupdesc</name></expr></argument>, <argument><expr><operator>(</operator><name>AttrNumber</name><operator>)</operator> <literal type="number">3</literal></expr></argument>, <argument><expr><literal type="string">"priority"</literal></expr></argument>,
+						   <argument><expr><name>TEXTOID</name></expr></argument>, <argument><expr><operator>-</operator><literal type="number">1</literal></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>TupleDescInitEntry</name><argument_list>(<argument><expr><name>tupdesc</name></expr></argument>, <argument><expr><operator>(</operator><name>AttrNumber</name><operator>)</operator> <literal type="number">4</literal></expr></argument>, <argument><expr><literal type="string">"weight"</literal></expr></argument>,
+						   <argument><expr><name>INT4OID</name></expr></argument>, <argument><expr><operator>-</operator><literal type="number">1</literal></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+
+		<expr_stmt><expr><name><name>funcctx</name><operator>-&gt;</operator><name>tuple_desc</name></name> <operator>=</operator> <call><name>BlessTupleDesc</name><argument_list>(<argument><expr><name>tupdesc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/*
+		 * Collect all the locking information that we will format and send
+		 * out as a result set.
+		 */</comment>
+		<expr_stmt><expr><name>context</name> <operator>=</operator> <operator>(</operator><name>Context</name> <operator>*</operator><operator>)</operator> <call><name>palloc</name><argument_list>(<argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>Context</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>funcctx</name><operator>-&gt;</operator><name>user_fctx</name></name> <operator>=</operator> <operator>(</operator><name>void</name> <operator>*</operator><operator>)</operator> <name>context</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>context</name><operator>-&gt;</operator><name>currentIndex</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>oldcontext</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<expr_stmt><expr><name>funcctx</name> <operator>=</operator> <call><name>SRF_PERCALL_SETUP</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>funcctx</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>context</name> <operator>=</operator> <operator>(</operator><name>Context</name> <operator>*</operator><operator>)</operator> <name><name>funcctx</name><operator>-&gt;</operator><name>user_fctx</name></name></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>context</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>IsResQueueEnabled</name><argument_list>()</argument_list></call> <operator>||</operator> <operator>!</operator><name>gp_enable_resqueue_priority</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>SRF_RETURN_DONE</name><argument_list>(<argument><expr><name>funcctx</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<while>while <condition>(<expr><name><name>context</name><operator>-&gt;</operator><name>currentIndex</name></name> <operator>&lt;</operator> <name><name>backoffSingleton</name><operator>-&gt;</operator><name>numEntries</name></name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>Datum</name></type>		<name><name>values</name><index>[<expr><literal type="number">4</literal></expr>]</index></name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>bool</name></type>		<name><name>nulls</name><index>[<expr><literal type="number">4</literal></expr>]</index></name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>HeapTuple</name></type>	<name>tuple</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>Datum</name></type>		<name>result</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>priorityVal</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+
+		<decl_stmt><decl><type><specifier>const</specifier> <name>BackoffBackendSharedEntry</name> <modifier>*</modifier></type><name>se</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+
+		<expr_stmt><expr><name>se</name> <operator>=</operator> <call><name>getBackoffEntryRO</name><argument_list>(<argument><expr><name><name>context</name><operator>-&gt;</operator><name>currentIndex</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>se</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>isValid</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>se</name><operator>-&gt;</operator><name>statementId</name></name></expr></argument>)</argument_list></call></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><name><name>context</name><operator>-&gt;</operator><name>currentIndex</name></name><operator>++</operator></expr>;</expr_stmt>
+			<continue>continue;</continue>
+		</block_content>}</block></if></if_stmt>
+
+		<comment type="block">/*
+		 * Form tuple with appropriate data.
+		 */</comment>
+		<expr_stmt><expr><call><name>MemSet</name><argument_list>(<argument><expr><name>values</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>values</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>MemSet</name><argument_list>(<argument><expr><name>nulls</name></expr></argument>, <argument><expr><name>false</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>nulls</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><name><name>values</name><index>[<expr><literal type="number">0</literal></expr>]</index></name> <operator>=</operator> <call><name>Int32GetDatum</name><argument_list>(<argument><expr><operator>(</operator><name>int32</name><operator>)</operator> <name><name>se</name><operator>-&gt;</operator><name>statementId</name><operator>.</operator><name>sessionId</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>values</name><index>[<expr><literal type="number">1</literal></expr>]</index></name> <operator>=</operator> <call><name>Int32GetDatum</name><argument_list>(<argument><expr><operator>(</operator><name>int32</name><operator>)</operator> <name><name>se</name><operator>-&gt;</operator><name>statementId</name><operator>.</operator><name>commandCount</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><name>priorityVal</name> <operator>=</operator> <call><name>BackoffPriorityIntToValue</name><argument_list>(<argument><expr><name><name>se</name><operator>-&gt;</operator><name>weight</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>priorityVal</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><name><name>values</name><index>[<expr><literal type="number">2</literal></expr>]</index></name> <operator>=</operator> <call><name>CStringGetTextDatum</name><argument_list>(<argument><expr><name>priorityVal</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>se</name><operator>-&gt;</operator><name>weight</name></name> <operator>&gt;</operator> <literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>values</name><index>[<expr><literal type="number">3</literal></expr>]</index></name> <operator>=</operator> <call><name>Int32GetDatum</name><argument_list>(<argument><expr><operator>(</operator><name>int32</name><operator>)</operator> <name><name>se</name><operator>-&gt;</operator><name>weight</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name>tuple</name> <operator>=</operator> <call><name>heap_form_tuple</name><argument_list>(<argument><expr><name><name>funcctx</name><operator>-&gt;</operator><name>tuple_desc</name></name></expr></argument>, <argument><expr><name>values</name></expr></argument>, <argument><expr><name>nulls</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name>result</name> <operator>=</operator> <call><name>HeapTupleGetDatum</name><argument_list>(<argument><expr><name>tuple</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><name><name>context</name><operator>-&gt;</operator><name>currentIndex</name></name><operator>++</operator></expr>;</expr_stmt>
+
+		<expr_stmt><expr><call><name>SRF_RETURN_NEXT</name><argument_list>(<argument><expr><name>funcctx</name></expr></argument>, <argument><expr><name>result</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></while>
+
+	<expr_stmt><expr><call><name>SRF_RETURN_DONE</name><argument_list>(<argument><expr><name>funcctx</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block" format="doxygen">/**
+ * What is the weight assigned to superuser issued queries?
+ */</comment>
+<function><type><specifier>static</specifier> <name>int</name></type>
+<name>BackoffSuperuserStatementWeight</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>int</name></type>			<name>wt</name> <init>= <expr><operator>-</operator><literal type="number">1</literal></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>superuser</name><argument_list>()</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>wt</name> <operator>=</operator> <call><name>BackoffPriorityValueToInt</name><argument_list>(<argument><expr><literal type="string">"MAX"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>wt</name> <operator>&gt;</operator> <literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<return>return <expr><name>wt</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block" format="doxygen">/**
+ * Integer value for default weight.
+ */</comment>
+<function><type><specifier>static</specifier> <name>int</name></type>
+<name>BackoffDefaultWeight</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>int</name></type>			<name>wt</name> <init>= <expr><call><name>BackoffPriorityValueToInt</name><argument_list>(<argument><expr><name>gp_resqueue_priority_default_value</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>wt</name> <operator>&gt;</operator> <literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<return>return <expr><name>wt</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block" format="doxygen">/**
+ * Get weight associated with queue. See queue.c.
+ *
+ * Attention is paid in order to avoid catalog lookups when not allowed.  The
+ * superuser() function performs catalog lookups in certain cases. Also the
+ * GetResqueueCapabilityEntry will always  do a catalog lookup. In such cases
+ * use the default weight.
+ */</comment>
+<function><type><name>int</name></type>
+<name>ResourceQueueGetPriorityWeight</name><parameter_list>(<parameter><decl><type><name>Oid</name></type> <name>queueId</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>List</name>	   <modifier>*</modifier></type><name>capabilitiesList</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>List</name>	   <modifier>*</modifier></type><name>entry</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>ListCell</name>   <modifier>*</modifier></type><name>le</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>weight</name> <init>= <expr><call><name>BackoffDefaultWeight</name><argument_list>()</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>IsTransactionState</name><argument_list>()</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>weight</name></expr>;</return></block_content></block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><call><name>superuser</name><argument_list>()</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><call><name>BackoffSuperuserStatementWeight</name><argument_list>()</argument_list></call></expr>;</return></block_content></block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>queueId</name> <operator>==</operator> <name>InvalidOid</name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>weight</name></expr>;</return></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><name>capabilitiesList</name> <operator>=</operator> <call><name>GetResqueueCapabilityEntry</name><argument_list>(<argument><expr><name>queueId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>		<comment type="block">/* This is a list of
+																 * lists */</comment>
+
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><name>capabilitiesList</name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>weight</name></expr>;</return></block_content></block></if></if_stmt>
+
+	<macro><name>foreach</name><argument_list>(<argument>le</argument>, <argument>capabilitiesList</argument>)</argument_list></macro>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>Value</name>	   <modifier>*</modifier></type><name>key</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+
+		<expr_stmt><expr><name>entry</name> <operator>=</operator> <operator>(</operator><name>List</name> <operator>*</operator><operator>)</operator> <call><name>lfirst</name><argument_list>(<argument><expr><name>le</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>entry</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name>key</name> <operator>=</operator> <operator>(</operator><name>Value</name> <operator>*</operator><operator>)</operator> <call><name>linitial</name><argument_list>(<argument><expr><name>entry</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>key</name><operator>-&gt;</operator><name>type</name></name> <operator>==</operator> <name>T_Integer</name></expr></argument>)</argument_list></call></expr>;</expr_stmt> <comment type="block">/* This is resource type id */</comment>
+		<if_stmt><if>if <condition>(<expr><call><name>intVal</name><argument_list>(<argument><expr><name>key</name></expr></argument>)</argument_list></call> <operator>==</operator> <name>PG_RESRCTYPE_PRIORITY</name></expr>)</condition>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>Value</name>	   <modifier>*</modifier></type><name>val</name> <init>= <expr><call><name>lsecond</name><argument_list>(<argument><expr><name>entry</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+			<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>val</name><operator>-&gt;</operator><name>type</name></name> <operator>==</operator> <name>T_String</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><name>weight</name> <operator>=</operator> <call><name>BackoffPriorityValueToInt</name><argument_list>(<argument><expr><call><name>strVal</name><argument_list>(<argument><expr><name>val</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+	</block_content>}</block>
+	<expr_stmt><expr><call><name>list_free</name><argument_list>(<argument><expr><name>capabilitiesList</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<return>return <expr><name>weight</name></expr>;</return>
+</block_content>}</block></function>
+
+<typedef>typedef <type><struct>struct <name>PriorityMapping</name>
+<block>{
+	<decl_stmt><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>priorityVal</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>weight</name></decl>;</decl_stmt>
+}</block></struct></type> <name>PriorityMapping</name>;</typedef>
+
+<decl_stmt><decl><type><specifier>const</specifier> <name><name>struct</name> <name>PriorityMapping</name></name></type> <name><name>priority_map</name><index>[]</index></name> <init>= <expr><block>{
+	<expr><block>{<expr><literal type="string">"MAX"</literal></expr>, <expr><literal type="number">1000000</literal></expr>}</block></expr>,
+	<expr><block>{<expr><literal type="string">"HIGH"</literal></expr>, <expr><literal type="number">1000</literal></expr>}</block></expr>,
+	<expr><block>{<expr><literal type="string">"MEDIUM"</literal></expr>, <expr><literal type="number">500</literal></expr>}</block></expr>,
+	<expr><block>{<expr><literal type="string">"LOW"</literal></expr>, <expr><literal type="number">200</literal></expr>}</block></expr>,
+	<expr><block>{<expr><literal type="string">"MIN"</literal></expr>, <expr><literal type="number">100</literal></expr>}</block></expr>,
+	<comment type="block">/* End of list marker */</comment>
+	<expr><block>{<expr><name>NULL</name></expr>, <expr><literal type="number">0</literal></expr>}</block></expr>
+}</block></expr></init></decl>;</decl_stmt>
+
+
+<comment type="block" format="doxygen">/**
+ * Resource queues are associated with priority values which are stored
+ * as text. This method maps them to double values that will be used for
+ * cpu target usage computations by the sweeper. Keep this method in sync
+ * with its dual BackoffPriorityIntToValue().
+ */</comment>
+<function><type><specifier>static</specifier> <name>int</name></type>
+<name>BackoffPriorityValueToInt</name><parameter_list>(<parameter><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>priorityVal</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><specifier>const</specifier> <name>PriorityMapping</name> <modifier>*</modifier></type><name>p</name> <init>= <expr><name>priority_map</name></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>p</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<while>while <condition>(<expr><name><name>p</name><operator>-&gt;</operator><name>priorityVal</name></name> <operator>!=</operator> <name>NULL</name> <operator>&amp;&amp;</operator> <operator>(</operator><call><name>pg_strcasecmp</name><argument_list>(<argument><expr><name>priorityVal</name></expr></argument>, <argument><expr><name><name>p</name><operator>-&gt;</operator><name>priorityVal</name></name></expr></argument>)</argument_list></call> <operator>!=</operator> <literal type="number">0</literal><operator>)</operator></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name>p</name><operator>++</operator></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <name>p</name> <operator>&lt;</operator> <operator>(</operator><specifier>const</specifier> <name>char</name> <operator>*</operator><operator>)</operator> <name>priority_map</name> <operator>+</operator> <sizeof>sizeof<argument_list>(<argument><expr><name>priority_map</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></while>
+
+	<if_stmt><if>if <condition>(<expr><name><name>p</name><operator>-&gt;</operator><name>priorityVal</name></name> <operator>==</operator> <name>NULL</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* No match found, throw an error */</comment>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"Invalid priority value."</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>p</name><operator>-&gt;</operator><name>weight</name></name> <operator>&gt;</operator> <literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<return>return <expr><name><name>p</name><operator>-&gt;</operator><name>weight</name></name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block" format="doxygen">/**
+ * Dual of the method BackoffPriorityValueToInt(). Given a weight, this
+ * method maps it to a text value corresponding to this weight. Caller is
+ * responsible for deallocating the return pointer.
+ */</comment>
+<function><type><name>char</name> <modifier>*</modifier></type>
+<name>BackoffPriorityIntToValue</name><parameter_list>(<parameter><decl><type><name>int</name></type> <name>weight</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><specifier>const</specifier> <name>PriorityMapping</name> <modifier>*</modifier></type><name>p</name> <init>= <expr><name>priority_map</name></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>p</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<while>while <condition>(<expr><name><name>p</name><operator>-&gt;</operator><name>priorityVal</name></name> <operator>!=</operator> <name>NULL</name> <operator>&amp;&amp;</operator> <operator>(</operator><name><name>p</name><operator>-&gt;</operator><name>weight</name></name> <operator>!=</operator> <name>weight</name><operator>)</operator></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name>p</name> <operator>=</operator> <name>p</name> <operator>+</operator> <literal type="number">1</literal></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <name>p</name> <operator>&lt;</operator> <operator>(</operator><specifier>const</specifier> <name>char</name> <operator>*</operator><operator>)</operator> <name>priority_map</name> <operator>+</operator> <sizeof>sizeof<argument_list>(<argument><expr><name>priority_map</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></while>
+
+	<if_stmt><if>if <condition>(<expr><name><name>p</name><operator>-&gt;</operator><name>priorityVal</name></name> <operator>!=</operator> <name>NULL</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>p</name><operator>-&gt;</operator><name>weight</name></name> <operator>==</operator> <name>weight</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<return>return <expr><call><name>pstrdup</name><argument_list>(<argument><expr><name><name>p</name><operator>-&gt;</operator><name>priorityVal</name></name></expr></argument>)</argument_list></call></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<return>return <expr><call><name>pstrdup</name><argument_list>(<argument><expr><literal type="string">"NON-STANDARD"</literal></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Helper method that verifies setting of default priority guc.
+ */</comment>
+<function><type><name>bool</name></type>
+<name>gpvars_check_gp_resqueue_priority_default_value</name> <parameter_list>(<parameter><decl><type><name>char</name> <modifier>*</modifier><modifier>*</modifier></type><name>newval</name></decl></parameter>,<parameter><decl><type><name>void</name> <modifier>*</modifier><modifier>*</modifier></type><name>extra</name></decl></parameter>,
+												<parameter><decl><type><name>GucSource</name></type> <name>source</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>int</name></type>			<name>wt</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name>wt</name> <operator>=</operator> <call><name>BackoffPriorityValueToInt</name><argument_list>(<argument><expr><operator>*</operator><name>newval</name></expr></argument>)</argument_list></call></expr>;</expr_stmt> <comment type="block">/* This will throw an error if * bad value is specified */</comment>
+
+	<if_stmt><if>if <condition>(<expr><name>wt</name> <operator>&gt;</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+		<return>return <expr><name>true</name></expr>;</return></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>GUC_check_errmsg</name><argument_list>(<argument><expr><literal type="string">"invalid value for gp_resqueue_priority_default_value: \"%s\""</literal></expr></argument>, <argument><expr><operator>*</operator><name>newval</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<return>return <expr><name>false</name></expr>;</return>
+</block_content>}</block></function>
+</unit>

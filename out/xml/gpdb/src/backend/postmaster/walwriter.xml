@@ -1,0 +1,352 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<unit xmlns="http://www.srcML.org/srcML/src" xmlns:cpp="http://www.srcML.org/srcML/cpp" revision="1.0.0" language="C" filename="/cloned_projects/gpdb/src/backend/postmaster/walwriter.c"><comment type="block">/*-------------------------------------------------------------------------
+ *
+ * walwriter.c
+ *
+ * The WAL writer background process is new as of Postgres 8.3.  It attempts
+ * to keep regular backends from having to write out (and fsync) WAL pages.
+ * Also, it guarantees that transaction commit records that weren't synced
+ * to disk immediately upon commit (ie, were "asynchronously committed")
+ * will reach disk within a knowable time --- which, as it happens, is at
+ * most three times the wal_writer_delay cycle time.
+ *
+ * Note that as with the bgwriter for shared buffers, regular backends are
+ * still empowered to issue WAL writes and fsyncs when the walwriter doesn't
+ * keep up. This means that the WALWriter is not an essential process and
+ * can shutdown quickly when requested.
+ *
+ * Because the walwriter's cycle is directly linked to the maximum delay
+ * before async-commit transactions are guaranteed committed, it's probably
+ * unwise to load additional functionality onto it.  For instance, if you've
+ * got a yen to create xlog segments further in advance, that'd be better done
+ * in bgwriter than in walwriter.
+ *
+ * The walwriter is started by the postmaster as soon as the startup subprocess
+ * finishes.  It remains alive until the postmaster commands it to terminate.
+ * Normal termination is by SIGTERM, which instructs the walwriter to exit(0).
+ * Emergency termination is by SIGQUIT; like any backend, the walwriter will
+ * simply abort and exit on SIGQUIT.
+ *
+ * If the walwriter exits unexpectedly, the postmaster treats that the same
+ * as a backend crash: shared memory may be corrupted, so remaining backends
+ * should be killed by SIGQUIT and then a recovery cycle started.
+ *
+ *
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ *
+ *
+ * IDENTIFICATION
+ *	  src/backend/postmaster/walwriter.c
+ *
+ *-------------------------------------------------------------------------
+ */</comment>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"postgres.h"</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;signal.h&gt;</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;unistd.h&gt;</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/xlog.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"libpq/pqsignal.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"miscadmin.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"pgstat.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"postmaster/walwriter.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/bufmgr.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/condition_variable.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/fd.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/ipc.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/lwlock.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/proc.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/smgr.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/guc.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/hsearch.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/memutils.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/resowner.h"</cpp:file></cpp:include>
+
+
+<comment type="block">/*
+ * GUC parameters
+ */</comment>
+<decl_stmt><decl><type><name>int</name></type>			<name>WalWriterDelay</name> <init>= <expr><literal type="number">200</literal></expr></init></decl>;</decl_stmt>
+<decl_stmt><decl><type><name>int</name></type>			<name>WalWriterFlushAfter</name> <init>= <expr><literal type="number">128</literal></expr></init></decl>;</decl_stmt>
+
+<comment type="block">/*
+ * Number of do-nothing loops before lengthening the delay time, and the
+ * multiplier to apply to WalWriterDelay when we do decide to hibernate.
+ * (Perhaps these need to be configurable?)
+ */</comment>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>LOOPS_UNTIL_HIBERNATE</name></cpp:macro>		<cpp:value>50</cpp:value></cpp:define>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>HIBERNATE_FACTOR</name></cpp:macro>			<cpp:value>25</cpp:value></cpp:define>
+
+<comment type="block">/*
+ * Flags set by interrupt handlers for later service in the main loop.
+ */</comment>
+<decl_stmt><decl><type><specifier>static</specifier> <specifier>volatile</specifier> <name>sig_atomic_t</name></type> <name>got_SIGHUP</name> <init>= <expr><name>false</name></expr></init></decl>;</decl_stmt>
+<decl_stmt><decl><type><specifier>static</specifier> <specifier>volatile</specifier> <name>sig_atomic_t</name></type> <name>shutdown_requested</name> <init>= <expr><name>false</name></expr></init></decl>;</decl_stmt>
+
+<comment type="block">/* Signal handlers */</comment>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>wal_quickdie</name><parameter_list>(<parameter><decl><type><name>SIGNAL_ARGS</name></type></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>WalSigHupHandler</name><parameter_list>(<parameter><decl><type><name>SIGNAL_ARGS</name></type></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>WalShutdownHandler</name><parameter_list>(<parameter><decl><type><name>SIGNAL_ARGS</name></type></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>walwriter_sigusr1_handler</name><parameter_list>(<parameter><decl><type><name>SIGNAL_ARGS</name></type></decl></parameter>)</parameter_list>;</function_decl>
+
+<comment type="block">/*
+ * Main entry point for walwriter process
+ *
+ * This is invoked from AuxiliaryProcessMain, which has already created the
+ * basic execution environment, but not enabled signals yet.
+ */</comment>
+<function><type><name>void</name></type>
+<name>WalWriterMain</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>sigjmp_buf</name></type>	<name>local_sigjmp_buf</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>MemoryContext</name></type> <name>walwriter_context</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type>			<name>left_till_hibernate</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type>		<name>hibernating</name></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * Properly accept or ignore signals the postmaster might send us
+	 *
+	 * We have no particular use for SIGINT at the moment, but seems
+	 * reasonable to treat like SIGTERM.
+	 */</comment>
+	<expr_stmt><expr><call><name>pqsignal</name><argument_list>(<argument><expr><name>SIGHUP</name></expr></argument>, <argument><expr><name>WalSigHupHandler</name></expr></argument>)</argument_list></call></expr>;</expr_stmt> <comment type="block">/* set flag to read config file */</comment>
+	<expr_stmt><expr><call><name>pqsignal</name><argument_list>(<argument><expr><name>SIGINT</name></expr></argument>, <argument><expr><name>WalShutdownHandler</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>	<comment type="block">/* request shutdown */</comment>
+	<expr_stmt><expr><call><name>pqsignal</name><argument_list>(<argument><expr><name>SIGTERM</name></expr></argument>, <argument><expr><name>WalShutdownHandler</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>	<comment type="block">/* request shutdown */</comment>
+	<expr_stmt><expr><call><name>pqsignal</name><argument_list>(<argument><expr><name>SIGQUIT</name></expr></argument>, <argument><expr><name>wal_quickdie</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>	<comment type="block">/* hard crash time */</comment>
+	<expr_stmt><expr><call><name>pqsignal</name><argument_list>(<argument><expr><name>SIGALRM</name></expr></argument>, <argument><expr><name>SIG_IGN</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>pqsignal</name><argument_list>(<argument><expr><name>SIGPIPE</name></expr></argument>, <argument><expr><name>SIG_IGN</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>pqsignal</name><argument_list>(<argument><expr><name>SIGUSR1</name></expr></argument>, <argument><expr><name>walwriter_sigusr1_handler</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>pqsignal</name><argument_list>(<argument><expr><name>SIGUSR2</name></expr></argument>, <argument><expr><name>SIG_IGN</name></expr></argument>)</argument_list></call></expr>;</expr_stmt> <comment type="block">/* not used */</comment>
+
+	<comment type="block">/*
+	 * Reset some signals that are accepted by postmaster but not here
+	 */</comment>
+	<expr_stmt><expr><call><name>pqsignal</name><argument_list>(<argument><expr><name>SIGCHLD</name></expr></argument>, <argument><expr><name>SIG_DFL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* We allow SIGQUIT (quickdie) at all times */</comment>
+	<expr_stmt><expr><call><name>sigdelset</name><argument_list>(<argument><expr><operator>&amp;</operator><name>BlockSig</name></expr></argument>, <argument><expr><name>SIGQUIT</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Create a memory context that we will do all our work in.  We do this so
+	 * that we can reset the context during error recovery and thereby avoid
+	 * possible memory leaks.  Formerly this code just ran in
+	 * TopMemoryContext, but resetting that would be a really bad idea.
+	 */</comment>
+	<expr_stmt><expr><name>walwriter_context</name> <operator>=</operator> <call><name>AllocSetContextCreate</name><argument_list>(<argument><expr><name>TopMemoryContext</name></expr></argument>,
+											  <argument><expr><literal type="string">"Wal Writer"</literal></expr></argument>,
+											  <argument><expr><name>ALLOCSET_DEFAULT_SIZES</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>walwriter_context</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * If an exception is encountered, processing resumes here.
+	 *
+	 * This code is heavily based on bgwriter.c, q.v.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><call><name>sigsetjmp</name><argument_list>(<argument><expr><name>local_sigjmp_buf</name></expr></argument>, <argument><expr><literal type="number">1</literal></expr></argument>)</argument_list></call> <operator>!=</operator> <literal type="number">0</literal></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* Since not using PG_TRY, must reset error stack by hand */</comment>
+		<expr_stmt><expr><name>error_context_stack</name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+
+		<comment type="block">/* Prevent interrupts while cleaning up */</comment>
+		<expr_stmt><expr><call><name>HOLD_INTERRUPTS</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/* Report the error to the server log */</comment>
+		<expr_stmt><expr><call><name>EmitErrorReport</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/*
+		 * These operations are really just a minimal subset of
+		 * AbortTransaction().  We don't have very many resources to worry
+		 * about in walwriter, but we do have LWLocks, and perhaps buffers?
+		 */</comment>
+		<expr_stmt><expr><call><name>LWLockReleaseAll</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>ConditionVariableCancelSleep</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>pgstat_report_wait_end</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>AbortBufferIO</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>UnlockBuffers</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>ReleaseAuxProcessResources</name><argument_list>(<argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>AtEOXact_Buffers</name><argument_list>(<argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>AtEOXact_SMgr</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>AtEOXact_Files</name><argument_list>(<argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>AtEOXact_HashTables</name><argument_list>(<argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/*
+		 * Now return to normal top-level context and clear ErrorContext for
+		 * next time.
+		 */</comment>
+		<expr_stmt><expr><call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>walwriter_context</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>FlushErrorState</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/* Flush any leaked data in the top-level context */</comment>
+		<expr_stmt><expr><call><name>MemoryContextResetAndDeleteChildren</name><argument_list>(<argument><expr><name>walwriter_context</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/* Now we can allow interrupts again */</comment>
+		<expr_stmt><expr><call><name>RESUME_INTERRUPTS</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/*
+		 * Sleep at least 1 second after any error.  A write error is likely
+		 * to be repeated, and we don't want to be filling the error logs as
+		 * fast as we can.
+		 */</comment>
+		<expr_stmt><expr><call><name>pg_usleep</name><argument_list>(<argument><expr><literal type="number">1000000L</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/*
+		 * Close all open files after any error.  This is helpful on Windows,
+		 * where holding deleted files open causes various strange errors.
+		 * It's not clear we need it elsewhere, but shouldn't hurt.
+		 */</comment>
+		<expr_stmt><expr><call><name>smgrcloseall</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/* We can now handle ereport(ERROR) */</comment>
+	<expr_stmt><expr><name>PG_exception_stack</name> <operator>=</operator> <operator>&amp;</operator><name>local_sigjmp_buf</name></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Unblock signals (they were blocked when the postmaster forked us)
+	 */</comment>
+	<expr_stmt><expr><call><name>PG_SETMASK</name><argument_list>(<argument><expr><operator>&amp;</operator><name>UnBlockSig</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Reset hibernation state after any error.
+	 */</comment>
+	<expr_stmt><expr><name>left_till_hibernate</name> <operator>=</operator> <name>LOOPS_UNTIL_HIBERNATE</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name>hibernating</name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>SetWalWriterSleeping</name><argument_list>(<argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Advertise our latch that backends can use to wake us up while we're
+	 * sleeping.
+	 */</comment>
+	<expr_stmt><expr><name><name>ProcGlobal</name><operator>-&gt;</operator><name>walwriterLatch</name></name> <operator>=</operator> <operator>&amp;</operator><name><name>MyProc</name><operator>-&gt;</operator><name>procLatch</name></name></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Loop forever
+	 */</comment>
+	<for>for <control>(<init>;</init><condition>;</condition><incr/>)</control>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>long</name></type>		<name>cur_timeout</name></decl>;</decl_stmt>
+
+		<comment type="block">/*
+		 * Advertise whether we might hibernate in this cycle.  We do this
+		 * before resetting the latch to ensure that any async commits will
+		 * see the flag set if they might possibly need to wake us up, and
+		 * that we won't miss any signal they send us.  (If we discover work
+		 * to do in the last cycle before we would hibernate, the global flag
+		 * will be set unnecessarily, but little harm is done.)  But avoid
+		 * touching the global flag if it doesn't need to change.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><name>hibernating</name> <operator>!=</operator> <operator>(</operator><name>left_till_hibernate</name> <operator>&lt;=</operator> <literal type="number">1</literal><operator>)</operator></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><name>hibernating</name> <operator>=</operator> <operator>(</operator><name>left_till_hibernate</name> <operator>&lt;=</operator> <literal type="number">1</literal><operator>)</operator></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>SetWalWriterSleeping</name><argument_list>(<argument><expr><name>hibernating</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+
+		<comment type="block">/* Clear any already-pending wakeups */</comment>
+		<expr_stmt><expr><call><name>ResetLatch</name><argument_list>(<argument><expr><name>MyLatch</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/*
+		 * Process any requests or signals received recently.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><name>got_SIGHUP</name></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><name>got_SIGHUP</name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>ProcessConfigFile</name><argument_list>(<argument><expr><name>PGC_SIGHUP</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+		<if_stmt><if>if <condition>(<expr><name>shutdown_requested</name></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/* Normal exit from the walwriter is here */</comment>
+			<expr_stmt><expr><call><name>proc_exit</name><argument_list>(<argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>		<comment type="block">/* done */</comment>
+		</block_content>}</block></if></if_stmt>
+
+		<comment type="block">/*
+		 * Do what we're here for; then, if XLogBackgroundFlush() found useful
+		 * work to do, reset hibernation counter.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><call><name>XLogBackgroundFlush</name><argument_list>()</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><name>left_till_hibernate</name> <operator>=</operator> <name>LOOPS_UNTIL_HIBERNATE</name></expr>;</expr_stmt></block_content></block></if>
+		<if type="elseif">else if <condition>(<expr><name>left_till_hibernate</name> <operator>&gt;</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><name>left_till_hibernate</name><operator>--</operator></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+		<comment type="block">/*
+		 * Sleep until we are signaled or WalWriterDelay has elapsed.  If we
+		 * haven't done anything useful for quite some time, lengthen the
+		 * sleep time so as to reduce the server's idle power consumption.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><name>left_till_hibernate</name> <operator>&gt;</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><name>cur_timeout</name> <operator>=</operator> <name>WalWriterDelay</name></expr>;</expr_stmt></block_content></block></if>	<comment type="block">/* in ms */</comment>
+		<else>else<block type="pseudo"><block_content>
+			<expr_stmt><expr><name>cur_timeout</name> <operator>=</operator> <name>WalWriterDelay</name> <operator>*</operator> <name>HIBERNATE_FACTOR</name></expr>;</expr_stmt></block_content></block></else></if_stmt>
+
+		<expr_stmt><expr><operator>(</operator><name>void</name><operator>)</operator> <call><name>WaitLatch</name><argument_list>(<argument><expr><name>MyLatch</name></expr></argument>,
+						 <argument><expr><name>WL_LATCH_SET</name> <operator>|</operator> <name>WL_TIMEOUT</name> <operator>|</operator> <name>WL_EXIT_ON_PM_DEATH</name></expr></argument>,
+						 <argument><expr><name>cur_timeout</name></expr></argument>,
+						 <argument><expr><name>WAIT_EVENT_WAL_WRITER_MAIN</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></for>
+</block_content>}</block></function>
+
+
+<comment type="block">/* --------------------------------
+ *		signal handler routines
+ * --------------------------------
+ */</comment>
+
+<comment type="block">/*
+ * wal_quickdie() occurs when signalled SIGQUIT by the postmaster.
+ *
+ * Some backend has bought the farm,
+ * so we need to stop what we're doing and exit.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>wal_quickdie</name><parameter_list>(<parameter><decl><type><name>SIGNAL_ARGS</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<comment type="block">/*
+	 * We DO NOT want to run proc_exit() or atexit() callbacks -- we're here
+	 * because shared memory may be corrupted, so we don't want to try to
+	 * clean up our transaction.  Just nail the windows shut and get out of
+	 * town.  The callbacks wouldn't be safe to run from a signal handler,
+	 * anyway.
+	 *
+	 * Note we do _exit(2) not _exit(0).  This is to force the postmaster into
+	 * a system reset cycle if someone sends a manual SIGQUIT to a random
+	 * backend.  This is necessary precisely because we don't clean up our
+	 * shared memory state.  (The "dead man switch" mechanism in pmsignal.c
+	 * should ensure the postmaster sees this as a crash, too, but no harm in
+	 * being doubly sure.)
+	 */</comment>
+	<expr_stmt><expr><call><name>_exit</name><argument_list>(<argument><expr><literal type="number">2</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/* SIGHUP: set flag to re-read config file at next convenient time */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>WalSigHupHandler</name><parameter_list>(<parameter><decl><type><name>SIGNAL_ARGS</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>int</name></type>			<name>save_errno</name> <init>= <expr><name>errno</name></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name>got_SIGHUP</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>SetLatch</name><argument_list>(<argument><expr><name>MyLatch</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>errno</name> <operator>=</operator> <name>save_errno</name></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/* SIGTERM: set flag to exit normally */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>WalShutdownHandler</name><parameter_list>(<parameter><decl><type><name>SIGNAL_ARGS</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>int</name></type>			<name>save_errno</name> <init>= <expr><name>errno</name></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name>shutdown_requested</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>SetLatch</name><argument_list>(<argument><expr><name>MyLatch</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>errno</name> <operator>=</operator> <name>save_errno</name></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/* SIGUSR1: used for latch wakeups */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>walwriter_sigusr1_handler</name><parameter_list>(<parameter><decl><type><name>SIGNAL_ARGS</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>int</name></type>			<name>save_errno</name> <init>= <expr><name>errno</name></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>latch_sigusr1_handler</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>errno</name> <operator>=</operator> <name>save_errno</name></expr>;</expr_stmt>
+</block_content>}</block></function>
+</unit>

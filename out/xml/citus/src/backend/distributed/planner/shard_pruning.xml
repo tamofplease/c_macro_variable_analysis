@@ -1,0 +1,2069 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<unit xmlns="http://www.srcML.org/srcML/src" xmlns:cpp="http://www.srcML.org/srcML/cpp" revision="1.0.0" language="C" filename="/cloned_projects/citus/src/backend/distributed/planner/shard_pruning.c"><comment type="block">/*-------------------------------------------------------------------------
+ *
+ * shard_pruning.c
+ *   Shard pruning related code.
+ *
+ * The goal of shard pruning is to find a minimal (super)set of shards that
+ * need to be queried to find rows matching the expression in a query.
+ *
+ * In PruneShards we first make a compact representation of the given
+ * query logical tree. This tree represents boolean operators and its
+ * associated valid constraints (expression nodes) and whether boolean
+ * operator has associated unknown constraints. This allows essentially
+ * unknown constraints to be replaced by a simple placeholder flag.
+ *
+ * For example query: WHERE (hash_col IN (1,2)) AND (other_col=1 OR other_col=2)
+ * Gets transformed by steps:
+ * 1. AND(hash_col IN (1,2), OR(X, X))
+ * 2. AND(hash_col IN (1,2), OR(X))
+ * 3. AND(hash_col IN (1,2), X)
+ * Where X represents any set of unrecognized unprunable constraint(s).
+ *
+ * Above allows the following pruning machinery to understand that
+ * the target shard is determined solely by constraint: hash_col IN (1,2).
+ * Here it does not matter what X is as its ANDed by a valid constraint.
+ * Pruning machinery will fail, returning all shards, if it encounters
+ * eg. OR(hash_col=1, X) as this condition does not limit the target shards.
+ *
+ * PruneShards secondly computes a simplified disjunctive normal form (DNF)
+ * of the logical tree as a list of pruning instances. Each pruning instance
+ * contains all AND-ed constraints on the partition column. An OR expression
+ * will result in two or more new pruning instances being added for the
+ * subexpressions. The "parent" instance is marked isPartial and ignored
+ * during pruning.
+ *
+ * We use the distributive property for constraints of the form P AND (Q OR R)
+ * to rewrite it to (P AND Q) OR (P AND R) by copying constraints from parent
+ * to "child" pruning instances. However, we do not distribute nested
+ * expressions. While (P OR Q) AND (R OR S) is logically equivalent to (P AND
+ * R) OR (P AND S) OR (Q AND R) OR (Q AND S), in our implementation it becomes
+ * P OR Q OR R OR S. This is acceptable since this will always result in a
+ * superset of shards. If this proves to be a issue in practice, a more
+ * complete algorithm could be implemented.
+ *
+ * We then evaluate each non-partial pruning instance in the disjunction
+ * through the following, increasingly expensive, steps:
+ *
+ * 1) If there is a constant equality constraint on the partition column, and
+ *    no overlapping shards exist, find the shard interval in which the
+ *    constant falls
+ *
+ * 2) If there is a hash range constraint on the partition column, find the
+ *    shard interval matching the range
+ *
+ * 3) If there are range constraints (e.g. (a &gt; 0 AND a &lt; 10)) on the
+ *    partition column, find the shard intervals that overlap with the range
+ *
+ * 4) If there are overlapping shards, exhaustively search all shards that are
+ *    not excluded by constraints
+ *
+ * Finally, the union of the shards found by each pruning instance is
+ * returned.
+ *
+ * Copyright (c) Citus Data, Inc.
+ *
+ *-------------------------------------------------------------------------
+ */</comment>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"postgres.h"</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/pg_version_constants.h"</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"fmgr.h"</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/shard_pruning.h"</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/nbtree.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/pg_am.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/pg_collation.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/pg_type.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/distributed_planner.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/listutils.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/log_utils.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/metadata_cache.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/multi_join_order.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/multi_physical_planner.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/pg_dist_partition.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/shardinterval_utils.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/version_compat.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"distributed/worker_protocol.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"nodes/nodeFuncs.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"nodes/makefuncs.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"optimizer/clauses.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"optimizer/planner.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"parser/parse_coerce.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/arrayaccess.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/catcache.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/fmgrprotos.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/lsyscache.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/memutils.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/ruleutils.h"</cpp:file></cpp:include>
+
+
+<comment type="block">/*
+ * Tree node for compact representation of the given query logical tree.
+ * Represent a single boolean operator node and its associated
+ * valid constraints (expression nodes) and invalid constraint flag.
+ */</comment>
+<typedef>typedef <type><struct>struct <name>PruningTreeNode</name>
+<block>{
+	<comment type="block">/* Indicates is this AND/OR boolean operator */</comment>
+	<decl_stmt><decl><type><name>BoolExprType</name></type> <name>boolop</name></decl>;</decl_stmt>
+
+	<comment type="block">/* Does this boolean operator have unknown/unprunable constraint(s) */</comment>
+	<decl_stmt><decl><type><name>bool</name></type> <name>hasInvalidConstraints</name></decl>;</decl_stmt>
+
+	<comment type="block">/* List of recognized valid prunable constraints of this boolean opearator */</comment>
+	<decl_stmt><decl><type><name>List</name> <modifier>*</modifier></type><name>validConstraints</name></decl>;</decl_stmt>
+
+	<comment type="block">/* Child boolean producing operators. Parents are always different from their children */</comment>
+	<decl_stmt><decl><type><name>List</name> <modifier>*</modifier></type><name>childBooleanNodes</name></decl>;</decl_stmt>
+}</block></struct></type> <name>PruningTreeNode</name>;</typedef>
+
+<comment type="block">/*
+ * Context used for expression_tree_walker
+ */</comment>
+<typedef>typedef <type><struct>struct <name>PruningTreeBuildContext</name>
+<block>{
+	<decl_stmt><decl><type><name>Var</name> <modifier>*</modifier></type><name>partitionColumn</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>PruningTreeNode</name> <modifier>*</modifier></type><name>current</name></decl>;</decl_stmt>
+}</block></struct></type> <name>PruningTreeBuildContext</name>;</typedef>
+
+<comment type="block">/*
+ * A pruning instance is a set of ANDed constraints on a partition key.
+ */</comment>
+<typedef>typedef <type><struct>struct <name>PruningInstance</name>
+<block>{
+	<comment type="block">/* Does this instance contain any prunable expressions? */</comment>
+	<decl_stmt><decl><type><name>bool</name></type> <name>hasValidConstraint</name></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * This constraint never evaluates to true, i.e. pruning does not have to
+	 * be performed.
+	 */</comment>
+	<decl_stmt><decl><type><name>bool</name></type> <name>evaluatesToFalse</name></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * Constraints on the partition column value. If multiple values are
+	 * found the more restrictive one should be stored here. Even for
+	 * a hash-partitioned table, actual column-values are stored here, *not*
+	 * hashed values.
+	 */</comment>
+	<decl_stmt><decl><type><name>Const</name> <modifier>*</modifier></type><name>lessConsts</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Const</name> <modifier>*</modifier></type><name>lessEqualConsts</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Const</name> <modifier>*</modifier></type><name>equalConsts</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Const</name> <modifier>*</modifier></type><name>greaterEqualConsts</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Const</name> <modifier>*</modifier></type><name>greaterConsts</name></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * Constraint using a pre-hashed column value. The constant will store the
+	 * hashed value, not the original value of the restriction.
+	 */</comment>
+	<decl_stmt><decl><type><name>Const</name> <modifier>*</modifier></type><name>hashedEqualConsts</name></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * Has this PruningInstance been added to
+	 * ClauseWalkerContext-&gt;pruningInstances? This is not done immediately,
+	 * but the first time a constraint (independent of us being able to handle
+	 * that constraint) is found.
+	 */</comment>
+	<decl_stmt><decl><type><name>bool</name></type> <name>addedToPruningInstances</name></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * When OR clauses are found, the non-ORed part (think of a &lt; 3 AND (a &gt; 5
+	 * OR a &gt; 7)) of the expression is stored in one PruningInstance which is
+	 * then copied for the ORed expressions. The original is marked as
+	 * isPartial, to avoid being used for pruning.
+	 */</comment>
+	<decl_stmt><decl><type><name>bool</name></type> <name>isPartial</name></decl>;</decl_stmt>
+}</block></struct></type> <name>PruningInstance</name>;</typedef>
+
+
+<comment type="block">/*
+ * Partial instances that need to be finished building. This is used to
+ * collect all ANDed restrictions, before looking into ORed expressions.
+ */</comment>
+<typedef>typedef <type><struct>struct <name>PendingPruningInstance</name>
+<block>{
+	<decl_stmt><decl><type><name>PruningInstance</name> <modifier>*</modifier></type><name>instance</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>PruningTreeNode</name> <modifier>*</modifier></type><name>continueAt</name></decl>;</decl_stmt>
+}</block></struct></type> <name>PendingPruningInstance</name>;</typedef>
+
+<typedef>typedef <type><union>union \
+<block>{ \
+	<decl_stmt><decl><type><name>FunctionCallInfoBaseData</name></type> <name>fcinfo</name></decl>;</decl_stmt> \
+	<comment type="block">/* ensure enough space for nargs args is available */</comment> \
+	<decl_stmt><decl><type><name>char</name></type> <name><name>fcinfo_data</name><index>[<expr><call><name>SizeForFunctionCallInfo</name><argument_list>(<argument><expr><literal type="number">2</literal></expr></argument>)</argument_list></call></expr>]</index></name></decl>;</decl_stmt> \
+}</block></union></type> <name>FunctionCall2InfoData</name>;</typedef>
+
+<comment type="block">/*
+ * We also ignore this warning in ./configure, but that's not always enough.
+ * The flags that are used during compilation by ./configure are determined by
+ * the compiler support it detects. This is usually GCC. This warning is only
+ * present in clang. So it would normally be fine to not use it with GCC. The
+ * problem is that clang is used to compile the JIT bitcode when postgres is
+ * compiled with -with-llvm. So in the end both clang and GCC are used to
+ * compile the project.
+ *
+ * So the flag is not provided on the command line, because ./configure notices
+ * that GCC doesn't support it. But this warning persists when compiling the
+ * bitcode. So that's why we ignore it here explicitly.
+ */</comment>
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>__clang__</name></cpp:ifdef>
+<cpp:pragma>#<cpp:directive>pragma</cpp:directive> <name>clang</name> <name>diagnostic</name> <name>ignored</name> <cpp:literal>"-Wgnu-variable-sized-type-not-at-end"</cpp:literal></cpp:pragma>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif> <comment type="block">/* __clang__ */</comment>
+
+<comment type="block">/*
+ * Data necessary to perform a single PruneShards().
+ */</comment>
+<typedef>typedef <type><struct>struct <name>ClauseWalkerContext</name>
+<block>{
+	<decl_stmt><decl><type><name>Var</name> <modifier>*</modifier></type><name>partitionColumn</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>char</name></type> <name>partitionMethod</name></decl>;</decl_stmt>
+
+	<comment type="block">/* ORed list of pruning targets */</comment>
+	<decl_stmt><decl><type><name>List</name> <modifier>*</modifier></type><name>pruningInstances</name></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * Partially built PruningInstances, that need to be completed by doing a
+	 * separate PrunableExpressionsWalker() pass.
+	 */</comment>
+	<decl_stmt><decl><type><name>List</name> <modifier>*</modifier></type><name>pendingInstances</name></decl>;</decl_stmt>
+
+	<comment type="block">/* PruningInstance currently being built, all eligible constraints are added here */</comment>
+	<decl_stmt><decl><type><name>PruningInstance</name> <modifier>*</modifier></type><name>currentPruningInstance</name></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * Information about function calls we need to perform. Re-using the same
+	 * FunctionCall2InfoData, instead of using FunctionCall2Coll, is often
+	 * cheaper.
+	 */</comment>
+	<decl_stmt><decl><type><name>FunctionCall2InfoData</name></type> <name>compareValueFunctionCall</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>FunctionCall2InfoData</name></type> <name>compareIntervalFunctionCall</name></decl>;</decl_stmt>
+}</block></struct></type> <name>ClauseWalkerContext</name>;</typedef>
+
+<function_decl><type><specifier>static</specifier> <name>bool</name></type> <name>BuildPruningTree</name><parameter_list>(<parameter><decl><type><name>Node</name> <modifier>*</modifier></type><name>node</name></decl></parameter>, <parameter><decl><type><name>PruningTreeBuildContext</name> <modifier>*</modifier></type><name>context</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>SimplifyPruningTree</name><parameter_list>(<parameter><decl><type><name>PruningTreeNode</name> <modifier>*</modifier></type><name>node</name></decl></parameter>, <parameter><decl><type><name>PruningTreeNode</name> <modifier>*</modifier></type><name>parent</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>PrunableExpressions</name><parameter_list>(<parameter><decl><type><name>PruningTreeNode</name> <modifier>*</modifier></type><name>node</name></decl></parameter>, <parameter><decl><type><name>ClauseWalkerContext</name> <modifier>*</modifier></type><name>context</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>PrunableExpressionsWalker</name><parameter_list>(<parameter><decl><type><name>PruningTreeNode</name> <modifier>*</modifier></type><name>node</name></decl></parameter>,
+									  <parameter><decl><type><name>ClauseWalkerContext</name> <modifier>*</modifier></type><name>context</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>bool</name></type> <name>IsValidPartitionKeyRestriction</name><parameter_list>(<parameter><decl><type><name>OpExpr</name> <modifier>*</modifier></type><name>opClause</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>AddPartitionKeyRestrictionToInstance</name><parameter_list>(<parameter><decl><type><name>ClauseWalkerContext</name> <modifier>*</modifier></type><name>context</name></decl></parameter>,
+												 <parameter><decl><type><name>OpExpr</name> <modifier>*</modifier></type><name>opClause</name></decl></parameter>, <parameter><decl><type><name>Var</name> <modifier>*</modifier></type><name>varClause</name></decl></parameter>,
+												 <parameter><decl><type><name>Const</name> <modifier>*</modifier></type><name>constantClause</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>AddSAOPartitionKeyRestrictionToInstance</name><parameter_list>(<parameter><decl><type><name>ClauseWalkerContext</name> <modifier>*</modifier></type><name>context</name></decl></parameter>,
+													<parameter><decl><type><name>ScalarArrayOpExpr</name> <modifier>*</modifier></type>
+													<name>arrayOperatorExpression</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>bool</name></type> <name>SAORestrictions</name><parameter_list>(<parameter><decl><type><name>ScalarArrayOpExpr</name> <modifier>*</modifier></type><name>arrayOperatorExpression</name></decl></parameter>,
+							<parameter><decl><type><name>Var</name> <modifier>*</modifier></type><name>partitionColumn</name></decl></parameter>,
+							<parameter><decl><type><name>List</name> <modifier>*</modifier><modifier>*</modifier></type><name>requestedRestrictions</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>ErrorTypesDontMatch</name><parameter_list>(<parameter><decl><type><name>Oid</name></type> <name>firstType</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>firstCollId</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>secondType</name></decl></parameter>,
+								<parameter><decl><type><name>Oid</name></type> <name>secondCollId</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>bool</name></type> <name>IsValidHashRestriction</name><parameter_list>(<parameter><decl><type><name>OpExpr</name> <modifier>*</modifier></type><name>opClause</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>AddHashRestrictionToInstance</name><parameter_list>(<parameter><decl><type><name>ClauseWalkerContext</name> <modifier>*</modifier></type><name>context</name></decl></parameter>, <parameter><decl><type><name>OpExpr</name> <modifier>*</modifier></type><name>opClause</name></decl></parameter>,
+										 <parameter><decl><type><name>Var</name> <modifier>*</modifier></type><name>varClause</name></decl></parameter>, <parameter><decl><type><name>Const</name> <modifier>*</modifier></type><name>constantClause</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>AddNewConjuction</name><parameter_list>(<parameter><decl><type><name>ClauseWalkerContext</name> <modifier>*</modifier></type><name>context</name></decl></parameter>, <parameter><decl><type><name>PruningTreeNode</name> <modifier>*</modifier></type><name>node</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>PruningInstance</name> <modifier>*</modifier></type> <name>CopyPartialPruningInstance</name><parameter_list>(<parameter><decl><type><name>PruningInstance</name> <modifier>*</modifier></type><name>sourceInstance</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>List</name> <modifier>*</modifier></type> <name>ShardArrayToList</name><parameter_list>(<parameter><decl><type><name>ShardInterval</name> <modifier>*</modifier><modifier>*</modifier></type><name>shardArray</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>length</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>List</name> <modifier>*</modifier></type> <name>DeepCopyShardIntervalList</name><parameter_list>(<parameter><decl><type><name>List</name> <modifier>*</modifier></type><name>originalShardIntervalList</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>int</name></type> <name>PerformValueCompare</name><parameter_list>(<parameter><decl><type><name>FunctionCallInfo</name></type> <name>compareFunctionCall</name></decl></parameter>, <parameter><decl><type><name>Datum</name></type> <name>a</name></decl></parameter>,
+							   <parameter><decl><type><name>Datum</name></type> <name>b</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>int</name></type> <name>PerformCompare</name><parameter_list>(<parameter><decl><type><name>FunctionCallInfo</name></type> <name>compareFunctionCall</name></decl></parameter>)</parameter_list>;</function_decl>
+
+<function_decl><type><specifier>static</specifier> <name>List</name> <modifier>*</modifier></type> <name>PruneOne</name><parameter_list>(<parameter><decl><type><name>CitusTableCacheEntry</name> <modifier>*</modifier></type><name>cacheEntry</name></decl></parameter>, <parameter><decl><type><name>ClauseWalkerContext</name> <modifier>*</modifier></type><name>context</name></decl></parameter>,
+					   <parameter><decl><type><name>PruningInstance</name> <modifier>*</modifier></type><name>prune</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>List</name> <modifier>*</modifier></type> <name>PruneWithBoundaries</name><parameter_list>(<parameter><decl><type><name>CitusTableCacheEntry</name> <modifier>*</modifier></type><name>cacheEntry</name></decl></parameter>,
+								  <parameter><decl><type><name>ClauseWalkerContext</name> <modifier>*</modifier></type><name>context</name></decl></parameter>,
+								  <parameter><decl><type><name>PruningInstance</name> <modifier>*</modifier></type><name>prune</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>List</name> <modifier>*</modifier></type> <name>ExhaustivePrune</name><parameter_list>(<parameter><decl><type><name>CitusTableCacheEntry</name> <modifier>*</modifier></type><name>cacheEntry</name></decl></parameter>,
+							  <parameter><decl><type><name>ClauseWalkerContext</name> <modifier>*</modifier></type><name>context</name></decl></parameter>,
+							  <parameter><decl><type><name>PruningInstance</name> <modifier>*</modifier></type><name>prune</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>bool</name></type> <name>ExhaustivePruneOne</name><parameter_list>(<parameter><decl><type><name>ShardInterval</name> <modifier>*</modifier></type><name>curInterval</name></decl></parameter>,
+							   <parameter><decl><type><name>ClauseWalkerContext</name> <modifier>*</modifier></type><name>context</name></decl></parameter>,
+							   <parameter><decl><type><name>PruningInstance</name> <modifier>*</modifier></type><name>prune</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>int</name></type> <name>UpperShardBoundary</name><parameter_list>(<parameter><decl><type><name>Datum</name></type> <name>partitionColumnValue</name></decl></parameter>,
+							  <parameter><decl><type><name>ShardInterval</name> <modifier>*</modifier><modifier>*</modifier></type><name>shardIntervalCache</name></decl></parameter>,
+							  <parameter><decl><type><name>int</name></type> <name>shardCount</name></decl></parameter>, <parameter><decl><type><name>FunctionCallInfo</name></type> <name>compareFunction</name></decl></parameter>,
+							  <parameter><decl><type><name>bool</name></type> <name>includeMin</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>int</name></type> <name>LowerShardBoundary</name><parameter_list>(<parameter><decl><type><name>Datum</name></type> <name>partitionColumnValue</name></decl></parameter>,
+							  <parameter><decl><type><name>ShardInterval</name> <modifier>*</modifier><modifier>*</modifier></type><name>shardIntervalCache</name></decl></parameter>,
+							  <parameter><decl><type><name>int</name></type> <name>shardCount</name></decl></parameter>, <parameter><decl><type><name>FunctionCallInfo</name></type> <name>compareFunction</name></decl></parameter>,
+							  <parameter><decl><type><name>bool</name></type> <name>includeMax</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>PruningTreeNode</name> <modifier>*</modifier></type> <name>CreatePruningNode</name><parameter_list>(<parameter><decl><type><name>BoolExprType</name></type> <name>boolop</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>OpExpr</name> <modifier>*</modifier></type> <name>SAORestrictionArrayEqualityOp</name><parameter_list>(<parameter><decl><type><name>ScalarArrayOpExpr</name> <modifier>*</modifier></type><name>arrayOperatorExpression</name></decl></parameter>,
+											  <parameter><decl><type><name>Var</name> <modifier>*</modifier></type><name>partitionColumn</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>DebugLogNode</name><parameter_list>(<parameter><decl><type><name>char</name> <modifier>*</modifier></type><name>fmt</name></decl></parameter>, <parameter><decl><type><name>Node</name> <modifier>*</modifier></type><name>node</name></decl></parameter>, <parameter><decl><type><name>List</name> <modifier>*</modifier></type><name>deparseCtx</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>DebugLogPruningInstance</name><parameter_list>(<parameter><decl><type><name>PruningInstance</name> <modifier>*</modifier></type><name>pruning</name></decl></parameter>, <parameter><decl><type><name>List</name> <modifier>*</modifier></type><name>deparseCtx</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>int</name></type> <name>ConstraintCount</name><parameter_list>(<parameter><decl><type><name>PruningTreeNode</name> <modifier>*</modifier></type><name>node</name></decl></parameter>)</parameter_list>;</function_decl>
+
+
+<comment type="block">/*
+ * PruneShards returns all shards from a distributed table that cannot be
+ * proven to be eliminated by whereClauseList.
+ *
+ * For non-distributed tables such as reference table, the function
+ * simply returns the single shard that the table has.
+ *
+ * When there is a single &lt;partition column&gt; = &lt;constant&gt; filter in the where
+ * clause list, the constant is written to the partitionValueConst pointer.
+ */</comment>
+<function><type><name>List</name> <modifier>*</modifier></type>
+<name>PruneShards</name><parameter_list>(<parameter><decl><type><name>Oid</name></type> <name>relationId</name></decl></parameter>, <parameter><decl><type><name>Index</name></type> <name>rangeTableId</name></decl></parameter>, <parameter><decl><type><name>List</name> <modifier>*</modifier></type><name>whereClauseList</name></decl></parameter>,
+			<parameter><decl><type><name>Const</name> <modifier>*</modifier><modifier>*</modifier></type><name>partitionValueConst</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>CitusTableCacheEntry</name> <modifier>*</modifier></type><name>cacheEntry</name> <init>= <expr><call><name>GetCitusTableCacheEntry</name><argument_list>(<argument><expr><name>relationId</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type> <name>shardCount</name> <init>= <expr><name><name>cacheEntry</name><operator>-&gt;</operator><name>shardIntervalArrayLength</name></name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>char</name></type> <name>partitionMethod</name> <init>= <expr><name><name>cacheEntry</name><operator>-&gt;</operator><name>partitionMethod</name></name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>ClauseWalkerContext</name></type> <name>context</name> <init>= <expr><block>{ <expr><literal type="number">0</literal></expr> }</block></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>ListCell</name> <modifier>*</modifier></type><name>pruneCell</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>List</name> <modifier>*</modifier></type><name>prunedList</name> <init>= <expr><name>NIL</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type> <name>foundRestriction</name> <init>= <expr><name>false</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type> <name>foundPartitionColumnValue</name> <init>= <expr><name>false</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Const</name> <modifier>*</modifier></type><name>singlePartitionValueConst</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+
+	<comment type="block">/* there are no shards to return */</comment>
+	<if_stmt><if>if <condition>(<expr><name>shardCount</name> <operator>==</operator> <literal type="number">0</literal></expr>)</condition>
+	<block>{<block_content>
+		<return>return <expr><name>NIL</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/* always return empty result if WHERE clause is of the form: false (AND ..) */</comment>
+	<if_stmt><if>if <condition>(<expr><call><name>ContainsFalseClause</name><argument_list>(<argument><expr><name>whereClauseList</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<return>return <expr><name>NIL</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/* short circuit for non-distributed tables such as reference table */</comment>
+	<if_stmt><if>if <condition>(<expr><call><name>IsCitusTableTypeCacheEntry</name><argument_list>(<argument><expr><name>cacheEntry</name></expr></argument>, <argument><expr><name>CITUS_TABLE_WITH_NO_DIST_KEY</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name>prunedList</name> <operator>=</operator> <call><name>ShardArrayToList</name><argument_list>(<argument><expr><name><name>cacheEntry</name><operator>-&gt;</operator><name>sortedShardIntervalArray</name></name></expr></argument>,
+									  <argument><expr><name><name>cacheEntry</name><operator>-&gt;</operator><name>shardIntervalArrayLength</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<return>return <expr><call><name>DeepCopyShardIntervalList</name><argument_list>(<argument><expr><name>prunedList</name></expr></argument>)</argument_list></call></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+
+	<expr_stmt><expr><name><name>context</name><operator>.</operator><name>partitionMethod</name></name> <operator>=</operator> <name>partitionMethod</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>context</name><operator>.</operator><name>partitionColumn</name></name> <operator>=</operator> <call><name>PartitionColumn</name><argument_list>(<argument><expr><name>relationId</name></expr></argument>, <argument><expr><name>rangeTableId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>context</name><operator>.</operator><name>currentPruningInstance</name></name> <operator>=</operator> <call><name>palloc0</name><argument_list>(<argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>PruningInstance</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name><name>cacheEntry</name><operator>-&gt;</operator><name>shardIntervalCompareFunction</name></name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* initiate function call info once (allows comparators to cache metadata) */</comment>
+		<expr_stmt><expr><call><name>InitFunctionCallInfoData</name><argument_list>(<argument><expr><operator>*</operator><operator>(</operator><name>FunctionCallInfo</name><operator>)</operator> <operator>&amp;</operator>
+								 <name><name>context</name><operator>.</operator><name>compareIntervalFunctionCall</name></name></expr></argument>,
+								 <argument><expr><name><name>cacheEntry</name><operator>-&gt;</operator><name>shardIntervalCompareFunction</name></name></expr></argument>,
+								 <argument><expr><literal type="number">2</literal></expr></argument>, <argument><expr><name><name>cacheEntry</name><operator>-&gt;</operator><name>partitionColumn</name><operator>-&gt;</operator><name>varcollid</name></name></expr></argument>, <argument><expr><name>NULL</name></expr></argument>, <argument><expr><name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<else>else
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><operator>(</operator><call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"shard pruning not possible without "</literal>
+							   <literal type="string">"a shard interval comparator"</literal></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></else></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name><name>cacheEntry</name><operator>-&gt;</operator><name>shardColumnCompareFunction</name></name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* initiate function call info once (allows comparators to cache metadata) */</comment>
+		<expr_stmt><expr><call><name>InitFunctionCallInfoData</name><argument_list>(<argument><expr><operator>*</operator><operator>(</operator><name>FunctionCallInfo</name><operator>)</operator> <operator>&amp;</operator>
+								 <name><name>context</name><operator>.</operator><name>compareValueFunctionCall</name></name></expr></argument>,
+								 <argument><expr><name><name>cacheEntry</name><operator>-&gt;</operator><name>shardColumnCompareFunction</name></name></expr></argument>,
+								 <argument><expr><literal type="number">2</literal></expr></argument>, <argument><expr><name><name>cacheEntry</name><operator>-&gt;</operator><name>partitionColumn</name><operator>-&gt;</operator><name>varcollid</name></name></expr></argument>, <argument><expr><name>NULL</name></expr></argument>, <argument><expr><name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<else>else
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><operator>(</operator><call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"shard pruning not possible without "</literal>
+							   <literal type="string">"a partition column comparator"</literal></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></else></if_stmt>
+
+	<decl_stmt><decl><type><name>PruningTreeNode</name> <modifier>*</modifier></type><name>tree</name> <init>= <expr><call><name>CreatePruningNode</name><argument_list>(<argument><expr><name>AND_EXPR</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<decl_stmt><decl><type><name>PruningTreeBuildContext</name></type> <name>treeBuildContext</name> <init>= <expr><block>{ <expr><literal type="number">0</literal></expr> }</block></expr></init></decl>;</decl_stmt>
+	<expr_stmt><expr><name><name>treeBuildContext</name><operator>.</operator><name>current</name></name> <operator>=</operator> <name>tree</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>treeBuildContext</name><operator>.</operator><name>partitionColumn</name></name> <operator>=</operator> <call><name>PartitionColumn</name><argument_list>(<argument><expr><name>relationId</name></expr></argument>, <argument><expr><name>rangeTableId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Build logical tree of prunable restrictions and invalid restrictions */</comment>
+	<expr_stmt><expr><call><name>BuildPruningTree</name><argument_list>(<argument><expr><operator>(</operator><name>Node</name> <operator>*</operator><operator>)</operator> <name>whereClauseList</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>treeBuildContext</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Simplify logic tree of prunable restrictions */</comment>
+	<expr_stmt><expr><call><name>SimplifyPruningTree</name><argument_list>(<argument><expr><name>tree</name></expr></argument>, <argument><expr><name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Figure out what we can prune on */</comment>
+	<expr_stmt><expr><call><name>PrunableExpressions</name><argument_list>(<argument><expr><name>tree</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>context</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<decl_stmt><decl><type><name>List</name> <modifier>*</modifier></type><name>debugLoggedPruningInstances</name> <init>= <expr><name>NIL</name></expr></init></decl>;</decl_stmt>
+
+	<comment type="block">/*
+	 * Prune using each of the PrunableInstances we found, and OR results
+	 * together.
+	 */</comment>
+	<macro><name>foreach</name><argument_list>(<argument>pruneCell</argument>, <argument>context.pruningInstances</argument>)</argument_list></macro>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>PruningInstance</name> <modifier>*</modifier></type><name>prune</name> <init>= <expr><operator>(</operator><name>PruningInstance</name> <operator>*</operator><operator>)</operator> <call><name>lfirst</name><argument_list>(<argument><expr><name>pruneCell</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+		<comment type="block">/*
+		 * If this is a partial instance, a fully built one has also been
+		 * added. Skip.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><name><name>prune</name><operator>-&gt;</operator><name>isPartial</name></name></expr>)</condition>
+		<block>{<block_content>
+			<continue>continue;</continue>
+		</block_content>}</block></if></if_stmt>
+
+		<comment type="block">/*
+		 * If the current instance has no prunable expressions, we'll have to
+		 * return all shards. No point in continuing pruning in that case.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><name><name>prune</name><operator>-&gt;</operator><name>hasValidConstraint</name></name></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><name>foundRestriction</name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+			<break>break;</break>
+		</block_content>}</block></if></if_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name><name>context</name><operator>.</operator><name>partitionMethod</name></name> <operator>==</operator> <name>DISTRIBUTE_BY_HASH</name></expr>)</condition>
+		<block>{<block_content>
+			<if_stmt><if>if <condition>(<expr><operator>!</operator><name><name>prune</name><operator>-&gt;</operator><name>evaluatesToFalse</name></name> <operator>&amp;&amp;</operator> <operator>!</operator><name><name>prune</name><operator>-&gt;</operator><name>equalConsts</name></name> <operator>&amp;&amp;</operator>
+				<operator>!</operator><name><name>prune</name><operator>-&gt;</operator><name>hashedEqualConsts</name></name></expr>)</condition>
+			<block>{<block_content>
+				<comment type="block">/* if hash-partitioned and no equals constraints, return all shards */</comment>
+				<expr_stmt><expr><name>foundRestriction</name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+				<break>break;</break>
+			</block_content>}</block></if>
+			<if type="elseif">else if <condition>(<expr><name>partitionValueConst</name> <operator>!=</operator> <name>NULL</name> <operator>&amp;&amp;</operator> <name><name>prune</name><operator>-&gt;</operator><name>equalConsts</name></name> <operator>!=</operator> <name>NULL</name></expr>)</condition>
+			<block>{<block_content>
+				<if_stmt><if>if <condition>(<expr><operator>!</operator><name>foundPartitionColumnValue</name></expr>)</condition>
+				<block>{<block_content>
+					<comment type="block">/* remember the partition column value */</comment>
+					<expr_stmt><expr><name>singlePartitionValueConst</name> <operator>=</operator> <name><name>prune</name><operator>-&gt;</operator><name>equalConsts</name></name></expr>;</expr_stmt>
+					<expr_stmt><expr><name>foundPartitionColumnValue</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+				</block_content>}</block></if>
+				<if type="elseif">else if <condition>(<expr><name>singlePartitionValueConst</name> <operator>==</operator> <name>NULL</name></expr>)</condition>
+				<block>{<block_content>
+					<comment type="block">/* already found multiple partition column values */</comment>
+				</block_content>}</block></if>
+				<if type="elseif">else if <condition>(<expr><operator>!</operator><call><name>equal</name><argument_list>(<argument><expr><name><name>prune</name><operator>-&gt;</operator><name>equalConsts</name></name></expr></argument>, <argument><expr><name>singlePartitionValueConst</name></expr></argument>)</argument_list></call></expr>)</condition>
+				<block>{<block_content>
+					<comment type="block">/* found multiple partition column values */</comment>
+					<expr_stmt><expr><name>singlePartitionValueConst</name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+				</block_content>}</block></if></if_stmt>
+			</block_content>}</block></if></if_stmt>
+		</block_content>}</block></if></if_stmt>
+
+		<decl_stmt><decl><type><name>List</name> <modifier>*</modifier></type><name>pruneOneList</name> <init>= <expr><call><name>PruneOne</name><argument_list>(<argument><expr><name>cacheEntry</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>context</name></expr></argument>, <argument><expr><name>prune</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name>prunedList</name></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/*
+			 * We can use list_union_ptr, which is a lot faster than doing
+			 * comparing shards by value, because all the ShardIntervals are
+			 * guaranteed to be from
+			 * CitusTableCacheEntry-&gt;sortedShardIntervalArray (thus having the
+			 * same pointer values).
+			 */</comment>
+			<expr_stmt><expr><name>prunedList</name> <operator>=</operator> <call><name>list_union_ptr</name><argument_list>(<argument><expr><name>prunedList</name></expr></argument>, <argument><expr><name>pruneOneList</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></if>
+		<else>else
+		<block>{<block_content>
+			<expr_stmt><expr><name>prunedList</name> <operator>=</operator> <name>pruneOneList</name></expr>;</expr_stmt>
+		</block_content>}</block></else></if_stmt>
+		<expr_stmt><expr><name>foundRestriction</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+
+		<if_stmt><if>if <condition>(<expr><call><name>IsLoggableLevel</name><argument_list>(<argument><expr><name>DEBUG3</name></expr></argument>)</argument_list></call> <operator>&amp;&amp;</operator> <name>pruneOneList</name></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><name>debugLoggedPruningInstances</name> <operator>=</operator> <call><name>lappend</name><argument_list>(<argument><expr><name>debugLoggedPruningInstances</name></expr></argument>, <argument><expr><name>prune</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+	</block_content>}</block>
+
+	<comment type="block">/* found no valid restriction, build list of all shards */</comment>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><name>foundRestriction</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name>prunedList</name> <operator>=</operator> <call><name>ShardArrayToList</name><argument_list>(<argument><expr><name><name>cacheEntry</name><operator>-&gt;</operator><name>sortedShardIntervalArray</name></name></expr></argument>,
+									  <argument><expr><name><name>cacheEntry</name><operator>-&gt;</operator><name>shardIntervalArrayLength</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><call><name>IsLoggableLevel</name><argument_list>(<argument><expr><name>DEBUG3</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>char</name> <modifier>*</modifier></type><name>relationName</name> <init>= <expr><call><name>get_rel_name</name><argument_list>(<argument><expr><name>relationId</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+		<if_stmt><if>if <condition>(<expr><name>foundRestriction</name> <operator>&amp;&amp;</operator> <name>debugLoggedPruningInstances</name> <operator>!=</operator> <name>NIL</name></expr>)</condition>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>List</name> <modifier>*</modifier></type><name>deparseCtx</name> <init>= <expr><call><name>deparse_context_for</name><argument_list>(<argument><expr><literal type="string">"unknown"</literal></expr></argument>, <argument><expr><name>relationId</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+			<macro><name>foreach</name><argument_list>(<argument>pruneCell</argument>, <argument>debugLoggedPruningInstances</argument>)</argument_list></macro>
+			<block>{<block_content>
+				<decl_stmt><decl><type><name>PruningInstance</name> <modifier>*</modifier></type><name>prune</name> <init>= <expr><operator>(</operator><name>PruningInstance</name> <operator>*</operator><operator>)</operator> <call><name>lfirst</name><argument_list>(<argument><expr><name>pruneCell</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+				<expr_stmt><expr><call><name>DebugLogPruningInstance</name><argument_list>(<argument><expr><name>prune</name></expr></argument>, <argument><expr><name>deparseCtx</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			</block_content>}</block>
+		</block_content>}</block></if>
+		<else>else
+		<block>{<block_content>
+			<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>DEBUG3</name></expr></argument>, <argument><expr><operator>(</operator><call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"no shard pruning constraints on %s found"</literal></expr></argument>,
+									<argument><expr><name>relationName</name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></else></if_stmt>
+
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>DEBUG3</name></expr></argument>, <argument><expr><operator>(</operator><call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"shard count after pruning for %s: %d"</literal></expr></argument>, <argument><expr><name>relationName</name></expr></argument>,
+								<argument><expr><call><name>list_length</name><argument_list>(<argument><expr><name>prunedList</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/* if requested, copy the partition value constant */</comment>
+	<if_stmt><if>if <condition>(<expr><name>partitionValueConst</name> <operator>!=</operator> <name>NULL</name></expr>)</condition>
+	<block>{<block_content>
+		<if_stmt><if>if <condition>(<expr><name>singlePartitionValueConst</name> <operator>!=</operator> <name>NULL</name></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><operator>*</operator><name>partitionValueConst</name> <operator>=</operator> <call><name>copyObject</name><argument_list>(<argument><expr><name>singlePartitionValueConst</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></if>
+		<else>else
+		<block>{<block_content>
+			<expr_stmt><expr><operator>*</operator><name>partitionValueConst</name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+		</block_content>}</block></else></if_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/*
+	 * Deep copy list, so it's independent of the CitusTableCacheEntry
+	 * contents.
+	 */</comment>
+	<return>return <expr><call><name>DeepCopyShardIntervalList</name><argument_list>(<argument><expr><name>prunedList</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * IsValidConditionNode checks whether node is a valid constraint for pruning.
+ */</comment>
+<function><type><specifier>static</specifier> <name>bool</name></type>
+<name>IsValidConditionNode</name><parameter_list>(<parameter><decl><type><name>Node</name> <modifier>*</modifier></type><name>node</name></decl></parameter>, <parameter><decl><type><name>Var</name> <modifier>*</modifier></type><name>partitionColumn</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<if_stmt><if>if <condition>(<expr><call><name>IsA</name><argument_list>(<argument><expr><name>node</name></expr></argument>, <argument><expr><name>OpExpr</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>OpExpr</name> <modifier>*</modifier></type><name>opClause</name> <init>= <expr><operator>(</operator><name>OpExpr</name> <operator>*</operator><operator>)</operator> <name>node</name></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>Var</name> <modifier>*</modifier></type><name>varClause</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+		<if_stmt><if>if <condition>(<expr><call><name>VarConstOpExprClause</name><argument_list>(<argument><expr><name>opClause</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>varClause</name></expr></argument>, <argument><expr><name>NULL</name></expr></argument>)</argument_list></call></expr>)</condition>
+		<block>{<block_content>
+			<if_stmt><if>if <condition>(<expr><call><name>equal</name><argument_list>(<argument><expr><name>varClause</name></expr></argument>, <argument><expr><name>partitionColumn</name></expr></argument>)</argument_list></call></expr>)</condition>
+			<block>{<block_content>
+				<return>return <expr><call><name>IsValidPartitionKeyRestriction</name><argument_list>(<argument><expr><name>opClause</name></expr></argument>)</argument_list></call></expr>;</return>
+			</block_content>}</block></if>
+			<if type="elseif">else if <condition>(<expr><name><name>varClause</name><operator>-&gt;</operator><name>varattno</name></name> <operator>==</operator> <name>RESERVED_HASHED_COLUMN_ID</name></expr>)</condition>
+			<block>{<block_content>
+				<return>return <expr><call><name>IsValidHashRestriction</name><argument_list>(<argument><expr><name>opClause</name></expr></argument>)</argument_list></call></expr>;</return>
+			</block_content>}</block></if></if_stmt>
+		</block_content>}</block></if></if_stmt>
+
+		<return>return <expr><name>false</name></expr>;</return>
+	</block_content>}</block></if>
+	<if type="elseif">else if <condition>(<expr><call><name>IsA</name><argument_list>(<argument><expr><name>node</name></expr></argument>, <argument><expr><name>ScalarArrayOpExpr</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>ScalarArrayOpExpr</name> <modifier>*</modifier></type><name>arrayOperatorExpression</name> <init>= <expr><operator>(</operator><name>ScalarArrayOpExpr</name> <operator>*</operator><operator>)</operator> <name>node</name></expr></init></decl>;</decl_stmt>
+		<return>return <expr><call><name>SAORestrictions</name><argument_list>(<argument><expr><name>arrayOperatorExpression</name></expr></argument>, <argument><expr><name>partitionColumn</name></expr></argument>, <argument><expr><name>NULL</name></expr></argument>)</argument_list></call></expr>;</return>
+	</block_content>}</block></if>
+	<else>else
+	<block>{<block_content>
+		<return>return <expr><name>false</name></expr>;</return>
+	</block_content>}</block></else></if_stmt>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * BuildPruningTree builds a logical tree of constraints for pruning.
+ */</comment>
+<function><type><specifier>static</specifier> <name>bool</name></type>
+<name>BuildPruningTree</name><parameter_list>(<parameter><decl><type><name>Node</name> <modifier>*</modifier></type><name>node</name></decl></parameter>, <parameter><decl><type><name>PruningTreeBuildContext</name> <modifier>*</modifier></type><name>context</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<if_stmt><if>if <condition>(<expr><name>node</name> <operator>==</operator> <name>NULL</name></expr>)</condition>
+	<block>{<block_content>
+		<return>return <expr><name>false</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><call><name>IsA</name><argument_list>(<argument><expr><name>node</name></expr></argument>, <argument><expr><name>List</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<return>return <expr><call><name>expression_tree_walker</name><argument_list>(<argument><expr><name>node</name></expr></argument>, <argument><expr><name>BuildPruningTree</name></expr></argument>, <argument><expr><name>context</name></expr></argument>)</argument_list></call></expr>;</return>
+	</block_content>}</block></if>
+	<if type="elseif">else if <condition>(<expr><call><name>IsA</name><argument_list>(<argument><expr><name>node</name></expr></argument>, <argument><expr><name>BoolExpr</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>BoolExpr</name> <modifier>*</modifier></type><name>boolExpr</name> <init>= <expr><operator>(</operator><name>BoolExpr</name> <operator>*</operator><operator>)</operator> <name>node</name></expr></init></decl>;</decl_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name><name>boolExpr</name><operator>-&gt;</operator><name>boolop</name></name> <operator>==</operator> <name>NOT_EXPR</name></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/*
+			 * With Var-Const conditions we should not encounter NOT_EXPR nodes.
+			 * Postgres standard planner applies De Morgan's laws to remove them.
+			 * We still encounter them with subqueries inside NOT, for example with:
+			 * WHERE id NOT IN (SELECT id FROM something).
+			 * We treat these as invalid constraints for pruning when we encounter them.
+			 */</comment>
+			<expr_stmt><expr><name><name>context</name><operator>-&gt;</operator><name>current</name><operator>-&gt;</operator><name>hasInvalidConstraints</name></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+
+			<return>return <expr><name>false</name></expr>;</return>
+		</block_content>}</block></if>
+		<if type="elseif">else if <condition>(<expr><name><name>context</name><operator>-&gt;</operator><name>current</name><operator>-&gt;</operator><name>boolop</name></name> <operator>!=</operator> <name><name>boolExpr</name><operator>-&gt;</operator><name>boolop</name></name></expr>)</condition>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>PruningTreeNode</name> <modifier>*</modifier></type><name>child</name> <init>= <expr><call><name>CreatePruningNode</name><argument_list>(<argument><expr><name><name>boolExpr</name><operator>-&gt;</operator><name>boolop</name></name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+			<expr_stmt><expr><name><name>context</name><operator>-&gt;</operator><name>current</name><operator>-&gt;</operator><name>childBooleanNodes</name></name> <operator>=</operator> <call><name>lappend</name><argument_list>(
+				<argument><expr><name><name>context</name><operator>-&gt;</operator><name>current</name><operator>-&gt;</operator><name>childBooleanNodes</name></name></expr></argument>, <argument><expr><name>child</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+			<decl_stmt><decl><type><name>PruningTreeBuildContext</name></type> <name>newContext</name> <init>= <expr><block>{ <expr><literal type="number">0</literal></expr> }</block></expr></init></decl>;</decl_stmt>
+			<expr_stmt><expr><name><name>newContext</name><operator>.</operator><name>partitionColumn</name></name> <operator>=</operator> <name><name>context</name><operator>-&gt;</operator><name>partitionColumn</name></name></expr>;</expr_stmt>
+			<expr_stmt><expr><name><name>newContext</name><operator>.</operator><name>current</name></name> <operator>=</operator> <name>child</name></expr>;</expr_stmt>
+
+			<return>return <expr><call><name>expression_tree_walker</name><argument_list>(<argument><expr><operator>(</operator><name>Node</name> <operator>*</operator><operator>)</operator> <name><name>boolExpr</name><operator>-&gt;</operator><name>args</name></name></expr></argument>,
+										  <argument><expr><name>BuildPruningTree</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>newContext</name></expr></argument>)</argument_list></call></expr>;</return>
+		</block_content>}</block></if>
+		<else>else
+		<block>{<block_content>
+			<return>return <expr><call><name>expression_tree_walker</name><argument_list>(<argument><expr><name>node</name></expr></argument>, <argument><expr><name>BuildPruningTree</name></expr></argument>, <argument><expr><name>context</name></expr></argument>)</argument_list></call></expr>;</return>
+		</block_content>}</block></else></if_stmt>
+	</block_content>}</block></if>
+	<if type="elseif">else if <condition>(<expr><call><name>IsValidConditionNode</name><argument_list>(<argument><expr><name>node</name></expr></argument>, <argument><expr><name><name>context</name><operator>-&gt;</operator><name>partitionColumn</name></name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name><name>context</name><operator>-&gt;</operator><name>current</name><operator>-&gt;</operator><name>validConstraints</name></name> <operator>=</operator> <call><name>lappend</name><argument_list>(<argument><expr><name><name>context</name><operator>-&gt;</operator><name>current</name><operator>-&gt;</operator><name>validConstraints</name></name></expr></argument>,
+													 <argument><expr><name>node</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<return>return <expr><name>false</name></expr>;</return>
+	</block_content>}</block></if>
+	<else>else
+	<block>{<block_content>
+		<expr_stmt><expr><name><name>context</name><operator>-&gt;</operator><name>current</name><operator>-&gt;</operator><name>hasInvalidConstraints</name></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+
+		<return>return <expr><name>false</name></expr>;</return>
+	</block_content>}</block></else></if_stmt>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * SimplifyPruningTree reduces logical tree of valid and invalid constraints for pruning.
+ * The goal is to remove any node having just a single constraint associated with it.
+ * This constraint is assigned to the parent logical node.
+ *
+ * For example 'AND(hash_col = 1, OR(X))' gets simplified to 'AND(hash_col = 1, X)',
+ * where X is any unknown condition.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>SimplifyPruningTree</name><parameter_list>(<parameter><decl><type><name>PruningTreeNode</name> <modifier>*</modifier></type><name>node</name></decl></parameter>, <parameter><decl><type><name>PruningTreeNode</name> <modifier>*</modifier></type><name>parent</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<comment type="block">/* Copy list of children as its mutated inside the loop */</comment>
+	<decl_stmt><decl><type><name>List</name> <modifier>*</modifier></type><name>childBooleanNodes</name> <init>= <expr><call><name>list_copy</name><argument_list>(<argument><expr><name><name>node</name><operator>-&gt;</operator><name>childBooleanNodes</name></name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<decl_stmt><decl><type><name>ListCell</name> <modifier>*</modifier></type><name>cell</name></decl>;</decl_stmt>
+	<macro><name>foreach</name><argument_list>(<argument>cell</argument>, <argument>childBooleanNodes</argument>)</argument_list></macro>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>PruningTreeNode</name> <modifier>*</modifier></type><name>child</name> <init>= <expr><operator>(</operator><name>PruningTreeNode</name> <operator>*</operator><operator>)</operator> <call><name>lfirst</name><argument_list>(<argument><expr><name>cell</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+		<expr_stmt><expr><call><name>SimplifyPruningTree</name><argument_list>(<argument><expr><name>child</name></expr></argument>, <argument><expr><name>node</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block>
+
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><name>parent</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* Root is always ANDed expressions */</comment>
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>node</name><operator>-&gt;</operator><name>boolop</name></name> <operator>==</operator> <name>AND_EXPR</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<return>return;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/* Boolean operator with single (recognized/unknown) constraint gets simplified */</comment>
+	<if_stmt><if>if <condition>(<expr><call><name>ConstraintCount</name><argument_list>(<argument><expr><name>node</name></expr></argument>)</argument_list></call> <operator>&lt;=</operator> <literal type="number">1</literal></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>node</name><operator>-&gt;</operator><name>childBooleanNodes</name></name> <operator>==</operator> <name>NIL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>parent</name><operator>-&gt;</operator><name>validConstraints</name></name> <operator>=</operator> <call><name>list_concat</name><argument_list>(<argument><expr><name><name>parent</name><operator>-&gt;</operator><name>validConstraints</name></name></expr></argument>,
+											   <argument><expr><name><name>node</name><operator>-&gt;</operator><name>validConstraints</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>parent</name><operator>-&gt;</operator><name>hasInvalidConstraints</name></name> <operator>=</operator> <name><name>parent</name><operator>-&gt;</operator><name>hasInvalidConstraints</name></name> <operator>||</operator>
+										<name><name>node</name><operator>-&gt;</operator><name>hasInvalidConstraints</name></name></expr>;</expr_stmt>
+
+		<comment type="block">/* Remove current node from parent. Its constraint was assigned to the parent above */</comment>
+		<expr_stmt><expr><name><name>parent</name><operator>-&gt;</operator><name>childBooleanNodes</name></name> <operator>=</operator> <call><name>list_delete_ptr</name><argument_list>(<argument><expr><name><name>parent</name><operator>-&gt;</operator><name>childBooleanNodes</name></name></expr></argument>, <argument><expr><name>node</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * ContainsFalseClause returns whether the flattened where clause list
+ * contains false as a clause.
+ */</comment>
+<function><type><name>bool</name></type>
+<name>ContainsFalseClause</name><parameter_list>(<parameter><decl><type><name>List</name> <modifier>*</modifier></type><name>whereClauseList</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>bool</name></type> <name>containsFalseClause</name> <init>= <expr><name>false</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>ListCell</name> <modifier>*</modifier></type><name>clauseCell</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+
+	<macro><name>foreach</name><argument_list>(<argument>clauseCell</argument>, <argument>whereClauseList</argument>)</argument_list></macro>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>Node</name> <modifier>*</modifier></type><name>clause</name> <init>= <expr><operator>(</operator><name>Node</name> <operator>*</operator><operator>)</operator> <call><name>lfirst</name><argument_list>(<argument><expr><name>clauseCell</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+		<if_stmt><if>if <condition>(<expr><call><name>IsA</name><argument_list>(<argument><expr><name>clause</name></expr></argument>, <argument><expr><name>Const</name></expr></argument>)</argument_list></call></expr>)</condition>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>Const</name> <modifier>*</modifier></type><name>constant</name> <init>= <expr><operator>(</operator><name>Const</name> <operator>*</operator><operator>)</operator> <name>clause</name></expr></init></decl>;</decl_stmt>
+			<if_stmt><if>if <condition>(<expr><name><name>constant</name><operator>-&gt;</operator><name>consttype</name></name> <operator>==</operator> <name>BOOLOID</name> <operator>&amp;&amp;</operator> <operator>!</operator><call><name>DatumGetBool</name><argument_list>(<argument><expr><name><name>constant</name><operator>-&gt;</operator><name>constvalue</name></name></expr></argument>)</argument_list></call></expr>)</condition>
+			<block>{<block_content>
+				<expr_stmt><expr><name>containsFalseClause</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+				<break>break;</break>
+			</block_content>}</block></if></if_stmt>
+		</block_content>}</block></if></if_stmt>
+	</block_content>}</block>
+
+	<return>return <expr><name>containsFalseClause</name></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * PrunableExpressions builds a list of all prunable expressions in node,
+ * storing them in context-&gt;pruningInstances.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>PrunableExpressions</name><parameter_list>(<parameter><decl><type><name>PruningTreeNode</name> <modifier>*</modifier></type><name>tree</name></decl></parameter>, <parameter><decl><type><name>ClauseWalkerContext</name> <modifier>*</modifier></type><name>context</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<comment type="block">/*
+	 * Build initial list of prunable expressions. As long as only,
+	 * implicitly or explicitly, ANDed expressions are found, this perform a
+	 * depth-first search. When an ORed expression is found, the current
+	 * PruningInstance is added to context-&gt;pruningInstances (once for each
+	 * ORed expression), then the tree-traversal is continued without
+	 * recursing. Once at the top-level again, we'll process all pending
+	 * expressions - that allows us to find all ANDed expressions, before
+	 * recursing into an ORed expression.
+	 */</comment>
+	<expr_stmt><expr><call><name>PrunableExpressionsWalker</name><argument_list>(<argument><expr><name>tree</name></expr></argument>, <argument><expr><name>context</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Process all pending instances. While processing, new ones might be
+	 * added to the list, so don't use foreach().
+	 *
+	 * Check the places in PruningInstanceWalker that push onto
+	 * context-&gt;pendingInstances why construction of the PruningInstance might
+	 * be pending.
+	 *
+	 * We copy the partial PruningInstance, and continue adding information by
+	 * calling PrunableExpressionsWalker() on the copy, continuing at the
+	 * node stored in PendingPruningInstance-&gt;continueAt.
+	 */</comment>
+	<while>while <condition>(<expr><name><name>context</name><operator>-&gt;</operator><name>pendingInstances</name></name> <operator>!=</operator> <name>NIL</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>PendingPruningInstance</name> <modifier>*</modifier></type><name>instance</name> <init>=
+			<expr><operator>(</operator><name>PendingPruningInstance</name> <operator>*</operator><operator>)</operator> <call><name>linitial</name><argument_list>(<argument><expr><name><name>context</name><operator>-&gt;</operator><name>pendingInstances</name></name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>PruningInstance</name> <modifier>*</modifier></type><name>newPrune</name> <init>= <expr><call><name>CopyPartialPruningInstance</name><argument_list>(<argument><expr><name><name>instance</name><operator>-&gt;</operator><name>instance</name></name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+		<expr_stmt><expr><name><name>context</name><operator>-&gt;</operator><name>pendingInstances</name></name> <operator>=</operator> <call><name>list_delete_first</name><argument_list>(<argument><expr><name><name>context</name><operator>-&gt;</operator><name>pendingInstances</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><name><name>context</name><operator>-&gt;</operator><name>currentPruningInstance</name></name> <operator>=</operator> <name>newPrune</name></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>PrunableExpressionsWalker</name><argument_list>(<argument><expr><name><name>instance</name><operator>-&gt;</operator><name>continueAt</name></name></expr></argument>, <argument><expr><name>context</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>context</name><operator>-&gt;</operator><name>currentPruningInstance</name></name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+	</block_content>}</block></while>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * PrunableExpressionsWalker() is the main work horse for
+ * PrunableExpressions().
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>PrunableExpressionsWalker</name><parameter_list>(<parameter><decl><type><name>PruningTreeNode</name> <modifier>*</modifier></type><name>node</name></decl></parameter>, <parameter><decl><type><name>ClauseWalkerContext</name> <modifier>*</modifier></type><name>context</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>ListCell</name> <modifier>*</modifier></type><name>cell</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>node</name> <operator>==</operator> <name>NULL</name></expr>)</condition>
+	<block>{<block_content>
+		<return>return;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name><name>node</name><operator>-&gt;</operator><name>boolop</name></name> <operator>==</operator> <name>OR_EXPR</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/*
+		 * "Queue" partial pruning instances. This is used to convert
+		 * expressions like (A AND (B OR C) AND D) into (A AND B AND D),
+		 * (A AND C AND D), with A, B, C, D being restrictions. When the
+		 * OR is encountered, a reference to the partially built
+		 * PruningInstance (containing A at this point), is added to
+		 * context-&gt;pendingInstances once for B and once for C. Once a
+		 * full tree-walk completed, PrunableExpressions() will complete
+		 * the pending instances, which'll now also know about restriction
+		 * D, by calling PrunableExpressionsWalker() once for B and once
+		 * for C.
+		 */</comment>
+
+		<if_stmt><if>if <condition>(<expr><name><name>node</name><operator>-&gt;</operator><name>hasInvalidConstraints</name></name></expr>)</condition>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>PruningTreeNode</name> <modifier>*</modifier></type><name>child</name> <init>= <expr><call><name>CreatePruningNode</name><argument_list>(<argument><expr><name>AND_EXPR</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+			<expr_stmt><expr><name><name>child</name><operator>-&gt;</operator><name>hasInvalidConstraints</name></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+
+			<expr_stmt><expr><call><name>AddNewConjuction</name><argument_list>(<argument><expr><name>context</name></expr></argument>, <argument><expr><name>child</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+
+		<macro><name>foreach</name><argument_list>(<argument>cell</argument>, <argument>node-&gt;validConstraints</argument>)</argument_list></macro>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>Node</name> <modifier>*</modifier></type><name>constraint</name> <init>= <expr><operator>(</operator><name>Node</name> <operator>*</operator><operator>)</operator> <call><name>lfirst</name><argument_list>(<argument><expr><name>cell</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+			<decl_stmt><decl><type><name>PruningTreeNode</name> <modifier>*</modifier></type><name>child</name> <init>= <expr><call><name>CreatePruningNode</name><argument_list>(<argument><expr><name>AND_EXPR</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+			<expr_stmt><expr><name><name>child</name><operator>-&gt;</operator><name>validConstraints</name></name> <operator>=</operator> <call><name>list_make1</name><argument_list>(<argument><expr><name>constraint</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+			<expr_stmt><expr><call><name>AddNewConjuction</name><argument_list>(<argument><expr><name>context</name></expr></argument>, <argument><expr><name>child</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block>
+
+		<macro><name>foreach</name><argument_list>(<argument>cell</argument>, <argument>node-&gt;childBooleanNodes</argument>)</argument_list></macro>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>PruningTreeNode</name> <modifier>*</modifier></type><name>child</name> <init>= <expr><operator>(</operator><name>PruningTreeNode</name> <operator>*</operator><operator>)</operator> <call><name>lfirst</name><argument_list>(<argument><expr><name>cell</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+			<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>child</name><operator>-&gt;</operator><name>boolop</name></name> <operator>==</operator> <name>AND_EXPR</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>AddNewConjuction</name><argument_list>(<argument><expr><name>context</name></expr></argument>, <argument><expr><name>child</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block>
+
+		<return>return;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>node</name><operator>-&gt;</operator><name>boolop</name></name> <operator>==</operator> <name>AND_EXPR</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<macro><name>foreach</name><argument_list>(<argument>cell</argument>, <argument>node-&gt;validConstraints</argument>)</argument_list></macro>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>Node</name> <modifier>*</modifier></type><name>constraint</name> <init>= <expr><operator>(</operator><name>Node</name> <operator>*</operator><operator>)</operator> <call><name>lfirst</name><argument_list>(<argument><expr><name>cell</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+		<if_stmt><if>if <condition>(<expr><call><name>IsA</name><argument_list>(<argument><expr><name>constraint</name></expr></argument>, <argument><expr><name>OpExpr</name></expr></argument>)</argument_list></call></expr>)</condition>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>OpExpr</name> <modifier>*</modifier></type><name>opClause</name> <init>= <expr><operator>(</operator><name>OpExpr</name> <operator>*</operator><operator>)</operator> <name>constraint</name></expr></init></decl>;</decl_stmt>
+			<decl_stmt><decl><type><name>PruningInstance</name> <modifier>*</modifier></type><name>prune</name> <init>= <expr><name><name>context</name><operator>-&gt;</operator><name>currentPruningInstance</name></name></expr></init></decl>;</decl_stmt>
+			<decl_stmt><decl><type><name>Var</name> <modifier>*</modifier></type><name>varClause</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+			<decl_stmt><decl><type><name>Const</name> <modifier>*</modifier></type><name>constantClause</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+
+			<if_stmt><if>if <condition>(<expr><operator>!</operator><name><name>prune</name><operator>-&gt;</operator><name>addedToPruningInstances</name></name></expr>)</condition>
+			<block>{<block_content>
+				<expr_stmt><expr><name><name>context</name><operator>-&gt;</operator><name>pruningInstances</name></name> <operator>=</operator> <call><name>lappend</name><argument_list>(<argument><expr><name><name>context</name><operator>-&gt;</operator><name>pruningInstances</name></name></expr></argument>, <argument><expr><name>prune</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<expr_stmt><expr><name><name>prune</name><operator>-&gt;</operator><name>addedToPruningInstances</name></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+			</block_content>}</block></if></if_stmt>
+
+			<if_stmt><if>if <condition>(<expr><call><name>VarConstOpExprClause</name><argument_list>(<argument><expr><name>opClause</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>varClause</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>constantClause</name></expr></argument>)</argument_list></call></expr>)</condition>
+			<block>{<block_content>
+				<if_stmt><if>if <condition>(<expr><call><name>equal</name><argument_list>(<argument><expr><name>varClause</name></expr></argument>, <argument><expr><name><name>context</name><operator>-&gt;</operator><name>partitionColumn</name></name></expr></argument>)</argument_list></call></expr>)</condition>
+				<block>{<block_content>
+					<comment type="block">/*
+					 * Found a restriction on the partition column itself. Update the
+					 * current constraint with the new information.
+					 */</comment>
+					<expr_stmt><expr><call><name>AddPartitionKeyRestrictionToInstance</name><argument_list>(<argument><expr><name>context</name></expr></argument>, <argument><expr><name>opClause</name></expr></argument>, <argument><expr><name>varClause</name></expr></argument>,
+														 <argument><expr><name>constantClause</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				</block_content>}</block></if>
+				<if type="elseif">else if <condition>(<expr><name><name>varClause</name><operator>-&gt;</operator><name>varattno</name></name> <operator>==</operator> <name>RESERVED_HASHED_COLUMN_ID</name></expr>)</condition>
+				<block>{<block_content>
+					<comment type="block">/*
+					 * Found restriction that directly specifies the boundaries of a
+					 * hashed column.
+					 */</comment>
+					<expr_stmt><expr><call><name>AddHashRestrictionToInstance</name><argument_list>(<argument><expr><name>context</name></expr></argument>, <argument><expr><name>opClause</name></expr></argument>, <argument><expr><name>varClause</name></expr></argument>,
+												 <argument><expr><name>constantClause</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				</block_content>}</block></if>
+				<else>else
+				<block>{<block_content>
+					<comment type="block">/* We encounter here only valid constraints */</comment>
+					<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				</block_content>}</block></else></if_stmt>
+			</block_content>}</block></if>
+			<else>else
+			<block>{<block_content>
+				<comment type="block">/* We encounter here only valid constraints */</comment>
+				<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			</block_content>}</block></else></if_stmt>
+		</block_content>}</block></if>
+		<if type="elseif">else if <condition>(<expr><call><name>IsA</name><argument_list>(<argument><expr><name>constraint</name></expr></argument>, <argument><expr><name>ScalarArrayOpExpr</name></expr></argument>)</argument_list></call></expr>)</condition>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>ScalarArrayOpExpr</name> <modifier>*</modifier></type><name>arrayOperatorExpression</name> <init>= <expr><operator>(</operator><name>ScalarArrayOpExpr</name> <operator>*</operator><operator>)</operator> <name>constraint</name></expr></init></decl>;</decl_stmt>
+			<expr_stmt><expr><call><name>AddSAOPartitionKeyRestrictionToInstance</name><argument_list>(<argument><expr><name>context</name></expr></argument>, <argument><expr><name>arrayOperatorExpression</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></if>
+		<else>else
+		<block>{<block_content>
+			<comment type="block">/* We encounter here only valid constraints */</comment>
+			<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></else></if_stmt>
+	</block_content>}</block>
+
+	<if_stmt><if>if <condition>(<expr><name><name>node</name><operator>-&gt;</operator><name>hasInvalidConstraints</name></name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>PruningInstance</name> <modifier>*</modifier></type><name>prune</name> <init>= <expr><name><name>context</name><operator>-&gt;</operator><name>currentPruningInstance</name></name></expr></init></decl>;</decl_stmt>
+
+		<comment type="block">/*
+		 * Mark unknown expression as added, so we'll fail pruning if there's no ANDed
+		 * restrictions that we know how to deal with.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><name><name>prune</name><operator>-&gt;</operator><name>addedToPruningInstances</name></name></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><name><name>context</name><operator>-&gt;</operator><name>pruningInstances</name></name> <operator>=</operator> <call><name>lappend</name><argument_list>(<argument><expr><name><name>context</name><operator>-&gt;</operator><name>pruningInstances</name></name></expr></argument>, <argument><expr><name>prune</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><name><name>prune</name><operator>-&gt;</operator><name>addedToPruningInstances</name></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<macro><name>foreach</name><argument_list>(<argument>cell</argument>, <argument>node-&gt;childBooleanNodes</argument>)</argument_list></macro>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>PruningTreeNode</name> <modifier>*</modifier></type><name>child</name> <init>= <expr><operator>(</operator><name>PruningTreeNode</name> <operator>*</operator><operator>)</operator> <call><name>lfirst</name><argument_list>(<argument><expr><name>cell</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>child</name><operator>-&gt;</operator><name>boolop</name></name> <operator>==</operator> <name>OR_EXPR</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>PrunableExpressionsWalker</name><argument_list>(<argument><expr><name>child</name></expr></argument>, <argument><expr><name>context</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * VarConstOpExprClause check whether an expression is a valid comparison of a Var to a Const.
+ * Also obtaining the var with constant when valid.
+ */</comment>
+<function><type><name>bool</name></type>
+<name>VarConstOpExprClause</name><parameter_list>(<parameter><decl><type><name>OpExpr</name> <modifier>*</modifier></type><name>opClause</name></decl></parameter>, <parameter><decl><type><name>Var</name> <modifier>*</modifier><modifier>*</modifier></type><name>varClause</name></decl></parameter>, <parameter><decl><type><name>Const</name> <modifier>*</modifier><modifier>*</modifier></type><name>constantClause</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>Var</name> <modifier>*</modifier></type><name>foundVarClause</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Const</name> <modifier>*</modifier></type><name>foundConstantClause</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+
+	<decl_stmt><decl><type><name>Node</name> <modifier>*</modifier></type><name>leftOperand</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Node</name> <modifier>*</modifier></type><name>rightOperand</name></decl>;</decl_stmt>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>BinaryOpExpression</name><argument_list>(<argument><expr><operator>(</operator><name>Expr</name> <operator>*</operator><operator>)</operator> <name>opClause</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>leftOperand</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>rightOperand</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<return>return <expr><name>false</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><call><name>IsA</name><argument_list>(<argument><expr><name>rightOperand</name></expr></argument>, <argument><expr><name>Const</name></expr></argument>)</argument_list></call> <operator>&amp;&amp;</operator> <call><name>IsA</name><argument_list>(<argument><expr><name>leftOperand</name></expr></argument>, <argument><expr><name>Var</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name>foundVarClause</name> <operator>=</operator> <operator>(</operator><name>Var</name> <operator>*</operator><operator>)</operator> <name>leftOperand</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name>foundConstantClause</name> <operator>=</operator> <operator>(</operator><name>Const</name> <operator>*</operator><operator>)</operator> <name>rightOperand</name></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<if type="elseif">else if <condition>(<expr><call><name>IsA</name><argument_list>(<argument><expr><name>leftOperand</name></expr></argument>, <argument><expr><name>Const</name></expr></argument>)</argument_list></call> <operator>&amp;&amp;</operator> <call><name>IsA</name><argument_list>(<argument><expr><name>rightOperand</name></expr></argument>, <argument><expr><name>Var</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name>foundVarClause</name> <operator>=</operator> <operator>(</operator><name>Var</name> <operator>*</operator><operator>)</operator> <name>rightOperand</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name>foundConstantClause</name> <operator>=</operator> <operator>(</operator><name>Const</name> <operator>*</operator><operator>)</operator> <name>leftOperand</name></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<else>else
+	<block>{<block_content>
+		<return>return <expr><name>false</name></expr>;</return>
+	</block_content>}</block></else></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>varClause</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><operator>*</operator><name>varClause</name> <operator>=</operator> <name>foundVarClause</name></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+	<if_stmt><if>if <condition>(<expr><name>constantClause</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><operator>*</operator><name>constantClause</name> <operator>=</operator> <name>foundConstantClause</name></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+	<return>return <expr><name>true</name></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * AddSAOPartitionKeyRestrictionToInstance adds partcol = arrayelem operator
+ * restriction to the current pruning instance for each element of the array. These
+ * restrictions are added to pruning instance to prune shards based on IN/=ANY
+ * constraints.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>AddSAOPartitionKeyRestrictionToInstance</name><parameter_list>(<parameter><decl><type><name>ClauseWalkerContext</name> <modifier>*</modifier></type><name>context</name></decl></parameter>,
+										<parameter><decl><type><name>ScalarArrayOpExpr</name> <modifier>*</modifier></type><name>arrayOperatorExpression</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>List</name> <modifier>*</modifier></type><name>restrictions</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name> <name>validSAORestriction</name></type> <name>PG_USED_FOR_ASSERTS_ONLY</name> <init>=
+		<expr><call><name>SAORestrictions</name><argument_list>(<argument><expr><name>arrayOperatorExpression</name></expr></argument>, <argument><expr><name><name>context</name><operator>-&gt;</operator><name>partitionColumn</name></name></expr></argument>, <argument><expr><operator>&amp;</operator><name>restrictions</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>validSAORestriction</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<decl_stmt><decl><type><name>PruningTreeNode</name> <modifier>*</modifier></type><name>node</name> <init>= <expr><call><name>CreatePruningNode</name><argument_list>(<argument><expr><name>OR_EXPR</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<expr_stmt><expr><name><name>node</name><operator>-&gt;</operator><name>validConstraints</name></name> <operator>=</operator> <name>restrictions</name></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>AddNewConjuction</name><argument_list>(<argument><expr><name>context</name></expr></argument>, <argument><expr><name>node</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * SAORestrictions checks whether an SAO constraint is valid.
+ * Also obtains equality restrictions.
+ */</comment>
+<function><type><specifier>static</specifier> <name>bool</name></type>
+<name>SAORestrictions</name><parameter_list>(<parameter><decl><type><name>ScalarArrayOpExpr</name> <modifier>*</modifier></type><name>arrayOperatorExpression</name></decl></parameter>, <parameter><decl><type><name>Var</name> <modifier>*</modifier></type><name>partitionColumn</name></decl></parameter>,
+				<parameter><decl><type><name>List</name> <modifier>*</modifier><modifier>*</modifier></type><name>requestedRestrictions</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>Node</name> <modifier>*</modifier></type><name>leftOpExpression</name> <init>= <expr><call><name>linitial</name><argument_list>(<argument><expr><name><name>arrayOperatorExpression</name><operator>-&gt;</operator><name>args</name></name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Node</name> <modifier>*</modifier></type><name>strippedLeftOpExpression</name> <init>= <expr><call><name>strip_implicit_coercions</name><argument_list>(<argument><expr><name>leftOpExpression</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type> <name>usingEqualityOperator</name> <init>= <expr><call><name>OperatorImplementsEquality</name><argument_list>(
+		<argument><expr><name><name>arrayOperatorExpression</name><operator>-&gt;</operator><name>opno</name></name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Expr</name> <modifier>*</modifier></type><name>arrayArgument</name> <init>= <expr><operator>(</operator><name>Expr</name> <operator>*</operator><operator>)</operator> <call><name>lsecond</name><argument_list>(<argument><expr><name><name>arrayOperatorExpression</name><operator>-&gt;</operator><name>args</name></name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<comment type="block">/* checking for partcol = ANY(const, value, s); or partcol IN (const,b,c); */</comment>
+	<if_stmt><if>if <condition>(<expr><name>usingEqualityOperator</name> <operator>&amp;&amp;</operator> <name>strippedLeftOpExpression</name> <operator>!=</operator> <name>NULL</name> <operator>&amp;&amp;</operator>
+		<call><name>equal</name><argument_list>(<argument><expr><name>strippedLeftOpExpression</name></expr></argument>, <argument><expr><name>partitionColumn</name></expr></argument>)</argument_list></call> <operator>&amp;&amp;</operator>
+		<call><name>IsA</name><argument_list>(<argument><expr><name>arrayArgument</name></expr></argument>, <argument><expr><name>Const</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>Const</name> <modifier>*</modifier></type><name>arrayConst</name> <init>= <expr><operator>(</operator><name>Const</name> <operator>*</operator><operator>)</operator> <name>arrayArgument</name></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>int16</name></type> <name>typlen</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>bool</name></type> <name>typbyval</name> <init>= <expr><name>false</name></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>char</name></type> <name>typalign</name> <init>= <expr><literal type="char">'\0'</literal></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>Datum</name></type> <name>arrayElement</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>Datum</name></type> <name>inArray</name> <init>= <expr><name><name>arrayConst</name><operator>-&gt;</operator><name>constvalue</name></name></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>bool</name></type> <name>isNull</name> <init>= <expr><name>false</name></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>bool</name></type> <name>foundValid</name> <init>= <expr><name>false</name></expr></init></decl>;</decl_stmt>
+
+		<comment type="block">/* check for the NULL right-hand expression*/</comment>
+		<if_stmt><if>if <condition>(<expr><name>inArray</name> <operator>==</operator> <literal type="number">0</literal></expr>)</condition>
+		<block>{<block_content>
+			<return>return <expr><name>false</name></expr>;</return>
+		</block_content>}</block></if></if_stmt>
+
+		<decl_stmt><decl><type><name>ArrayType</name> <modifier>*</modifier></type><name>array</name> <init>= <expr><call><name>DatumGetArrayTypeP</name><argument_list>(<argument><expr><name><name>arrayConst</name><operator>-&gt;</operator><name>constvalue</name></name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+		<comment type="block">/* get the necessary information from array type to iterate over it */</comment>
+		<decl_stmt><decl><type><name>Oid</name></type> <name>elementType</name> <init>= <expr><call><name>ARR_ELEMTYPE</name><argument_list>(<argument><expr><name>array</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+		<expr_stmt><expr><call><name>get_typlenbyvalalign</name><argument_list>(<argument><expr><name>elementType</name></expr></argument>,
+							 <argument><expr><operator>&amp;</operator><name>typlen</name></expr></argument>,
+							 <argument><expr><operator>&amp;</operator><name>typbyval</name></expr></argument>,
+							 <argument><expr><operator>&amp;</operator><name>typalign</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/* Iterate over the righthand array of expression */</comment>
+		<decl_stmt><decl><type><name>ArrayIterator</name></type> <name>arrayIterator</name> <init>= <expr><call><name>array_create_iterator</name><argument_list>(<argument><expr><name>array</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><name>NULL</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+		<while>while <condition>(<expr><call><name>array_iterate</name><argument_list>(<argument><expr><name>arrayIterator</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>arrayElement</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>isNull</name></expr></argument>)</argument_list></call></expr>)</condition>
+		<block>{<block_content>
+			<if_stmt><if>if <condition>(<expr><name>isNull</name></expr>)</condition>
+			<block>{<block_content>
+				<comment type="block">/*
+				 * We can ignore IN (NULL) clauses because a value is never
+				 * equal to NULL.
+				 */</comment>
+				<continue>continue;</continue>
+			</block_content>}</block></if></if_stmt>
+
+			<expr_stmt><expr><name>foundValid</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+
+			<if_stmt><if>if <condition>(<expr><name>requestedRestrictions</name></expr>)</condition>
+			<block>{<block_content>
+				<decl_stmt><decl><type><name>Const</name> <modifier>*</modifier></type><name>constElement</name> <init>= <expr><call><name>makeConst</name><argument_list>(<argument><expr><name>elementType</name></expr></argument>, <argument><expr><operator>-</operator><literal type="number">1</literal></expr></argument>,
+												<argument><expr><name><name>arrayConst</name><operator>-&gt;</operator><name>constcollid</name></name></expr></argument>,
+												<argument><expr><name>typlen</name></expr></argument>, <argument><expr><name>arrayElement</name></expr></argument>,
+												<argument><expr><name>isNull</name></expr></argument>, <argument><expr><name>typbyval</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+				<comment type="block">/* build partcol = arrayelem operator */</comment>
+				<decl_stmt><decl><type><name>OpExpr</name> <modifier>*</modifier></type><name>arrayEqualityOp</name> <init>= <expr><call><name>SAORestrictionArrayEqualityOp</name><argument_list>(
+					<argument><expr><name>arrayOperatorExpression</name></expr></argument>,
+					<argument><expr><name>partitionColumn</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+				<expr_stmt><expr><name><name>arrayEqualityOp</name><operator>-&gt;</operator><name>args</name></name> <operator>=</operator> <call><name>list_make2</name><argument_list>(<argument><expr><name>strippedLeftOpExpression</name></expr></argument>,
+												   <argument><expr><name>constElement</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+				<expr_stmt><expr><operator>*</operator><name>requestedRestrictions</name> <operator>=</operator> <call><name>lappend</name><argument_list>(<argument><expr><operator>*</operator><name>requestedRestrictions</name></expr></argument>, <argument><expr><name>arrayEqualityOp</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			</block_content>}</block></if>
+			<else>else
+			<block>{<block_content>
+				<break>break;</break>
+			</block_content>}</block></else></if_stmt>
+		</block_content>}</block></while>
+
+		<return>return <expr><name>foundValid</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<return>return <expr><name>false</name></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * AddNewConjuction adds the OpExpr to pending instance list of context
+ * as conjunction as partial instance.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>AddNewConjuction</name><parameter_list>(<parameter><decl><type><name>ClauseWalkerContext</name> <modifier>*</modifier></type><name>context</name></decl></parameter>, <parameter><decl><type><name>PruningTreeNode</name> <modifier>*</modifier></type><name>node</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>PendingPruningInstance</name> <modifier>*</modifier></type><name>instance</name> <init>= <expr><call><name>palloc0</name><argument_list>(<argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>PendingPruningInstance</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name><name>instance</name><operator>-&gt;</operator><name>instance</name></name> <operator>=</operator> <name><name>context</name><operator>-&gt;</operator><name>currentPruningInstance</name></name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>instance</name><operator>-&gt;</operator><name>continueAt</name></name> <operator>=</operator> <name>node</name></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Signal that this instance is not to be used for pruning on
+	 * its own. Once the pending instance is processed, it'll be
+	 * used.
+	 */</comment>
+	<expr_stmt><expr><name><name>instance</name><operator>-&gt;</operator><name>instance</name><operator>-&gt;</operator><name>isPartial</name></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>context</name><operator>-&gt;</operator><name>pendingInstances</name></name> <operator>=</operator> <call><name>lappend</name><argument_list>(<argument><expr><name><name>context</name><operator>-&gt;</operator><name>pendingInstances</name></name></expr></argument>, <argument><expr><name>instance</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * IsValidPartitionKeyRestriction check whether an operator clause is
+ * a valid restriction for comparing to a partition column.
+ */</comment>
+<function><type><specifier>static</specifier> <name>bool</name></type>
+<name>IsValidPartitionKeyRestriction</name><parameter_list>(<parameter><decl><type><name>OpExpr</name> <modifier>*</modifier></type><name>opClause</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>ListCell</name> <modifier>*</modifier></type><name>btreeInterpretationCell</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type> <name>matchedOp</name> <init>= <expr><name>false</name></expr></init></decl>;</decl_stmt>
+
+	<decl_stmt><decl><type><name>List</name> <modifier>*</modifier></type><name>btreeInterpretationList</name> <init>=
+		<expr><call><name>get_op_btree_interpretation</name><argument_list>(<argument><expr><name><name>opClause</name><operator>-&gt;</operator><name>opno</name></name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<macro><name>foreach</name><argument_list>(<argument>btreeInterpretationCell</argument>, <argument>btreeInterpretationList</argument>)</argument_list></macro>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>OpBtreeInterpretation</name> <modifier>*</modifier></type><name>btreeInterpretation</name> <init>=
+			<expr><operator>(</operator><name>OpBtreeInterpretation</name> <operator>*</operator><operator>)</operator> <call><name>lfirst</name><argument_list>(<argument><expr><name>btreeInterpretationCell</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name><name>btreeInterpretation</name><operator>-&gt;</operator><name>strategy</name></name> <operator>==</operator> <name>ROWCOMPARE_NE</name></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/* TODO: could add support for this, if we feel like it */</comment>
+			<return>return <expr><name>false</name></expr>;</return>
+		</block_content>}</block></if></if_stmt>
+
+		<expr_stmt><expr><name>matchedOp</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+	</block_content>}</block>
+
+	<return>return <expr><name>matchedOp</name></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * AddPartitionKeyRestrictionToInstance adds information about a PartitionKey
+ * $op Const restriction to the current pruning instance.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>AddPartitionKeyRestrictionToInstance</name><parameter_list>(<parameter><decl><type><name>ClauseWalkerContext</name> <modifier>*</modifier></type><name>context</name></decl></parameter>, <parameter><decl><type><name>OpExpr</name> <modifier>*</modifier></type><name>opClause</name></decl></parameter>,
+									 <parameter><decl><type><name>Var</name> <modifier>*</modifier></type><name>partitionColumn</name></decl></parameter>, <parameter><decl><type><name>Const</name> <modifier>*</modifier></type><name>constantClause</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>PruningInstance</name> <modifier>*</modifier></type><name>prune</name> <init>= <expr><name><name>context</name><operator>-&gt;</operator><name>currentPruningInstance</name></name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>ListCell</name> <modifier>*</modifier></type><name>btreeInterpretationCell</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+
+	<comment type="block">/* only have extra work to do if const isn't same type as partition column */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>constantClause</name><operator>-&gt;</operator><name>consttype</name></name> <operator>!=</operator> <name><name>partitionColumn</name><operator>-&gt;</operator><name>vartype</name></name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* we want our restriction value in terms of the type of the partition column */</comment>
+		<expr_stmt><expr><name>constantClause</name> <operator>=</operator> <call><name>TransformPartitionRestrictionValue</name><argument_list>(<argument><expr><name>partitionColumn</name></expr></argument>,
+															<argument><expr><name>constantClause</name></expr></argument>, <argument><expr><name>true</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<if_stmt><if>if <condition>(<expr><name>constantClause</name> <operator>==</operator> <name>NULL</name></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/* couldn't coerce value, its invalid restriction */</comment>
+			<return>return;</return>
+		</block_content>}</block></if></if_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name><name>constantClause</name><operator>-&gt;</operator><name>constisnull</name></name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* we cannot do pruning on NULL values */</comment>
+		<return>return;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/* at this point, we'd better be able to pass binary Datums to comparison functions */</comment>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>IsBinaryCoercible</name><argument_list>(<argument><expr><name><name>constantClause</name><operator>-&gt;</operator><name>consttype</name></name></expr></argument>, <argument><expr><name><name>partitionColumn</name><operator>-&gt;</operator><name>vartype</name></name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<decl_stmt><decl><type><name>List</name> <modifier>*</modifier></type><name>btreeInterpretationList</name> <init>= <expr><call><name>get_op_btree_interpretation</name><argument_list>(<argument><expr><name><name>opClause</name><operator>-&gt;</operator><name>opno</name></name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<macro><name>foreach</name><argument_list>(<argument>btreeInterpretationCell</argument>, <argument>btreeInterpretationList</argument>)</argument_list></macro>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>OpBtreeInterpretation</name> <modifier>*</modifier></type><name>btreeInterpretation</name> <init>=
+			<expr><operator>(</operator><name>OpBtreeInterpretation</name> <operator>*</operator><operator>)</operator> <call><name>lfirst</name><argument_list>(<argument><expr><name>btreeInterpretationCell</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+		<switch>switch <condition>(<expr><name><name>btreeInterpretation</name><operator>-&gt;</operator><name>strategy</name></name></expr>)</condition>
+		<block>{<block_content>
+			<case>case <expr><name>BTLessStrategyNumber</name></expr>:</case>
+			<block>{<block_content>
+				<if_stmt><if>if <condition>(<expr><operator>!</operator><name><name>prune</name><operator>-&gt;</operator><name>lessConsts</name></name> <operator>||</operator>
+					<call><name>PerformValueCompare</name><argument_list>(<argument><expr><operator>(</operator><name>FunctionCallInfo</name><operator>)</operator> <operator>&amp;</operator>
+										<name><name>context</name><operator>-&gt;</operator><name>compareValueFunctionCall</name></name></expr></argument>,
+										<argument><expr><name><name>constantClause</name><operator>-&gt;</operator><name>constvalue</name></name></expr></argument>,
+										<argument><expr><name><name>prune</name><operator>-&gt;</operator><name>lessConsts</name><operator>-&gt;</operator><name>constvalue</name></name></expr></argument>)</argument_list></call> <operator>&lt;</operator> <literal type="number">0</literal></expr>)</condition>
+				<block>{<block_content>
+					<expr_stmt><expr><name><name>prune</name><operator>-&gt;</operator><name>lessConsts</name></name> <operator>=</operator> <name>constantClause</name></expr>;</expr_stmt>
+				</block_content>}</block></if></if_stmt>
+				<break>break;</break>
+			</block_content>}</block>
+
+			<case>case <expr><name>BTLessEqualStrategyNumber</name></expr>:</case>
+			<block>{<block_content>
+				<if_stmt><if>if <condition>(<expr><operator>!</operator><name><name>prune</name><operator>-&gt;</operator><name>lessEqualConsts</name></name> <operator>||</operator>
+					<call><name>PerformValueCompare</name><argument_list>(<argument><expr><operator>(</operator><name>FunctionCallInfo</name><operator>)</operator> <operator>&amp;</operator>
+										<name><name>context</name><operator>-&gt;</operator><name>compareValueFunctionCall</name></name></expr></argument>,
+										<argument><expr><name><name>constantClause</name><operator>-&gt;</operator><name>constvalue</name></name></expr></argument>,
+										<argument><expr><name><name>prune</name><operator>-&gt;</operator><name>lessEqualConsts</name><operator>-&gt;</operator><name>constvalue</name></name></expr></argument>)</argument_list></call> <operator>&lt;</operator> <literal type="number">0</literal></expr>)</condition>
+				<block>{<block_content>
+					<expr_stmt><expr><name><name>prune</name><operator>-&gt;</operator><name>lessEqualConsts</name></name> <operator>=</operator> <name>constantClause</name></expr>;</expr_stmt>
+				</block_content>}</block></if></if_stmt>
+				<break>break;</break>
+			</block_content>}</block>
+
+			<case>case <expr><name>BTEqualStrategyNumber</name></expr>:</case>
+			<block>{<block_content>
+				<if_stmt><if>if <condition>(<expr><operator>!</operator><name><name>prune</name><operator>-&gt;</operator><name>equalConsts</name></name></expr>)</condition>
+				<block>{<block_content>
+					<expr_stmt><expr><name><name>prune</name><operator>-&gt;</operator><name>equalConsts</name></name> <operator>=</operator> <name>constantClause</name></expr>;</expr_stmt>
+				</block_content>}</block></if>
+				<if type="elseif">else if <condition>(<expr><call><name>PerformValueCompare</name><argument_list>(<argument><expr><operator>(</operator><name>FunctionCallInfo</name><operator>)</operator> <operator>&amp;</operator>
+											 <name><name>context</name><operator>-&gt;</operator><name>compareValueFunctionCall</name></name></expr></argument>,
+											 <argument><expr><name><name>constantClause</name><operator>-&gt;</operator><name>constvalue</name></name></expr></argument>,
+											 <argument><expr><name><name>prune</name><operator>-&gt;</operator><name>equalConsts</name><operator>-&gt;</operator><name>constvalue</name></name></expr></argument>)</argument_list></call> <operator>!=</operator> <literal type="number">0</literal></expr>)</condition>
+				<block>{<block_content>
+					<comment type="block">/* key can't be equal to two values */</comment>
+					<expr_stmt><expr><name><name>prune</name><operator>-&gt;</operator><name>evaluatesToFalse</name></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+				</block_content>}</block></if></if_stmt>
+				<break>break;</break>
+			</block_content>}</block>
+
+			<case>case <expr><name>BTGreaterEqualStrategyNumber</name></expr>:</case>
+			<block>{<block_content>
+				<if_stmt><if>if <condition>(<expr><operator>!</operator><name><name>prune</name><operator>-&gt;</operator><name>greaterEqualConsts</name></name> <operator>||</operator>
+					<call><name>PerformValueCompare</name><argument_list>(<argument><expr><operator>(</operator><name>FunctionCallInfo</name><operator>)</operator> <operator>&amp;</operator>
+										<name><name>context</name><operator>-&gt;</operator><name>compareValueFunctionCall</name></name></expr></argument>,
+										<argument><expr><name><name>constantClause</name><operator>-&gt;</operator><name>constvalue</name></name></expr></argument>,
+										<argument><expr><name><name>prune</name><operator>-&gt;</operator><name>greaterEqualConsts</name><operator>-&gt;</operator><name>constvalue</name></name></expr></argument>)</argument_list></call> <operator>&gt;</operator> <literal type="number">0</literal></expr>
+					)</condition>
+				<block>{<block_content>
+					<expr_stmt><expr><name><name>prune</name><operator>-&gt;</operator><name>greaterEqualConsts</name></name> <operator>=</operator> <name>constantClause</name></expr>;</expr_stmt>
+				</block_content>}</block></if></if_stmt>
+				<break>break;</break>
+			</block_content>}</block>
+
+			<case>case <expr><name>BTGreaterStrategyNumber</name></expr>:</case>
+			<block>{<block_content>
+				<if_stmt><if>if <condition>(<expr><operator>!</operator><name><name>prune</name><operator>-&gt;</operator><name>greaterConsts</name></name> <operator>||</operator>
+					<call><name>PerformValueCompare</name><argument_list>(<argument><expr><operator>(</operator><name>FunctionCallInfo</name><operator>)</operator> <operator>&amp;</operator>
+										<name><name>context</name><operator>-&gt;</operator><name>compareValueFunctionCall</name></name></expr></argument>,
+										<argument><expr><name><name>constantClause</name><operator>-&gt;</operator><name>constvalue</name></name></expr></argument>,
+										<argument><expr><name><name>prune</name><operator>-&gt;</operator><name>greaterConsts</name><operator>-&gt;</operator><name>constvalue</name></name></expr></argument>)</argument_list></call> <operator>&gt;</operator> <literal type="number">0</literal></expr>)</condition>
+				<block>{<block_content>
+					<expr_stmt><expr><name><name>prune</name><operator>-&gt;</operator><name>greaterConsts</name></name> <operator>=</operator> <name>constantClause</name></expr>;</expr_stmt>
+				</block_content>}</block></if></if_stmt>
+				<break>break;</break>
+			</block_content>}</block>
+
+			<default>default:</default>
+				<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></switch>
+	</block_content>}</block>
+
+	<expr_stmt><expr><name><name>prune</name><operator>-&gt;</operator><name>hasValidConstraint</name></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * TransformPartitionRestrictionValue works around how PostgreSQL sometimes
+ * chooses to try to wrap our Var in a coercion rather than the Const.
+ * To deal with this, we strip coercions from both and manually coerce
+ * the Const into the type of our partition column.
+ * It is conceivable that in some instances this may not be possible,
+ * in those cases we will simply fail to prune partitions based on this clause.
+ */</comment>
+<function><type><name>Const</name> <modifier>*</modifier></type>
+<name>TransformPartitionRestrictionValue</name><parameter_list>(<parameter><decl><type><name>Var</name> <modifier>*</modifier></type><name>partitionColumn</name></decl></parameter>, <parameter><decl><type><name>Const</name> <modifier>*</modifier></type><name>restrictionValue</name></decl></parameter>,
+								   <parameter><decl><type><name>bool</name></type> <name>missingOk</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>Node</name> <modifier>*</modifier></type><name>transformedValue</name> <init>= <expr><call><name>coerce_to_target_type</name><argument_list>(<argument><expr><name>NULL</name></expr></argument>, <argument><expr><operator>(</operator><name>Node</name> <operator>*</operator><operator>)</operator> <name>restrictionValue</name></expr></argument>,
+												   <argument><expr><name><name>restrictionValue</name><operator>-&gt;</operator><name>consttype</name></name></expr></argument>,
+												   <argument><expr><name><name>partitionColumn</name><operator>-&gt;</operator><name>vartype</name></name></expr></argument>,
+												   <argument><expr><name><name>partitionColumn</name><operator>-&gt;</operator><name>vartypmod</name></name></expr></argument>,
+												   <argument><expr><name>COERCION_ASSIGNMENT</name></expr></argument>,
+												   <argument><expr><name>COERCE_IMPLICIT_CAST</name></expr></argument>, <argument><expr><operator>-</operator><literal type="number">1</literal></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<comment type="block">/* if NULL, no implicit coercion is possible between the types */</comment>
+	<if_stmt><if>if <condition>(<expr><name>transformedValue</name> <operator>==</operator> <name>NULL</name></expr>)</condition>
+	<block>{<block_content>
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><name>missingOk</name></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><call><name>ErrorTypesDontMatch</name><argument_list>(<argument><expr><name><name>partitionColumn</name><operator>-&gt;</operator><name>vartype</name></name></expr></argument>, <argument><expr><name><name>partitionColumn</name><operator>-&gt;</operator><name>varcollid</name></name></expr></argument>,
+								<argument><expr><name><name>restrictionValue</name><operator>-&gt;</operator><name>consttype</name></name></expr></argument>,
+								<argument><expr><name><name>restrictionValue</name><operator>-&gt;</operator><name>constcollid</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+
+		<return>return <expr><name>NULL</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/* if still not a constant, evaluate coercion */</comment>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>IsA</name><argument_list>(<argument><expr><name>transformedValue</name></expr></argument>, <argument><expr><name>Const</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name>transformedValue</name> <operator>=</operator> <operator>(</operator><name>Node</name> <operator>*</operator><operator>)</operator> <call><name>expression_planner</name><argument_list>(<argument><expr><operator>(</operator><name>Expr</name> <operator>*</operator><operator>)</operator> <name>transformedValue</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/* if still not a constant, no immutable coercion matched */</comment>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>IsA</name><argument_list>(<argument><expr><name>transformedValue</name></expr></argument>, <argument><expr><name>Const</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><name>missingOk</name></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><call><name>ErrorTypesDontMatch</name><argument_list>(<argument><expr><name><name>partitionColumn</name><operator>-&gt;</operator><name>vartype</name></name></expr></argument>, <argument><expr><name><name>partitionColumn</name><operator>-&gt;</operator><name>varcollid</name></name></expr></argument>,
+								<argument><expr><name><name>restrictionValue</name><operator>-&gt;</operator><name>consttype</name></name></expr></argument>,
+								<argument><expr><name><name>restrictionValue</name><operator>-&gt;</operator><name>constcollid</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+
+		<return>return <expr><name>NULL</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<return>return <expr><operator>(</operator><name>Const</name> <operator>*</operator><operator>)</operator> <name>transformedValue</name></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * ErrorTypesDontMatch throws an error explicitly printing the type names.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>ErrorTypesDontMatch</name><parameter_list>(<parameter><decl><type><name>Oid</name></type> <name>firstType</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>firstCollId</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>secondType</name></decl></parameter>, <parameter><decl><type><name>Oid</name></type> <name>secondCollId</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>Datum</name></type> <name>firstTypename</name> <init>=
+		<expr><call><name>DirectFunctionCall1Coll</name><argument_list>(<argument><expr><name>regtypeout</name></expr></argument>, <argument><expr><name>firstCollId</name></expr></argument>, <argument><expr><call><name>ObjectIdGetDatum</name><argument_list>(<argument><expr><name>firstType</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<decl_stmt><decl><type><name>Datum</name></type> <name>secondTypename</name> <init>=
+		<expr><call><name>DirectFunctionCall1Coll</name><argument_list>(<argument><expr><name>regtypeout</name></expr></argument>, <argument><expr><name>secondCollId</name></expr></argument>, <argument><expr><call><name>ObjectIdGetDatum</name><argument_list>(<argument><expr><name>secondType</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><operator>(</operator><call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"Cannot coerce %s to %s"</literal></expr></argument>,
+						   <argument><expr><call><name>DatumGetCString</name><argument_list>(<argument><expr><name>secondTypename</name></expr></argument>)</argument_list></call></expr></argument>,
+						   <argument><expr><call><name>DatumGetCString</name><argument_list>(<argument><expr><name>firstTypename</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * IsValidHashRestriction checks whether an operator clause is a valid restriction for hashed column.
+ */</comment>
+<function><type><specifier>static</specifier> <name>bool</name></type>
+<name>IsValidHashRestriction</name><parameter_list>(<parameter><decl><type><name>OpExpr</name> <modifier>*</modifier></type><name>opClause</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>ListCell</name> <modifier>*</modifier></type><name>btreeInterpretationCell</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+
+	<decl_stmt><decl><type><name>List</name> <modifier>*</modifier></type><name>btreeInterpretationList</name> <init>=
+		<expr><call><name>get_op_btree_interpretation</name><argument_list>(<argument><expr><name><name>opClause</name><operator>-&gt;</operator><name>opno</name></name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<macro><name>foreach</name><argument_list>(<argument>btreeInterpretationCell</argument>, <argument>btreeInterpretationList</argument>)</argument_list></macro>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>OpBtreeInterpretation</name> <modifier>*</modifier></type><name>btreeInterpretation</name> <init>=
+			<expr><operator>(</operator><name>OpBtreeInterpretation</name> <operator>*</operator><operator>)</operator> <call><name>lfirst</name><argument_list>(<argument><expr><name>btreeInterpretationCell</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name><name>btreeInterpretation</name><operator>-&gt;</operator><name>strategy</name></name> <operator>==</operator> <name>BTGreaterEqualStrategyNumber</name></expr>)</condition>
+		<block>{<block_content>
+			<return>return <expr><name>true</name></expr>;</return>
+		</block_content>}</block></if></if_stmt>
+	</block_content>}</block>
+
+	<return>return <expr><name>false</name></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * AddHashRestrictionToInstance adds information about a
+ * RESERVED_HASHED_COLUMN_ID = Const restriction to the current pruning
+ * instance.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>AddHashRestrictionToInstance</name><parameter_list>(<parameter><decl><type><name>ClauseWalkerContext</name> <modifier>*</modifier></type><name>context</name></decl></parameter>, <parameter><decl><type><name>OpExpr</name> <modifier>*</modifier></type><name>opClause</name></decl></parameter>,
+							 <parameter><decl><type><name>Var</name> <modifier>*</modifier></type><name>varClause</name></decl></parameter>, <parameter><decl><type><name>Const</name> <modifier>*</modifier></type><name>constantClause</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<comment type="block">/* be paranoid */</comment>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>IsBinaryCoercible</name><argument_list>(<argument><expr><name><name>constantClause</name><operator>-&gt;</operator><name>consttype</name></name></expr></argument>, <argument><expr><name>INT4OID</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>IsValidHashRestriction</name><argument_list>(<argument><expr><name>opClause</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Ladidadida, dirty hackety hack. We only add such
+	 * constraints (in ShardIntervalOpExpressions()) to select a
+	 * shard based on its exact boundaries. For efficient binary
+	 * search it's better to simply use one representative value
+	 * to look up the shard. In practice, this is sufficient for
+	 * now.
+	 */</comment>
+	<decl_stmt><decl><type><name>PruningInstance</name> <modifier>*</modifier></type><name>prune</name> <init>= <expr><name><name>context</name><operator>-&gt;</operator><name>currentPruningInstance</name></name></expr></init></decl>;</decl_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><operator>!</operator><name><name>prune</name><operator>-&gt;</operator><name>hashedEqualConsts</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>prune</name><operator>-&gt;</operator><name>hashedEqualConsts</name></name> <operator>=</operator> <name>constantClause</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>prune</name><operator>-&gt;</operator><name>hasValidConstraint</name></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * CopyPartialPruningInstance copies a partial PruningInstance, so it can be
+ * completed.
+ */</comment>
+<function><type><specifier>static</specifier> <name>PruningInstance</name> <modifier>*</modifier></type>
+<name>CopyPartialPruningInstance</name><parameter_list>(<parameter><decl><type><name>PruningInstance</name> <modifier>*</modifier></type><name>sourceInstance</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>PruningInstance</name> <modifier>*</modifier></type><name>newInstance</name> <init>= <expr><call><name>palloc</name><argument_list>(<argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>PruningInstance</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>sourceInstance</name><operator>-&gt;</operator><name>isPartial</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * To make the new PruningInstance useful for pruning, we have to reset it
+	 * being partial - if necessary it'll be marked so again by
+	 * PrunableExpressionsWalker().
+	 */</comment>
+	<expr_stmt><expr><operator>*</operator><name>newInstance</name> <operator>=</operator> <operator>*</operator><name>sourceInstance</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>newInstance</name><operator>-&gt;</operator><name>addedToPruningInstances</name></name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>newInstance</name><operator>-&gt;</operator><name>isPartial</name></name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+
+	<return>return <expr><name>newInstance</name></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * ShardArrayToList builds a list of out the array of ShardInterval*.
+ */</comment>
+<function><type><specifier>static</specifier> <name>List</name> <modifier>*</modifier></type>
+<name>ShardArrayToList</name><parameter_list>(<parameter><decl><type><name>ShardInterval</name> <modifier>*</modifier><modifier>*</modifier></type><name>shardArray</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>length</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>List</name> <modifier>*</modifier></type><name>shardIntervalList</name> <init>= <expr><name>NIL</name></expr></init></decl>;</decl_stmt>
+
+	<for>for <control>(<init><decl><type><name>int</name></type> <name>shardIndex</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</init> <condition><expr><name>shardIndex</name> <operator>&lt;</operator> <name>length</name></expr>;</condition> <incr><expr><name>shardIndex</name><operator>++</operator></expr></incr>)</control>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>ShardInterval</name> <modifier>*</modifier></type><name>shardInterval</name> <init>=
+			<expr><name><name>shardArray</name><index>[<expr><name>shardIndex</name></expr>]</index></name></expr></init></decl>;</decl_stmt>
+		<expr_stmt><expr><name>shardIntervalList</name> <operator>=</operator> <call><name>lappend</name><argument_list>(<argument><expr><name>shardIntervalList</name></expr></argument>, <argument><expr><name>shardInterval</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></for>
+
+	<return>return <expr><name>shardIntervalList</name></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * DeepCopyShardIntervalList copies originalShardIntervalList and the
+ * contained ShardIntervals, into a new list.
+ */</comment>
+<function><type><specifier>static</specifier> <name>List</name> <modifier>*</modifier></type>
+<name>DeepCopyShardIntervalList</name><parameter_list>(<parameter><decl><type><name>List</name> <modifier>*</modifier></type><name>originalShardIntervalList</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>List</name> <modifier>*</modifier></type><name>copiedShardIntervalList</name> <init>= <expr><name>NIL</name></expr></init></decl>;</decl_stmt>
+
+	<decl_stmt><decl><type><name>ShardInterval</name> <modifier>*</modifier></type><name>originalShardInterval</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+	<macro><name>foreach_ptr</name><argument_list>(<argument>originalShardInterval</argument>, <argument>originalShardIntervalList</argument>)</argument_list></macro>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>ShardInterval</name> <modifier>*</modifier></type><name>copiedShardInterval</name> <init>= <expr><call><name>CopyShardInterval</name><argument_list>(<argument><expr><name>originalShardInterval</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+		<expr_stmt><expr><name>copiedShardIntervalList</name> <operator>=</operator> <call><name>lappend</name><argument_list>(<argument><expr><name>copiedShardIntervalList</name></expr></argument>, <argument><expr><name>copiedShardInterval</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block>
+
+	<return>return <expr><name>copiedShardIntervalList</name></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * PruneOne returns all shards in the table that match a single
+ * PruningInstance.
+ */</comment>
+<function><type><specifier>static</specifier> <name>List</name> <modifier>*</modifier></type>
+<name>PruneOne</name><parameter_list>(<parameter><decl><type><name>CitusTableCacheEntry</name> <modifier>*</modifier></type><name>cacheEntry</name></decl></parameter>, <parameter><decl><type><name>ClauseWalkerContext</name> <modifier>*</modifier></type><name>context</name></decl></parameter>,
+		 <parameter><decl><type><name>PruningInstance</name> <modifier>*</modifier></type><name>prune</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>ShardInterval</name> <modifier>*</modifier></type><name>shardInterval</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+
+	<comment type="block">/* Well, if life always were this easy... */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>prune</name><operator>-&gt;</operator><name>evaluatesToFalse</name></name></expr>)</condition>
+	<block>{<block_content>
+		<return>return <expr><name>NIL</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/*
+	 * For an equal constraints, if there's no overlapping shards (always the
+	 * case for hash and range partitioning, sometimes for append), can
+	 * perform binary search for the right interval. That's usually the
+	 * fastest, so try that first.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>prune</name><operator>-&gt;</operator><name>equalConsts</name></name> <operator>&amp;&amp;</operator>
+		<operator>!</operator><name><name>cacheEntry</name><operator>-&gt;</operator><name>hasOverlappingShardInterval</name></name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name>shardInterval</name> <operator>=</operator> <call><name>FindShardInterval</name><argument_list>(<argument><expr><name><name>prune</name><operator>-&gt;</operator><name>equalConsts</name><operator>-&gt;</operator><name>constvalue</name></name></expr></argument>, <argument><expr><name>cacheEntry</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/*
+		 * If pruned down to nothing, we're done. Otherwise see if other
+		 * methods prune down further / to nothing.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><name>shardInterval</name></expr>)</condition>
+		<block>{<block_content>
+			<return>return <expr><name>NIL</name></expr>;</return>
+		</block_content>}</block></if></if_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/*
+	 * If the hash value we're looking for is known, we can search for the
+	 * interval directly. That's fast and should only ever be the case for a
+	 * hash-partitioned table.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>prune</name><operator>-&gt;</operator><name>hashedEqualConsts</name></name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>ShardInterval</name> <modifier>*</modifier><modifier>*</modifier></type><name>sortedShardIntervalArray</name> <init>= <expr><name><name>cacheEntry</name><operator>-&gt;</operator><name>sortedShardIntervalArray</name></name></expr></init></decl>;</decl_stmt>
+
+		<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>context</name><operator>-&gt;</operator><name>partitionMethod</name></name> <operator>==</operator> <name>DISTRIBUTE_BY_HASH</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<decl_stmt><decl><type><name>int</name></type> <name>shardIndex</name> <init>= <expr><call><name>FindShardIntervalIndex</name><argument_list>(<argument><expr><name><name>prune</name><operator>-&gt;</operator><name>hashedEqualConsts</name><operator>-&gt;</operator><name>constvalue</name></name></expr></argument>,
+												<argument><expr><name>cacheEntry</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name>shardIndex</name> <operator>==</operator> <name>INVALID_SHARD_INDEX</name></expr>)</condition>
+		<block>{<block_content>
+			<return>return <expr><name>NIL</name></expr>;</return>
+		</block_content>}</block></if>
+		<if type="elseif">else if <condition>(<expr><name>shardInterval</name> <operator>&amp;&amp;</operator>
+				 <name><name>sortedShardIntervalArray</name><index>[<expr><name>shardIndex</name></expr>]</index></name><operator>-&gt;</operator><name>shardId</name> <operator>!=</operator> <name><name>shardInterval</name><operator>-&gt;</operator><name>shardId</name></name></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/*
+			 * equalConst based pruning above yielded a different shard than
+			 * pruning based on pre-hashed equality. This is useful in case
+			 * of INSERT ... SELECT, where both can occur together (one via
+			 * join/colocation, the other via a plain equality restriction).
+			 */</comment>
+			<return>return <expr><name>NIL</name></expr>;</return>
+		</block_content>}</block></if>
+		<else>else
+		<block>{<block_content>
+			<return>return <expr><call><name>list_make1</name><argument_list>(<argument><expr><name><name>sortedShardIntervalArray</name><index>[<expr><name>shardIndex</name></expr>]</index></name></expr></argument>)</argument_list></call></expr>;</return>
+		</block_content>}</block></else></if_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/*
+	 * If previous pruning method yielded a single shard, and the table is not
+	 * hash partitioned, attempt range based pruning to exclude it further.
+	 *
+	 * That's particularly important in particular for subquery pushdown,
+	 * where it's very common to have a user specified equality restriction,
+	 * and a range based restriction for shard boundaries, added by the
+	 * subquery machinery.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name>shardInterval</name></expr>)</condition>
+	<block>{<block_content>
+		<if_stmt><if>if <condition>(<expr><name><name>context</name><operator>-&gt;</operator><name>partitionMethod</name></name> <operator>!=</operator> <name>DISTRIBUTE_BY_HASH</name> <operator>&amp;&amp;</operator>
+			<call><name>ExhaustivePruneOne</name><argument_list>(<argument><expr><name>shardInterval</name></expr></argument>, <argument><expr><name>context</name></expr></argument>, <argument><expr><name>prune</name></expr></argument>)</argument_list></call></expr>)</condition>
+		<block>{<block_content>
+			<return>return <expr><name>NIL</name></expr>;</return>
+		</block_content>}</block></if>
+		<else>else
+		<block>{<block_content>
+			<comment type="block">/* no chance to prune further, return */</comment>
+			<return>return <expr><call><name>list_make1</name><argument_list>(<argument><expr><name>shardInterval</name></expr></argument>)</argument_list></call></expr>;</return>
+		</block_content>}</block></else></if_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/*
+	 * Should never get here for hashing, we've filtered down to either zero
+	 * or one shard, and returned.
+	 */</comment>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>context</name><operator>-&gt;</operator><name>partitionMethod</name></name> <operator>!=</operator> <name>DISTRIBUTE_BY_HASH</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Next method: binary search with fuzzy boundaries. Can't trivially do so
+	 * if shards have overlapping boundaries.
+	 *
+	 * TODO: If we kept shard intervals separately sorted by both upper and
+	 * lower boundaries, this should be possible?
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><name><name>cacheEntry</name><operator>-&gt;</operator><name>hasOverlappingShardInterval</name></name> <operator>&amp;&amp;</operator> <operator>(</operator>
+			<name><name>prune</name><operator>-&gt;</operator><name>greaterConsts</name></name> <operator>||</operator> <name><name>prune</name><operator>-&gt;</operator><name>greaterEqualConsts</name></name> <operator>||</operator>
+			<name><name>prune</name><operator>-&gt;</operator><name>lessConsts</name></name> <operator>||</operator> <name><name>prune</name><operator>-&gt;</operator><name>lessEqualConsts</name></name><operator>)</operator></expr>)</condition>
+	<block>{<block_content>
+		<return>return <expr><call><name>PruneWithBoundaries</name><argument_list>(<argument><expr><name>cacheEntry</name></expr></argument>, <argument><expr><name>context</name></expr></argument>, <argument><expr><name>prune</name></expr></argument>)</argument_list></call></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/*
+	 * Brute force: Check each shard.
+	 */</comment>
+	<return>return <expr><call><name>ExhaustivePrune</name><argument_list>(<argument><expr><name>cacheEntry</name></expr></argument>, <argument><expr><name>context</name></expr></argument>, <argument><expr><name>prune</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * PerformCompare invokes comparator with prepared values, check for
+ * unexpected NULL returns.
+ */</comment>
+<function><type><specifier>static</specifier> <name>int</name></type>
+<name>PerformCompare</name><parameter_list>(<parameter><decl><type><name>FunctionCallInfo</name></type> <name>compareFunctionCall</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>Datum</name></type> <name>result</name> <init>= <expr><call><name>FunctionCallInvoke</name><argument_list>(<argument><expr><name>compareFunctionCall</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name><name>compareFunctionCall</name><operator>-&gt;</operator><name>isnull</name></name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"function %u returned NULL"</literal></expr></argument>, <argument><expr><name><name>compareFunctionCall</name><operator>-&gt;</operator><name>flinfo</name><operator>-&gt;</operator><name>fn_oid</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<return>return <expr><call><name>DatumGetInt32</name><argument_list>(<argument><expr><name>result</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * PerformValueCompare invokes comparator with a/b, and checks for unexpected
+ * NULL returns.
+ */</comment>
+<function><type><specifier>static</specifier> <name>int</name></type>
+<name>PerformValueCompare</name><parameter_list>(<parameter><decl><type><name>FunctionCallInfo</name></type> <name>compareFunctionCall</name></decl></parameter>, <parameter><decl><type><name>Datum</name></type> <name>a</name></decl></parameter>, <parameter><decl><type><name>Datum</name></type> <name>b</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>fcSetArg</name><argument_list>(<argument><expr><name>compareFunctionCall</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><name>a</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>fcSetArg</name><argument_list>(<argument><expr><name>compareFunctionCall</name></expr></argument>, <argument><expr><literal type="number">1</literal></expr></argument>, <argument><expr><name>b</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<return>return <expr><call><name>PerformCompare</name><argument_list>(<argument><expr><name>compareFunctionCall</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * LowerShardBoundary returns the index of the first ShardInterval that's &gt;=
+ * (if includeMax) or &gt; partitionColumnValue.
+ */</comment>
+<function><type><specifier>static</specifier> <name>int</name></type>
+<name>LowerShardBoundary</name><parameter_list>(<parameter><decl><type><name>Datum</name></type> <name>partitionColumnValue</name></decl></parameter>, <parameter><decl><type><name>ShardInterval</name> <modifier>*</modifier><modifier>*</modifier></type><name>shardIntervalCache</name></decl></parameter>,
+				   <parameter><decl><type><name>int</name></type> <name>shardCount</name></decl></parameter>, <parameter><decl><type><name>FunctionCallInfo</name></type> <name>compareFunction</name></decl></parameter>, <parameter><decl><type><name>bool</name></type> <name>includeMax</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>int</name></type> <name>lowerBoundIndex</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type> <name>upperBoundIndex</name> <init>= <expr><name>shardCount</name></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>shardCount</name> <operator>!=</operator> <literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* setup partitionColumnValue argument once */</comment>
+	<expr_stmt><expr><call><name>fcSetArg</name><argument_list>(<argument><expr><name>compareFunction</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><name>partitionColumnValue</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Now we test partitionColumnValue used in where clause such as
+	 * partCol &gt; partitionColumnValue (or partCol &gt;= partitionColumnValue)
+	 * against four possibilities, these are:
+	 * 1) partitionColumnValue falls into a specific shard, such that:
+	 *    partitionColumnValue &gt;= shard[x].min, and
+	 *    partitionColumnValue &lt; shard[x].max (or partitionColumnValue &lt;= shard[x].max).
+	 * 2) partitionColumnValue &lt; shard[x].min for all the shards
+	 * 3) partitionColumnValue &gt; shard[x].max for all the shards
+	 * 4) partitionColumnValue falls in between two shards, such that:
+	 *    partitionColumnValue &gt; shard[x].max and
+	 *    partitionColumnValue &lt; shard[x+1].min
+	 *
+	 * For 1), we find that shard in below loop using binary search and
+	 * return the index of it. For the others, see the end of this function.
+	 */</comment>
+	<while>while <condition>(<expr><name>lowerBoundIndex</name> <operator>&lt;</operator> <name>upperBoundIndex</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>int</name></type> <name>middleIndex</name> <init>= <expr><name>lowerBoundIndex</name> <operator>+</operator> <operator>(</operator><operator>(</operator><name>upperBoundIndex</name> <operator>-</operator> <name>lowerBoundIndex</name><operator>)</operator> <operator>/</operator> <literal type="number">2</literal><operator>)</operator></expr></init></decl>;</decl_stmt>
+
+		<comment type="block">/* setup minValue as argument */</comment>
+		<expr_stmt><expr><call><name>fcSetArg</name><argument_list>(<argument><expr><name>compareFunction</name></expr></argument>, <argument><expr><literal type="number">1</literal></expr></argument>, <argument><expr><name><name>shardIntervalCache</name><index>[<expr><name>middleIndex</name></expr>]</index></name><operator>-&gt;</operator><name>minValue</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/* execute cmp(partitionValue, lowerBound) */</comment>
+		<decl_stmt><decl><type><name>int</name></type> <name>minValueComparison</name> <init>= <expr><call><name>PerformCompare</name><argument_list>(<argument><expr><name>compareFunction</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+		<comment type="block">/* and evaluate results */</comment>
+		<if_stmt><if>if <condition>(<expr><name>minValueComparison</name> <operator>&lt;</operator> <literal type="number">0</literal></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/* value smaller than entire range */</comment>
+			<expr_stmt><expr><name>upperBoundIndex</name> <operator>=</operator> <name>middleIndex</name></expr>;</expr_stmt>
+			<continue>continue;</continue>
+		</block_content>}</block></if></if_stmt>
+
+		<comment type="block">/* setup maxValue as argument */</comment>
+		<expr_stmt><expr><call><name>fcSetArg</name><argument_list>(<argument><expr><name>compareFunction</name></expr></argument>, <argument><expr><literal type="number">1</literal></expr></argument>, <argument><expr><name><name>shardIntervalCache</name><index>[<expr><name>middleIndex</name></expr>]</index></name><operator>-&gt;</operator><name>maxValue</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/* execute cmp(partitionValue, upperBound) */</comment>
+		<decl_stmt><decl><type><name>int</name></type> <name>maxValueComparison</name> <init>= <expr><call><name>PerformCompare</name><argument_list>(<argument><expr><name>compareFunction</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+		<if_stmt><if>if <condition>(<expr><operator>(</operator><name>maxValueComparison</name> <operator>==</operator> <literal type="number">0</literal> <operator>&amp;&amp;</operator> <operator>!</operator><name>includeMax</name><operator>)</operator> <operator>||</operator>
+			<name>maxValueComparison</name> <operator>&gt;</operator> <literal type="number">0</literal></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/* value bigger than entire range */</comment>
+			<expr_stmt><expr><name>lowerBoundIndex</name> <operator>=</operator> <name>middleIndex</name> <operator>+</operator> <literal type="number">1</literal></expr>;</expr_stmt>
+			<continue>continue;</continue>
+		</block_content>}</block></if></if_stmt>
+
+		<comment type="block">/* partitionColumnValue falls into a specific shard, possibility 1) */</comment>
+		<return>return <expr><name>middleIndex</name></expr>;</return>
+	</block_content>}</block></while>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>lowerBoundIndex</name> <operator>==</operator> <name>upperBoundIndex</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * If we get here, none of the ShardIntervals exactly contain the value
+	 * (we'd have hit the return middleIndex; case otherwise). Figure out
+	 * whether there's possibly any interval containing a value that's bigger
+	 * than the partition key one.
+	 *
+	 * Also note that we initialized lowerBoundIndex with 0. Similarly,
+	 * we always set it to the index of the  shard that we consider as our
+	 * lower boundary during binary search.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name>lowerBoundIndex</name> <operator>==</operator> <name>shardCount</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/*
+		 * Since lowerBoundIndex is an inclusive index, being equal to shardCount
+		 * means all the shards have smaller values than partitionColumnValue,
+		 * which corresponds to possibility 3).
+		 * In that case, since we can't have a lower bound shard, we return
+		 * INVALID_SHARD_INDEX here.
+		 */</comment>
+		<return>return <expr><name>INVALID_SHARD_INDEX</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/*
+	 * partitionColumnValue is either smaller than all the shards or falls in
+	 * between two shards, which corresponds to possibility 2) or 4).
+	 * Knowing that lowerBoundIndex is an inclusive index, we directly return
+	 * it as the index for the lower bound shard here.
+	 */</comment>
+	<return>return <expr><name>lowerBoundIndex</name></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * UpperShardBoundary returns the index of the last ShardInterval that's &lt;=
+ * (if includeMin) or &lt; partitionColumnValue.
+ */</comment>
+<function><type><specifier>static</specifier> <name>int</name></type>
+<name>UpperShardBoundary</name><parameter_list>(<parameter><decl><type><name>Datum</name></type> <name>partitionColumnValue</name></decl></parameter>, <parameter><decl><type><name>ShardInterval</name> <modifier>*</modifier><modifier>*</modifier></type><name>shardIntervalCache</name></decl></parameter>,
+				   <parameter><decl><type><name>int</name></type> <name>shardCount</name></decl></parameter>, <parameter><decl><type><name>FunctionCallInfo</name></type> <name>compareFunction</name></decl></parameter>, <parameter><decl><type><name>bool</name></type> <name>includeMin</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>int</name></type> <name>lowerBoundIndex</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type> <name>upperBoundIndex</name> <init>= <expr><name>shardCount</name></expr></init></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>shardCount</name> <operator>!=</operator> <literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* setup partitionColumnValue argument once */</comment>
+	<expr_stmt><expr><call><name>fcSetArg</name><argument_list>(<argument><expr><name>compareFunction</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><name>partitionColumnValue</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Now we test partitionColumnValue used in where clause such as
+	 * partCol &lt; partitionColumnValue (or partCol &lt;= partitionColumnValue)
+	 * against four possibilities, these are:
+	 * 1) partitionColumnValue falls into a specific shard, such that:
+	 *    partitionColumnValue &lt;= shard[x].max, and
+	 *    partitionColumnValue &gt; shard[x].min (or partitionColumnValue &gt;= shard[x].min).
+	 * 2) partitionColumnValue &gt; shard[x].max for all the shards
+	 * 3) partitionColumnValue &lt; shard[x].min for all the shards
+	 * 4) partitionColumnValue falls in between two shards, such that:
+	 *    partitionColumnValue &gt; shard[x].max and
+	 *    partitionColumnValue &lt; shard[x+1].min
+	 *
+	 * For 1), we find that shard in below loop using binary search and
+	 * return the index of it. For the others, see the end of this function.
+	 */</comment>
+
+	<while>while <condition>(<expr><name>lowerBoundIndex</name> <operator>&lt;</operator> <name>upperBoundIndex</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>int</name></type> <name>middleIndex</name> <init>= <expr><name>lowerBoundIndex</name> <operator>+</operator> <operator>(</operator><operator>(</operator><name>upperBoundIndex</name> <operator>-</operator> <name>lowerBoundIndex</name><operator>)</operator> <operator>/</operator> <literal type="number">2</literal><operator>)</operator></expr></init></decl>;</decl_stmt>
+
+		<comment type="block">/* setup minValue as argument */</comment>
+		<expr_stmt><expr><call><name>fcSetArg</name><argument_list>(<argument><expr><name>compareFunction</name></expr></argument>, <argument><expr><literal type="number">1</literal></expr></argument>, <argument><expr><name><name>shardIntervalCache</name><index>[<expr><name>middleIndex</name></expr>]</index></name><operator>-&gt;</operator><name>minValue</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/* execute cmp(partitionValue, lowerBound) */</comment>
+		<decl_stmt><decl><type><name>int</name></type> <name>minValueComparison</name> <init>= <expr><call><name>PerformCompare</name><argument_list>(<argument><expr><name>compareFunction</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+		<comment type="block">/* and evaluate results */</comment>
+		<if_stmt><if>if <condition>(<expr><operator>(</operator><name>minValueComparison</name> <operator>==</operator> <literal type="number">0</literal> <operator>&amp;&amp;</operator> <operator>!</operator><name>includeMin</name><operator>)</operator> <operator>||</operator>
+			<name>minValueComparison</name> <operator>&lt;</operator> <literal type="number">0</literal></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/* value smaller than entire range */</comment>
+			<expr_stmt><expr><name>upperBoundIndex</name> <operator>=</operator> <name>middleIndex</name></expr>;</expr_stmt>
+			<continue>continue;</continue>
+		</block_content>}</block></if></if_stmt>
+
+		<comment type="block">/* setup maxValue as argument */</comment>
+		<expr_stmt><expr><call><name>fcSetArg</name><argument_list>(<argument><expr><name>compareFunction</name></expr></argument>, <argument><expr><literal type="number">1</literal></expr></argument>, <argument><expr><name><name>shardIntervalCache</name><index>[<expr><name>middleIndex</name></expr>]</index></name><operator>-&gt;</operator><name>maxValue</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/* execute cmp(partitionValue, upperBound) */</comment>
+		<decl_stmt><decl><type><name>int</name></type> <name>maxValueComparison</name> <init>= <expr><call><name>PerformCompare</name><argument_list>(<argument><expr><name>compareFunction</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name>maxValueComparison</name> <operator>&gt;</operator> <literal type="number">0</literal></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/* value bigger than entire range */</comment>
+			<expr_stmt><expr><name>lowerBoundIndex</name> <operator>=</operator> <name>middleIndex</name> <operator>+</operator> <literal type="number">1</literal></expr>;</expr_stmt>
+			<continue>continue;</continue>
+		</block_content>}</block></if></if_stmt>
+
+		<comment type="block">/* partitionColumnValue falls into a specific shard, possibility 1) */</comment>
+		<return>return <expr><name>middleIndex</name></expr>;</return>
+	</block_content>}</block></while>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>lowerBoundIndex</name> <operator>==</operator> <name>upperBoundIndex</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * If we get here, none of the ShardIntervals exactly contain the value
+	 * (we'd have hit the return middleIndex; case otherwise). Figure out
+	 * whether there's possibly any interval containing a value that's smaller
+	 * than the partition key one.
+	 *
+	 * Also note that we initialized upperBoundIndex with shardCount. Similarly,
+	 * we always set it to the index of the next shard that we consider as our
+	 * upper boundary during binary search.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name>upperBoundIndex</name> <operator>==</operator> <literal type="number">0</literal></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/*
+		 * Since upperBoundIndex is an exclusive index, being equal to 0 means
+		 * all the shards have greater values than partitionColumnValue, which
+		 * corresponds to possibility 3).
+		 * In that case, since we can't have an upper bound shard, we return
+		 * INVALID_SHARD_INDEX here.
+		 */</comment>
+		<return>return <expr><name>INVALID_SHARD_INDEX</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/*
+	 * partitionColumnValue is either greater than all the shards or falls in
+	 * between two shards, which corresponds to possibility 2) or 4).
+	 * Knowing that upperBoundIndex is an exclusive index, we return the index
+	 * for the previous shard here.
+	 */</comment>
+	<return>return <expr><name>upperBoundIndex</name> <operator>-</operator> <literal type="number">1</literal></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * PruneWithBoundaries searches for shards that match inequality constraints,
+ * using binary search on both the upper and lower boundary, and returns a
+ * list of surviving shards.
+ */</comment>
+<function><type><specifier>static</specifier> <name>List</name> <modifier>*</modifier></type>
+<name>PruneWithBoundaries</name><parameter_list>(<parameter><decl><type><name>CitusTableCacheEntry</name> <modifier>*</modifier></type><name>cacheEntry</name></decl></parameter>, <parameter><decl><type><name>ClauseWalkerContext</name> <modifier>*</modifier></type><name>context</name></decl></parameter>,
+					<parameter><decl><type><name>PruningInstance</name> <modifier>*</modifier></type><name>prune</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>List</name> <modifier>*</modifier></type><name>remainingShardList</name> <init>= <expr><name>NIL</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type> <name>shardCount</name> <init>= <expr><name><name>cacheEntry</name><operator>-&gt;</operator><name>shardIntervalArrayLength</name></name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>ShardInterval</name> <modifier>*</modifier><modifier>*</modifier></type><name>sortedShardIntervalArray</name> <init>= <expr><name><name>cacheEntry</name><operator>-&gt;</operator><name>sortedShardIntervalArray</name></name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type> <name>hasLowerBound</name> <init>= <expr><name>false</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type> <name>hasUpperBound</name> <init>= <expr><name>false</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Datum</name></type> <name>lowerBound</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Datum</name></type> <name>upperBound</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type> <name>lowerBoundInclusive</name> <init>= <expr><name>false</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type> <name>upperBoundInclusive</name> <init>= <expr><name>false</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type> <name>lowerBoundIdx</name> <init>= <expr><operator>-</operator><literal type="number">1</literal></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type> <name>upperBoundIdx</name> <init>= <expr><operator>-</operator><literal type="number">1</literal></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>FunctionCallInfo</name></type> <name>compareFunctionCall</name> <init>= <expr><operator>(</operator><name>FunctionCallInfo</name><operator>)</operator> <operator>&amp;</operator>
+										   <name><name>context</name><operator>-&gt;</operator><name>compareIntervalFunctionCall</name></name></expr></init></decl>;</decl_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name><name>prune</name><operator>-&gt;</operator><name>greaterEqualConsts</name></name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name>lowerBound</name> <operator>=</operator> <name><name>prune</name><operator>-&gt;</operator><name>greaterEqualConsts</name><operator>-&gt;</operator><name>constvalue</name></name></expr>;</expr_stmt>
+		<expr_stmt><expr><name>lowerBoundInclusive</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name>hasLowerBound</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+	<if_stmt><if>if <condition>(<expr><name><name>prune</name><operator>-&gt;</operator><name>greaterConsts</name></name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/*
+		 * Use the more restrictive one, if both greater and greaterEqual
+		 * constraints are specified.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><name>hasLowerBound</name> <operator>||</operator>
+			<call><name>PerformValueCompare</name><argument_list>(<argument><expr><name>compareFunctionCall</name></expr></argument>,
+								<argument><expr><name><name>prune</name><operator>-&gt;</operator><name>greaterConsts</name><operator>-&gt;</operator><name>constvalue</name></name></expr></argument>,
+								<argument><expr><name>lowerBound</name></expr></argument>)</argument_list></call> <operator>&gt;=</operator> <literal type="number">0</literal></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><name>lowerBound</name> <operator>=</operator> <name><name>prune</name><operator>-&gt;</operator><name>greaterConsts</name><operator>-&gt;</operator><name>constvalue</name></name></expr>;</expr_stmt>
+			<expr_stmt><expr><name>lowerBoundInclusive</name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+			<expr_stmt><expr><name>hasLowerBound</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+	</block_content>}</block></if></if_stmt>
+	<if_stmt><if>if <condition>(<expr><name><name>prune</name><operator>-&gt;</operator><name>lessEqualConsts</name></name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name>upperBound</name> <operator>=</operator> <name><name>prune</name><operator>-&gt;</operator><name>lessEqualConsts</name><operator>-&gt;</operator><name>constvalue</name></name></expr>;</expr_stmt>
+		<expr_stmt><expr><name>upperBoundInclusive</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name>hasUpperBound</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+	<if_stmt><if>if <condition>(<expr><name><name>prune</name><operator>-&gt;</operator><name>lessConsts</name></name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/*
+		 * Use the more restrictive one, if both less and lessEqual
+		 * constraints are specified.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><name>hasUpperBound</name> <operator>||</operator>
+			<call><name>PerformValueCompare</name><argument_list>(<argument><expr><name>compareFunctionCall</name></expr></argument>,
+								<argument><expr><name><name>prune</name><operator>-&gt;</operator><name>lessConsts</name><operator>-&gt;</operator><name>constvalue</name></name></expr></argument>,
+								<argument><expr><name>upperBound</name></expr></argument>)</argument_list></call> <operator>&lt;=</operator> <literal type="number">0</literal></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><name>upperBound</name> <operator>=</operator> <name><name>prune</name><operator>-&gt;</operator><name>lessConsts</name><operator>-&gt;</operator><name>constvalue</name></name></expr>;</expr_stmt>
+			<expr_stmt><expr><name>upperBoundInclusive</name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+			<expr_stmt><expr><name>hasUpperBound</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>hasLowerBound</name> <operator>||</operator> <name>hasUpperBound</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* find lower bound */</comment>
+	<if_stmt><if>if <condition>(<expr><name>hasLowerBound</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name>lowerBoundIdx</name> <operator>=</operator> <call><name>LowerShardBoundary</name><argument_list>(<argument><expr><name>lowerBound</name></expr></argument>, <argument><expr><name>sortedShardIntervalArray</name></expr></argument>,
+										   <argument><expr><name>shardCount</name></expr></argument>, <argument><expr><name>compareFunctionCall</name></expr></argument>,
+										   <argument><expr><name>lowerBoundInclusive</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<else>else
+	<block>{<block_content>
+		<expr_stmt><expr><name>lowerBoundIdx</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+	</block_content>}</block></else></if_stmt>
+
+	<comment type="block">/* find upper bound */</comment>
+	<if_stmt><if>if <condition>(<expr><name>hasUpperBound</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name>upperBoundIdx</name> <operator>=</operator> <call><name>UpperShardBoundary</name><argument_list>(<argument><expr><name>upperBound</name></expr></argument>, <argument><expr><name>sortedShardIntervalArray</name></expr></argument>,
+										   <argument><expr><name>shardCount</name></expr></argument>, <argument><expr><name>compareFunctionCall</name></expr></argument>,
+										   <argument><expr><name>upperBoundInclusive</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<else>else
+	<block>{<block_content>
+		<expr_stmt><expr><name>upperBoundIdx</name> <operator>=</operator> <name>shardCount</name> <operator>-</operator> <literal type="number">1</literal></expr>;</expr_stmt>
+	</block_content>}</block></else></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>lowerBoundIdx</name> <operator>==</operator> <name>INVALID_SHARD_INDEX</name></expr>)</condition>
+	<block>{<block_content>
+		<return>return <expr><name>NIL</name></expr>;</return>
+	</block_content>}</block></if>
+	<if type="elseif">else if <condition>(<expr><name>upperBoundIdx</name> <operator>==</operator> <name>INVALID_SHARD_INDEX</name></expr>)</condition>
+	<block>{<block_content>
+		<return>return <expr><name>NIL</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/*
+	 * Build list of all shards that are in the range of shards (possibly 0).
+	 */</comment>
+	<for>for <control>(<init><decl><type><name>int</name></type> <name>curIdx</name> <init>= <expr><name>lowerBoundIdx</name></expr></init></decl>;</init> <condition><expr><name>curIdx</name> <operator>&lt;=</operator> <name>upperBoundIdx</name></expr>;</condition> <incr><expr><name>curIdx</name><operator>++</operator></expr></incr>)</control>
+	<block>{<block_content>
+		<expr_stmt><expr><name>remainingShardList</name> <operator>=</operator> <call><name>lappend</name><argument_list>(<argument><expr><name>remainingShardList</name></expr></argument>,
+									 <argument><expr><name><name>sortedShardIntervalArray</name><index>[<expr><name>curIdx</name></expr>]</index></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></for>
+
+	<return>return <expr><name>remainingShardList</name></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * ExhaustivePrune returns a list of shards matching PruningInstances
+ * constraints, by simply checking them for each individual shard.
+ */</comment>
+<function><type><specifier>static</specifier> <name>List</name> <modifier>*</modifier></type>
+<name>ExhaustivePrune</name><parameter_list>(<parameter><decl><type><name>CitusTableCacheEntry</name> <modifier>*</modifier></type><name>cacheEntry</name></decl></parameter>, <parameter><decl><type><name>ClauseWalkerContext</name> <modifier>*</modifier></type><name>context</name></decl></parameter>,
+				<parameter><decl><type><name>PruningInstance</name> <modifier>*</modifier></type><name>prune</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>List</name> <modifier>*</modifier></type><name>remainingShardList</name> <init>= <expr><name>NIL</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>int</name></type> <name>shardCount</name> <init>= <expr><name><name>cacheEntry</name><operator>-&gt;</operator><name>shardIntervalArrayLength</name></name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>ShardInterval</name> <modifier>*</modifier><modifier>*</modifier></type><name>sortedShardIntervalArray</name> <init>= <expr><name><name>cacheEntry</name><operator>-&gt;</operator><name>sortedShardIntervalArray</name></name></expr></init></decl>;</decl_stmt>
+
+	<for>for <control>(<init><decl><type><name>int</name></type> <name>curIdx</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</init> <condition><expr><name>curIdx</name> <operator>&lt;</operator> <name>shardCount</name></expr>;</condition> <incr><expr><name>curIdx</name><operator>++</operator></expr></incr>)</control>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>ShardInterval</name> <modifier>*</modifier></type><name>curInterval</name> <init>= <expr><name><name>sortedShardIntervalArray</name><index>[<expr><name>curIdx</name></expr>]</index></name></expr></init></decl>;</decl_stmt>
+
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>ExhaustivePruneOne</name><argument_list>(<argument><expr><name>curInterval</name></expr></argument>, <argument><expr><name>context</name></expr></argument>, <argument><expr><name>prune</name></expr></argument>)</argument_list></call></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><name>remainingShardList</name> <operator>=</operator> <call><name>lappend</name><argument_list>(<argument><expr><name>remainingShardList</name></expr></argument>, <argument><expr><name>curInterval</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+	</block_content>}</block></for>
+
+	<return>return <expr><name>remainingShardList</name></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * ExhaustivePruneOne returns whether curInterval is pruned away.
+ */</comment>
+<function><type><specifier>static</specifier> <name>bool</name></type>
+<name>ExhaustivePruneOne</name><parameter_list>(<parameter><decl><type><name>ShardInterval</name> <modifier>*</modifier></type><name>curInterval</name></decl></parameter>,
+				   <parameter><decl><type><name>ClauseWalkerContext</name> <modifier>*</modifier></type><name>context</name></decl></parameter>,
+				   <parameter><decl><type><name>PruningInstance</name> <modifier>*</modifier></type><name>prune</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>FunctionCallInfo</name></type> <name>compareFunctionCall</name> <init>= <expr><operator>(</operator><name>FunctionCallInfo</name><operator>)</operator> <operator>&amp;</operator>
+										   <name><name>context</name><operator>-&gt;</operator><name>compareIntervalFunctionCall</name></name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Datum</name></type> <name>compareWith</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+
+	<comment type="block">/* NULL boundaries can't be compared to */</comment>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><name><name>curInterval</name><operator>-&gt;</operator><name>minValueExists</name></name> <operator>||</operator> <operator>!</operator><name><name>curInterval</name><operator>-&gt;</operator><name>maxValueExists</name></name></expr>)</condition>
+	<block>{<block_content>
+		<return>return <expr><name>false</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name><name>prune</name><operator>-&gt;</operator><name>equalConsts</name></name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name>compareWith</name> <operator>=</operator> <name><name>prune</name><operator>-&gt;</operator><name>equalConsts</name><operator>-&gt;</operator><name>constvalue</name></name></expr>;</expr_stmt>
+
+		<if_stmt><if>if <condition>(<expr><call><name>PerformValueCompare</name><argument_list>(<argument><expr><name>compareFunctionCall</name></expr></argument>,
+								<argument><expr><name>compareWith</name></expr></argument>,
+								<argument><expr><name><name>curInterval</name><operator>-&gt;</operator><name>minValue</name></name></expr></argument>)</argument_list></call> <operator>&lt;</operator> <literal type="number">0</literal></expr>)</condition>
+		<block>{<block_content>
+			<return>return <expr><name>true</name></expr>;</return>
+		</block_content>}</block></if></if_stmt>
+
+		<if_stmt><if>if <condition>(<expr><call><name>PerformValueCompare</name><argument_list>(<argument><expr><name>compareFunctionCall</name></expr></argument>,
+								<argument><expr><name>compareWith</name></expr></argument>,
+								<argument><expr><name><name>curInterval</name><operator>-&gt;</operator><name>maxValue</name></name></expr></argument>)</argument_list></call> <operator>&gt;</operator> <literal type="number">0</literal></expr>)</condition>
+		<block>{<block_content>
+			<return>return <expr><name>true</name></expr>;</return>
+		</block_content>}</block></if></if_stmt>
+	</block_content>}</block></if></if_stmt>
+	<if_stmt><if>if <condition>(<expr><name><name>prune</name><operator>-&gt;</operator><name>greaterEqualConsts</name></name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name>compareWith</name> <operator>=</operator> <name><name>prune</name><operator>-&gt;</operator><name>greaterEqualConsts</name><operator>-&gt;</operator><name>constvalue</name></name></expr>;</expr_stmt>
+
+		<if_stmt><if>if <condition>(<expr><call><name>PerformValueCompare</name><argument_list>(<argument><expr><name>compareFunctionCall</name></expr></argument>,
+								<argument><expr><name><name>curInterval</name><operator>-&gt;</operator><name>maxValue</name></name></expr></argument>,
+								<argument><expr><name>compareWith</name></expr></argument>)</argument_list></call> <operator>&lt;</operator> <literal type="number">0</literal></expr>)</condition>
+		<block>{<block_content>
+			<return>return <expr><name>true</name></expr>;</return>
+		</block_content>}</block></if></if_stmt>
+	</block_content>}</block></if></if_stmt>
+	<if_stmt><if>if <condition>(<expr><name><name>prune</name><operator>-&gt;</operator><name>greaterConsts</name></name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name>compareWith</name> <operator>=</operator> <name><name>prune</name><operator>-&gt;</operator><name>greaterConsts</name><operator>-&gt;</operator><name>constvalue</name></name></expr>;</expr_stmt>
+
+		<if_stmt><if>if <condition>(<expr><call><name>PerformValueCompare</name><argument_list>(<argument><expr><name>compareFunctionCall</name></expr></argument>,
+								<argument><expr><name><name>curInterval</name><operator>-&gt;</operator><name>maxValue</name></name></expr></argument>,
+								<argument><expr><name>compareWith</name></expr></argument>)</argument_list></call> <operator>&lt;=</operator> <literal type="number">0</literal></expr>)</condition>
+		<block>{<block_content>
+			<return>return <expr><name>true</name></expr>;</return>
+		</block_content>}</block></if></if_stmt>
+	</block_content>}</block></if></if_stmt>
+	<if_stmt><if>if <condition>(<expr><name><name>prune</name><operator>-&gt;</operator><name>lessEqualConsts</name></name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name>compareWith</name> <operator>=</operator> <name><name>prune</name><operator>-&gt;</operator><name>lessEqualConsts</name><operator>-&gt;</operator><name>constvalue</name></name></expr>;</expr_stmt>
+
+		<if_stmt><if>if <condition>(<expr><call><name>PerformValueCompare</name><argument_list>(<argument><expr><name>compareFunctionCall</name></expr></argument>,
+								<argument><expr><name><name>curInterval</name><operator>-&gt;</operator><name>minValue</name></name></expr></argument>,
+								<argument><expr><name>compareWith</name></expr></argument>)</argument_list></call> <operator>&gt;</operator> <literal type="number">0</literal></expr>)</condition>
+		<block>{<block_content>
+			<return>return <expr><name>true</name></expr>;</return>
+		</block_content>}</block></if></if_stmt>
+	</block_content>}</block></if></if_stmt>
+	<if_stmt><if>if <condition>(<expr><name><name>prune</name><operator>-&gt;</operator><name>lessConsts</name></name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name>compareWith</name> <operator>=</operator> <name><name>prune</name><operator>-&gt;</operator><name>lessConsts</name><operator>-&gt;</operator><name>constvalue</name></name></expr>;</expr_stmt>
+
+		<if_stmt><if>if <condition>(<expr><call><name>PerformValueCompare</name><argument_list>(<argument><expr><name>compareFunctionCall</name></expr></argument>,
+								<argument><expr><name><name>curInterval</name><operator>-&gt;</operator><name>minValue</name></name></expr></argument>,
+								<argument><expr><name>compareWith</name></expr></argument>)</argument_list></call> <operator>&gt;=</operator> <literal type="number">0</literal></expr>)</condition>
+		<block>{<block_content>
+			<return>return <expr><name>true</name></expr>;</return>
+		</block_content>}</block></if></if_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<return>return <expr><name>false</name></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * Helper for creating a node for pruning tree
+ */</comment>
+<function><type><specifier>static</specifier> <name>PruningTreeNode</name> <modifier>*</modifier></type>
+<name>CreatePruningNode</name><parameter_list>(<parameter><decl><type><name>BoolExprType</name></type> <name>boolop</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>PruningTreeNode</name> <modifier>*</modifier></type><name>node</name> <init>= <expr><call><name>palloc0</name><argument_list>(<argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>PruningTreeNode</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<expr_stmt><expr><name><name>node</name><operator>-&gt;</operator><name>boolop</name></name> <operator>=</operator> <name>boolop</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>node</name><operator>-&gt;</operator><name>childBooleanNodes</name></name> <operator>=</operator> <name>NIL</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>node</name><operator>-&gt;</operator><name>validConstraints</name></name> <operator>=</operator> <name>NIL</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>node</name><operator>-&gt;</operator><name>hasInvalidConstraints</name></name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+	<return>return <expr><name>node</name></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * SAORestrictionArrayEqualityOp creates an equality operator
+ * for a single element of a scalar array constraint.
+ */</comment>
+<function><type><specifier>static</specifier> <name>OpExpr</name> <modifier>*</modifier></type>
+<name>SAORestrictionArrayEqualityOp</name><parameter_list>(<parameter><decl><type><name>ScalarArrayOpExpr</name> <modifier>*</modifier></type><name>arrayOperatorExpression</name></decl></parameter>,
+							  <parameter><decl><type><name>Var</name> <modifier>*</modifier></type><name>partitionColumn</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>OpExpr</name> <modifier>*</modifier></type><name>arrayEqualityOp</name> <init>= <expr><call><name>makeNode</name><argument_list>(<argument><expr><name>OpExpr</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<expr_stmt><expr><name><name>arrayEqualityOp</name><operator>-&gt;</operator><name>opno</name></name> <operator>=</operator> <name><name>arrayOperatorExpression</name><operator>-&gt;</operator><name>opno</name></name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>arrayEqualityOp</name><operator>-&gt;</operator><name>opfuncid</name></name> <operator>=</operator> <name><name>arrayOperatorExpression</name><operator>-&gt;</operator><name>opfuncid</name></name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>arrayEqualityOp</name><operator>-&gt;</operator><name>inputcollid</name></name> <operator>=</operator> <name><name>arrayOperatorExpression</name><operator>-&gt;</operator><name>inputcollid</name></name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>arrayEqualityOp</name><operator>-&gt;</operator><name>opresulttype</name></name> <operator>=</operator> <call><name>get_func_rettype</name><argument_list>(
+		<argument><expr><name><name>arrayOperatorExpression</name><operator>-&gt;</operator><name>opfuncid</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>arrayEqualityOp</name><operator>-&gt;</operator><name>opcollid</name></name> <operator>=</operator> <name><name>partitionColumn</name><operator>-&gt;</operator><name>varcollid</name></name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>arrayEqualityOp</name><operator>-&gt;</operator><name>location</name></name> <operator>=</operator> <operator>-</operator><literal type="number">1</literal></expr>;</expr_stmt>
+	<return>return <expr><name>arrayEqualityOp</name></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * DebugLogNode is a helper for logging expression nodes.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>DebugLogNode</name><parameter_list>(<parameter><decl><type><name>char</name> <modifier>*</modifier></type><name>fmt</name></decl></parameter>, <parameter><decl><type><name>Node</name> <modifier>*</modifier></type><name>node</name></decl></parameter>, <parameter><decl><type><name>List</name> <modifier>*</modifier></type><name>deparseCtx</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<if_stmt><if>if <condition>(<expr><name>node</name> <operator>!=</operator> <name>NULL</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>char</name> <modifier>*</modifier></type><name>deparsed</name> <init>= <expr><call><name>deparse_expression</name><argument_list>(<argument><expr><name>node</name></expr></argument>, <argument><expr><name>deparseCtx</name></expr></argument>, <argument><expr><name>false</name></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>DEBUG3</name></expr></argument>, <argument><expr><operator>(</operator><call><name>errmsg</name><argument_list>(<argument><expr><name>fmt</name></expr></argument>, <argument><expr><name>deparsed</name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * DebugLogPruningInstance is a helper for logging purning constraints.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>DebugLogPruningInstance</name><parameter_list>(<parameter><decl><type><name>PruningInstance</name> <modifier>*</modifier></type><name>pruning</name></decl></parameter>, <parameter><decl><type><name>List</name> <modifier>*</modifier></type><name>deparseCtx</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>DebugLogNode</name><argument_list>(<argument><expr><literal type="string">"constraint value: %s"</literal></expr></argument>,
+				 <argument><expr><operator>(</operator><name>Node</name> <operator>*</operator><operator>)</operator> <name><name>pruning</name><operator>-&gt;</operator><name>equalConsts</name></name></expr></argument>, <argument><expr><name>deparseCtx</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>DebugLogNode</name><argument_list>(<argument><expr><literal type="string">"constraint (lt) value: %s"</literal></expr></argument>, \
+				 <argument><expr><operator>(</operator><name>Node</name> <operator>*</operator><operator>)</operator> <name><name>pruning</name><operator>-&gt;</operator><name>lessConsts</name></name></expr></argument>, <argument><expr><name>deparseCtx</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>DebugLogNode</name><argument_list>(<argument><expr><literal type="string">"constraint (lteq) value: %s"</literal></expr></argument>, \
+				 <argument><expr><operator>(</operator><name>Node</name> <operator>*</operator><operator>)</operator> <name><name>pruning</name><operator>-&gt;</operator><name>lessEqualConsts</name></name></expr></argument>, <argument><expr><name>deparseCtx</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>DebugLogNode</name><argument_list>(<argument><expr><literal type="string">"constraint (gt) value: %s"</literal></expr></argument>, \
+				 <argument><expr><operator>(</operator><name>Node</name> <operator>*</operator><operator>)</operator> <name><name>pruning</name><operator>-&gt;</operator><name>greaterConsts</name></name></expr></argument>, <argument><expr><name>deparseCtx</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>DebugLogNode</name><argument_list>(<argument><expr><literal type="string">"constraint (gteq) value: %s"</literal></expr></argument>,
+				 <argument><expr><operator>(</operator><name>Node</name> <operator>*</operator><operator>)</operator> <name><name>pruning</name><operator>-&gt;</operator><name>greaterEqualConsts</name></name></expr></argument>, <argument><expr><name>deparseCtx</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * ConstraintCount returns how many arguments this node is taking.
+ */</comment>
+<function><type><specifier>static</specifier> <name>int</name></type>
+<name>ConstraintCount</name><parameter_list>(<parameter><decl><type><name>PruningTreeNode</name> <modifier>*</modifier></type><name>node</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<return>return <expr><call><name>list_length</name><argument_list>(<argument><expr><name><name>node</name><operator>-&gt;</operator><name>childBooleanNodes</name></name></expr></argument>)</argument_list></call> <operator>+</operator>
+		   <call><name>list_length</name><argument_list>(<argument><expr><name><name>node</name><operator>-&gt;</operator><name>validConstraints</name></name></expr></argument>)</argument_list></call> <operator>+</operator>
+		   <operator>(</operator><ternary><condition><expr><name><name>node</name><operator>-&gt;</operator><name>hasInvalidConstraints</name></name></expr> ?</condition><then> <expr><literal type="number">1</literal></expr> </then><else>: <expr><literal type="number">0</literal></expr></else></ternary><operator>)</operator></expr>;</return>
+</block_content>}</block></function>
+</unit>

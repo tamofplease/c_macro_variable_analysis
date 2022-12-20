@@ -1,0 +1,1085 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<unit xmlns="http://www.srcML.org/srcML/src" xmlns:cpp="http://www.srcML.org/srcML/cpp" revision="1.0.0" language="C" filename="/cloned_projects/PolarDB-for-PostgreSQL/src/backend/replication/logical/logical.c"><comment type="block">/*-------------------------------------------------------------------------
+ * logical.c
+ *	   PostgreSQL logical decoding coordination
+ *
+ * Copyright (c) 2012-2018, PostgreSQL Global Development Group
+ *
+ * IDENTIFICATION
+ *	  src/backend/replication/logical/logical.c
+ *
+ * NOTES
+ *	  This file coordinates interaction between the various modules that
+ *	  together provide logical decoding, primarily by providing so
+ *	  called LogicalDecodingContexts. The goal is to encapsulate most of the
+ *	  internal complexity for consumers of logical decoding, so they can
+ *	  create and consume a changestream with a low amount of code. Builtin
+ *	  consumers are the walsender and SQL SRF interface, but it's possible to
+ *	  add further ones without changing core code, e.g. to consume changes in
+ *	  a bgworker.
+ *
+ *	  The idea is that a consumer provides three callbacks, one to read WAL,
+ *	  one to prepare a data write, and a final one for actually writing since
+ *	  their implementation depends on the type of consumer.  Check
+ *	  logicalfuncs.c for an example implementation of a fairly simple consumer
+ *	  and an implementation of a WAL reading callback that's suitable for
+ *	  simple consumers.
+ *-------------------------------------------------------------------------
+ */</comment>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"postgres.h"</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"miscadmin.h"</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/xact.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/xlog_internal.h"</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"replication/decode.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"replication/logical.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"replication/reorderbuffer.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"replication/origin.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"replication/snapbuild.h"</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/proc.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/procarray.h"</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/memutils.h"</cpp:file></cpp:include>
+
+<comment type="block">/* data for errcontext callback */</comment>
+<typedef>typedef <type><struct>struct <name>LogicalErrorCallbackState</name>
+<block>{
+	<decl_stmt><decl><type><name>LogicalDecodingContext</name> <modifier>*</modifier></type><name>ctx</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>callback_name</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>XLogRecPtr</name></type>	<name>report_location</name></decl>;</decl_stmt>
+}</block></struct></type> <name>LogicalErrorCallbackState</name>;</typedef>
+
+<comment type="block">/* wrappers around output plugin callbacks */</comment>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>output_plugin_error_callback</name><parameter_list>(<parameter><decl><type><name>void</name> <modifier>*</modifier></type><name>arg</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>startup_cb_wrapper</name><parameter_list>(<parameter><decl><type><name>LogicalDecodingContext</name> <modifier>*</modifier></type><name>ctx</name></decl></parameter>, <parameter><decl><type><name>OutputPluginOptions</name> <modifier>*</modifier></type><name>opt</name></decl></parameter>,
+				   <parameter><decl><type><name>bool</name></type> <name>is_init</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>shutdown_cb_wrapper</name><parameter_list>(<parameter><decl><type><name>LogicalDecodingContext</name> <modifier>*</modifier></type><name>ctx</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>begin_cb_wrapper</name><parameter_list>(<parameter><decl><type><name>ReorderBuffer</name> <modifier>*</modifier></type><name>cache</name></decl></parameter>, <parameter><decl><type><name>ReorderBufferTXN</name> <modifier>*</modifier></type><name>txn</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>commit_cb_wrapper</name><parameter_list>(<parameter><decl><type><name>ReorderBuffer</name> <modifier>*</modifier></type><name>cache</name></decl></parameter>, <parameter><decl><type><name>ReorderBufferTXN</name> <modifier>*</modifier></type><name>txn</name></decl></parameter>,
+				  <parameter><decl><type><name>XLogRecPtr</name></type> <name>commit_lsn</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>change_cb_wrapper</name><parameter_list>(<parameter><decl><type><name>ReorderBuffer</name> <modifier>*</modifier></type><name>cache</name></decl></parameter>, <parameter><decl><type><name>ReorderBufferTXN</name> <modifier>*</modifier></type><name>txn</name></decl></parameter>,
+				  <parameter><decl><type><name>Relation</name></type> <name>relation</name></decl></parameter>, <parameter><decl><type><name>ReorderBufferChange</name> <modifier>*</modifier></type><name>change</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>truncate_cb_wrapper</name><parameter_list>(<parameter><decl><type><name>ReorderBuffer</name> <modifier>*</modifier></type><name>cache</name></decl></parameter>, <parameter><decl><type><name>ReorderBufferTXN</name> <modifier>*</modifier></type><name>txn</name></decl></parameter>,
+					<parameter><decl><type><name>int</name></type> <name>nrelations</name></decl></parameter>, <parameter><decl><type><name>Relation</name></type> <name><name>relations</name><index>[]</index></name></decl></parameter>, <parameter><decl><type><name>ReorderBufferChange</name> <modifier>*</modifier></type><name>change</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>message_cb_wrapper</name><parameter_list>(<parameter><decl><type><name>ReorderBuffer</name> <modifier>*</modifier></type><name>cache</name></decl></parameter>, <parameter><decl><type><name>ReorderBufferTXN</name> <modifier>*</modifier></type><name>txn</name></decl></parameter>,
+				   <parameter><decl><type><name>XLogRecPtr</name></type> <name>message_lsn</name></decl></parameter>, <parameter><decl><type><name>bool</name></type> <name>transactional</name></decl></parameter>,
+				   <parameter><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>prefix</name></decl></parameter>, <parameter><decl><type><name>Size</name></type> <name>message_size</name></decl></parameter>, <parameter><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>message</name></decl></parameter>)</parameter_list>;</function_decl>
+
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>LoadOutputPlugin</name><parameter_list>(<parameter><decl><type><name>OutputPluginCallbacks</name> <modifier>*</modifier></type><name>callbacks</name></decl></parameter>, <parameter><decl><type><name>char</name> <modifier>*</modifier></type><name>plugin</name></decl></parameter>)</parameter_list>;</function_decl>
+
+<comment type="block">/*
+ * Make sure the current settings &amp; environment are capable of doing logical
+ * decoding.
+ */</comment>
+<function><type><name>void</name></type>
+<name>CheckLogicalDecodingRequirements</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>CheckSlotRequirements</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * NB: Adding a new requirement likely means that RestoreSlotFromDisk()
+	 * needs the same check.
+	 */</comment>
+
+	<if_stmt><if>if <condition>(<expr><name>wal_level</name> <operator>&lt;</operator> <name>WAL_LEVEL_LOGICAL</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE</name></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"logical decoding requires wal_level &gt;= logical"</literal></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>MyDatabaseId</name> <operator>==</operator> <name>InvalidOid</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE</name></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"logical decoding requires a database connection"</literal></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<comment type="block">/* ----
+	 * TODO: We got to change that someday soon...
+	 *
+	 * There's basically three things missing to allow this:
+	 * 1) We need to be able to correctly and quickly identify the timeline a
+	 *	  LSN belongs to
+	 * 2) We need to force hot_standby_feedback to be enabled at all times so
+	 *	  the primary cannot remove rows we need.
+	 * 3) support dropping replication slots referring to a database, in
+	 *	  dbase_redo. There can't be any active ones due to HS recovery
+	 *	  conflicts, so that should be relatively easy.
+	 * ----
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><call><name>RecoveryInProgress</name><argument_list>()</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_FEATURE_NOT_SUPPORTED</name></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"logical decoding cannot be used while in recovery"</literal></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Helper function for CreateInitialDecodingContext() and
+ * CreateDecodingContext() performing common tasks.
+ */</comment>
+<function><type><specifier>static</specifier> <name>LogicalDecodingContext</name> <modifier>*</modifier></type>
+<name>StartupDecodingContext</name><parameter_list>(<parameter><decl><type><name>List</name> <modifier>*</modifier></type><name>output_plugin_options</name></decl></parameter>,
+					   <parameter><decl><type><name>XLogRecPtr</name></type> <name>start_lsn</name></decl></parameter>,
+					   <parameter><decl><type><name>TransactionId</name></type> <name>xmin_horizon</name></decl></parameter>,
+					   <parameter><decl><type><name>bool</name></type> <name>need_full_snapshot</name></decl></parameter>,
+					   <parameter><decl><type><name>bool</name></type> <name>fast_forward</name></decl></parameter>,
+					   <parameter><decl><type><name>XLogPageReadCB</name></type> <name>read_page</name></decl></parameter>,
+					   <parameter><decl><type><name>LogicalOutputPluginWriterPrepareWrite</name></type> <name>prepare_write</name></decl></parameter>,
+					   <parameter><decl><type><name>LogicalOutputPluginWriterWrite</name></type> <name>do_write</name></decl></parameter>,
+					   <parameter><decl><type><name>LogicalOutputPluginWriterUpdateProgress</name></type> <name>update_progress</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>ReplicationSlot</name> <modifier>*</modifier></type><name>slot</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>MemoryContext</name></type> <name>context</name></decl>,
+				<decl><type ref="prev"/><name>old_context</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>LogicalDecodingContext</name> <modifier>*</modifier></type><name>ctx</name></decl>;</decl_stmt>
+
+	<comment type="block">/* shorter lines... */</comment>
+	<expr_stmt><expr><name>slot</name> <operator>=</operator> <name>MyReplicationSlot</name></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>context</name> <operator>=</operator> <call><name>AllocSetContextCreate</name><argument_list>(<argument><expr><name>CurrentMemoryContext</name></expr></argument>,
+									<argument><expr><literal type="string">"Logical decoding context"</literal></expr></argument>,
+									<argument><expr><name>ALLOCSET_DEFAULT_SIZES</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>old_context</name> <operator>=</operator> <call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>context</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>ctx</name> <operator>=</operator> <call><name>palloc0</name><argument_list>(<argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>LogicalDecodingContext</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name><name>ctx</name><operator>-&gt;</operator><name>context</name></name> <operator>=</operator> <name>context</name></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * (re-)load output plugins, so we detect a bad (removed) output plugin
+	 * now.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><name>fast_forward</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>LoadOutputPlugin</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>ctx</name><operator>-&gt;</operator><name>callbacks</name></name></expr></argument>, <argument><expr><call><name>NameStr</name><argument_list>(<argument><expr><name><name>slot</name><operator>-&gt;</operator><name>data</name><operator>.</operator><name>plugin</name></name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<comment type="block">/*
+	 * Now that the slot's xmin has been set, we can announce ourselves as a
+	 * logical decoding backend which doesn't need to be checked individually
+	 * when computing the xmin horizon because the xmin is enforced via
+	 * replication slots.
+	 *
+	 * We can only do so if we're outside of a transaction (i.e. the case when
+	 * streaming changes via walsender), otherwise an already setup
+	 * snapshot/xid would end up being ignored. That's not a particularly
+	 * bothersome restriction since the SQL interface can't be used for
+	 * streaming anyway.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>IsTransactionOrTransactionBlock</name><argument_list>()</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>LWLockAcquire</name><argument_list>(<argument><expr><name>ProcArrayLock</name></expr></argument>, <argument><expr><name>LW_EXCLUSIVE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>MyPgXact</name><operator>-&gt;</operator><name>vacuumFlags</name></name> <operator>|=</operator> <name>PROC_IN_LOGICAL_DECODING</name></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><name>ProcArrayLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<expr_stmt><expr><name><name>ctx</name><operator>-&gt;</operator><name>slot</name></name> <operator>=</operator> <name>slot</name></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name><name>ctx</name><operator>-&gt;</operator><name>reader</name></name> <operator>=</operator> <call><name>XLogReaderAllocate</name><argument_list>(<argument><expr><name>wal_segment_size</name></expr></argument>, <argument><expr><name>read_page</name></expr></argument>, <argument><expr><name>ctx</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><name><name>ctx</name><operator>-&gt;</operator><name>reader</name></name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_OUT_OF_MEMORY</name></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"out of memory"</literal></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><name><name>ctx</name><operator>-&gt;</operator><name>reader</name><operator>-&gt;</operator><name>private_data</name></name> <operator>=</operator> <name>ctx</name></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name><name>ctx</name><operator>-&gt;</operator><name>reorder</name></name> <operator>=</operator> <call><name>ReorderBufferAllocate</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>ctx</name><operator>-&gt;</operator><name>snapshot_builder</name></name> <operator>=</operator>
+		<call><name>AllocateSnapshotBuilder</name><argument_list>(<argument><expr><name><name>ctx</name><operator>-&gt;</operator><name>reorder</name></name></expr></argument>, <argument><expr><name>xmin_horizon</name></expr></argument>, <argument><expr><name>start_lsn</name></expr></argument>,
+								<argument><expr><name>need_full_snapshot</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name><name>ctx</name><operator>-&gt;</operator><name>reorder</name><operator>-&gt;</operator><name>private_data</name></name> <operator>=</operator> <name>ctx</name></expr>;</expr_stmt>
+
+	<comment type="block">/* wrap output plugin callbacks, so we can add error context information */</comment>
+	<expr_stmt><expr><name><name>ctx</name><operator>-&gt;</operator><name>reorder</name><operator>-&gt;</operator><name>begin</name></name> <operator>=</operator> <name>begin_cb_wrapper</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>ctx</name><operator>-&gt;</operator><name>reorder</name><operator>-&gt;</operator><name>apply_change</name></name> <operator>=</operator> <name>change_cb_wrapper</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>ctx</name><operator>-&gt;</operator><name>reorder</name><operator>-&gt;</operator><name>apply_truncate</name></name> <operator>=</operator> <name>truncate_cb_wrapper</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>ctx</name><operator>-&gt;</operator><name>reorder</name><operator>-&gt;</operator><name>commit</name></name> <operator>=</operator> <name>commit_cb_wrapper</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>ctx</name><operator>-&gt;</operator><name>reorder</name><operator>-&gt;</operator><name>message</name></name> <operator>=</operator> <name>message_cb_wrapper</name></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name><name>ctx</name><operator>-&gt;</operator><name>out</name></name> <operator>=</operator> <call><name>makeStringInfo</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>ctx</name><operator>-&gt;</operator><name>prepare_write</name></name> <operator>=</operator> <name>prepare_write</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>ctx</name><operator>-&gt;</operator><name>write</name></name> <operator>=</operator> <name>do_write</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>ctx</name><operator>-&gt;</operator><name>update_progress</name></name> <operator>=</operator> <name>update_progress</name></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name><name>ctx</name><operator>-&gt;</operator><name>output_plugin_options</name></name> <operator>=</operator> <name>output_plugin_options</name></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name><name>ctx</name><operator>-&gt;</operator><name>fast_forward</name></name> <operator>=</operator> <name>fast_forward</name></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>old_context</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<return>return <expr><name>ctx</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Create a new decoding context, for a new logical slot.
+ *
+ * plugin contains the name of the output plugin
+ * output_plugin_options contains options passed to the output plugin
+ * read_page, prepare_write, do_write, update_progress
+ *		callbacks that have to be filled to perform the use-case dependent,
+ *		actual, work.
+ *
+ * Needs to be called while in a memory context that's at least as long lived
+ * as the decoding context because further memory contexts will be created
+ * inside it.
+ *
+ * Returns an initialized decoding context after calling the output plugin's
+ * startup function.
+ */</comment>
+<function><type><name>LogicalDecodingContext</name> <modifier>*</modifier></type>
+<name>CreateInitDecodingContext</name><parameter_list>(<parameter><decl><type><name>char</name> <modifier>*</modifier></type><name>plugin</name></decl></parameter>,
+						  <parameter><decl><type><name>List</name> <modifier>*</modifier></type><name>output_plugin_options</name></decl></parameter>,
+						  <parameter><decl><type><name>bool</name></type> <name>need_full_snapshot</name></decl></parameter>,
+						  <parameter><decl><type><name>XLogPageReadCB</name></type> <name>read_page</name></decl></parameter>,
+						  <parameter><decl><type><name>LogicalOutputPluginWriterPrepareWrite</name></type> <name>prepare_write</name></decl></parameter>,
+						  <parameter><decl><type><name>LogicalOutputPluginWriterWrite</name></type> <name>do_write</name></decl></parameter>,
+						  <parameter><decl><type><name>LogicalOutputPluginWriterUpdateProgress</name></type> <name>update_progress</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>TransactionId</name></type> <name>xmin_horizon</name> <init>= <expr><name>InvalidTransactionId</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>ReplicationSlot</name> <modifier>*</modifier></type><name>slot</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>LogicalDecodingContext</name> <modifier>*</modifier></type><name>ctx</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>MemoryContext</name></type> <name>old_context</name></decl>;</decl_stmt>
+
+	<comment type="block">/* shorter lines... */</comment>
+	<expr_stmt><expr><name>slot</name> <operator>=</operator> <name>MyReplicationSlot</name></expr>;</expr_stmt>
+
+	<comment type="block">/* first some sanity checks that are unlikely to be violated */</comment>
+	<if_stmt><if>if <condition>(<expr><name>slot</name> <operator>==</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"cannot perform logical decoding without an acquired slot"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>plugin</name> <operator>==</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"cannot initialize logical decoding without a specified plugin"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<comment type="block">/* Make sure the passed slot is suitable. These are user facing errors. */</comment>
+	<if_stmt><if>if <condition>(<expr><call><name>SlotIsPhysical</name><argument_list>(<argument><expr><name>slot</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE</name></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"cannot use physical replication slot for logical decoding"</literal></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name><name>slot</name><operator>-&gt;</operator><name>data</name><operator>.</operator><name>database</name></name> <operator>!=</operator> <name>MyDatabaseId</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE</name></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"replication slot \"%s\" was not created in this database"</literal></expr></argument>,
+						<argument><expr><call><name>NameStr</name><argument_list>(<argument><expr><name><name>slot</name><operator>-&gt;</operator><name>data</name><operator>.</operator><name>name</name></name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><call><name>IsTransactionState</name><argument_list>()</argument_list></call> <operator>&amp;&amp;</operator>
+		<call><name>GetTopTransactionIdIfAny</name><argument_list>()</argument_list></call> <operator>!=</operator> <name>InvalidTransactionId</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_ACTIVE_SQL_TRANSACTION</name></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"cannot create logical replication slot in transaction that has performed writes"</literal></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<comment type="block">/* register output plugin name with slot */</comment>
+	<expr_stmt><expr><call><name>SpinLockAcquire</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>slot</name><operator>-&gt;</operator><name>mutex</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>StrNCpy</name><argument_list>(<argument><expr><call><name>NameStr</name><argument_list>(<argument><expr><name><name>slot</name><operator>-&gt;</operator><name>data</name><operator>.</operator><name>plugin</name></name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>plugin</name></expr></argument>, <argument><expr><name>NAMEDATALEN</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>SpinLockRelease</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>slot</name><operator>-&gt;</operator><name>mutex</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>ReplicationSlotReserveWal</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* ----
+	 * This is a bit tricky: We need to determine a safe xmin horizon to start
+	 * decoding from, to avoid starting from a running xacts record referring
+	 * to xids whose rows have been vacuumed or pruned
+	 * already. GetOldestSafeDecodingTransactionId() returns such a value, but
+	 * without further interlock its return value might immediately be out of
+	 * date.
+	 *
+	 * So we have to acquire the ProcArrayLock to prevent computation of new
+	 * xmin horizons by other backends, get the safe decoding xid, and inform
+	 * the slot machinery about the new limit. Once that's done the
+	 * ProcArrayLock can be released as the slot machinery now is
+	 * protecting against vacuum.
+	 *
+	 * Note that, temporarily, the data, not just the catalog, xmin has to be
+	 * reserved if a data snapshot is to be exported.  Otherwise the initial
+	 * data snapshot created here is not guaranteed to be valid. After that
+	 * the data xmin doesn't need to be managed anymore and the global xmin
+	 * should be recomputed. As we are fine with losing the pegged data xmin
+	 * after crash - no chance a snapshot would get exported anymore - we can
+	 * get away with just setting the slot's
+	 * effective_xmin. ReplicationSlotRelease will reset it again.
+	 *
+	 * ----
+	 */</comment>
+	<expr_stmt><expr><call><name>LWLockAcquire</name><argument_list>(<argument><expr><name>ProcArrayLock</name></expr></argument>, <argument><expr><name>LW_EXCLUSIVE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>xmin_horizon</name> <operator>=</operator> <call><name>GetOldestSafeDecodingTransactionId</name><argument_list>(<argument><expr><operator>!</operator><name>need_full_snapshot</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>SpinLockAcquire</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>slot</name><operator>-&gt;</operator><name>mutex</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>slot</name><operator>-&gt;</operator><name>effective_catalog_xmin</name></name> <operator>=</operator> <name>xmin_horizon</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>slot</name><operator>-&gt;</operator><name>data</name><operator>.</operator><name>catalog_xmin</name></name> <operator>=</operator> <name>xmin_horizon</name></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><name>need_full_snapshot</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name><name>slot</name><operator>-&gt;</operator><name>effective_xmin</name></name> <operator>=</operator> <name>xmin_horizon</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	<expr_stmt><expr><call><name>SpinLockRelease</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>slot</name><operator>-&gt;</operator><name>mutex</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>ReplicationSlotsComputeRequiredXmin</name><argument_list>(<argument><expr><name>true</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><name>ProcArrayLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>ReplicationSlotMarkDirty</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>ReplicationSlotSave</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>ctx</name> <operator>=</operator> <call><name>StartupDecodingContext</name><argument_list>(<argument><expr><name>NIL</name></expr></argument>, <argument><expr><name>InvalidXLogRecPtr</name></expr></argument>, <argument><expr><name>xmin_horizon</name></expr></argument>,
+								 <argument><expr><name>need_full_snapshot</name></expr></argument>, <argument><expr><name>false</name></expr></argument>,
+								 <argument><expr><name>read_page</name></expr></argument>, <argument><expr><name>prepare_write</name></expr></argument>, <argument><expr><name>do_write</name></expr></argument>,
+								 <argument><expr><name>update_progress</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* call output plugin initialization callback */</comment>
+	<expr_stmt><expr><name>old_context</name> <operator>=</operator> <call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name><name>ctx</name><operator>-&gt;</operator><name>context</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><name><name>ctx</name><operator>-&gt;</operator><name>callbacks</name><operator>.</operator><name>startup_cb</name></name> <operator>!=</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>startup_cb_wrapper</name><argument_list>(<argument><expr><name>ctx</name></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>ctx</name><operator>-&gt;</operator><name>options</name></name></expr></argument>, <argument><expr><name>true</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	<expr_stmt><expr><call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>old_context</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name><name>ctx</name><operator>-&gt;</operator><name>reorder</name><operator>-&gt;</operator><name>output_rewrites</name></name> <operator>=</operator> <name><name>ctx</name><operator>-&gt;</operator><name>options</name><operator>.</operator><name>receive_rewrites</name></name></expr>;</expr_stmt>
+
+	<return>return <expr><name>ctx</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Create a new decoding context, for a logical slot that has previously been
+ * used already.
+ *
+ * start_lsn
+ *		The LSN at which to start decoding.  If InvalidXLogRecPtr, restart
+ *		from the slot's confirmed_flush; otherwise, start from the specified
+ *		location (but move it forwards to confirmed_flush if it's older than
+ *		that, see below).
+ *
+ * output_plugin_options
+ *		options passed to the output plugin.
+ *
+ * fast_forward
+ *		bypass the generation of logical changes.
+ *
+ * read_page, prepare_write, do_write, update_progress
+ *		callbacks that have to be filled to perform the use-case dependent,
+ *		actual work.
+ *
+ * Needs to be called while in a memory context that's at least as long lived
+ * as the decoding context because further memory contexts will be created
+ * inside it.
+ *
+ * Returns an initialized decoding context after calling the output plugin's
+ * startup function.
+ */</comment>
+<function><type><name>LogicalDecodingContext</name> <modifier>*</modifier></type>
+<name>CreateDecodingContext</name><parameter_list>(<parameter><decl><type><name>XLogRecPtr</name></type> <name>start_lsn</name></decl></parameter>,
+					  <parameter><decl><type><name>List</name> <modifier>*</modifier></type><name>output_plugin_options</name></decl></parameter>,
+					  <parameter><decl><type><name>bool</name></type> <name>fast_forward</name></decl></parameter>,
+					  <parameter><decl><type><name>XLogPageReadCB</name></type> <name>read_page</name></decl></parameter>,
+					  <parameter><decl><type><name>LogicalOutputPluginWriterPrepareWrite</name></type> <name>prepare_write</name></decl></parameter>,
+					  <parameter><decl><type><name>LogicalOutputPluginWriterWrite</name></type> <name>do_write</name></decl></parameter>,
+					  <parameter><decl><type><name>LogicalOutputPluginWriterUpdateProgress</name></type> <name>update_progress</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>LogicalDecodingContext</name> <modifier>*</modifier></type><name>ctx</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>ReplicationSlot</name> <modifier>*</modifier></type><name>slot</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>MemoryContext</name></type> <name>old_context</name></decl>;</decl_stmt>
+
+	<comment type="block">/* shorter lines... */</comment>
+	<expr_stmt><expr><name>slot</name> <operator>=</operator> <name>MyReplicationSlot</name></expr>;</expr_stmt>
+
+	<comment type="block">/* first some sanity checks that are unlikely to be violated */</comment>
+	<if_stmt><if>if <condition>(<expr><name>slot</name> <operator>==</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"cannot perform logical decoding without an acquired slot"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<comment type="block">/* make sure the passed slot is suitable, these are user facing errors */</comment>
+	<if_stmt><if>if <condition>(<expr><call><name>SlotIsPhysical</name><argument_list>(<argument><expr><name>slot</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE</name></expr></argument>)</argument_list></call><operator>,</operator>
+				 <operator>(</operator><call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"cannot use physical replication slot for logical decoding"</literal></expr></argument>)</argument_list></call><operator>)</operator><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name><name>slot</name><operator>-&gt;</operator><name>data</name><operator>.</operator><name>database</name></name> <operator>!=</operator> <name>MyDatabaseId</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE</name></expr></argument>)</argument_list></call><operator>,</operator>
+				 <operator>(</operator><call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"replication slot \"%s\" was not created in this database"</literal></expr></argument>,
+						 <argument><expr><call><name>NameStr</name><argument_list>(<argument><expr><name><name>slot</name><operator>-&gt;</operator><name>data</name><operator>.</operator><name>name</name></name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call><operator>)</operator><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>start_lsn</name> <operator>==</operator> <name>InvalidXLogRecPtr</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* continue from last position */</comment>
+		<expr_stmt><expr><name>start_lsn</name> <operator>=</operator> <name><name>slot</name><operator>-&gt;</operator><name>data</name><operator>.</operator><name>confirmed_flush</name></name></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<if type="elseif">else if <condition>(<expr><name>start_lsn</name> <operator>&lt;</operator> <name><name>slot</name><operator>-&gt;</operator><name>data</name><operator>.</operator><name>confirmed_flush</name></name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/*
+		 * It might seem like we should error out in this case, but it's
+		 * pretty common for a client to acknowledge a LSN it doesn't have to
+		 * do anything for, and thus didn't store persistently, because the
+		 * xlog records didn't result in anything relevant for logical
+		 * decoding. Clients have to be able to do that to support synchronous
+		 * replication.
+		 */</comment>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>DEBUG1</name></expr></argument>, <argument><expr><literal type="string">"cannot stream from %X/%X, minimum is %X/%X, forwarding"</literal></expr></argument>,
+			 <argument><expr><operator>(</operator><name>uint32</name><operator>)</operator> <operator>(</operator><name>start_lsn</name> <operator>&gt;&gt;</operator> <literal type="number">32</literal><operator>)</operator></expr></argument>, <argument><expr><operator>(</operator><name>uint32</name><operator>)</operator> <name>start_lsn</name></expr></argument>,
+			 <argument><expr><operator>(</operator><name>uint32</name><operator>)</operator> <operator>(</operator><name><name>slot</name><operator>-&gt;</operator><name>data</name><operator>.</operator><name>confirmed_flush</name></name> <operator>&gt;&gt;</operator> <literal type="number">32</literal><operator>)</operator></expr></argument>,
+			 <argument><expr><operator>(</operator><name>uint32</name><operator>)</operator> <name><name>slot</name><operator>-&gt;</operator><name>data</name><operator>.</operator><name>confirmed_flush</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><name>start_lsn</name> <operator>=</operator> <name><name>slot</name><operator>-&gt;</operator><name>data</name><operator>.</operator><name>confirmed_flush</name></name></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<expr_stmt><expr><name>ctx</name> <operator>=</operator> <call><name>StartupDecodingContext</name><argument_list>(<argument><expr><name>output_plugin_options</name></expr></argument>,
+								 <argument><expr><name>start_lsn</name></expr></argument>, <argument><expr><name>InvalidTransactionId</name></expr></argument>, <argument><expr><name>false</name></expr></argument>,
+								 <argument><expr><name>fast_forward</name></expr></argument>, <argument><expr><name>read_page</name></expr></argument>, <argument><expr><name>prepare_write</name></expr></argument>,
+								 <argument><expr><name>do_write</name></expr></argument>, <argument><expr><name>update_progress</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* call output plugin initialization callback */</comment>
+	<expr_stmt><expr><name>old_context</name> <operator>=</operator> <call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name><name>ctx</name><operator>-&gt;</operator><name>context</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><name><name>ctx</name><operator>-&gt;</operator><name>callbacks</name><operator>.</operator><name>startup_cb</name></name> <operator>!=</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>startup_cb_wrapper</name><argument_list>(<argument><expr><name>ctx</name></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>ctx</name><operator>-&gt;</operator><name>options</name></name></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	<expr_stmt><expr><call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>old_context</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name><name>ctx</name><operator>-&gt;</operator><name>reorder</name><operator>-&gt;</operator><name>output_rewrites</name></name> <operator>=</operator> <name><name>ctx</name><operator>-&gt;</operator><name>options</name><operator>.</operator><name>receive_rewrites</name></name></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>LOG</name></expr></argument>,
+			<argument><expr><operator>(</operator><call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"starting logical decoding for slot \"%s\""</literal></expr></argument>,
+					<argument><expr><call><name>NameStr</name><argument_list>(<argument><expr><name><name>slot</name><operator>-&gt;</operator><name>data</name><operator>.</operator><name>name</name></name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call><operator>,</operator>
+			 <call><name>errdetail</name><argument_list>(<argument><expr><literal type="string">"Streaming transactions committing after %X/%X, reading WAL from %X/%X."</literal></expr></argument>,
+					   <argument><expr><operator>(</operator><name>uint32</name><operator>)</operator> <operator>(</operator><name><name>slot</name><operator>-&gt;</operator><name>data</name><operator>.</operator><name>confirmed_flush</name></name> <operator>&gt;&gt;</operator> <literal type="number">32</literal><operator>)</operator></expr></argument>,
+					   <argument><expr><operator>(</operator><name>uint32</name><operator>)</operator> <name><name>slot</name><operator>-&gt;</operator><name>data</name><operator>.</operator><name>confirmed_flush</name></name></expr></argument>,
+					   <argument><expr><operator>(</operator><name>uint32</name><operator>)</operator> <operator>(</operator><name><name>slot</name><operator>-&gt;</operator><name>data</name><operator>.</operator><name>restart_lsn</name></name> <operator>&gt;&gt;</operator> <literal type="number">32</literal><operator>)</operator></expr></argument>,
+					   <argument><expr><operator>(</operator><name>uint32</name><operator>)</operator> <name><name>slot</name><operator>-&gt;</operator><name>data</name><operator>.</operator><name>restart_lsn</name></name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<return>return <expr><name>ctx</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Returns true if a consistent initial decoding snapshot has been built.
+ */</comment>
+<function><type><name>bool</name></type>
+<name>DecodingContextReady</name><parameter_list>(<parameter><decl><type><name>LogicalDecodingContext</name> <modifier>*</modifier></type><name>ctx</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<return>return <expr><call><name>SnapBuildCurrentState</name><argument_list>(<argument><expr><name><name>ctx</name><operator>-&gt;</operator><name>snapshot_builder</name></name></expr></argument>)</argument_list></call> <operator>==</operator> <name>SNAPBUILD_CONSISTENT</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Read from the decoding slot, until it is ready to start extracting changes.
+ */</comment>
+<function><type><name>void</name></type>
+<name>DecodingContextFindStartpoint</name><parameter_list>(<parameter><decl><type><name>LogicalDecodingContext</name> <modifier>*</modifier></type><name>ctx</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>XLogRecPtr</name></type>	<name>startptr</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>ReplicationSlot</name> <modifier>*</modifier></type><name>slot</name> <init>= <expr><name><name>ctx</name><operator>-&gt;</operator><name>slot</name></name></expr></init></decl>;</decl_stmt>
+
+	<comment type="block">/* Initialize from where to start reading WAL. */</comment>
+	<expr_stmt><expr><name>startptr</name> <operator>=</operator> <name><name>slot</name><operator>-&gt;</operator><name>data</name><operator>.</operator><name>restart_lsn</name></name></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>DEBUG1</name></expr></argument>, <argument><expr><literal type="string">"searching for logical decoding starting point, starting at %X/%X"</literal></expr></argument>,
+		 <argument><expr><operator>(</operator><name>uint32</name><operator>)</operator> <operator>(</operator><name><name>slot</name><operator>-&gt;</operator><name>data</name><operator>.</operator><name>restart_lsn</name></name> <operator>&gt;&gt;</operator> <literal type="number">32</literal><operator>)</operator></expr></argument>,
+		 <argument><expr><operator>(</operator><name>uint32</name><operator>)</operator> <name><name>slot</name><operator>-&gt;</operator><name>data</name><operator>.</operator><name>restart_lsn</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Wait for a consistent starting point */</comment>
+	<for>for <control>(<init>;</init><condition>;</condition><incr/>)</control>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>XLogRecord</name> <modifier>*</modifier></type><name>record</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>err</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+
+		<comment type="block">/* the read_page callback waits for new WAL */</comment>
+		<expr_stmt><expr><name>record</name> <operator>=</operator> <call><name>XLogReadRecord</name><argument_list>(<argument><expr><name><name>ctx</name><operator>-&gt;</operator><name>reader</name></name></expr></argument>, <argument><expr><name>startptr</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>err</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<if_stmt><if>if <condition>(<expr><name>err</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"%s"</literal></expr></argument>, <argument><expr><name>err</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><name>record</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"no record found"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt> <comment type="block">/* shouldn't happen */</comment>
+
+		<expr_stmt><expr><name>startptr</name> <operator>=</operator> <name>InvalidXLogRecPtr</name></expr>;</expr_stmt>
+
+		<expr_stmt><expr><call><name>LogicalDecodingProcessRecord</name><argument_list>(<argument><expr><name>ctx</name></expr></argument>, <argument><expr><name><name>ctx</name><operator>-&gt;</operator><name>reader</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/* only continue till we found a consistent spot */</comment>
+		<if_stmt><if>if <condition>(<expr><call><name>DecodingContextReady</name><argument_list>(<argument><expr><name>ctx</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<break>break;</break></block_content></block></if></if_stmt>
+
+		<expr_stmt><expr><call><name>CHECK_FOR_INTERRUPTS</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></for>
+
+	<expr_stmt><expr><call><name>SpinLockAcquire</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>slot</name><operator>-&gt;</operator><name>mutex</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>slot</name><operator>-&gt;</operator><name>data</name><operator>.</operator><name>confirmed_flush</name></name> <operator>=</operator> <name><name>ctx</name><operator>-&gt;</operator><name>reader</name><operator>-&gt;</operator><name>EndRecPtr</name></name></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>SpinLockRelease</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>slot</name><operator>-&gt;</operator><name>mutex</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Free a previously allocated decoding context, invoking the shutdown
+ * callback if necessary.
+ */</comment>
+<function><type><name>void</name></type>
+<name>FreeDecodingContext</name><parameter_list>(<parameter><decl><type><name>LogicalDecodingContext</name> <modifier>*</modifier></type><name>ctx</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<if_stmt><if>if <condition>(<expr><name><name>ctx</name><operator>-&gt;</operator><name>callbacks</name><operator>.</operator><name>shutdown_cb</name></name> <operator>!=</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>shutdown_cb_wrapper</name><argument_list>(<argument><expr><name>ctx</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>ReorderBufferFree</name><argument_list>(<argument><expr><name><name>ctx</name><operator>-&gt;</operator><name>reorder</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>FreeSnapshotBuilder</name><argument_list>(<argument><expr><name><name>ctx</name><operator>-&gt;</operator><name>snapshot_builder</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>XLogReaderFree</name><argument_list>(<argument><expr><name><name>ctx</name><operator>-&gt;</operator><name>reader</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>MemoryContextDelete</name><argument_list>(<argument><expr><name><name>ctx</name><operator>-&gt;</operator><name>context</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Prepare a write using the context's output routine.
+ */</comment>
+<function><type><name>void</name></type>
+<name>OutputPluginPrepareWrite</name><parameter_list>(<parameter><decl><type><name><name>struct</name> <name>LogicalDecodingContext</name></name> <modifier>*</modifier></type><name>ctx</name></decl></parameter>, <parameter><decl><type><name>bool</name></type> <name>last_write</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><name><name>ctx</name><operator>-&gt;</operator><name>accept_writes</name></name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"writes are only accepted in commit, begin and change callbacks"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><call><name><name>ctx</name><operator>-&gt;</operator><name>prepare_write</name></name><argument_list>(<argument><expr><name>ctx</name></expr></argument>, <argument><expr><name><name>ctx</name><operator>-&gt;</operator><name>write_location</name></name></expr></argument>, <argument><expr><name><name>ctx</name><operator>-&gt;</operator><name>write_xid</name></name></expr></argument>, <argument><expr><name>last_write</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>ctx</name><operator>-&gt;</operator><name>prepared_write</name></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Perform a write using the context's output routine.
+ */</comment>
+<function><type><name>void</name></type>
+<name>OutputPluginWrite</name><parameter_list>(<parameter><decl><type><name><name>struct</name> <name>LogicalDecodingContext</name></name> <modifier>*</modifier></type><name>ctx</name></decl></parameter>, <parameter><decl><type><name>bool</name></type> <name>last_write</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><name><name>ctx</name><operator>-&gt;</operator><name>prepared_write</name></name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"OutputPluginPrepareWrite needs to be called before OutputPluginWrite"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><call><name><name>ctx</name><operator>-&gt;</operator><name>write</name></name><argument_list>(<argument><expr><name>ctx</name></expr></argument>, <argument><expr><name><name>ctx</name><operator>-&gt;</operator><name>write_location</name></name></expr></argument>, <argument><expr><name><name>ctx</name><operator>-&gt;</operator><name>write_xid</name></name></expr></argument>, <argument><expr><name>last_write</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>ctx</name><operator>-&gt;</operator><name>prepared_write</name></name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Update progress tracking (if supported).
+ */</comment>
+<function><type><name>void</name></type>
+<name>OutputPluginUpdateProgress</name><parameter_list>(<parameter><decl><type><name><name>struct</name> <name>LogicalDecodingContext</name></name> <modifier>*</modifier></type><name>ctx</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><name><name>ctx</name><operator>-&gt;</operator><name>update_progress</name></name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return;</return></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><call><name><name>ctx</name><operator>-&gt;</operator><name>update_progress</name></name><argument_list>(<argument><expr><name>ctx</name></expr></argument>, <argument><expr><name><name>ctx</name><operator>-&gt;</operator><name>write_location</name></name></expr></argument>, <argument><expr><name><name>ctx</name><operator>-&gt;</operator><name>write_xid</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Load the output plugin, lookup its output plugin init function, and check
+ * that it provides the required callbacks.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>LoadOutputPlugin</name><parameter_list>(<parameter><decl><type><name>OutputPluginCallbacks</name> <modifier>*</modifier></type><name>callbacks</name></decl></parameter>, <parameter><decl><type><name>char</name> <modifier>*</modifier></type><name>plugin</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>LogicalOutputPluginInit</name></type> <name>plugin_init</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name>plugin_init</name> <operator>=</operator> <operator>(</operator><name>LogicalOutputPluginInit</name><operator>)</operator>
+		<call><name>load_external_function</name><argument_list>(<argument><expr><name>plugin</name></expr></argument>, <argument><expr><literal type="string">"_PG_output_plugin_init"</literal></expr></argument>, <argument><expr><name>false</name></expr></argument>, <argument><expr><name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>plugin_init</name> <operator>==</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"output plugins have to declare the _PG_output_plugin_init symbol"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<comment type="block">/* ask the output plugin to fill the callback struct */</comment>
+	<expr_stmt><expr><call><name>plugin_init</name><argument_list>(<argument><expr><name>callbacks</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name><name>callbacks</name><operator>-&gt;</operator><name>begin_cb</name></name> <operator>==</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"output plugins have to register a begin callback"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	<if_stmt><if>if <condition>(<expr><name><name>callbacks</name><operator>-&gt;</operator><name>change_cb</name></name> <operator>==</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"output plugins have to register a change callback"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	<if_stmt><if>if <condition>(<expr><name><name>callbacks</name><operator>-&gt;</operator><name>commit_cb</name></name> <operator>==</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"output plugins have to register a commit callback"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+</block_content>}</block></function>
+
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>output_plugin_error_callback</name><parameter_list>(<parameter><decl><type><name>void</name> <modifier>*</modifier></type><name>arg</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>LogicalErrorCallbackState</name> <modifier>*</modifier></type><name>state</name> <init>= <expr><operator>(</operator><name>LogicalErrorCallbackState</name> <operator>*</operator><operator>)</operator> <name>arg</name></expr></init></decl>;</decl_stmt>
+
+	<comment type="block">/* not all callbacks have an associated LSN  */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>state</name><operator>-&gt;</operator><name>report_location</name></name> <operator>!=</operator> <name>InvalidXLogRecPtr</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>errcontext</name><argument_list>(<argument><expr><literal type="string">"slot \"%s\", output plugin \"%s\", in the %s callback, associated LSN %X/%X"</literal></expr></argument>,
+				   <argument><expr><call><name>NameStr</name><argument_list>(<argument><expr><name><name>state</name><operator>-&gt;</operator><name>ctx</name><operator>-&gt;</operator><name>slot</name><operator>-&gt;</operator><name>data</name><operator>.</operator><name>name</name></name></expr></argument>)</argument_list></call></expr></argument>,
+				   <argument><expr><call><name>NameStr</name><argument_list>(<argument><expr><name><name>state</name><operator>-&gt;</operator><name>ctx</name><operator>-&gt;</operator><name>slot</name><operator>-&gt;</operator><name>data</name><operator>.</operator><name>plugin</name></name></expr></argument>)</argument_list></call></expr></argument>,
+				   <argument><expr><name><name>state</name><operator>-&gt;</operator><name>callback_name</name></name></expr></argument>,
+				   <argument><expr><operator>(</operator><name>uint32</name><operator>)</operator> <operator>(</operator><name><name>state</name><operator>-&gt;</operator><name>report_location</name></name> <operator>&gt;&gt;</operator> <literal type="number">32</literal><operator>)</operator></expr></argument>,
+				   <argument><expr><operator>(</operator><name>uint32</name><operator>)</operator> <name><name>state</name><operator>-&gt;</operator><name>report_location</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if>
+	<else>else<block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>errcontext</name><argument_list>(<argument><expr><literal type="string">"slot \"%s\", output plugin \"%s\", in the %s callback"</literal></expr></argument>,
+				   <argument><expr><call><name>NameStr</name><argument_list>(<argument><expr><name><name>state</name><operator>-&gt;</operator><name>ctx</name><operator>-&gt;</operator><name>slot</name><operator>-&gt;</operator><name>data</name><operator>.</operator><name>name</name></name></expr></argument>)</argument_list></call></expr></argument>,
+				   <argument><expr><call><name>NameStr</name><argument_list>(<argument><expr><name><name>state</name><operator>-&gt;</operator><name>ctx</name><operator>-&gt;</operator><name>slot</name><operator>-&gt;</operator><name>data</name><operator>.</operator><name>plugin</name></name></expr></argument>)</argument_list></call></expr></argument>,
+				   <argument><expr><name><name>state</name><operator>-&gt;</operator><name>callback_name</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></else></if_stmt>
+</block_content>}</block></function>
+
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>startup_cb_wrapper</name><parameter_list>(<parameter><decl><type><name>LogicalDecodingContext</name> <modifier>*</modifier></type><name>ctx</name></decl></parameter>, <parameter><decl><type><name>OutputPluginOptions</name> <modifier>*</modifier></type><name>opt</name></decl></parameter>, <parameter><decl><type><name>bool</name></type> <name>is_init</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>LogicalErrorCallbackState</name></type> <name>state</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>ErrorContextCallback</name></type> <name>errcallback</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><operator>!</operator><name><name>ctx</name><operator>-&gt;</operator><name>fast_forward</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Push callback + info on the error context stack */</comment>
+	<expr_stmt><expr><name><name>state</name><operator>.</operator><name>ctx</name></name> <operator>=</operator> <name>ctx</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>state</name><operator>.</operator><name>callback_name</name></name> <operator>=</operator> <literal type="string">"startup"</literal></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>state</name><operator>.</operator><name>report_location</name></name> <operator>=</operator> <name>InvalidXLogRecPtr</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>errcallback</name><operator>.</operator><name>callback</name></name> <operator>=</operator> <name>output_plugin_error_callback</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>errcallback</name><operator>.</operator><name>arg</name></name> <operator>=</operator> <operator>(</operator><name>void</name> <operator>*</operator><operator>)</operator> <operator>&amp;</operator><name>state</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>errcallback</name><operator>.</operator><name>previous</name></name> <operator>=</operator> <name>error_context_stack</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name>error_context_stack</name> <operator>=</operator> <operator>&amp;</operator><name>errcallback</name></expr>;</expr_stmt>
+
+	<comment type="block">/* set output state */</comment>
+	<expr_stmt><expr><name><name>ctx</name><operator>-&gt;</operator><name>accept_writes</name></name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+
+	<comment type="block">/* do the actual work: call callback */</comment>
+	<expr_stmt><expr><call><name><name>ctx</name><operator>-&gt;</operator><name>callbacks</name><operator>.</operator><name>startup_cb</name></name><argument_list>(<argument><expr><name>ctx</name></expr></argument>, <argument><expr><name>opt</name></expr></argument>, <argument><expr><name>is_init</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Pop the error context stack */</comment>
+	<expr_stmt><expr><name>error_context_stack</name> <operator>=</operator> <name><name>errcallback</name><operator>.</operator><name>previous</name></name></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>shutdown_cb_wrapper</name><parameter_list>(<parameter><decl><type><name>LogicalDecodingContext</name> <modifier>*</modifier></type><name>ctx</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>LogicalErrorCallbackState</name></type> <name>state</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>ErrorContextCallback</name></type> <name>errcallback</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><operator>!</operator><name><name>ctx</name><operator>-&gt;</operator><name>fast_forward</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Push callback + info on the error context stack */</comment>
+	<expr_stmt><expr><name><name>state</name><operator>.</operator><name>ctx</name></name> <operator>=</operator> <name>ctx</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>state</name><operator>.</operator><name>callback_name</name></name> <operator>=</operator> <literal type="string">"shutdown"</literal></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>state</name><operator>.</operator><name>report_location</name></name> <operator>=</operator> <name>InvalidXLogRecPtr</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>errcallback</name><operator>.</operator><name>callback</name></name> <operator>=</operator> <name>output_plugin_error_callback</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>errcallback</name><operator>.</operator><name>arg</name></name> <operator>=</operator> <operator>(</operator><name>void</name> <operator>*</operator><operator>)</operator> <operator>&amp;</operator><name>state</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>errcallback</name><operator>.</operator><name>previous</name></name> <operator>=</operator> <name>error_context_stack</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name>error_context_stack</name> <operator>=</operator> <operator>&amp;</operator><name>errcallback</name></expr>;</expr_stmt>
+
+	<comment type="block">/* set output state */</comment>
+	<expr_stmt><expr><name><name>ctx</name><operator>-&gt;</operator><name>accept_writes</name></name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+
+	<comment type="block">/* do the actual work: call callback */</comment>
+	<expr_stmt><expr><call><name><name>ctx</name><operator>-&gt;</operator><name>callbacks</name><operator>.</operator><name>shutdown_cb</name></name><argument_list>(<argument><expr><name>ctx</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Pop the error context stack */</comment>
+	<expr_stmt><expr><name>error_context_stack</name> <operator>=</operator> <name><name>errcallback</name><operator>.</operator><name>previous</name></name></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * Callbacks for ReorderBuffer which add in some more information and then call
+ * output_plugin.h plugins.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>begin_cb_wrapper</name><parameter_list>(<parameter><decl><type><name>ReorderBuffer</name> <modifier>*</modifier></type><name>cache</name></decl></parameter>, <parameter><decl><type><name>ReorderBufferTXN</name> <modifier>*</modifier></type><name>txn</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>LogicalDecodingContext</name> <modifier>*</modifier></type><name>ctx</name> <init>= <expr><name><name>cache</name><operator>-&gt;</operator><name>private_data</name></name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>LogicalErrorCallbackState</name></type> <name>state</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>ErrorContextCallback</name></type> <name>errcallback</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><operator>!</operator><name><name>ctx</name><operator>-&gt;</operator><name>fast_forward</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Push callback + info on the error context stack */</comment>
+	<expr_stmt><expr><name><name>state</name><operator>.</operator><name>ctx</name></name> <operator>=</operator> <name>ctx</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>state</name><operator>.</operator><name>callback_name</name></name> <operator>=</operator> <literal type="string">"begin"</literal></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>state</name><operator>.</operator><name>report_location</name></name> <operator>=</operator> <name><name>txn</name><operator>-&gt;</operator><name>first_lsn</name></name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>errcallback</name><operator>.</operator><name>callback</name></name> <operator>=</operator> <name>output_plugin_error_callback</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>errcallback</name><operator>.</operator><name>arg</name></name> <operator>=</operator> <operator>(</operator><name>void</name> <operator>*</operator><operator>)</operator> <operator>&amp;</operator><name>state</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>errcallback</name><operator>.</operator><name>previous</name></name> <operator>=</operator> <name>error_context_stack</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name>error_context_stack</name> <operator>=</operator> <operator>&amp;</operator><name>errcallback</name></expr>;</expr_stmt>
+
+	<comment type="block">/* set output state */</comment>
+	<expr_stmt><expr><name><name>ctx</name><operator>-&gt;</operator><name>accept_writes</name></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>ctx</name><operator>-&gt;</operator><name>write_xid</name></name> <operator>=</operator> <name><name>txn</name><operator>-&gt;</operator><name>xid</name></name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>ctx</name><operator>-&gt;</operator><name>write_location</name></name> <operator>=</operator> <name><name>txn</name><operator>-&gt;</operator><name>first_lsn</name></name></expr>;</expr_stmt>
+
+	<comment type="block">/* do the actual work: call callback */</comment>
+	<expr_stmt><expr><call><name><name>ctx</name><operator>-&gt;</operator><name>callbacks</name><operator>.</operator><name>begin_cb</name></name><argument_list>(<argument><expr><name>ctx</name></expr></argument>, <argument><expr><name>txn</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Pop the error context stack */</comment>
+	<expr_stmt><expr><name>error_context_stack</name> <operator>=</operator> <name><name>errcallback</name><operator>.</operator><name>previous</name></name></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>commit_cb_wrapper</name><parameter_list>(<parameter><decl><type><name>ReorderBuffer</name> <modifier>*</modifier></type><name>cache</name></decl></parameter>, <parameter><decl><type><name>ReorderBufferTXN</name> <modifier>*</modifier></type><name>txn</name></decl></parameter>,
+				  <parameter><decl><type><name>XLogRecPtr</name></type> <name>commit_lsn</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>LogicalDecodingContext</name> <modifier>*</modifier></type><name>ctx</name> <init>= <expr><name><name>cache</name><operator>-&gt;</operator><name>private_data</name></name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>LogicalErrorCallbackState</name></type> <name>state</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>ErrorContextCallback</name></type> <name>errcallback</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><operator>!</operator><name><name>ctx</name><operator>-&gt;</operator><name>fast_forward</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Push callback + info on the error context stack */</comment>
+	<expr_stmt><expr><name><name>state</name><operator>.</operator><name>ctx</name></name> <operator>=</operator> <name>ctx</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>state</name><operator>.</operator><name>callback_name</name></name> <operator>=</operator> <literal type="string">"commit"</literal></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>state</name><operator>.</operator><name>report_location</name></name> <operator>=</operator> <name><name>txn</name><operator>-&gt;</operator><name>final_lsn</name></name></expr>;</expr_stmt> <comment type="block">/* beginning of commit record */</comment>
+	<expr_stmt><expr><name><name>errcallback</name><operator>.</operator><name>callback</name></name> <operator>=</operator> <name>output_plugin_error_callback</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>errcallback</name><operator>.</operator><name>arg</name></name> <operator>=</operator> <operator>(</operator><name>void</name> <operator>*</operator><operator>)</operator> <operator>&amp;</operator><name>state</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>errcallback</name><operator>.</operator><name>previous</name></name> <operator>=</operator> <name>error_context_stack</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name>error_context_stack</name> <operator>=</operator> <operator>&amp;</operator><name>errcallback</name></expr>;</expr_stmt>
+
+	<comment type="block">/* set output state */</comment>
+	<expr_stmt><expr><name><name>ctx</name><operator>-&gt;</operator><name>accept_writes</name></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>ctx</name><operator>-&gt;</operator><name>write_xid</name></name> <operator>=</operator> <name><name>txn</name><operator>-&gt;</operator><name>xid</name></name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>ctx</name><operator>-&gt;</operator><name>write_location</name></name> <operator>=</operator> <name><name>txn</name><operator>-&gt;</operator><name>end_lsn</name></name></expr>;</expr_stmt> <comment type="block">/* points to the end of the record */</comment>
+
+	<comment type="block">/* do the actual work: call callback */</comment>
+	<expr_stmt><expr><call><name><name>ctx</name><operator>-&gt;</operator><name>callbacks</name><operator>.</operator><name>commit_cb</name></name><argument_list>(<argument><expr><name>ctx</name></expr></argument>, <argument><expr><name>txn</name></expr></argument>, <argument><expr><name>commit_lsn</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Pop the error context stack */</comment>
+	<expr_stmt><expr><name>error_context_stack</name> <operator>=</operator> <name><name>errcallback</name><operator>.</operator><name>previous</name></name></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>change_cb_wrapper</name><parameter_list>(<parameter><decl><type><name>ReorderBuffer</name> <modifier>*</modifier></type><name>cache</name></decl></parameter>, <parameter><decl><type><name>ReorderBufferTXN</name> <modifier>*</modifier></type><name>txn</name></decl></parameter>,
+				  <parameter><decl><type><name>Relation</name></type> <name>relation</name></decl></parameter>, <parameter><decl><type><name>ReorderBufferChange</name> <modifier>*</modifier></type><name>change</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>LogicalDecodingContext</name> <modifier>*</modifier></type><name>ctx</name> <init>= <expr><name><name>cache</name><operator>-&gt;</operator><name>private_data</name></name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>LogicalErrorCallbackState</name></type> <name>state</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>ErrorContextCallback</name></type> <name>errcallback</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><operator>!</operator><name><name>ctx</name><operator>-&gt;</operator><name>fast_forward</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Push callback + info on the error context stack */</comment>
+	<expr_stmt><expr><name><name>state</name><operator>.</operator><name>ctx</name></name> <operator>=</operator> <name>ctx</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>state</name><operator>.</operator><name>callback_name</name></name> <operator>=</operator> <literal type="string">"change"</literal></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>state</name><operator>.</operator><name>report_location</name></name> <operator>=</operator> <name><name>change</name><operator>-&gt;</operator><name>lsn</name></name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>errcallback</name><operator>.</operator><name>callback</name></name> <operator>=</operator> <name>output_plugin_error_callback</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>errcallback</name><operator>.</operator><name>arg</name></name> <operator>=</operator> <operator>(</operator><name>void</name> <operator>*</operator><operator>)</operator> <operator>&amp;</operator><name>state</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>errcallback</name><operator>.</operator><name>previous</name></name> <operator>=</operator> <name>error_context_stack</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name>error_context_stack</name> <operator>=</operator> <operator>&amp;</operator><name>errcallback</name></expr>;</expr_stmt>
+
+	<comment type="block">/* set output state */</comment>
+	<expr_stmt><expr><name><name>ctx</name><operator>-&gt;</operator><name>accept_writes</name></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>ctx</name><operator>-&gt;</operator><name>write_xid</name></name> <operator>=</operator> <name><name>txn</name><operator>-&gt;</operator><name>xid</name></name></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * report this change's lsn so replies from clients can give an up2date
+	 * answer. This won't ever be enough (and shouldn't be!) to confirm
+	 * receipt of this transaction, but it might allow another transaction's
+	 * commit to be confirmed with one message.
+	 */</comment>
+	<expr_stmt><expr><name><name>ctx</name><operator>-&gt;</operator><name>write_location</name></name> <operator>=</operator> <name><name>change</name><operator>-&gt;</operator><name>lsn</name></name></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name><name>ctx</name><operator>-&gt;</operator><name>callbacks</name><operator>.</operator><name>change_cb</name></name><argument_list>(<argument><expr><name>ctx</name></expr></argument>, <argument><expr><name>txn</name></expr></argument>, <argument><expr><name>relation</name></expr></argument>, <argument><expr><name>change</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Pop the error context stack */</comment>
+	<expr_stmt><expr><name>error_context_stack</name> <operator>=</operator> <name><name>errcallback</name><operator>.</operator><name>previous</name></name></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>truncate_cb_wrapper</name><parameter_list>(<parameter><decl><type><name>ReorderBuffer</name> <modifier>*</modifier></type><name>cache</name></decl></parameter>, <parameter><decl><type><name>ReorderBufferTXN</name> <modifier>*</modifier></type><name>txn</name></decl></parameter>,
+					<parameter><decl><type><name>int</name></type> <name>nrelations</name></decl></parameter>, <parameter><decl><type><name>Relation</name></type> <name><name>relations</name><index>[]</index></name></decl></parameter>, <parameter><decl><type><name>ReorderBufferChange</name> <modifier>*</modifier></type><name>change</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>LogicalDecodingContext</name> <modifier>*</modifier></type><name>ctx</name> <init>= <expr><name><name>cache</name><operator>-&gt;</operator><name>private_data</name></name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>LogicalErrorCallbackState</name></type> <name>state</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>ErrorContextCallback</name></type> <name>errcallback</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><operator>!</operator><name><name>ctx</name><operator>-&gt;</operator><name>fast_forward</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><name><name>ctx</name><operator>-&gt;</operator><name>callbacks</name><operator>.</operator><name>truncate_cb</name></name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return;</return></block_content></block></if></if_stmt>
+
+	<comment type="block">/* Push callback + info on the error context stack */</comment>
+	<expr_stmt><expr><name><name>state</name><operator>.</operator><name>ctx</name></name> <operator>=</operator> <name>ctx</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>state</name><operator>.</operator><name>callback_name</name></name> <operator>=</operator> <literal type="string">"truncate"</literal></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>state</name><operator>.</operator><name>report_location</name></name> <operator>=</operator> <name><name>change</name><operator>-&gt;</operator><name>lsn</name></name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>errcallback</name><operator>.</operator><name>callback</name></name> <operator>=</operator> <name>output_plugin_error_callback</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>errcallback</name><operator>.</operator><name>arg</name></name> <operator>=</operator> <operator>(</operator><name>void</name> <operator>*</operator><operator>)</operator> <operator>&amp;</operator><name>state</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>errcallback</name><operator>.</operator><name>previous</name></name> <operator>=</operator> <name>error_context_stack</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name>error_context_stack</name> <operator>=</operator> <operator>&amp;</operator><name>errcallback</name></expr>;</expr_stmt>
+
+	<comment type="block">/* set output state */</comment>
+	<expr_stmt><expr><name><name>ctx</name><operator>-&gt;</operator><name>accept_writes</name></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>ctx</name><operator>-&gt;</operator><name>write_xid</name></name> <operator>=</operator> <name><name>txn</name><operator>-&gt;</operator><name>xid</name></name></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * report this change's lsn so replies from clients can give an up2date
+	 * answer. This won't ever be enough (and shouldn't be!) to confirm
+	 * receipt of this transaction, but it might allow another transaction's
+	 * commit to be confirmed with one message.
+	 */</comment>
+	<expr_stmt><expr><name><name>ctx</name><operator>-&gt;</operator><name>write_location</name></name> <operator>=</operator> <name><name>change</name><operator>-&gt;</operator><name>lsn</name></name></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name><name>ctx</name><operator>-&gt;</operator><name>callbacks</name><operator>.</operator><name>truncate_cb</name></name><argument_list>(<argument><expr><name>ctx</name></expr></argument>, <argument><expr><name>txn</name></expr></argument>, <argument><expr><name>nrelations</name></expr></argument>, <argument><expr><name>relations</name></expr></argument>, <argument><expr><name>change</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Pop the error context stack */</comment>
+	<expr_stmt><expr><name>error_context_stack</name> <operator>=</operator> <name><name>errcallback</name><operator>.</operator><name>previous</name></name></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<function><type><name>bool</name></type>
+<name>filter_by_origin_cb_wrapper</name><parameter_list>(<parameter><decl><type><name>LogicalDecodingContext</name> <modifier>*</modifier></type><name>ctx</name></decl></parameter>, <parameter><decl><type><name>RepOriginId</name></type> <name>origin_id</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>LogicalErrorCallbackState</name></type> <name>state</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>ErrorContextCallback</name></type> <name>errcallback</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>bool</name></type>		<name>ret</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><operator>!</operator><name><name>ctx</name><operator>-&gt;</operator><name>fast_forward</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Push callback + info on the error context stack */</comment>
+	<expr_stmt><expr><name><name>state</name><operator>.</operator><name>ctx</name></name> <operator>=</operator> <name>ctx</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>state</name><operator>.</operator><name>callback_name</name></name> <operator>=</operator> <literal type="string">"filter_by_origin"</literal></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>state</name><operator>.</operator><name>report_location</name></name> <operator>=</operator> <name>InvalidXLogRecPtr</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>errcallback</name><operator>.</operator><name>callback</name></name> <operator>=</operator> <name>output_plugin_error_callback</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>errcallback</name><operator>.</operator><name>arg</name></name> <operator>=</operator> <operator>(</operator><name>void</name> <operator>*</operator><operator>)</operator> <operator>&amp;</operator><name>state</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>errcallback</name><operator>.</operator><name>previous</name></name> <operator>=</operator> <name>error_context_stack</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name>error_context_stack</name> <operator>=</operator> <operator>&amp;</operator><name>errcallback</name></expr>;</expr_stmt>
+
+	<comment type="block">/* set output state */</comment>
+	<expr_stmt><expr><name><name>ctx</name><operator>-&gt;</operator><name>accept_writes</name></name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+
+	<comment type="block">/* do the actual work: call callback */</comment>
+	<expr_stmt><expr><name>ret</name> <operator>=</operator> <call><name><name>ctx</name><operator>-&gt;</operator><name>callbacks</name><operator>.</operator><name>filter_by_origin_cb</name></name><argument_list>(<argument><expr><name>ctx</name></expr></argument>, <argument><expr><name>origin_id</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Pop the error context stack */</comment>
+	<expr_stmt><expr><name>error_context_stack</name> <operator>=</operator> <name><name>errcallback</name><operator>.</operator><name>previous</name></name></expr>;</expr_stmt>
+
+	<return>return <expr><name>ret</name></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>message_cb_wrapper</name><parameter_list>(<parameter><decl><type><name>ReorderBuffer</name> <modifier>*</modifier></type><name>cache</name></decl></parameter>, <parameter><decl><type><name>ReorderBufferTXN</name> <modifier>*</modifier></type><name>txn</name></decl></parameter>,
+				   <parameter><decl><type><name>XLogRecPtr</name></type> <name>message_lsn</name></decl></parameter>, <parameter><decl><type><name>bool</name></type> <name>transactional</name></decl></parameter>,
+				   <parameter><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>prefix</name></decl></parameter>, <parameter><decl><type><name>Size</name></type> <name>message_size</name></decl></parameter>, <parameter><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>message</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>LogicalDecodingContext</name> <modifier>*</modifier></type><name>ctx</name> <init>= <expr><name><name>cache</name><operator>-&gt;</operator><name>private_data</name></name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>LogicalErrorCallbackState</name></type> <name>state</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>ErrorContextCallback</name></type> <name>errcallback</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><operator>!</operator><name><name>ctx</name><operator>-&gt;</operator><name>fast_forward</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name><name>ctx</name><operator>-&gt;</operator><name>callbacks</name><operator>.</operator><name>message_cb</name></name> <operator>==</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return;</return></block_content></block></if></if_stmt>
+
+	<comment type="block">/* Push callback + info on the error context stack */</comment>
+	<expr_stmt><expr><name><name>state</name><operator>.</operator><name>ctx</name></name> <operator>=</operator> <name>ctx</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>state</name><operator>.</operator><name>callback_name</name></name> <operator>=</operator> <literal type="string">"message"</literal></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>state</name><operator>.</operator><name>report_location</name></name> <operator>=</operator> <name>message_lsn</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>errcallback</name><operator>.</operator><name>callback</name></name> <operator>=</operator> <name>output_plugin_error_callback</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>errcallback</name><operator>.</operator><name>arg</name></name> <operator>=</operator> <operator>(</operator><name>void</name> <operator>*</operator><operator>)</operator> <operator>&amp;</operator><name>state</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>errcallback</name><operator>.</operator><name>previous</name></name> <operator>=</operator> <name>error_context_stack</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name>error_context_stack</name> <operator>=</operator> <operator>&amp;</operator><name>errcallback</name></expr>;</expr_stmt>
+
+	<comment type="block">/* set output state */</comment>
+	<expr_stmt><expr><name><name>ctx</name><operator>-&gt;</operator><name>accept_writes</name></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>ctx</name><operator>-&gt;</operator><name>write_xid</name></name> <operator>=</operator> <ternary><condition><expr><name>txn</name> <operator>!=</operator> <name>NULL</name></expr> ?</condition><then> <expr><name><name>txn</name><operator>-&gt;</operator><name>xid</name></name></expr> </then><else>: <expr><name>InvalidTransactionId</name></expr></else></ternary></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>ctx</name><operator>-&gt;</operator><name>write_location</name></name> <operator>=</operator> <name>message_lsn</name></expr>;</expr_stmt>
+
+	<comment type="block">/* do the actual work: call callback */</comment>
+	<expr_stmt><expr><call><name><name>ctx</name><operator>-&gt;</operator><name>callbacks</name><operator>.</operator><name>message_cb</name></name><argument_list>(<argument><expr><name>ctx</name></expr></argument>, <argument><expr><name>txn</name></expr></argument>, <argument><expr><name>message_lsn</name></expr></argument>, <argument><expr><name>transactional</name></expr></argument>, <argument><expr><name>prefix</name></expr></argument>,
+							  <argument><expr><name>message_size</name></expr></argument>, <argument><expr><name>message</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Pop the error context stack */</comment>
+	<expr_stmt><expr><name>error_context_stack</name> <operator>=</operator> <name><name>errcallback</name><operator>.</operator><name>previous</name></name></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Set the required catalog xmin horizon for historic snapshots in the current
+ * replication slot.
+ *
+ * Note that in the most cases, we won't be able to immediately use the xmin
+ * to increase the xmin horizon: we need to wait till the client has confirmed
+ * receiving current_lsn with LogicalConfirmReceivedLocation().
+ */</comment>
+<function><type><name>void</name></type>
+<name>LogicalIncreaseXminForSlot</name><parameter_list>(<parameter><decl><type><name>XLogRecPtr</name></type> <name>current_lsn</name></decl></parameter>, <parameter><decl><type><name>TransactionId</name></type> <name>xmin</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>bool</name></type>		<name>updated_xmin</name> <init>= <expr><name>false</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>ReplicationSlot</name> <modifier>*</modifier></type><name>slot</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name>slot</name> <operator>=</operator> <name>MyReplicationSlot</name></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>slot</name> <operator>!=</operator> <name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>SpinLockAcquire</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>slot</name><operator>-&gt;</operator><name>mutex</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * don't overwrite if we already have a newer xmin. This can happen if we
+	 * restart decoding in a slot.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><call><name>TransactionIdPrecedesOrEquals</name><argument_list>(<argument><expr><name>xmin</name></expr></argument>, <argument><expr><name><name>slot</name><operator>-&gt;</operator><name>data</name><operator>.</operator><name>catalog_xmin</name></name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+	</block_content>}</block></if>
+
+	<comment type="block">/*
+	 * If the client has already confirmed up to this lsn, we directly can
+	 * mark this as accepted. This can happen if we restart decoding in a
+	 * slot.
+	 */</comment>
+	<if type="elseif">else if <condition>(<expr><name>current_lsn</name> <operator>&lt;=</operator> <name><name>slot</name><operator>-&gt;</operator><name>data</name><operator>.</operator><name>confirmed_flush</name></name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name><name>slot</name><operator>-&gt;</operator><name>candidate_catalog_xmin</name></name> <operator>=</operator> <name>xmin</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>slot</name><operator>-&gt;</operator><name>candidate_xmin_lsn</name></name> <operator>=</operator> <name>current_lsn</name></expr>;</expr_stmt>
+
+		<comment type="block">/* our candidate can directly be used */</comment>
+		<expr_stmt><expr><name>updated_xmin</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+	</block_content>}</block></if>
+
+	<comment type="block">/*
+	 * Only increase if the previous values have been applied, otherwise we
+	 * might never end up updating if the receiver acks too slowly.
+	 */</comment>
+	<if type="elseif">else if <condition>(<expr><name><name>slot</name><operator>-&gt;</operator><name>candidate_xmin_lsn</name></name> <operator>==</operator> <name>InvalidXLogRecPtr</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name><name>slot</name><operator>-&gt;</operator><name>candidate_catalog_xmin</name></name> <operator>=</operator> <name>xmin</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>slot</name><operator>-&gt;</operator><name>candidate_xmin_lsn</name></name> <operator>=</operator> <name>current_lsn</name></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+	<expr_stmt><expr><call><name>SpinLockRelease</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>slot</name><operator>-&gt;</operator><name>mutex</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* candidate already valid with the current flush position, apply */</comment>
+	<if_stmt><if>if <condition>(<expr><name>updated_xmin</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>LogicalConfirmReceivedLocation</name><argument_list>(<argument><expr><name><name>slot</name><operator>-&gt;</operator><name>data</name><operator>.</operator><name>confirmed_flush</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Mark the minimal LSN (restart_lsn) we need to read to replay all
+ * transactions that have not yet committed at current_lsn.
+ *
+ * Just like IncreaseRestartDecodingForSlot this only takes effect when the
+ * client has confirmed to have received current_lsn.
+ */</comment>
+<function><type><name>void</name></type>
+<name>LogicalIncreaseRestartDecodingForSlot</name><parameter_list>(<parameter><decl><type><name>XLogRecPtr</name></type> <name>current_lsn</name></decl></parameter>, <parameter><decl><type><name>XLogRecPtr</name></type> <name>restart_lsn</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>bool</name></type>		<name>updated_lsn</name> <init>= <expr><name>false</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>ReplicationSlot</name> <modifier>*</modifier></type><name>slot</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><name>slot</name> <operator>=</operator> <name>MyReplicationSlot</name></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>slot</name> <operator>!=</operator> <name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>restart_lsn</name> <operator>!=</operator> <name>InvalidXLogRecPtr</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>current_lsn</name> <operator>!=</operator> <name>InvalidXLogRecPtr</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>SpinLockAcquire</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>slot</name><operator>-&gt;</operator><name>mutex</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* don't overwrite if have a newer restart lsn */</comment>
+	<if_stmt><if>if <condition>(<expr><name>restart_lsn</name> <operator>&lt;=</operator> <name><name>slot</name><operator>-&gt;</operator><name>data</name><operator>.</operator><name>restart_lsn</name></name></expr>)</condition>
+	<block>{<block_content>
+	</block_content>}</block></if>
+
+	<comment type="block">/*
+	 * We might have already flushed far enough to directly accept this lsn,
+	 * in this case there is no need to check for existing candidate LSNs
+	 */</comment>
+	<if type="elseif">else if <condition>(<expr><name>current_lsn</name> <operator>&lt;=</operator> <name><name>slot</name><operator>-&gt;</operator><name>data</name><operator>.</operator><name>confirmed_flush</name></name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name><name>slot</name><operator>-&gt;</operator><name>candidate_restart_valid</name></name> <operator>=</operator> <name>current_lsn</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>slot</name><operator>-&gt;</operator><name>candidate_restart_lsn</name></name> <operator>=</operator> <name>restart_lsn</name></expr>;</expr_stmt>
+
+		<comment type="block">/* our candidate can directly be used */</comment>
+		<expr_stmt><expr><name>updated_lsn</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/*
+	 * Only increase if the previous values have been applied, otherwise we
+	 * might never end up updating if the receiver acks too slowly. A missed
+	 * value here will just cause some extra effort after reconnecting.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>slot</name><operator>-&gt;</operator><name>candidate_restart_valid</name></name> <operator>==</operator> <name>InvalidXLogRecPtr</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name><name>slot</name><operator>-&gt;</operator><name>candidate_restart_valid</name></name> <operator>=</operator> <name>current_lsn</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>slot</name><operator>-&gt;</operator><name>candidate_restart_lsn</name></name> <operator>=</operator> <name>restart_lsn</name></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>SpinLockRelease</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>slot</name><operator>-&gt;</operator><name>mutex</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>DEBUG1</name></expr></argument>, <argument><expr><literal type="string">"got new restart lsn %X/%X at %X/%X"</literal></expr></argument>,
+			 <argument><expr><operator>(</operator><name>uint32</name><operator>)</operator> <operator>(</operator><name>restart_lsn</name> <operator>&gt;&gt;</operator> <literal type="number">32</literal><operator>)</operator></expr></argument>, <argument><expr><operator>(</operator><name>uint32</name><operator>)</operator> <name>restart_lsn</name></expr></argument>,
+			 <argument><expr><operator>(</operator><name>uint32</name><operator>)</operator> <operator>(</operator><name>current_lsn</name> <operator>&gt;&gt;</operator> <literal type="number">32</literal><operator>)</operator></expr></argument>, <argument><expr><operator>(</operator><name>uint32</name><operator>)</operator> <name>current_lsn</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<else>else
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>XLogRecPtr</name></type>	<name>candidate_restart_lsn</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>XLogRecPtr</name></type>	<name>candidate_restart_valid</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>XLogRecPtr</name></type>	<name>confirmed_flush</name></decl>;</decl_stmt>
+
+		<expr_stmt><expr><name>candidate_restart_lsn</name> <operator>=</operator> <name><name>slot</name><operator>-&gt;</operator><name>candidate_restart_lsn</name></name></expr>;</expr_stmt>
+		<expr_stmt><expr><name>candidate_restart_valid</name> <operator>=</operator> <name><name>slot</name><operator>-&gt;</operator><name>candidate_restart_valid</name></name></expr>;</expr_stmt>
+		<expr_stmt><expr><name>confirmed_flush</name> <operator>=</operator> <name><name>slot</name><operator>-&gt;</operator><name>data</name><operator>.</operator><name>confirmed_flush</name></name></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>SpinLockRelease</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>slot</name><operator>-&gt;</operator><name>mutex</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>DEBUG1</name></expr></argument>, <argument><expr><literal type="string">"failed to increase restart lsn: proposed %X/%X, after %X/%X, current candidate %X/%X, current after %X/%X, flushed up to %X/%X"</literal></expr></argument>,
+			 <argument><expr><operator>(</operator><name>uint32</name><operator>)</operator> <operator>(</operator><name>restart_lsn</name> <operator>&gt;&gt;</operator> <literal type="number">32</literal><operator>)</operator></expr></argument>, <argument><expr><operator>(</operator><name>uint32</name><operator>)</operator> <name>restart_lsn</name></expr></argument>,
+			 <argument><expr><operator>(</operator><name>uint32</name><operator>)</operator> <operator>(</operator><name>current_lsn</name> <operator>&gt;&gt;</operator> <literal type="number">32</literal><operator>)</operator></expr></argument>, <argument><expr><operator>(</operator><name>uint32</name><operator>)</operator> <name>current_lsn</name></expr></argument>,
+			 <argument><expr><operator>(</operator><name>uint32</name><operator>)</operator> <operator>(</operator><name>candidate_restart_lsn</name> <operator>&gt;&gt;</operator> <literal type="number">32</literal><operator>)</operator></expr></argument>,
+			 <argument><expr><operator>(</operator><name>uint32</name><operator>)</operator> <name>candidate_restart_lsn</name></expr></argument>,
+			 <argument><expr><operator>(</operator><name>uint32</name><operator>)</operator> <operator>(</operator><name>candidate_restart_valid</name> <operator>&gt;&gt;</operator> <literal type="number">32</literal><operator>)</operator></expr></argument>,
+			 <argument><expr><operator>(</operator><name>uint32</name><operator>)</operator> <name>candidate_restart_valid</name></expr></argument>,
+			 <argument><expr><operator>(</operator><name>uint32</name><operator>)</operator> <operator>(</operator><name>confirmed_flush</name> <operator>&gt;&gt;</operator> <literal type="number">32</literal><operator>)</operator></expr></argument>,
+			 <argument><expr><operator>(</operator><name>uint32</name><operator>)</operator> <name>confirmed_flush</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></else></if_stmt>
+
+	<comment type="block">/* candidates are already valid with the current flush position, apply */</comment>
+	<if_stmt><if>if <condition>(<expr><name>updated_lsn</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>LogicalConfirmReceivedLocation</name><argument_list>(<argument><expr><name><name>slot</name><operator>-&gt;</operator><name>data</name><operator>.</operator><name>confirmed_flush</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Handle a consumer's confirmation having received all changes up to lsn.
+ */</comment>
+<function><type><name>void</name></type>
+<name>LogicalConfirmReceivedLocation</name><parameter_list>(<parameter><decl><type><name>XLogRecPtr</name></type> <name>lsn</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>lsn</name> <operator>!=</operator> <name>InvalidXLogRecPtr</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Do an unlocked check for candidate_lsn first. */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>MyReplicationSlot</name><operator>-&gt;</operator><name>candidate_xmin_lsn</name></name> <operator>!=</operator> <name>InvalidXLogRecPtr</name> <operator>||</operator>
+		<name><name>MyReplicationSlot</name><operator>-&gt;</operator><name>candidate_restart_valid</name></name> <operator>!=</operator> <name>InvalidXLogRecPtr</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>bool</name></type>		<name>updated_xmin</name> <init>= <expr><name>false</name></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>bool</name></type>		<name>updated_restart</name> <init>= <expr><name>false</name></expr></init></decl>;</decl_stmt>
+
+		<expr_stmt><expr><call><name>SpinLockAcquire</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>MyReplicationSlot</name><operator>-&gt;</operator><name>mutex</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><name><name>MyReplicationSlot</name><operator>-&gt;</operator><name>data</name><operator>.</operator><name>confirmed_flush</name></name> <operator>=</operator> <name>lsn</name></expr>;</expr_stmt>
+
+		<comment type="block">/* if we're past the location required for bumping xmin, do so */</comment>
+		<if_stmt><if>if <condition>(<expr><name><name>MyReplicationSlot</name><operator>-&gt;</operator><name>candidate_xmin_lsn</name></name> <operator>!=</operator> <name>InvalidXLogRecPtr</name> <operator>&amp;&amp;</operator>
+			<name><name>MyReplicationSlot</name><operator>-&gt;</operator><name>candidate_xmin_lsn</name></name> <operator>&lt;=</operator> <name>lsn</name></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/*
+			 * We have to write the changed xmin to disk *before* we change
+			 * the in-memory value, otherwise after a crash we wouldn't know
+			 * that some catalog tuples might have been removed already.
+			 *
+			 * Ensure that by first writing to -&gt;xmin and only update
+			 * -&gt;effective_xmin once the new state is synced to disk. After a
+			 * crash -&gt;effective_xmin is set to -&gt;xmin.
+			 */</comment>
+			<if_stmt><if>if <condition>(<expr><call><name>TransactionIdIsValid</name><argument_list>(<argument><expr><name><name>MyReplicationSlot</name><operator>-&gt;</operator><name>candidate_catalog_xmin</name></name></expr></argument>)</argument_list></call> <operator>&amp;&amp;</operator>
+				<name><name>MyReplicationSlot</name><operator>-&gt;</operator><name>data</name><operator>.</operator><name>catalog_xmin</name></name> <operator>!=</operator> <name><name>MyReplicationSlot</name><operator>-&gt;</operator><name>candidate_catalog_xmin</name></name></expr>)</condition>
+			<block>{<block_content>
+				<expr_stmt><expr><name><name>MyReplicationSlot</name><operator>-&gt;</operator><name>data</name><operator>.</operator><name>catalog_xmin</name></name> <operator>=</operator> <name><name>MyReplicationSlot</name><operator>-&gt;</operator><name>candidate_catalog_xmin</name></name></expr>;</expr_stmt>
+				<expr_stmt><expr><name><name>MyReplicationSlot</name><operator>-&gt;</operator><name>candidate_catalog_xmin</name></name> <operator>=</operator> <name>InvalidTransactionId</name></expr>;</expr_stmt>
+				<expr_stmt><expr><name><name>MyReplicationSlot</name><operator>-&gt;</operator><name>candidate_xmin_lsn</name></name> <operator>=</operator> <name>InvalidXLogRecPtr</name></expr>;</expr_stmt>
+				<expr_stmt><expr><name>updated_xmin</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+			</block_content>}</block></if></if_stmt>
+		</block_content>}</block></if></if_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name><name>MyReplicationSlot</name><operator>-&gt;</operator><name>candidate_restart_valid</name></name> <operator>!=</operator> <name>InvalidXLogRecPtr</name> <operator>&amp;&amp;</operator>
+			<name><name>MyReplicationSlot</name><operator>-&gt;</operator><name>candidate_restart_valid</name></name> <operator>&lt;=</operator> <name>lsn</name></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>MyReplicationSlot</name><operator>-&gt;</operator><name>candidate_restart_lsn</name></name> <operator>!=</operator> <name>InvalidXLogRecPtr</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+			<expr_stmt><expr><name><name>MyReplicationSlot</name><operator>-&gt;</operator><name>data</name><operator>.</operator><name>restart_lsn</name></name> <operator>=</operator> <name><name>MyReplicationSlot</name><operator>-&gt;</operator><name>candidate_restart_lsn</name></name></expr>;</expr_stmt>
+			<expr_stmt><expr><name><name>MyReplicationSlot</name><operator>-&gt;</operator><name>candidate_restart_lsn</name></name> <operator>=</operator> <name>InvalidXLogRecPtr</name></expr>;</expr_stmt>
+			<expr_stmt><expr><name><name>MyReplicationSlot</name><operator>-&gt;</operator><name>candidate_restart_valid</name></name> <operator>=</operator> <name>InvalidXLogRecPtr</name></expr>;</expr_stmt>
+			<expr_stmt><expr><name>updated_restart</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+
+		<expr_stmt><expr><call><name>SpinLockRelease</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>MyReplicationSlot</name><operator>-&gt;</operator><name>mutex</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/* first write new xmin to disk, so we know what's up after a crash */</comment>
+		<if_stmt><if>if <condition>(<expr><name>updated_xmin</name> <operator>||</operator> <name>updated_restart</name></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><call><name>ReplicationSlotMarkDirty</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>ReplicationSlotSave</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>DEBUG1</name></expr></argument>, <argument><expr><literal type="string">"updated xmin: %u restart: %u"</literal></expr></argument>, <argument><expr><name>updated_xmin</name></expr></argument>, <argument><expr><name>updated_restart</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+
+		<comment type="block">/*
+		 * Now the new xmin is safely on disk, we can let the global value
+		 * advance. We do not take ProcArrayLock or similar since we only
+		 * advance xmin here and there's not much harm done by a concurrent
+		 * computation missing that.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><name>updated_xmin</name></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><call><name>SpinLockAcquire</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>MyReplicationSlot</name><operator>-&gt;</operator><name>mutex</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><name><name>MyReplicationSlot</name><operator>-&gt;</operator><name>effective_catalog_xmin</name></name> <operator>=</operator> <name><name>MyReplicationSlot</name><operator>-&gt;</operator><name>data</name><operator>.</operator><name>catalog_xmin</name></name></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>SpinLockRelease</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>MyReplicationSlot</name><operator>-&gt;</operator><name>mutex</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+			<expr_stmt><expr><call><name>ReplicationSlotsComputeRequiredXmin</name><argument_list>(<argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>ReplicationSlotsComputeRequiredLSN</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+	</block_content>}</block></if>
+	<else>else
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>SpinLockAcquire</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>MyReplicationSlot</name><operator>-&gt;</operator><name>mutex</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>MyReplicationSlot</name><operator>-&gt;</operator><name>data</name><operator>.</operator><name>confirmed_flush</name></name> <operator>=</operator> <name>lsn</name></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>SpinLockRelease</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>MyReplicationSlot</name><operator>-&gt;</operator><name>mutex</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></else></if_stmt>
+</block_content>}</block></function>
+</unit>

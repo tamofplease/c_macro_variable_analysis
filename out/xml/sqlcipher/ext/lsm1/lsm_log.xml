@@ -1,0 +1,1158 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<unit xmlns="http://www.srcML.org/srcML/src" xmlns:cpp="http://www.srcML.org/srcML/cpp" revision="1.0.0" language="C" filename="/cloned_projects/sqlcipher/ext/lsm1/lsm_log.c"><comment type="block">/*
+** 2011-08-13
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+*************************************************************************
+**
+** This file contains the implementation of LSM database logging. Logging
+** has one purpose in LSM - to make transactions durable.
+**
+** When data is written to an LSM database, it is initially stored in an
+** in-memory tree structure. Since this structure is in volatile memory,
+** if a power failure or application crash occurs it may be lost. To
+** prevent loss of data in this case, each time a record is written to the
+** in-memory tree an equivalent record is appended to the log on disk.
+** If a power failure or application crash does occur, data can be recovered
+** by reading the log.
+**
+** A log file consists of the following types of records representing data
+** written into the database:
+**
+**   LOG_WRITE:  A key-value pair written to the database.
+**   LOG_DELETE: A delete key issued to the database.
+**   LOG_COMMIT: A transaction commit.
+**
+** And the following types of records for ancillary purposes..
+**
+**   LOG_EOF:    A record indicating the end of a log file.
+**   LOG_PAD1:   A single byte padding record.
+**   LOG_PAD2:   An N byte padding record (N&gt;1).
+**   LOG_JUMP:   A pointer to another offset within the log file.
+**
+** Each transaction written to the log contains one or more LOG_WRITE and/or
+** LOG_DELETE records, followed by a LOG_COMMIT record. The LOG_COMMIT record
+** contains an 8-byte checksum based on all previous data written to the
+** log file.
+**
+** LOG CHECKSUMS &amp; RECOVERY
+**
+**   Checksums are found in two types of log records: LOG_COMMIT and
+**   LOG_CKSUM records. In order to recover content from a log, a client
+**   reads each record from the start of the log, calculating a checksum as
+**   it does. Each time a LOG_COMMIT or LOG_CKSUM is encountered, the 
+**   recovery process verifies that the checksum stored in the log 
+**   matches the calculated checksum. If it does not, the recovery process
+**   can stop reading the log.
+**
+**   If a recovery process reads records (other than COMMIT or CKSUM) 
+**   consisting of at least LSM_CKSUM_MAXDATA bytes, then the next record in
+**   the log must be either a LOG_CKSUM or LOG_COMMIT record. If it is
+**   not, the recovery process also stops reading the log.
+**
+**   To recover the log file, it must be read twice. The first time to 
+**   determine the location of the last valid commit record. And the second
+**   time to load data into the in-memory tree.
+**
+**   Todo: Surely there is a better way...
+**
+** LOG WRAPPING
+**
+**   If the log file were never deleted or wrapped, it would be possible to
+**   read it from start to end each time is required recovery (i.e each time
+**   the number of database clients changes from 0 to 1). Effectively reading
+**   the entire history of the database each time. This would quickly become 
+**   inefficient. Additionally, since the log file would grow without bound,
+**   it wastes storage space.
+**
+**   Instead, part of each checkpoint written into the database file contains 
+**   a log offset (and other information required to read the log starting at
+**   at this offset) at which to begin recovery. Offset $O.
+**
+**   Once a checkpoint has been written and synced into the database file, it
+**   is guaranteed that no recovery process will need to read any data before
+**   offset $O of the log file. It is therefore safe to begin overwriting
+**   any data that occurs before offset $O.
+**
+**   This implementation separates the log into three regions mapped into
+**   the log file - regions 0, 1 and 2. During recovery, regions are read
+**   in ascending order (i.e. 0, then 1, then 2). Each region is zero or
+**   more bytes in size.
+**
+**     |---1---|..|--0--|.|--2--|....
+**
+**   New records are always appended to the end of region 2.
+**
+**   Initially (when it is empty), all three regions are zero bytes in size.
+**   Each of them are located at the beginning of the file. As records are
+**   added to the log, region 2 grows, so that the log consists of a zero
+**   byte region 1, followed by a zero byte region 0, followed by an N byte
+**   region 2. After one or more checkpoints have been written to disk, 
+**   the start point of region 2 is moved to $O. For example:
+**
+**     A) ||.........|--2--|....
+**   
+**   (both regions 0 and 1 are 0 bytes in size at offset 0).
+**
+**   Eventually, the log wraps around to write new records into the start.
+**   At this point, region 2 is renamed to region 0. Region 0 is renamed
+**   to region 2. After appending a few records to the new region 2, the
+**   log file looks like this:
+**
+**     B) ||--2--|...|--0--|....
+**
+**   (region 1 is still 0 bytes in size, located at offset 0).
+**
+**   Any checkpoints made at this point may reduce the size of region 0.
+**   However, if they do not, and region 2 expands so that it is about to
+**   overwrite the start of region 0, then region 2 is renamed to region 1,
+**   and a new region 2 created at the end of the file following the existing
+**   region 0.
+**
+**     C) |---1---|..|--0--|.|-2-|
+**
+**   In this state records are appended to region 2 until checkpoints have
+**   contracted regions 0 AND 1 UNTil they are both zero bytes in size. They 
+**   are then shifted to the start of the log file, leaving the system in 
+**   the equivalent of state A above.
+**
+**   Alternatively, state B may transition directly to state A if the size
+**   of region 0 is reduced to zero bytes before region 2 threatens to 
+**   encroach upon it.
+**
+** LOG_PAD1 &amp; LOG_PAD2 RECORDS
+**
+**   PAD1 and PAD2 records may appear in a log file at any point. They allow
+**   a process writing the log file align the beginning of transactions with 
+**   the beginning of disk sectors, which increases robustness.
+**
+** RECORD FORMATS:
+**
+**   LOG_EOF:    * A single 0x00 byte.
+**
+**   LOG_PAD1:   * A single 0x01 byte.
+**
+**   LOG_PAD2:   * A single 0x02 byte, followed by
+**               * The number of unused bytes (N) as a varint,
+**               * An N byte block of unused space.
+**
+**   LOG_COMMIT: * A single 0x03 byte.
+**               * An 8-byte checksum.
+**
+**   LOG_JUMP:   * A single 0x04 byte.
+**               * Absolute file offset to jump to, encoded as a varint.
+**
+**   LOG_WRITE:  * A single 0x06 or 0x07 byte, 
+**               * The number of bytes in the key, encoded as a varint, 
+**               * The number of bytes in the value, encoded as a varint, 
+**               * If the first byte was 0x07, an 8 byte checksum.
+**               * The key data,
+**               * The value data.
+**
+**   LOG_DELETE: * A single 0x08 or 0x09 byte, 
+**               * The number of bytes in the key, encoded as a varint, 
+**               * If the first byte was 0x09, an 8 byte checksum.
+**               * The key data.
+**
+**   Varints are as described in lsm_varint.c (SQLite 4 format).
+**
+** CHECKSUMS:
+**
+**   The checksum is calculated using two 32-bit unsigned integers, s0 and
+**   s1. The initial value for both is 42. It is updated each time a record
+**   is written into the log file by treating the encoded (binary) record as 
+**   an array of 32-bit little-endian integers. Then, if x[] is the integer
+**   array, updating the checksum accumulators as follows:
+**
+**     for i from 0 to n-1 step 2:
+**       s0 += x[i] + s1;
+**       s1 += x[i+1] + s0;
+**     endfor
+**
+**   If the record is not an even multiple of 8-bytes in size it is padded
+**   with zeroes to make it so before the checksum is updated.
+**
+**   The checksum stored in a COMMIT, WRITE or DELETE is based on all bytes
+**   up to the start of the 8-byte checksum itself, including the COMMIT,
+**   WRITE or DELETE fields that appear before the checksum in the record.
+**
+** VARINT FORMAT
+**
+** See lsm_varint.c.
+*/</comment>
+
+<cpp:ifndef>#<cpp:directive>ifndef</cpp:directive> <name>_LSM_INT_H</name></cpp:ifndef>
+<cpp:include># <cpp:directive>include</cpp:directive> <cpp:file>"lsmInt.h"</cpp:file></cpp:include>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+<comment type="block">/* Log record types */</comment>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>LSM_LOG_EOF</name></cpp:macro>          <cpp:value>0x00</cpp:value></cpp:define>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>LSM_LOG_PAD1</name></cpp:macro>         <cpp:value>0x01</cpp:value></cpp:define>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>LSM_LOG_PAD2</name></cpp:macro>         <cpp:value>0x02</cpp:value></cpp:define>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>LSM_LOG_COMMIT</name></cpp:macro>       <cpp:value>0x03</cpp:value></cpp:define>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>LSM_LOG_JUMP</name></cpp:macro>         <cpp:value>0x04</cpp:value></cpp:define>
+
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>LSM_LOG_WRITE</name></cpp:macro>        <cpp:value>0x06</cpp:value></cpp:define>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>LSM_LOG_WRITE_CKSUM</name></cpp:macro>  <cpp:value>0x07</cpp:value></cpp:define>
+
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>LSM_LOG_DELETE</name></cpp:macro>       <cpp:value>0x08</cpp:value></cpp:define>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>LSM_LOG_DELETE_CKSUM</name></cpp:macro> <cpp:value>0x09</cpp:value></cpp:define>
+
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>LSM_LOG_DRANGE</name></cpp:macro>       <cpp:value>0x0A</cpp:value></cpp:define>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>LSM_LOG_DRANGE_CKSUM</name></cpp:macro> <cpp:value>0x0B</cpp:value></cpp:define>
+
+<comment type="block">/* Require a checksum every 32KB. */</comment>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>LSM_CKSUM_MAXDATA</name></cpp:macro> <cpp:value>(32*1024)</cpp:value></cpp:define>
+
+<comment type="block">/* Do not wrap a log file smaller than this in bytes. */</comment>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>LSM_MIN_LOGWRAP</name></cpp:macro>      <cpp:value>(128*1024)</cpp:value></cpp:define>
+
+<comment type="block">/*
+** szSector:
+**   Commit records must be aligned to end on szSector boundaries. If
+**   the safety-mode is set to NORMAL or OFF, this value is 1. Otherwise,
+**   if the safety-mode is set to FULL, it is the size of the file-system
+**   sectors as reported by lsmFsSectorSize().
+*/</comment>
+<struct>struct <name>LogWriter</name> <block>{
+  <decl_stmt><decl><type><name>u32</name></type> <name>cksum0</name></decl>;</decl_stmt>                     <comment type="block">/* Checksum 0 at offset iOff */</comment>
+  <decl_stmt><decl><type><name>u32</name></type> <name>cksum1</name></decl>;</decl_stmt>                     <comment type="block">/* Checksum 1 at offset iOff */</comment>
+  <decl_stmt><decl><type><name>int</name></type> <name>iCksumBuf</name></decl>;</decl_stmt>                  <comment type="block">/* Bytes of buf that have been checksummed */</comment>
+  <decl_stmt><decl><type><name>i64</name></type> <name>iOff</name></decl>;</decl_stmt>                       <comment type="block">/* Offset at start of buffer buf */</comment>
+  <decl_stmt><decl><type><name>int</name></type> <name>szSector</name></decl>;</decl_stmt>                   <comment type="block">/* Sector size for this transaction */</comment>
+  <decl_stmt><decl><type><name>LogRegion</name></type> <name>jump</name></decl>;</decl_stmt>                 <comment type="block">/* Avoid writing to this region */</comment>
+  <decl_stmt><decl><type><name>i64</name></type> <name>iRegion1End</name></decl>;</decl_stmt>                <comment type="block">/* End of first region written by trans */</comment>
+  <decl_stmt><decl><type><name>i64</name></type> <name>iRegion2Start</name></decl>;</decl_stmt>              <comment type="block">/* Start of second regions written by trans */</comment>
+  <decl_stmt><decl><type><name>LsmString</name></type> <name>buf</name></decl>;</decl_stmt>                  <comment type="block">/* Buffer containing data not yet written */</comment>
+}</block>;</struct>
+
+<comment type="block">/*
+** Return the result of interpreting the first 4 bytes in buffer aIn as 
+** a 32-bit unsigned little-endian integer.
+*/</comment>
+<function><type><specifier>static</specifier> <name>u32</name></type> <name>getU32le</name><parameter_list>(<parameter><decl><type><name>u8</name> <modifier>*</modifier></type><name>aIn</name></decl></parameter>)</parameter_list><block>{<block_content>
+  <return>return <expr><operator>(</operator><operator>(</operator><name>u32</name><operator>)</operator><name><name>aIn</name><index>[<expr><literal type="number">3</literal></expr>]</index></name> <operator>&lt;&lt;</operator> <literal type="number">24</literal><operator>)</operator> 
+       <operator>+</operator> <operator>(</operator><operator>(</operator><name>u32</name><operator>)</operator><name><name>aIn</name><index>[<expr><literal type="number">2</literal></expr>]</index></name> <operator>&lt;&lt;</operator> <literal type="number">16</literal><operator>)</operator> 
+       <operator>+</operator> <operator>(</operator><operator>(</operator><name>u32</name><operator>)</operator><name><name>aIn</name><index>[<expr><literal type="number">1</literal></expr>]</index></name> <operator>&lt;&lt;</operator> <literal type="number">8</literal><operator>)</operator> 
+       <operator>+</operator> <operator>(</operator><operator>(</operator><name>u32</name><operator>)</operator><name><name>aIn</name><index>[<expr><literal type="number">0</literal></expr>]</index></name><operator>)</operator></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+** This function is the same as logCksum(), except that pointer "a" need
+** not be aligned to an 8-byte boundary or padded with zero bytes. This
+** version is slower, but sometimes more convenient to use.
+*/</comment>
+<function><type><specifier>static</specifier> <name>void</name></type> <name>logCksumUnaligned</name><parameter_list>(
+  <parameter><decl><type><name>char</name> <modifier>*</modifier></type><name>z</name></decl></parameter>,                        <comment type="block">/* Input buffer */</comment>
+  <parameter><decl><type><name>int</name></type> <name>n</name></decl></parameter>,                          <comment type="block">/* Size of input buffer in bytes */</comment>
+  <parameter><decl><type><name>u32</name> <modifier>*</modifier></type><name>pCksum0</name></decl></parameter>,                   <comment type="block">/* IN/OUT: Checksum value 1 */</comment>
+  <parameter><decl><type><name>u32</name> <modifier>*</modifier></type><name>pCksum1</name></decl></parameter>                    <comment type="block">/* IN/OUT: Checksum value 2 */</comment>
+)</parameter_list><block>{<block_content>
+  <decl_stmt><decl><type><name>u8</name> <modifier>*</modifier></type><name>a</name> <init>= <expr><operator>(</operator><name>u8</name> <operator>*</operator><operator>)</operator><name>z</name></expr></init></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>u32</name></type> <name>cksum0</name> <init>= <expr><operator>*</operator><name>pCksum0</name></expr></init></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>u32</name></type> <name>cksum1</name> <init>= <expr><operator>*</operator><name>pCksum1</name></expr></init></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>int</name></type> <name>nIn</name> <init>= <expr><operator>(</operator><name>n</name><operator>/</operator><literal type="number">8</literal><operator>)</operator> <operator>*</operator> <literal type="number">8</literal></expr></init></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>int</name></type> <name>i</name></decl>;</decl_stmt>
+
+  <expr_stmt><expr><call><name>assert</name><argument_list>( <argument><expr><name>n</name><operator>&gt;</operator><literal type="number">0</literal></expr></argument> )</argument_list></call></expr>;</expr_stmt>
+  <for>for<control>(<init><expr><name>i</name><operator>=</operator><literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name><operator>&lt;</operator><name>nIn</name></expr>;</condition> <incr><expr><name>i</name><operator>+=</operator><literal type="number">8</literal></expr></incr>)</control><block>{<block_content>
+    <expr_stmt><expr><name>cksum0</name> <operator>+=</operator> <call><name>getU32le</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>a</name><index>[<expr><name>i</name></expr>]</index></name></expr></argument>)</argument_list></call> <operator>+</operator> <name>cksum1</name></expr>;</expr_stmt>
+    <expr_stmt><expr><name>cksum1</name> <operator>+=</operator> <call><name>getU32le</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>a</name><index>[<expr><name>i</name><operator>+</operator><literal type="number">4</literal></expr>]</index></name></expr></argument>)</argument_list></call> <operator>+</operator> <name>cksum0</name></expr>;</expr_stmt>
+  </block_content>}</block></for>
+
+  <if_stmt><if>if<condition>( <expr><name>nIn</name><operator>!=</operator><name>n</name></expr> )</condition><block>{<block_content>
+    <decl_stmt><decl><type><name>u8</name></type> <name><name>aBuf</name><index>[<expr><literal type="number">8</literal></expr>]</index></name> <init>= <expr><block>{<expr><literal type="number">0</literal></expr>, <expr><literal type="number">0</literal></expr>, <expr><literal type="number">0</literal></expr>, <expr><literal type="number">0</literal></expr>, <expr><literal type="number">0</literal></expr>, <expr><literal type="number">0</literal></expr>, <expr><literal type="number">0</literal></expr>, <expr><literal type="number">0</literal></expr>}</block></expr></init></decl>;</decl_stmt>
+    <expr_stmt><expr><call><name>assert</name><argument_list>( <argument><expr><operator>(</operator><name>n</name><operator>-</operator><name>nIn</name><operator>)</operator><operator>&lt;</operator><literal type="number">8</literal> <operator>&amp;&amp;</operator> <name>n</name><operator>&gt;</operator><name>nIn</name></expr></argument> )</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><call><name>memcpy</name><argument_list>(<argument><expr><name>aBuf</name></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>a</name><index>[<expr><name>nIn</name></expr>]</index></name></expr></argument>, <argument><expr><name>n</name><operator>-</operator><name>nIn</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><name>cksum0</name> <operator>+=</operator> <call><name>getU32le</name><argument_list>(<argument><expr><name>aBuf</name></expr></argument>)</argument_list></call> <operator>+</operator> <name>cksum1</name></expr>;</expr_stmt>
+    <expr_stmt><expr><name>cksum1</name> <operator>+=</operator> <call><name>getU32le</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>aBuf</name><index>[<expr><literal type="number">4</literal></expr>]</index></name></expr></argument>)</argument_list></call> <operator>+</operator> <name>cksum0</name></expr>;</expr_stmt>
+  </block_content>}</block></if></if_stmt>
+
+  <expr_stmt><expr><operator>*</operator><name>pCksum0</name> <operator>=</operator> <name>cksum0</name></expr>;</expr_stmt>
+  <expr_stmt><expr><operator>*</operator><name>pCksum1</name> <operator>=</operator> <name>cksum1</name></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+** Update pLog-&gt;cksum0 and pLog-&gt;cksum1 so that the first nBuf bytes in the 
+** write buffer (pLog-&gt;buf) are included in the checksum.
+*/</comment>
+<function><type><specifier>static</specifier> <name>void</name></type> <name>logUpdateCksum</name><parameter_list>(<parameter><decl><type><name>LogWriter</name> <modifier>*</modifier></type><name>pLog</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>nBuf</name></decl></parameter>)</parameter_list><block>{<block_content>
+  <expr_stmt><expr><call><name>assert</name><argument_list>( <argument><expr><operator>(</operator><name><name>pLog</name><operator>-&gt;</operator><name>iCksumBuf</name></name> <operator>%</operator> <literal type="number">8</literal><operator>)</operator><operator>==</operator><literal type="number">0</literal></expr></argument> )</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><call><name>assert</name><argument_list>( <argument><expr><name><name>pLog</name><operator>-&gt;</operator><name>iCksumBuf</name></name><operator>&lt;=</operator><name>nBuf</name></expr></argument> )</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><call><name>assert</name><argument_list>( <argument><expr><operator>(</operator><name>nBuf</name> <operator>%</operator> <literal type="number">8</literal><operator>)</operator><operator>==</operator><literal type="number">0</literal> <operator>||</operator> <name>nBuf</name><operator>==</operator><name><name>pLog</name><operator>-&gt;</operator><name>buf</name><operator>.</operator><name>n</name></name></expr></argument> )</argument_list></call></expr>;</expr_stmt>
+  <if_stmt><if>if<condition>( <expr><name>nBuf</name><operator>&gt;</operator><name><name>pLog</name><operator>-&gt;</operator><name>iCksumBuf</name></name></expr> )</condition><block>{<block_content>
+    <expr_stmt><expr><call><name>logCksumUnaligned</name><argument_list>(
+        <argument><expr><operator>&amp;</operator><name><name>pLog</name><operator>-&gt;</operator><name>buf</name><operator>.</operator><name>z</name><index>[<expr><name><name>pLog</name><operator>-&gt;</operator><name>iCksumBuf</name></name></expr>]</index></name></expr></argument>, <argument><expr><name>nBuf</name><operator>-</operator><name><name>pLog</name><operator>-&gt;</operator><name>iCksumBuf</name></name></expr></argument>, 
+        <argument><expr><operator>&amp;</operator><name><name>pLog</name><operator>-&gt;</operator><name>cksum0</name></name></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>pLog</name><operator>-&gt;</operator><name>cksum1</name></name></expr></argument>
+    )</argument_list></call></expr>;</expr_stmt>
+  </block_content>}</block></if></if_stmt>
+  <expr_stmt><expr><name><name>pLog</name><operator>-&gt;</operator><name>iCksumBuf</name></name> <operator>=</operator> <name>nBuf</name></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<function><type><specifier>static</specifier> <name>i64</name></type> <name>firstByteOnSector</name><parameter_list>(<parameter><decl><type><name>LogWriter</name> <modifier>*</modifier></type><name>pLog</name></decl></parameter>, <parameter><decl><type><name>i64</name></type> <name>iOff</name></decl></parameter>)</parameter_list><block>{<block_content>
+  <return>return <expr><operator>(</operator><name>iOff</name> <operator>/</operator> <name><name>pLog</name><operator>-&gt;</operator><name>szSector</name></name><operator>)</operator> <operator>*</operator> <name><name>pLog</name><operator>-&gt;</operator><name>szSector</name></name></expr>;</return>
+</block_content>}</block></function>
+<function><type><specifier>static</specifier> <name>i64</name></type> <name>lastByteOnSector</name><parameter_list>(<parameter><decl><type><name>LogWriter</name> <modifier>*</modifier></type><name>pLog</name></decl></parameter>, <parameter><decl><type><name>i64</name></type> <name>iOff</name></decl></parameter>)</parameter_list><block>{<block_content>
+  <return>return <expr><call><name>firstByteOnSector</name><argument_list>(<argument><expr><name>pLog</name></expr></argument>, <argument><expr><name>iOff</name></expr></argument>)</argument_list></call> <operator>+</operator> <name><name>pLog</name><operator>-&gt;</operator><name>szSector</name></name> <operator>-</operator> <literal type="number">1</literal></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+** If possible, reclaim log file space. Log file space is reclaimed after
+** a snapshot that points to the same data in the database file is synced
+** into the db header.
+*/</comment>
+<function><type><specifier>static</specifier> <name>int</name></type> <name>logReclaimSpace</name><parameter_list>(<parameter><decl><type><name>lsm_db</name> <modifier>*</modifier></type><name>pDb</name></decl></parameter>)</parameter_list><block>{<block_content>
+  <decl_stmt><decl><type><name>int</name></type> <name>rc</name></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>int</name></type> <name>iMeta</name></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>int</name></type> <name>bRotrans</name></decl>;</decl_stmt>                   <comment type="block">/* True if there exists some ro-trans */</comment>
+
+  <comment type="block">/* Test if there exists some other connection with a read-only transaction
+  ** open. If there does, then log file space may not be reclaimed.  */</comment>
+  <expr_stmt><expr><name>rc</name> <operator>=</operator> <call><name>lsmDetectRoTrans</name><argument_list>(<argument><expr><name>pDb</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>bRotrans</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <if_stmt><if>if<condition>( <expr><name>rc</name><operator>!=</operator><name>LSM_OK</name> <operator>||</operator> <name>bRotrans</name></expr> )</condition><block type="pseudo"><block_content> <return>return <expr><name>rc</name></expr>;</return></block_content></block></if></if_stmt>
+
+  <expr_stmt><expr><name>iMeta</name> <operator>=</operator> <operator>(</operator><name>int</name><operator>)</operator><name><name>pDb</name><operator>-&gt;</operator><name>pShmhdr</name><operator>-&gt;</operator><name>iMetaPage</name></name></expr>;</expr_stmt>
+  <if_stmt><if>if<condition>( <expr><name>iMeta</name><operator>==</operator><literal type="number">1</literal> <operator>||</operator> <name>iMeta</name><operator>==</operator><literal type="number">2</literal></expr> )</condition><block>{<block_content>
+    <decl_stmt><decl><type><name>DbLog</name> <modifier>*</modifier></type><name>pLog</name> <init>= <expr><operator>&amp;</operator><name><name>pDb</name><operator>-&gt;</operator><name>treehdr</name><operator>.</operator><name>log</name></name></expr></init></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>i64</name></type> <name>iSyncedId</name></decl>;</decl_stmt>
+
+    <comment type="block">/* Read the snapshot-id of the snapshot stored on meta-page iMeta. Note
+    ** that in theory, the value read is untrustworthy (due to a race 
+    ** condition - see comments above lsmFsReadSyncedId()). So it is only 
+    ** ever used to conclude that no log space can be reclaimed. If it seems
+    ** to indicate that it may be possible to reclaim log space, a
+    ** second call to lsmCheckpointSynced() (which does return trustworthy
+    ** values) is made below to confirm.  */</comment>
+    <expr_stmt><expr><name>rc</name> <operator>=</operator> <call><name>lsmFsReadSyncedId</name><argument_list>(<argument><expr><name>pDb</name></expr></argument>, <argument><expr><name>iMeta</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>iSyncedId</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+    <if_stmt><if>if<condition>( <expr><name>rc</name><operator>==</operator><name>LSM_OK</name> <operator>&amp;&amp;</operator> <name><name>pLog</name><operator>-&gt;</operator><name>iSnapshotId</name></name><operator>!=</operator><name>iSyncedId</name></expr> )</condition><block>{<block_content>
+      <decl_stmt><decl><type><name>i64</name></type> <name>iSnapshotId</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+      <decl_stmt><decl><type><name>i64</name></type> <name>iOff</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+      <expr_stmt><expr><name>rc</name> <operator>=</operator> <call><name>lsmCheckpointSynced</name><argument_list>(<argument><expr><name>pDb</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>iSnapshotId</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>iOff</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+      <if_stmt><if>if<condition>( <expr><name>rc</name><operator>==</operator><name>LSM_OK</name> <operator>&amp;&amp;</operator> <name><name>pLog</name><operator>-&gt;</operator><name>iSnapshotId</name></name><operator>&lt;</operator><name>iSnapshotId</name></expr> )</condition><block>{<block_content>
+        <decl_stmt><decl><type><name>int</name></type> <name>iRegion</name></decl>;</decl_stmt>
+        <for>for<control>(<init><expr><name>iRegion</name><operator>=</operator><literal type="number">0</literal></expr>;</init> <condition><expr><name>iRegion</name><operator>&lt;</operator><literal type="number">3</literal></expr>;</condition> <incr><expr><name>iRegion</name><operator>++</operator></expr></incr>)</control><block>{<block_content>
+          <decl_stmt><decl><type><name>LogRegion</name> <modifier>*</modifier></type><name>p</name> <init>= <expr><operator>&amp;</operator><name><name>pLog</name><operator>-&gt;</operator><name>aRegion</name><index>[<expr><name>iRegion</name></expr>]</index></name></expr></init></decl>;</decl_stmt>
+          <if_stmt><if>if<condition>( <expr><name>iOff</name><operator>&gt;=</operator><name><name>p</name><operator>-&gt;</operator><name>iStart</name></name> <operator>&amp;&amp;</operator> <name>iOff</name><operator>&lt;=</operator><name><name>p</name><operator>-&gt;</operator><name>iEnd</name></name></expr> )</condition><block type="pseudo"><block_content> <break>break;</break></block_content></block></if></if_stmt>
+          <expr_stmt><expr><name><name>p</name><operator>-&gt;</operator><name>iStart</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+          <expr_stmt><expr><name><name>p</name><operator>-&gt;</operator><name>iEnd</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+        </block_content>}</block></for>
+        <expr_stmt><expr><call><name>assert</name><argument_list>( <argument><expr><name>iRegion</name><operator>&lt;</operator><literal type="number">3</literal></expr></argument> )</argument_list></call></expr>;</expr_stmt>
+        <expr_stmt><expr><name><name>pLog</name><operator>-&gt;</operator><name>aRegion</name><index>[<expr><name>iRegion</name></expr>]</index></name><operator>.</operator><name>iStart</name> <operator>=</operator> <name>iOff</name></expr>;</expr_stmt>
+        <expr_stmt><expr><name><name>pLog</name><operator>-&gt;</operator><name>iSnapshotId</name></name> <operator>=</operator> <name>iSnapshotId</name></expr>;</expr_stmt>
+      </block_content>}</block></if></if_stmt>
+    </block_content>}</block></if></if_stmt>
+  </block_content>}</block></if></if_stmt>
+  <return>return <expr><name>rc</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+** This function is called when a write-transaction is first opened. It
+** is assumed that the caller is holding the client-mutex when it is 
+** called.
+**
+** Before returning, this function allocates the LogWriter object that
+** will be used to write to the log file during the write transaction.
+** LSM_OK is returned if no error occurs, otherwise an LSM error code.
+*/</comment>
+<function><type><name>int</name></type> <name>lsmLogBegin</name><parameter_list>(<parameter><decl><type><name>lsm_db</name> <modifier>*</modifier></type><name>pDb</name></decl></parameter>)</parameter_list><block>{<block_content>
+  <decl_stmt><decl><type><name>int</name></type> <name>rc</name> <init>= <expr><name>LSM_OK</name></expr></init></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>LogWriter</name> <modifier>*</modifier></type><name>pNew</name></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>LogRegion</name> <modifier>*</modifier></type><name>aReg</name></decl>;</decl_stmt>
+
+  <if_stmt><if>if<condition>( <expr><name><name>pDb</name><operator>-&gt;</operator><name>bUseLog</name></name><operator>==</operator><literal type="number">0</literal></expr> )</condition><block type="pseudo"><block_content> <return>return <expr><name>LSM_OK</name></expr>;</return></block_content></block></if></if_stmt>
+
+  <comment type="block">/* If the log file has not yet been opened, open it now. Also allocate
+  ** the LogWriter structure, if it has not already been allocated.  */</comment>
+  <expr_stmt><expr><name>rc</name> <operator>=</operator> <call><name>lsmFsOpenLog</name><argument_list>(<argument><expr><name>pDb</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <if_stmt><if>if<condition>( <expr><name><name>pDb</name><operator>-&gt;</operator><name>pLogWriter</name></name><operator>==</operator><literal type="number">0</literal></expr> )</condition><block>{<block_content>
+    <expr_stmt><expr><name>pNew</name> <operator>=</operator> <call><name>lsmMallocZeroRc</name><argument_list>(<argument><expr><name><name>pDb</name><operator>-&gt;</operator><name>pEnv</name></name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>LogWriter</name></expr></argument>)</argument_list></sizeof></expr></argument>, <argument><expr><operator>&amp;</operator><name>rc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <if_stmt><if>if<condition>( <expr><name>pNew</name></expr> )</condition><block>{<block_content>
+      <expr_stmt><expr><call><name>lsmStringInit</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>pNew</name><operator>-&gt;</operator><name>buf</name></name></expr></argument>, <argument><expr><name><name>pDb</name><operator>-&gt;</operator><name>pEnv</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+      <expr_stmt><expr><name>rc</name> <operator>=</operator> <call><name>lsmStringExtend</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>pNew</name><operator>-&gt;</operator><name>buf</name></name></expr></argument>, <argument><expr><literal type="number">2</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    </block_content>}</block></if></if_stmt>
+    <expr_stmt><expr><name><name>pDb</name><operator>-&gt;</operator><name>pLogWriter</name></name> <operator>=</operator> <name>pNew</name></expr>;</expr_stmt>
+  </block_content>}</block></if><else>else<block>{<block_content>
+    <expr_stmt><expr><name>pNew</name> <operator>=</operator> <name><name>pDb</name><operator>-&gt;</operator><name>pLogWriter</name></name></expr>;</expr_stmt>
+    <expr_stmt><expr><call><name>assert</name><argument_list>( <argument><expr><operator>(</operator><name>u8</name> <operator>*</operator><operator>)</operator><operator>(</operator><operator>&amp;</operator><name><name>pNew</name><index>[<expr><literal type="number">1</literal></expr>]</index></name><operator>)</operator><operator>==</operator><operator>(</operator><name>u8</name> <operator>*</operator><operator>)</operator><operator>(</operator><operator>&amp;</operator><operator>(</operator><operator>(</operator><operator>&amp;</operator><name><name>pNew</name><operator>-&gt;</operator><name>buf</name></name><operator>)</operator><index>[<expr><literal type="number">1</literal></expr>]</index><operator>)</operator><operator>)</operator></expr></argument> )</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><name>pNew</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><operator>(</operator><operator>(</operator><name>u8</name> <operator>*</operator><operator>)</operator><operator>&amp;</operator><name><name>pNew</name><operator>-&gt;</operator><name>buf</name></name><operator>)</operator> <operator>-</operator> <operator>(</operator><name>u8</name> <operator>*</operator><operator>)</operator><name>pNew</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>pNew</name><operator>-&gt;</operator><name>buf</name><operator>.</operator><name>n</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+  </block_content>}</block></else></if_stmt>
+
+  <if_stmt><if>if<condition>( <expr><name>rc</name><operator>==</operator><name>LSM_OK</name></expr> )</condition><block>{<block_content>
+    <comment type="block">/* The following call detects whether or not a new snapshot has been 
+    ** synced into the database file. If so, it updates the contents of
+    ** the pDb-&gt;treehdr.log structure to reclaim any space in the log
+    ** file that is no longer required. 
+    **
+    ** TODO: Calling this every transaction is overkill. And since the 
+    ** call has to read and checksum a snapshot from the database file,
+    ** it is expensive. It would be better to figure out a way so that
+    ** this is only called occasionally - say for every 32KB written to 
+    ** the log file.
+    */</comment>
+    <expr_stmt><expr><name>rc</name> <operator>=</operator> <call><name>logReclaimSpace</name><argument_list>(<argument><expr><name>pDb</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  </block_content>}</block></if></if_stmt>
+  <if_stmt><if>if<condition>( <expr><name>rc</name><operator>!=</operator><name>LSM_OK</name></expr> )</condition><block>{<block_content>
+    <expr_stmt><expr><call><name>lsmLogClose</name><argument_list>(<argument><expr><name>pDb</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <return>return <expr><name>rc</name></expr>;</return>
+  </block_content>}</block></if></if_stmt>
+
+  <comment type="block">/* Set the effective sector-size for this transaction. Sectors are assumed
+  ** to be one byte in size if the safety-mode is OFF or NORMAL, or as
+  ** reported by lsmFsSectorSize if it is FULL.  */</comment>
+  <if_stmt><if>if<condition>( <expr><name><name>pDb</name><operator>-&gt;</operator><name>eSafety</name></name><operator>==</operator><name>LSM_SAFETY_FULL</name></expr> )</condition><block>{<block_content>
+    <expr_stmt><expr><name><name>pNew</name><operator>-&gt;</operator><name>szSector</name></name> <operator>=</operator> <call><name>lsmFsSectorSize</name><argument_list>(<argument><expr><name><name>pDb</name><operator>-&gt;</operator><name>pFS</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><call><name>assert</name><argument_list>( <argument><expr><name><name>pNew</name><operator>-&gt;</operator><name>szSector</name></name><operator>&gt;</operator><literal type="number">0</literal></expr></argument> )</argument_list></call></expr>;</expr_stmt>
+  </block_content>}</block></if><else>else<block>{<block_content>
+    <expr_stmt><expr><name><name>pNew</name><operator>-&gt;</operator><name>szSector</name></name> <operator>=</operator> <literal type="number">1</literal></expr>;</expr_stmt>
+  </block_content>}</block></else></if_stmt>
+
+  <comment type="block">/* There are now three scenarios:
+  **
+  **   1) Regions 0 and 1 are both zero bytes in size and region 2 begins
+  **      at a file offset greater than LSM_MIN_LOGWRAP. In this case, wrap
+  **      around to the start and write data into the start of the log file. 
+  **
+  **   2) Region 1 is zero bytes in size and region 2 occurs earlier in the 
+  **      file than region 0. In this case, append data to region 2, but
+  **      remember to jump over region 1 if required.
+  **
+  **   3) Region 2 is the last in the file. Append to it.
+  */</comment>
+  <expr_stmt><expr><name>aReg</name> <operator>=</operator> <operator>&amp;</operator><name><name>pDb</name><operator>-&gt;</operator><name>treehdr</name><operator>.</operator><name>log</name><operator>.</operator><name>aRegion</name><index>[<expr><literal type="number">0</literal></expr>]</index></name></expr>;</expr_stmt>
+
+  <expr_stmt><expr><call><name>assert</name><argument_list>( <argument><expr><name><name>aReg</name><index>[<expr><literal type="number">0</literal></expr>]</index></name><operator>.</operator><name>iEnd</name><operator>==</operator><literal type="number">0</literal> <operator>||</operator> <name><name>aReg</name><index>[<expr><literal type="number">0</literal></expr>]</index></name><operator>.</operator><name>iEnd</name><operator>&gt;</operator><name><name>aReg</name><index>[<expr><literal type="number">0</literal></expr>]</index></name><operator>.</operator><name>iStart</name></expr></argument> )</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><call><name>assert</name><argument_list>( <argument><expr><name><name>aReg</name><index>[<expr><literal type="number">1</literal></expr>]</index></name><operator>.</operator><name>iEnd</name><operator>==</operator><literal type="number">0</literal> <operator>||</operator> <name><name>aReg</name><index>[<expr><literal type="number">1</literal></expr>]</index></name><operator>.</operator><name>iEnd</name><operator>&gt;</operator><name><name>aReg</name><index>[<expr><literal type="number">1</literal></expr>]</index></name><operator>.</operator><name>iStart</name></expr></argument> )</argument_list></call></expr>;</expr_stmt>
+
+  <expr_stmt><expr><name><name>pNew</name><operator>-&gt;</operator><name>cksum0</name></name> <operator>=</operator> <name><name>pDb</name><operator>-&gt;</operator><name>treehdr</name><operator>.</operator><name>log</name><operator>.</operator><name>cksum0</name></name></expr>;</expr_stmt>
+  <expr_stmt><expr><name><name>pNew</name><operator>-&gt;</operator><name>cksum1</name></name> <operator>=</operator> <name><name>pDb</name><operator>-&gt;</operator><name>treehdr</name><operator>.</operator><name>log</name><operator>.</operator><name>cksum1</name></name></expr>;</expr_stmt>
+
+  <if_stmt><if>if<condition>( <expr><name><name>aReg</name><index>[<expr><literal type="number">0</literal></expr>]</index></name><operator>.</operator><name>iEnd</name><operator>==</operator><literal type="number">0</literal> <operator>&amp;&amp;</operator> <name><name>aReg</name><index>[<expr><literal type="number">1</literal></expr>]</index></name><operator>.</operator><name>iEnd</name><operator>==</operator><literal type="number">0</literal> <operator>&amp;&amp;</operator> <name><name>aReg</name><index>[<expr><literal type="number">2</literal></expr>]</index></name><operator>.</operator><name>iStart</name><operator>&gt;=</operator><name>LSM_MIN_LOGWRAP</name></expr> )</condition><block>{<block_content>
+    <comment type="block">/* Case 1. Wrap around to the start of the file. Write an LSM_LOG_JUMP 
+    ** into the log file in this case. Pad it out to 8 bytes using a PAD2
+    ** record so that the checksums can be updated immediately.  */</comment>
+    <decl_stmt><decl><type><name>u8</name></type> <name><name>aJump</name><index>[]</index></name> <init>= <expr><block>{ 
+      <expr><name>LSM_LOG_PAD2</name></expr>, <expr><literal type="number">0x04</literal></expr>, <expr><literal type="number">0x00</literal></expr>, <expr><literal type="number">0x00</literal></expr>, <expr><literal type="number">0x00</literal></expr>, <expr><literal type="number">0x00</literal></expr>, <expr><name>LSM_LOG_JUMP</name></expr>, <expr><literal type="number">0x00</literal></expr> 
+    }</block></expr></init></decl>;</decl_stmt>
+
+    <expr_stmt><expr><call><name>lsmStringBinAppend</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>pNew</name><operator>-&gt;</operator><name>buf</name></name></expr></argument>, <argument><expr><name>aJump</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>aJump</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><call><name>logUpdateCksum</name><argument_list>(<argument><expr><name>pNew</name></expr></argument>, <argument><expr><name><name>pNew</name><operator>-&gt;</operator><name>buf</name><operator>.</operator><name>n</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><name>rc</name> <operator>=</operator> <call><name>lsmFsWriteLog</name><argument_list>(<argument><expr><name><name>pDb</name><operator>-&gt;</operator><name>pFS</name></name></expr></argument>, <argument><expr><name><name>aReg</name><index>[<expr><literal type="number">2</literal></expr>]</index></name><operator>.</operator><name>iEnd</name></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>pNew</name><operator>-&gt;</operator><name>buf</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>pNew</name><operator>-&gt;</operator><name>iCksumBuf</name></name> <operator>=</operator> <name><name>pNew</name><operator>-&gt;</operator><name>buf</name><operator>.</operator><name>n</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+
+    <expr_stmt><expr><name><name>aReg</name><index>[<expr><literal type="number">2</literal></expr>]</index></name><operator>.</operator><name>iEnd</name> <operator>+=</operator> <literal type="number">8</literal></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>pNew</name><operator>-&gt;</operator><name>jump</name></name> <operator>=</operator> <name><name>aReg</name><index>[<expr><literal type="number">0</literal></expr>]</index></name> <operator>=</operator> <name><name>aReg</name><index>[<expr><literal type="number">2</literal></expr>]</index></name></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>aReg</name><index>[<expr><literal type="number">2</literal></expr>]</index></name><operator>.</operator><name>iStart</name> <operator>=</operator> <name><name>aReg</name><index>[<expr><literal type="number">2</literal></expr>]</index></name><operator>.</operator><name>iEnd</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+  </block_content>}</block></if><if type="elseif">else if<condition>( <expr><name><name>aReg</name><index>[<expr><literal type="number">1</literal></expr>]</index></name><operator>.</operator><name>iEnd</name><operator>==</operator><literal type="number">0</literal> <operator>&amp;&amp;</operator> <name><name>aReg</name><index>[<expr><literal type="number">2</literal></expr>]</index></name><operator>.</operator><name>iEnd</name><operator>&lt;</operator><name><name>aReg</name><index>[<expr><literal type="number">0</literal></expr>]</index></name><operator>.</operator><name>iEnd</name></expr> )</condition><block>{<block_content>
+    <comment type="block">/* Case 2. */</comment>
+    <expr_stmt><expr><name><name>pNew</name><operator>-&gt;</operator><name>iOff</name></name> <operator>=</operator> <name><name>aReg</name><index>[<expr><literal type="number">2</literal></expr>]</index></name><operator>.</operator><name>iEnd</name></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>pNew</name><operator>-&gt;</operator><name>jump</name></name> <operator>=</operator> <name><name>aReg</name><index>[<expr><literal type="number">0</literal></expr>]</index></name></expr>;</expr_stmt>
+  </block_content>}</block></if><else>else<block>{<block_content>
+    <comment type="block">/* Case 3. */</comment>
+    <expr_stmt><expr><call><name>assert</name><argument_list>( <argument><expr><name><name>aReg</name><index>[<expr><literal type="number">2</literal></expr>]</index></name><operator>.</operator><name>iStart</name><operator>&gt;=</operator><name><name>aReg</name><index>[<expr><literal type="number">0</literal></expr>]</index></name><operator>.</operator><name>iEnd</name> <operator>&amp;&amp;</operator> <name><name>aReg</name><index>[<expr><literal type="number">2</literal></expr>]</index></name><operator>.</operator><name>iStart</name><operator>&gt;=</operator><name><name>aReg</name><index>[<expr><literal type="number">1</literal></expr>]</index></name><operator>.</operator><name>iEnd</name></expr></argument> )</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>pNew</name><operator>-&gt;</operator><name>iOff</name></name> <operator>=</operator> <name><name>aReg</name><index>[<expr><literal type="number">2</literal></expr>]</index></name><operator>.</operator><name>iEnd</name></expr>;</expr_stmt>
+  </block_content>}</block></else></if_stmt>
+
+  <if_stmt><if>if<condition>( <expr><name><name>pNew</name><operator>-&gt;</operator><name>jump</name><operator>.</operator><name>iStart</name></name></expr> )</condition><block>{<block_content>
+    <decl_stmt><decl><type><name>i64</name></type> <name>iRound</name></decl>;</decl_stmt>
+    <expr_stmt><expr><call><name>assert</name><argument_list>( <argument><expr><name><name>pNew</name><operator>-&gt;</operator><name>jump</name><operator>.</operator><name>iStart</name></name><operator>&gt;</operator><name><name>pNew</name><operator>-&gt;</operator><name>iOff</name></name></expr></argument> )</argument_list></call></expr>;</expr_stmt>
+
+    <expr_stmt><expr><name>iRound</name> <operator>=</operator> <call><name>firstByteOnSector</name><argument_list>(<argument><expr><name>pNew</name></expr></argument>, <argument><expr><name><name>pNew</name><operator>-&gt;</operator><name>jump</name><operator>.</operator><name>iStart</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <if_stmt><if>if<condition>( <expr><name>iRound</name><operator>&gt;</operator><name><name>pNew</name><operator>-&gt;</operator><name>iOff</name></name></expr> )</condition><block type="pseudo"><block_content> <expr_stmt><expr><name><name>pNew</name><operator>-&gt;</operator><name>jump</name><operator>.</operator><name>iStart</name></name> <operator>=</operator> <name>iRound</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+    <expr_stmt><expr><name><name>pNew</name><operator>-&gt;</operator><name>jump</name><operator>.</operator><name>iEnd</name></name> <operator>=</operator> <call><name>lastByteOnSector</name><argument_list>(<argument><expr><name>pNew</name></expr></argument>, <argument><expr><name><name>pNew</name><operator>-&gt;</operator><name>jump</name><operator>.</operator><name>iEnd</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  </block_content>}</block></if></if_stmt>
+
+  <expr_stmt><expr><call><name>assert</name><argument_list>( <argument><expr><name><name>pDb</name><operator>-&gt;</operator><name>pLogWriter</name></name><operator>==</operator><name>pNew</name></expr></argument> )</argument_list></call></expr>;</expr_stmt>
+  <return>return <expr><name>rc</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+** This function is called when a write-transaction is being closed.
+** Parameter bCommit is true if the transaction is being committed,
+** or false otherwise. The caller must hold the client-mutex to call
+** this function.
+**
+** A call to this function deletes the LogWriter object allocated by
+** lsmLogBegin(). If the transaction is being committed, the shared state
+** in *pLog is updated before returning.
+*/</comment>
+<function><type><name>void</name></type> <name>lsmLogEnd</name><parameter_list>(<parameter><decl><type><name>lsm_db</name> <modifier>*</modifier></type><name>pDb</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>bCommit</name></decl></parameter>)</parameter_list><block>{<block_content>
+  <decl_stmt><decl><type><name>DbLog</name> <modifier>*</modifier></type><name>pLog</name></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>LogWriter</name> <modifier>*</modifier></type><name>p</name></decl>;</decl_stmt>
+  <expr_stmt><expr><name>p</name> <operator>=</operator> <name><name>pDb</name><operator>-&gt;</operator><name>pLogWriter</name></name></expr>;</expr_stmt>
+
+  <if_stmt><if>if<condition>( <expr><name>p</name><operator>==</operator><literal type="number">0</literal></expr> )</condition><block type="pseudo"><block_content> <return>return;</return></block_content></block></if></if_stmt>
+  <expr_stmt><expr><name>pLog</name> <operator>=</operator> <operator>&amp;</operator><name><name>pDb</name><operator>-&gt;</operator><name>treehdr</name><operator>.</operator><name>log</name></name></expr>;</expr_stmt>
+
+  <if_stmt><if>if<condition>( <expr><name>bCommit</name></expr> )</condition><block>{<block_content>
+    <expr_stmt><expr><name><name>pLog</name><operator>-&gt;</operator><name>aRegion</name><index>[<expr><literal type="number">2</literal></expr>]</index></name><operator>.</operator><name>iEnd</name> <operator>=</operator> <name><name>p</name><operator>-&gt;</operator><name>iOff</name></name></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>pLog</name><operator>-&gt;</operator><name>cksum0</name></name> <operator>=</operator> <name><name>p</name><operator>-&gt;</operator><name>cksum0</name></name></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>pLog</name><operator>-&gt;</operator><name>cksum1</name></name> <operator>=</operator> <name><name>p</name><operator>-&gt;</operator><name>cksum1</name></name></expr>;</expr_stmt>
+    <if_stmt><if>if<condition>( <expr><name><name>p</name><operator>-&gt;</operator><name>iRegion1End</name></name></expr> )</condition><block>{<block_content>
+      <comment type="block">/* This happens when the transaction had to jump over some other
+      ** part of the log.  */</comment>
+      <expr_stmt><expr><call><name>assert</name><argument_list>( <argument><expr><name><name>pLog</name><operator>-&gt;</operator><name>aRegion</name><index>[<expr><literal type="number">1</literal></expr>]</index></name><operator>.</operator><name>iEnd</name><operator>==</operator><literal type="number">0</literal></expr></argument> )</argument_list></call></expr>;</expr_stmt>
+      <expr_stmt><expr><call><name>assert</name><argument_list>( <argument><expr><name><name>pLog</name><operator>-&gt;</operator><name>aRegion</name><index>[<expr><literal type="number">2</literal></expr>]</index></name><operator>.</operator><name>iStart</name><operator>&lt;</operator><name><name>p</name><operator>-&gt;</operator><name>iRegion1End</name></name></expr></argument> )</argument_list></call></expr>;</expr_stmt>
+      <expr_stmt><expr><name><name>pLog</name><operator>-&gt;</operator><name>aRegion</name><index>[<expr><literal type="number">1</literal></expr>]</index></name><operator>.</operator><name>iStart</name> <operator>=</operator> <name><name>pLog</name><operator>-&gt;</operator><name>aRegion</name><index>[<expr><literal type="number">2</literal></expr>]</index></name><operator>.</operator><name>iStart</name></expr>;</expr_stmt>
+      <expr_stmt><expr><name><name>pLog</name><operator>-&gt;</operator><name>aRegion</name><index>[<expr><literal type="number">1</literal></expr>]</index></name><operator>.</operator><name>iEnd</name> <operator>=</operator> <name><name>p</name><operator>-&gt;</operator><name>iRegion1End</name></name></expr>;</expr_stmt>
+      <expr_stmt><expr><name><name>pLog</name><operator>-&gt;</operator><name>aRegion</name><index>[<expr><literal type="number">2</literal></expr>]</index></name><operator>.</operator><name>iStart</name> <operator>=</operator> <name><name>p</name><operator>-&gt;</operator><name>iRegion2Start</name></name></expr>;</expr_stmt>
+    </block_content>}</block></if></if_stmt>
+  </block_content>}</block></if></if_stmt>
+</block_content>}</block></function>
+
+<function><type><specifier>static</specifier> <name>int</name></type> <name>jumpIfRequired</name><parameter_list>(
+  <parameter><decl><type><name>lsm_db</name> <modifier>*</modifier></type><name>pDb</name></decl></parameter>,
+  <parameter><decl><type><name>LogWriter</name> <modifier>*</modifier></type><name>pLog</name></decl></parameter>,
+  <parameter><decl><type><name>int</name></type> <name>nReq</name></decl></parameter>,
+  <parameter><decl><type><name>int</name> <modifier>*</modifier></type><name>pbJump</name></decl></parameter>
+)</parameter_list><block>{<block_content>
+  <comment type="block">/* Determine if it is necessary to add an LSM_LOG_JUMP to jump over the
+  ** jump region before writing the LSM_LOG_WRITE or DELETE record. This
+  ** is necessary if there is insufficient room between the current offset
+  ** and the jump region to fit the new WRITE/DELETE record and the largest
+  ** possible JUMP record with up to 7 bytes of padding (a total of 17 
+  ** bytes).  */</comment>
+  <if_stmt><if>if<condition>( <expr><operator>(</operator><name><name>pLog</name><operator>-&gt;</operator><name>jump</name><operator>.</operator><name>iStart</name></name> <operator>&gt;</operator> <operator>(</operator><name><name>pLog</name><operator>-&gt;</operator><name>iOff</name></name> <operator>+</operator> <name><name>pLog</name><operator>-&gt;</operator><name>buf</name><operator>.</operator><name>n</name></name><operator>)</operator><operator>)</operator>
+   <operator>&amp;&amp;</operator> <operator>(</operator><name><name>pLog</name><operator>-&gt;</operator><name>jump</name><operator>.</operator><name>iStart</name></name> <operator>&lt;</operator> <operator>(</operator><name><name>pLog</name><operator>-&gt;</operator><name>iOff</name></name> <operator>+</operator> <name><name>pLog</name><operator>-&gt;</operator><name>buf</name><operator>.</operator><name>n</name></name> <operator>+</operator> <operator>(</operator><name>nReq</name> <operator>+</operator> <literal type="number">17</literal><operator>)</operator><operator>)</operator><operator>)</operator></expr> 
+  )</condition><block>{<block_content>
+    <decl_stmt><decl><type><name>int</name></type> <name>rc</name></decl>;</decl_stmt>                       <comment type="block">/* Return code */</comment>
+    <decl_stmt><decl><type><name>i64</name></type> <name>iJump</name></decl>;</decl_stmt>                    <comment type="block">/* Offset to jump to */</comment>
+    <decl_stmt><decl><type><name>u8</name></type> <name><name>aJump</name><index>[<expr><literal type="number">10</literal></expr>]</index></name></decl>;</decl_stmt>                 <comment type="block">/* Encoded jump record */</comment>
+    <decl_stmt><decl><type><name>int</name></type> <name>nJump</name></decl>;</decl_stmt>                    <comment type="block">/* Valid bytes in aJump[] */</comment>
+    <decl_stmt><decl><type><name>int</name></type> <name>nPad</name></decl>;</decl_stmt>                     <comment type="block">/* Bytes of padding required */</comment>
+
+    <comment type="block">/* Serialize the JUMP record */</comment>
+    <expr_stmt><expr><name>iJump</name> <operator>=</operator> <name><name>pLog</name><operator>-&gt;</operator><name>jump</name><operator>.</operator><name>iEnd</name></name><operator>+</operator><literal type="number">1</literal></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>aJump</name><index>[<expr><literal type="number">0</literal></expr>]</index></name> <operator>=</operator> <name>LSM_LOG_JUMP</name></expr>;</expr_stmt>
+    <expr_stmt><expr><name>nJump</name> <operator>=</operator> <literal type="number">1</literal> <operator>+</operator> <call><name>lsmVarintPut64</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>aJump</name><index>[<expr><literal type="number">1</literal></expr>]</index></name></expr></argument>, <argument><expr><name>iJump</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+    <comment type="block">/* Adding padding to the contents of the buffer so that it will be a 
+    ** multiple of 8 bytes in size after the JUMP record is appended. This
+    ** is not strictly required, it just makes the keeping the running 
+    ** checksum up to date in this file a little simpler.  */</comment>
+    <expr_stmt><expr><name>nPad</name> <operator>=</operator> <operator>(</operator><name><name>pLog</name><operator>-&gt;</operator><name>buf</name><operator>.</operator><name>n</name></name> <operator>+</operator> <name>nJump</name><operator>)</operator> <operator>%</operator> <literal type="number">8</literal></expr>;</expr_stmt>
+    <if_stmt><if>if<condition>( <expr><name>nPad</name></expr> )</condition><block>{<block_content>
+      <decl_stmt><decl><type><name>u8</name></type> <name><name>aPad</name><index>[<expr><literal type="number">7</literal></expr>]</index></name> <init>= <expr><block>{<expr><literal type="number">0</literal></expr>,<expr><literal type="number">0</literal></expr>,<expr><literal type="number">0</literal></expr>,<expr><literal type="number">0</literal></expr>,<expr><literal type="number">0</literal></expr>,<expr><literal type="number">0</literal></expr>,<expr><literal type="number">0</literal></expr>}</block></expr></init></decl>;</decl_stmt>
+      <expr_stmt><expr><name>nPad</name> <operator>=</operator> <literal type="number">8</literal><operator>-</operator><name>nPad</name></expr>;</expr_stmt>
+      <if_stmt><if>if<condition>( <expr><name>nPad</name><operator>==</operator><literal type="number">1</literal></expr> )</condition><block>{<block_content>
+        <expr_stmt><expr><name><name>aPad</name><index>[<expr><literal type="number">0</literal></expr>]</index></name> <operator>=</operator> <name>LSM_LOG_PAD1</name></expr>;</expr_stmt>
+      </block_content>}</block></if><else>else<block>{<block_content>
+        <expr_stmt><expr><name><name>aPad</name><index>[<expr><literal type="number">0</literal></expr>]</index></name> <operator>=</operator> <name>LSM_LOG_PAD2</name></expr>;</expr_stmt>
+        <expr_stmt><expr><name><name>aPad</name><index>[<expr><literal type="number">1</literal></expr>]</index></name> <operator>=</operator> <operator>(</operator><name>u8</name><operator>)</operator><operator>(</operator><name>nPad</name><operator>-</operator><literal type="number">2</literal><operator>)</operator></expr>;</expr_stmt>
+      </block_content>}</block></else></if_stmt>
+      <expr_stmt><expr><name>rc</name> <operator>=</operator> <call><name>lsmStringBinAppend</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>pLog</name><operator>-&gt;</operator><name>buf</name></name></expr></argument>, <argument><expr><name>aPad</name></expr></argument>, <argument><expr><name>nPad</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+      <if_stmt><if>if<condition>( <expr><name>rc</name><operator>!=</operator><name>LSM_OK</name></expr> )</condition><block type="pseudo"><block_content> <return>return <expr><name>rc</name></expr>;</return></block_content></block></if></if_stmt>
+    </block_content>}</block></if></if_stmt>
+
+    <comment type="block">/* Append the JUMP record to the buffer. Then flush the buffer to disk
+    ** and update the checksums. The next write to the log file (assuming
+    ** there is no transaction rollback) will be to offset iJump (just past
+    ** the jump region).  */</comment>
+    <expr_stmt><expr><name>rc</name> <operator>=</operator> <call><name>lsmStringBinAppend</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>pLog</name><operator>-&gt;</operator><name>buf</name></name></expr></argument>, <argument><expr><name>aJump</name></expr></argument>, <argument><expr><name>nJump</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <if_stmt><if>if<condition>( <expr><name>rc</name><operator>!=</operator><name>LSM_OK</name></expr> )</condition><block type="pseudo"><block_content> <return>return <expr><name>rc</name></expr>;</return></block_content></block></if></if_stmt>
+    <expr_stmt><expr><call><name>assert</name><argument_list>( <argument><expr><operator>(</operator><name><name>pLog</name><operator>-&gt;</operator><name>buf</name><operator>.</operator><name>n</name></name> <operator>%</operator> <literal type="number">8</literal><operator>)</operator><operator>==</operator><literal type="number">0</literal></expr></argument> )</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><name>rc</name> <operator>=</operator> <call><name>lsmFsWriteLog</name><argument_list>(<argument><expr><name><name>pDb</name><operator>-&gt;</operator><name>pFS</name></name></expr></argument>, <argument><expr><name><name>pLog</name><operator>-&gt;</operator><name>iOff</name></name></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>pLog</name><operator>-&gt;</operator><name>buf</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <if_stmt><if>if<condition>( <expr><name>rc</name><operator>!=</operator><name>LSM_OK</name></expr> )</condition><block type="pseudo"><block_content> <return>return <expr><name>rc</name></expr>;</return></block_content></block></if></if_stmt>
+    <expr_stmt><expr><call><name>logUpdateCksum</name><argument_list>(<argument><expr><name>pLog</name></expr></argument>, <argument><expr><name><name>pLog</name><operator>-&gt;</operator><name>buf</name><operator>.</operator><name>n</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>pLog</name><operator>-&gt;</operator><name>iRegion1End</name></name> <operator>=</operator> <operator>(</operator><name><name>pLog</name><operator>-&gt;</operator><name>iOff</name></name> <operator>+</operator> <name><name>pLog</name><operator>-&gt;</operator><name>buf</name><operator>.</operator><name>n</name></name><operator>)</operator></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>pLog</name><operator>-&gt;</operator><name>iRegion2Start</name></name> <operator>=</operator> <name>iJump</name></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>pLog</name><operator>-&gt;</operator><name>iOff</name></name> <operator>=</operator> <name>iJump</name></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>pLog</name><operator>-&gt;</operator><name>iCksumBuf</name></name> <operator>=</operator> <name><name>pLog</name><operator>-&gt;</operator><name>buf</name><operator>.</operator><name>n</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+    <if_stmt><if>if<condition>( <expr><name>pbJump</name></expr> )</condition><block type="pseudo"><block_content> <expr_stmt><expr><operator>*</operator><name>pbJump</name> <operator>=</operator> <literal type="number">1</literal></expr>;</expr_stmt></block_content></block></if></if_stmt>
+  </block_content>}</block></if></if_stmt>
+
+  <return>return <expr><name>LSM_OK</name></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><specifier>static</specifier> <name>int</name></type> <name>logCksumAndFlush</name><parameter_list>(<parameter><decl><type><name>lsm_db</name> <modifier>*</modifier></type><name>pDb</name></decl></parameter>)</parameter_list><block>{<block_content>
+  <decl_stmt><decl><type><name>int</name></type> <name>rc</name></decl>;</decl_stmt>                         <comment type="block">/* Return code */</comment>
+  <decl_stmt><decl><type><name>LogWriter</name> <modifier>*</modifier></type><name>pLog</name> <init>= <expr><name><name>pDb</name><operator>-&gt;</operator><name>pLogWriter</name></name></expr></init></decl>;</decl_stmt>
+
+  <comment type="block">/* Calculate the checksum value. Append it to the buffer. */</comment>
+  <expr_stmt><expr><call><name>logUpdateCksum</name><argument_list>(<argument><expr><name>pLog</name></expr></argument>, <argument><expr><name><name>pLog</name><operator>-&gt;</operator><name>buf</name><operator>.</operator><name>n</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><call><name>lsmPutU32</name><argument_list>(<argument><expr><operator>(</operator><name>u8</name> <operator>*</operator><operator>)</operator><operator>&amp;</operator><name><name>pLog</name><operator>-&gt;</operator><name>buf</name><operator>.</operator><name>z</name><index>[<expr><name><name>pLog</name><operator>-&gt;</operator><name>buf</name><operator>.</operator><name>n</name></name></expr>]</index></name></expr></argument>, <argument><expr><name><name>pLog</name><operator>-&gt;</operator><name>cksum0</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><name><name>pLog</name><operator>-&gt;</operator><name>buf</name><operator>.</operator><name>n</name></name> <operator>+=</operator> <literal type="number">4</literal></expr>;</expr_stmt>
+  <expr_stmt><expr><call><name>lsmPutU32</name><argument_list>(<argument><expr><operator>(</operator><name>u8</name> <operator>*</operator><operator>)</operator><operator>&amp;</operator><name><name>pLog</name><operator>-&gt;</operator><name>buf</name><operator>.</operator><name>z</name><index>[<expr><name><name>pLog</name><operator>-&gt;</operator><name>buf</name><operator>.</operator><name>n</name></name></expr>]</index></name></expr></argument>, <argument><expr><name><name>pLog</name><operator>-&gt;</operator><name>cksum1</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><name><name>pLog</name><operator>-&gt;</operator><name>buf</name><operator>.</operator><name>n</name></name> <operator>+=</operator> <literal type="number">4</literal></expr>;</expr_stmt>
+
+  <comment type="block">/* Write the contents of the buffer to disk. */</comment>
+  <expr_stmt><expr><name>rc</name> <operator>=</operator> <call><name>lsmFsWriteLog</name><argument_list>(<argument><expr><name><name>pDb</name><operator>-&gt;</operator><name>pFS</name></name></expr></argument>, <argument><expr><name><name>pLog</name><operator>-&gt;</operator><name>iOff</name></name></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>pLog</name><operator>-&gt;</operator><name>buf</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><name><name>pLog</name><operator>-&gt;</operator><name>iOff</name></name> <operator>+=</operator> <name><name>pLog</name><operator>-&gt;</operator><name>buf</name><operator>.</operator><name>n</name></name></expr>;</expr_stmt>
+  <expr_stmt><expr><name><name>pLog</name><operator>-&gt;</operator><name>iCksumBuf</name></name> <operator>=</operator> <name><name>pLog</name><operator>-&gt;</operator><name>buf</name><operator>.</operator><name>n</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+
+  <return>return <expr><name>rc</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+** Write the contents of the log-buffer to disk. Then write either a CKSUM
+** or COMMIT record, depending on the value of parameter eType.
+*/</comment>
+<function><type><specifier>static</specifier> <name>int</name></type> <name>logFlush</name><parameter_list>(<parameter><decl><type><name>lsm_db</name> <modifier>*</modifier></type><name>pDb</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>eType</name></decl></parameter>)</parameter_list><block>{<block_content>
+  <decl_stmt><decl><type><name>int</name></type> <name>rc</name></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>int</name></type> <name>nReq</name></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>LogWriter</name> <modifier>*</modifier></type><name>pLog</name> <init>= <expr><name><name>pDb</name><operator>-&gt;</operator><name>pLogWriter</name></name></expr></init></decl>;</decl_stmt>
+  
+  <expr_stmt><expr><call><name>assert</name><argument_list>( <argument><expr><name>eType</name><operator>==</operator><name>LSM_LOG_COMMIT</name></expr></argument> )</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><call><name>assert</name><argument_list>( <argument><expr><name>pLog</name></expr></argument> )</argument_list></call></expr>;</expr_stmt>
+
+  <comment type="block">/* Commit record is always 9 bytes in size. */</comment>
+  <expr_stmt><expr><name>nReq</name> <operator>=</operator> <literal type="number">9</literal></expr>;</expr_stmt>
+  <if_stmt><if>if<condition>( <expr><name>eType</name><operator>==</operator><name>LSM_LOG_COMMIT</name> <operator>&amp;&amp;</operator> <name><name>pLog</name><operator>-&gt;</operator><name>szSector</name></name><operator>&gt;</operator><literal type="number">1</literal></expr> )</condition><block type="pseudo"><block_content> <expr_stmt><expr><name>nReq</name> <operator>+=</operator> <name><name>pLog</name><operator>-&gt;</operator><name>szSector</name></name> <operator>+</operator> <literal type="number">17</literal></expr>;</expr_stmt></block_content></block></if></if_stmt>
+  <expr_stmt><expr><name>rc</name> <operator>=</operator> <call><name>jumpIfRequired</name><argument_list>(<argument><expr><name>pDb</name></expr></argument>, <argument><expr><name>pLog</name></expr></argument>, <argument><expr><name>nReq</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+  <comment type="block">/* If this is a COMMIT, add padding to the log so that the COMMIT record
+  ** is aligned against the end of a disk sector. In other words, add padding
+  ** so that the first byte following the COMMIT record lies on a different
+  ** sector.  */</comment>
+  <if_stmt><if>if<condition>( <expr><name>eType</name><operator>==</operator><name>LSM_LOG_COMMIT</name> <operator>&amp;&amp;</operator> <name><name>pLog</name><operator>-&gt;</operator><name>szSector</name></name><operator>&gt;</operator><literal type="number">1</literal></expr> )</condition><block>{<block_content>
+    <decl_stmt><decl><type><name>int</name></type> <name>nPad</name></decl>;</decl_stmt>                     <comment type="block">/* Bytes of padding to add */</comment>
+
+    <comment type="block">/* Determine the value of nPad. */</comment>
+    <expr_stmt><expr><name>nPad</name> <operator>=</operator> <operator>(</operator><operator>(</operator><name><name>pLog</name><operator>-&gt;</operator><name>iOff</name></name> <operator>+</operator> <name><name>pLog</name><operator>-&gt;</operator><name>buf</name><operator>.</operator><name>n</name></name> <operator>+</operator> <literal type="number">9</literal><operator>)</operator> <operator>%</operator> <name><name>pLog</name><operator>-&gt;</operator><name>szSector</name></name><operator>)</operator></expr>;</expr_stmt>
+    <if_stmt><if>if<condition>( <expr><name>nPad</name></expr> )</condition><block type="pseudo"><block_content> <expr_stmt><expr><name>nPad</name> <operator>=</operator> <name><name>pLog</name><operator>-&gt;</operator><name>szSector</name></name> <operator>-</operator> <name>nPad</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+    <expr_stmt><expr><name>rc</name> <operator>=</operator> <call><name>lsmStringExtend</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>pLog</name><operator>-&gt;</operator><name>buf</name></name></expr></argument>, <argument><expr><name>nPad</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <if_stmt><if>if<condition>( <expr><name>rc</name><operator>!=</operator><name>LSM_OK</name></expr> )</condition><block type="pseudo"><block_content> <return>return <expr><name>rc</name></expr>;</return></block_content></block></if></if_stmt>
+
+    <while>while<condition>( <expr><name>nPad</name></expr> )</condition><block>{<block_content>
+      <if_stmt><if>if<condition>( <expr><name>nPad</name><operator>==</operator><literal type="number">1</literal></expr> )</condition><block>{<block_content>
+        <expr_stmt><expr><name><name>pLog</name><operator>-&gt;</operator><name>buf</name><operator>.</operator><name>z</name><index>[<expr><name><name>pLog</name><operator>-&gt;</operator><name>buf</name><operator>.</operator><name>n</name></name><operator>++</operator></expr>]</index></name> <operator>=</operator> <name>LSM_LOG_PAD1</name></expr>;</expr_stmt>
+        <expr_stmt><expr><name>nPad</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+      </block_content>}</block></if><else>else<block>{<block_content>
+        <decl_stmt><decl><type><name>int</name></type> <name>n</name> <init>= <expr><call><name>LSM_MIN</name><argument_list>(<argument><expr><literal type="number">200</literal></expr></argument>, <argument><expr><name>nPad</name><operator>-</operator><literal type="number">2</literal></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+        <expr_stmt><expr><name><name>pLog</name><operator>-&gt;</operator><name>buf</name><operator>.</operator><name>z</name><index>[<expr><name><name>pLog</name><operator>-&gt;</operator><name>buf</name><operator>.</operator><name>n</name></name><operator>++</operator></expr>]</index></name> <operator>=</operator> <name>LSM_LOG_PAD2</name></expr>;</expr_stmt>
+        <expr_stmt><expr><name><name>pLog</name><operator>-&gt;</operator><name>buf</name><operator>.</operator><name>z</name><index>[<expr><name><name>pLog</name><operator>-&gt;</operator><name>buf</name><operator>.</operator><name>n</name></name><operator>++</operator></expr>]</index></name> <operator>=</operator> <operator>(</operator><name>char</name><operator>)</operator><name>n</name></expr>;</expr_stmt>
+        <expr_stmt><expr><name>nPad</name> <operator>-=</operator> <literal type="number">2</literal></expr>;</expr_stmt>
+        <expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>pLog</name><operator>-&gt;</operator><name>buf</name><operator>.</operator><name>z</name><index>[<expr><name><name>pLog</name><operator>-&gt;</operator><name>buf</name><operator>.</operator><name>n</name></name></expr>]</index></name></expr></argument>, <argument><expr><literal type="number">0x2B</literal></expr></argument>, <argument><expr><name>n</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <expr_stmt><expr><name><name>pLog</name><operator>-&gt;</operator><name>buf</name><operator>.</operator><name>n</name></name> <operator>+=</operator> <name>n</name></expr>;</expr_stmt>
+        <expr_stmt><expr><name>nPad</name> <operator>-=</operator> <name>n</name></expr>;</expr_stmt>
+      </block_content>}</block></else></if_stmt>
+    </block_content>}</block></while>
+  </block_content>}</block></if></if_stmt>
+
+  <comment type="block">/* Make sure there is room in the log-buffer to add the CKSUM or COMMIT
+  ** record. Then add the first byte of it.  */</comment>
+  <expr_stmt><expr><name>rc</name> <operator>=</operator> <call><name>lsmStringExtend</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>pLog</name><operator>-&gt;</operator><name>buf</name></name></expr></argument>, <argument><expr><literal type="number">9</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <if_stmt><if>if<condition>( <expr><name>rc</name><operator>!=</operator><name>LSM_OK</name></expr> )</condition><block type="pseudo"><block_content> <return>return <expr><name>rc</name></expr>;</return></block_content></block></if></if_stmt>
+  <expr_stmt><expr><name><name>pLog</name><operator>-&gt;</operator><name>buf</name><operator>.</operator><name>z</name><index>[<expr><name><name>pLog</name><operator>-&gt;</operator><name>buf</name><operator>.</operator><name>n</name></name><operator>++</operator></expr>]</index></name> <operator>=</operator> <operator>(</operator><name>char</name><operator>)</operator><name>eType</name></expr>;</expr_stmt>
+  <expr_stmt><expr><call><name>memset</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>pLog</name><operator>-&gt;</operator><name>buf</name><operator>.</operator><name>z</name><index>[<expr><name><name>pLog</name><operator>-&gt;</operator><name>buf</name><operator>.</operator><name>n</name></name></expr>]</index></name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><literal type="number">8</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+  <expr_stmt><expr><name>rc</name> <operator>=</operator> <call><name>logCksumAndFlush</name><argument_list>(<argument><expr><name>pDb</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+  <comment type="block">/* If this is a commit and synchronous=full, sync the log to disk. */</comment>
+  <if_stmt><if>if<condition>( <expr><name>rc</name><operator>==</operator><name>LSM_OK</name> <operator>&amp;&amp;</operator> <name>eType</name><operator>==</operator><name>LSM_LOG_COMMIT</name> <operator>&amp;&amp;</operator> <name><name>pDb</name><operator>-&gt;</operator><name>eSafety</name></name><operator>==</operator><name>LSM_SAFETY_FULL</name></expr> )</condition><block>{<block_content>
+    <expr_stmt><expr><name>rc</name> <operator>=</operator> <call><name>lsmFsSyncLog</name><argument_list>(<argument><expr><name><name>pDb</name><operator>-&gt;</operator><name>pFS</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  </block_content>}</block></if></if_stmt>
+  <return>return <expr><name>rc</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+** Append an LSM_LOG_WRITE (if nVal&gt;=0) or LSM_LOG_DELETE (if nVal&lt;0) 
+** record to the database log.
+*/</comment>
+<function><type><name>int</name></type> <name>lsmLogWrite</name><parameter_list>(
+  <parameter><decl><type><name>lsm_db</name> <modifier>*</modifier></type><name>pDb</name></decl></parameter>,                    <comment type="block">/* Database handle */</comment>
+  <parameter><decl><type><name>int</name></type> <name>eType</name></decl></parameter>,
+  <parameter><decl><type><name>void</name> <modifier>*</modifier></type><name>pKey</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>nKey</name></decl></parameter>,           <comment type="block">/* Database key to write to log */</comment>
+  <parameter><decl><type><name>void</name> <modifier>*</modifier></type><name>pVal</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>nVal</name></decl></parameter>            <comment type="block">/* Database value (or nVal&lt;0) to write */</comment>
+)</parameter_list><block>{<block_content>
+  <decl_stmt><decl><type><name>int</name></type> <name>rc</name> <init>= <expr><name>LSM_OK</name></expr></init></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>LogWriter</name> <modifier>*</modifier></type><name>pLog</name></decl>;</decl_stmt>                <comment type="block">/* Log object to write to */</comment>
+  <decl_stmt><decl><type><name>int</name></type> <name>nReq</name></decl>;</decl_stmt>                       <comment type="block">/* Bytes of space required in log */</comment>
+  <decl_stmt><decl><type><name>int</name></type> <name>bCksum</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>                 <comment type="block">/* True to embed a checksum in this record */</comment>
+
+  <expr_stmt><expr><call><name>assert</name><argument_list>( <argument><expr><name>eType</name><operator>==</operator><name>LSM_WRITE</name> <operator>||</operator> <name>eType</name><operator>==</operator><name>LSM_DELETE</name> <operator>||</operator> <name>eType</name><operator>==</operator><name>LSM_DRANGE</name></expr></argument> )</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><call><name>assert</name><argument_list>( <argument><expr><name>LSM_LOG_WRITE</name><operator>==</operator><name>LSM_WRITE</name></expr></argument> )</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><call><name>assert</name><argument_list>( <argument><expr><name>LSM_LOG_DELETE</name><operator>==</operator><name>LSM_DELETE</name></expr></argument> )</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><call><name>assert</name><argument_list>( <argument><expr><name>LSM_LOG_DRANGE</name><operator>==</operator><name>LSM_DRANGE</name></expr></argument> )</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><call><name>assert</name><argument_list>( <argument><expr><operator>(</operator><name>eType</name><operator>==</operator><name>LSM_LOG_DELETE</name><operator>)</operator><operator>==</operator><operator>(</operator><name>nVal</name><operator>&lt;</operator><literal type="number">0</literal><operator>)</operator></expr></argument> )</argument_list></call></expr>;</expr_stmt>
+
+  <if_stmt><if>if<condition>( <expr><name><name>pDb</name><operator>-&gt;</operator><name>bUseLog</name></name><operator>==</operator><literal type="number">0</literal></expr> )</condition><block type="pseudo"><block_content> <return>return <expr><name>LSM_OK</name></expr>;</return></block_content></block></if></if_stmt>
+  <expr_stmt><expr><name>pLog</name> <operator>=</operator> <name><name>pDb</name><operator>-&gt;</operator><name>pLogWriter</name></name></expr>;</expr_stmt>
+
+  <comment type="block">/* Determine how many bytes of space are required, assuming that a checksum
+  ** will be embedded in this record (even though it may not be).  */</comment>
+  <expr_stmt><expr><name>nReq</name> <operator>=</operator> <literal type="number">1</literal> <operator>+</operator> <call><name>lsmVarintLen32</name><argument_list>(<argument><expr><name>nKey</name></expr></argument>)</argument_list></call> <operator>+</operator> <literal type="number">8</literal> <operator>+</operator> <name>nKey</name></expr>;</expr_stmt>
+  <if_stmt><if>if<condition>( <expr><name>eType</name><operator>!=</operator><name>LSM_LOG_DELETE</name></expr> )</condition><block type="pseudo"><block_content> <expr_stmt><expr><name>nReq</name> <operator>+=</operator> <call><name>lsmVarintLen32</name><argument_list>(<argument><expr><name>nVal</name></expr></argument>)</argument_list></call> <operator>+</operator> <name>nVal</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+  <comment type="block">/* Jump over the jump region if required. Set bCksum to true to tell the
+  ** code below to include a checksum in the record if either (a) writing
+  ** this record would mean that more than LSM_CKSUM_MAXDATA bytes of data
+  ** have been written to the log since the last checksum, or (b) the jump
+  ** is taken.  */</comment>
+  <expr_stmt><expr><name>rc</name> <operator>=</operator> <call><name>jumpIfRequired</name><argument_list>(<argument><expr><name>pDb</name></expr></argument>, <argument><expr><name>pLog</name></expr></argument>, <argument><expr><name>nReq</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>bCksum</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <if_stmt><if>if<condition>( <expr><operator>(</operator><name><name>pLog</name><operator>-&gt;</operator><name>buf</name><operator>.</operator><name>n</name></name><operator>+</operator><name>nReq</name><operator>)</operator> <operator>&gt;</operator> <name>LSM_CKSUM_MAXDATA</name></expr> )</condition><block type="pseudo"><block_content> <expr_stmt><expr><name>bCksum</name> <operator>=</operator> <literal type="number">1</literal></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+  <if_stmt><if>if<condition>( <expr><name>rc</name><operator>==</operator><name>LSM_OK</name></expr> )</condition><block>{<block_content>
+    <expr_stmt><expr><name>rc</name> <operator>=</operator> <call><name>lsmStringExtend</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>pLog</name><operator>-&gt;</operator><name>buf</name></name></expr></argument>, <argument><expr><name>nReq</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  </block_content>}</block></if></if_stmt>
+  <if_stmt><if>if<condition>( <expr><name>rc</name><operator>==</operator><name>LSM_OK</name></expr> )</condition><block>{<block_content>
+    <decl_stmt><decl><type><name>u8</name> <modifier>*</modifier></type><name>a</name> <init>= <expr><operator>(</operator><name>u8</name> <operator>*</operator><operator>)</operator><operator>&amp;</operator><name><name>pLog</name><operator>-&gt;</operator><name>buf</name><operator>.</operator><name>z</name><index>[<expr><name><name>pLog</name><operator>-&gt;</operator><name>buf</name><operator>.</operator><name>n</name></name></expr>]</index></name></expr></init></decl>;</decl_stmt>
+    
+    <comment type="block">/* Write the record header - the type byte followed by either 1 (for
+    ** DELETE) or 2 (for WRITE) varints.  */</comment>
+    <expr_stmt><expr><call><name>assert</name><argument_list>( <argument><expr><name>LSM_LOG_WRITE_CKSUM</name> <operator>==</operator> <operator>(</operator><name>LSM_LOG_WRITE</name> <operator>|</operator> <literal type="number">0x0001</literal><operator>)</operator></expr></argument> )</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><call><name>assert</name><argument_list>( <argument><expr><name>LSM_LOG_DELETE_CKSUM</name> <operator>==</operator> <operator>(</operator><name>LSM_LOG_DELETE</name> <operator>|</operator> <literal type="number">0x0001</literal><operator>)</operator></expr></argument> )</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><call><name>assert</name><argument_list>( <argument><expr><name>LSM_LOG_DRANGE_CKSUM</name> <operator>==</operator> <operator>(</operator><name>LSM_LOG_DRANGE</name> <operator>|</operator> <literal type="number">0x0001</literal><operator>)</operator></expr></argument> )</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><operator>*</operator><operator>(</operator><name>a</name><operator>++</operator><operator>)</operator> <operator>=</operator> <operator>(</operator><name>u8</name><operator>)</operator><name>eType</name> <operator>|</operator> <operator>(</operator><name>u8</name><operator>)</operator><name>bCksum</name></expr>;</expr_stmt>
+    <expr_stmt><expr><name>a</name> <operator>+=</operator> <call><name>lsmVarintPut32</name><argument_list>(<argument><expr><name>a</name></expr></argument>, <argument><expr><name>nKey</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <if_stmt><if>if<condition>( <expr><name>eType</name><operator>!=</operator><name>LSM_LOG_DELETE</name></expr> )</condition><block type="pseudo"><block_content> <expr_stmt><expr><name>a</name> <operator>+=</operator> <call><name>lsmVarintPut32</name><argument_list>(<argument><expr><name>a</name></expr></argument>, <argument><expr><name>nVal</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+    <if_stmt><if>if<condition>( <expr><name>bCksum</name></expr> )</condition><block>{<block_content>
+      <expr_stmt><expr><name><name>pLog</name><operator>-&gt;</operator><name>buf</name><operator>.</operator><name>n</name></name> <operator>=</operator> <operator>(</operator><name>a</name> <operator>-</operator> <operator>(</operator><name>u8</name> <operator>*</operator><operator>)</operator><name><name>pLog</name><operator>-&gt;</operator><name>buf</name><operator>.</operator><name>z</name></name><operator>)</operator></expr>;</expr_stmt>
+      <expr_stmt><expr><name>rc</name> <operator>=</operator> <call><name>logCksumAndFlush</name><argument_list>(<argument><expr><name>pDb</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+      <expr_stmt><expr><name>a</name> <operator>=</operator> <operator>(</operator><name>u8</name> <operator>*</operator><operator>)</operator><operator>&amp;</operator><name><name>pLog</name><operator>-&gt;</operator><name>buf</name><operator>.</operator><name>z</name><index>[<expr><name><name>pLog</name><operator>-&gt;</operator><name>buf</name><operator>.</operator><name>n</name></name></expr>]</index></name></expr>;</expr_stmt>
+    </block_content>}</block></if></if_stmt>
+
+    <expr_stmt><expr><call><name>memcpy</name><argument_list>(<argument><expr><name>a</name></expr></argument>, <argument><expr><name>pKey</name></expr></argument>, <argument><expr><name>nKey</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><name>a</name> <operator>+=</operator> <name>nKey</name></expr>;</expr_stmt>
+    <if_stmt><if>if<condition>( <expr><name>eType</name><operator>!=</operator><name>LSM_LOG_DELETE</name></expr> )</condition><block>{<block_content>
+      <expr_stmt><expr><call><name>memcpy</name><argument_list>(<argument><expr><name>a</name></expr></argument>, <argument><expr><name>pVal</name></expr></argument>, <argument><expr><name>nVal</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+      <expr_stmt><expr><name>a</name> <operator>+=</operator> <name>nVal</name></expr>;</expr_stmt>
+    </block_content>}</block></if></if_stmt>
+    <expr_stmt><expr><name><name>pLog</name><operator>-&gt;</operator><name>buf</name><operator>.</operator><name>n</name></name> <operator>=</operator> <name>a</name> <operator>-</operator> <operator>(</operator><name>u8</name> <operator>*</operator><operator>)</operator><name><name>pLog</name><operator>-&gt;</operator><name>buf</name><operator>.</operator><name>z</name></name></expr>;</expr_stmt>
+    <expr_stmt><expr><call><name>assert</name><argument_list>( <argument><expr><name><name>pLog</name><operator>-&gt;</operator><name>buf</name><operator>.</operator><name>n</name></name><operator>&lt;=</operator><name><name>pLog</name><operator>-&gt;</operator><name>buf</name><operator>.</operator><name>nAlloc</name></name></expr></argument> )</argument_list></call></expr>;</expr_stmt>
+  </block_content>}</block></if></if_stmt>
+
+  <return>return <expr><name>rc</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+** Append an LSM_LOG_COMMIT record to the database log.
+*/</comment>
+<function><type><name>int</name></type> <name>lsmLogCommit</name><parameter_list>(<parameter><decl><type><name>lsm_db</name> <modifier>*</modifier></type><name>pDb</name></decl></parameter>)</parameter_list><block>{<block_content>
+  <if_stmt><if>if<condition>( <expr><name><name>pDb</name><operator>-&gt;</operator><name>bUseLog</name></name><operator>==</operator><literal type="number">0</literal></expr> )</condition><block type="pseudo"><block_content> <return>return <expr><name>LSM_OK</name></expr>;</return></block_content></block></if></if_stmt>
+  <return>return <expr><call><name>logFlush</name><argument_list>(<argument><expr><name>pDb</name></expr></argument>, <argument><expr><name>LSM_LOG_COMMIT</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+** Store the current offset and other checksum related information in the
+** structure *pMark. Later, *pMark can be passed to lsmLogSeek() to "rewind"
+** the LogWriter object to the current log file offset. This is used when
+** rolling back savepoint transactions.
+*/</comment>
+<function><type><name>void</name></type> <name>lsmLogTell</name><parameter_list>(
+  <parameter><decl><type><name>lsm_db</name> <modifier>*</modifier></type><name>pDb</name></decl></parameter>,                    <comment type="block">/* Database handle */</comment>
+  <parameter><decl><type><name>LogMark</name> <modifier>*</modifier></type><name>pMark</name></decl></parameter>                  <comment type="block">/* Populate this object with current offset */</comment>
+)</parameter_list><block>{<block_content>
+  <decl_stmt><decl><type><name>LogWriter</name> <modifier>*</modifier></type><name>pLog</name></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>int</name></type> <name>nCksum</name></decl>;</decl_stmt>
+
+  <if_stmt><if>if<condition>( <expr><name><name>pDb</name><operator>-&gt;</operator><name>bUseLog</name></name><operator>==</operator><literal type="number">0</literal></expr> )</condition><block type="pseudo"><block_content> <return>return;</return></block_content></block></if></if_stmt>
+  <expr_stmt><expr><name>pLog</name> <operator>=</operator> <name><name>pDb</name><operator>-&gt;</operator><name>pLogWriter</name></name></expr>;</expr_stmt>
+  <expr_stmt><expr><name>nCksum</name> <operator>=</operator> <name><name>pLog</name><operator>-&gt;</operator><name>buf</name><operator>.</operator><name>n</name></name> <operator>&amp;</operator> <literal type="number">0xFFFFFFF8</literal></expr>;</expr_stmt>
+  <expr_stmt><expr><call><name>logUpdateCksum</name><argument_list>(<argument><expr><name>pLog</name></expr></argument>, <argument><expr><name>nCksum</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><call><name>assert</name><argument_list>( <argument><expr><name><name>pLog</name><operator>-&gt;</operator><name>iCksumBuf</name></name><operator>==</operator><name>nCksum</name></expr></argument> )</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><name><name>pMark</name><operator>-&gt;</operator><name>nBuf</name></name> <operator>=</operator> <name><name>pLog</name><operator>-&gt;</operator><name>buf</name><operator>.</operator><name>n</name></name> <operator>-</operator> <name>nCksum</name></expr>;</expr_stmt>
+  <expr_stmt><expr><call><name>memcpy</name><argument_list>(<argument><expr><name><name>pMark</name><operator>-&gt;</operator><name>aBuf</name></name></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>pLog</name><operator>-&gt;</operator><name>buf</name><operator>.</operator><name>z</name><index>[<expr><name>nCksum</name></expr>]</index></name></expr></argument>, <argument><expr><name><name>pMark</name><operator>-&gt;</operator><name>nBuf</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+  <expr_stmt><expr><name><name>pMark</name><operator>-&gt;</operator><name>iOff</name></name> <operator>=</operator> <name><name>pLog</name><operator>-&gt;</operator><name>iOff</name></name> <operator>+</operator> <name><name>pLog</name><operator>-&gt;</operator><name>buf</name><operator>.</operator><name>n</name></name></expr>;</expr_stmt>
+  <expr_stmt><expr><name><name>pMark</name><operator>-&gt;</operator><name>cksum0</name></name> <operator>=</operator> <name><name>pLog</name><operator>-&gt;</operator><name>cksum0</name></name></expr>;</expr_stmt>
+  <expr_stmt><expr><name><name>pMark</name><operator>-&gt;</operator><name>cksum1</name></name> <operator>=</operator> <name><name>pLog</name><operator>-&gt;</operator><name>cksum1</name></name></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+** Seek (rewind) back to the log file offset stored by an ealier call to
+** lsmLogTell() in *pMark.
+*/</comment>
+<function><type><name>void</name></type> <name>lsmLogSeek</name><parameter_list>(
+  <parameter><decl><type><name>lsm_db</name> <modifier>*</modifier></type><name>pDb</name></decl></parameter>,                    <comment type="block">/* Database handle */</comment>
+  <parameter><decl><type><name>LogMark</name> <modifier>*</modifier></type><name>pMark</name></decl></parameter>                  <comment type="block">/* Object containing log offset to seek to */</comment>
+)</parameter_list><block>{<block_content>
+  <decl_stmt><decl><type><name>LogWriter</name> <modifier>*</modifier></type><name>pLog</name></decl>;</decl_stmt>
+
+  <if_stmt><if>if<condition>( <expr><name><name>pDb</name><operator>-&gt;</operator><name>bUseLog</name></name><operator>==</operator><literal type="number">0</literal></expr> )</condition><block type="pseudo"><block_content> <return>return;</return></block_content></block></if></if_stmt>
+  <expr_stmt><expr><name>pLog</name> <operator>=</operator> <name><name>pDb</name><operator>-&gt;</operator><name>pLogWriter</name></name></expr>;</expr_stmt>
+
+  <expr_stmt><expr><call><name>assert</name><argument_list>( <argument><expr><name><name>pMark</name><operator>-&gt;</operator><name>iOff</name></name><operator>&lt;=</operator><name><name>pLog</name><operator>-&gt;</operator><name>iOff</name></name><operator>+</operator><name><name>pLog</name><operator>-&gt;</operator><name>buf</name><operator>.</operator><name>n</name></name></expr></argument> )</argument_list></call></expr>;</expr_stmt>
+  <if_stmt><if>if<condition>( <expr><operator>(</operator><name><name>pMark</name><operator>-&gt;</operator><name>iOff</name></name> <operator>&amp;</operator> <literal type="number">0xFFFFFFF8</literal><operator>)</operator><operator>&gt;=</operator><name><name>pLog</name><operator>-&gt;</operator><name>iOff</name></name></expr> )</condition><block>{<block_content>
+    <expr_stmt><expr><name><name>pLog</name><operator>-&gt;</operator><name>buf</name><operator>.</operator><name>n</name></name> <operator>=</operator> <operator>(</operator><name>int</name><operator>)</operator><operator>(</operator><name><name>pMark</name><operator>-&gt;</operator><name>iOff</name></name> <operator>-</operator> <name><name>pLog</name><operator>-&gt;</operator><name>iOff</name></name><operator>)</operator></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>pLog</name><operator>-&gt;</operator><name>iCksumBuf</name></name> <operator>=</operator> <operator>(</operator><name><name>pLog</name><operator>-&gt;</operator><name>buf</name><operator>.</operator><name>n</name></name> <operator>&amp;</operator> <literal type="number">0xFFFFFFF8</literal><operator>)</operator></expr>;</expr_stmt>
+  </block_content>}</block></if><else>else<block>{<block_content>
+    <expr_stmt><expr><name><name>pLog</name><operator>-&gt;</operator><name>buf</name><operator>.</operator><name>n</name></name> <operator>=</operator> <name><name>pMark</name><operator>-&gt;</operator><name>nBuf</name></name></expr>;</expr_stmt>
+    <expr_stmt><expr><call><name>memcpy</name><argument_list>(<argument><expr><name><name>pLog</name><operator>-&gt;</operator><name>buf</name><operator>.</operator><name>z</name></name></expr></argument>, <argument><expr><name><name>pMark</name><operator>-&gt;</operator><name>aBuf</name></name></expr></argument>, <argument><expr><name><name>pMark</name><operator>-&gt;</operator><name>nBuf</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>pLog</name><operator>-&gt;</operator><name>iCksumBuf</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>pLog</name><operator>-&gt;</operator><name>iOff</name></name> <operator>=</operator> <name><name>pMark</name><operator>-&gt;</operator><name>iOff</name></name> <operator>-</operator> <name><name>pMark</name><operator>-&gt;</operator><name>nBuf</name></name></expr>;</expr_stmt>
+  </block_content>}</block></else></if_stmt>
+  <expr_stmt><expr><name><name>pLog</name><operator>-&gt;</operator><name>cksum0</name></name> <operator>=</operator> <name><name>pMark</name><operator>-&gt;</operator><name>cksum0</name></name></expr>;</expr_stmt>
+  <expr_stmt><expr><name><name>pLog</name><operator>-&gt;</operator><name>cksum1</name></name> <operator>=</operator> <name><name>pMark</name><operator>-&gt;</operator><name>cksum1</name></name></expr>;</expr_stmt>
+
+  <if_stmt><if>if<condition>( <expr><name><name>pMark</name><operator>-&gt;</operator><name>iOff</name></name> <operator>&gt;</operator> <name><name>pLog</name><operator>-&gt;</operator><name>iRegion1End</name></name></expr> )</condition><block type="pseudo"><block_content> <expr_stmt><expr><name><name>pLog</name><operator>-&gt;</operator><name>iRegion1End</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt></block_content></block></if></if_stmt>
+  <if_stmt><if>if<condition>( <expr><name><name>pMark</name><operator>-&gt;</operator><name>iOff</name></name> <operator>&gt;</operator> <name><name>pLog</name><operator>-&gt;</operator><name>iRegion2Start</name></name></expr> )</condition><block type="pseudo"><block_content> <expr_stmt><expr><name><name>pLog</name><operator>-&gt;</operator><name>iRegion2Start</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt></block_content></block></if></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+** This function does the work for an lsm_info(LOG_STRUCTURE) request.
+*/</comment>
+<function><type><name>int</name></type> <name>lsmInfoLogStructure</name><parameter_list>(<parameter><decl><type><name>lsm_db</name> <modifier>*</modifier></type><name>pDb</name></decl></parameter>, <parameter><decl><type><name>char</name> <modifier>*</modifier><modifier>*</modifier></type><name>pzVal</name></decl></parameter>)</parameter_list><block>{<block_content>
+  <decl_stmt><decl><type><name>int</name></type> <name>rc</name> <init>= <expr><name>LSM_OK</name></expr></init></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>char</name> <modifier>*</modifier></type><name>zVal</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+
+  <comment type="block">/* If there is no read or write transaction open, read the latest 
+  ** tree-header from shared-memory to report on. If necessary, update
+  ** it based on the contents of the database header.  
+  **
+  ** No locks are taken here - these are passive read operations only.
+  */</comment>
+  <if_stmt><if>if<condition>( <expr><name><name>pDb</name><operator>-&gt;</operator><name>pCsr</name></name><operator>==</operator><literal type="number">0</literal> <operator>&amp;&amp;</operator> <name><name>pDb</name><operator>-&gt;</operator><name>nTransOpen</name></name><operator>==</operator><literal type="number">0</literal></expr> )</condition><block>{<block_content>
+    <expr_stmt><expr><name>rc</name> <operator>=</operator> <call><name>lsmTreeLoadHeader</name><argument_list>(<argument><expr><name>pDb</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <if_stmt><if>if<condition>( <expr><name>rc</name><operator>==</operator><name>LSM_OK</name></expr> )</condition><block type="pseudo"><block_content> <expr_stmt><expr><name>rc</name> <operator>=</operator> <call><name>logReclaimSpace</name><argument_list>(<argument><expr><name>pDb</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+  </block_content>}</block></if></if_stmt>
+
+  <if_stmt><if>if<condition>( <expr><name>rc</name><operator>==</operator><name>LSM_OK</name></expr> )</condition><block>{<block_content>
+    <decl_stmt><decl><type><name>DbLog</name> <modifier>*</modifier></type><name>pLog</name> <init>= <expr><operator>&amp;</operator><name><name>pDb</name><operator>-&gt;</operator><name>treehdr</name><operator>.</operator><name>log</name></name></expr></init></decl>;</decl_stmt>
+    <expr_stmt><expr><name>zVal</name> <operator>=</operator> <call><name>lsmMallocPrintf</name><argument_list>(<argument><expr><name><name>pDb</name><operator>-&gt;</operator><name>pEnv</name></name></expr></argument>, 
+        <argument><expr><literal type="string">"%d %d %d %d %d %d"</literal></expr></argument>, 
+        <argument><expr><operator>(</operator><name>int</name><operator>)</operator><name><name>pLog</name><operator>-&gt;</operator><name>aRegion</name><index>[<expr><literal type="number">0</literal></expr>]</index></name><operator>.</operator><name>iStart</name></expr></argument>, <argument><expr><operator>(</operator><name>int</name><operator>)</operator><name><name>pLog</name><operator>-&gt;</operator><name>aRegion</name><index>[<expr><literal type="number">0</literal></expr>]</index></name><operator>.</operator><name>iEnd</name></expr></argument>,
+        <argument><expr><operator>(</operator><name>int</name><operator>)</operator><name><name>pLog</name><operator>-&gt;</operator><name>aRegion</name><index>[<expr><literal type="number">1</literal></expr>]</index></name><operator>.</operator><name>iStart</name></expr></argument>, <argument><expr><operator>(</operator><name>int</name><operator>)</operator><name><name>pLog</name><operator>-&gt;</operator><name>aRegion</name><index>[<expr><literal type="number">1</literal></expr>]</index></name><operator>.</operator><name>iEnd</name></expr></argument>,
+        <argument><expr><operator>(</operator><name>int</name><operator>)</operator><name><name>pLog</name><operator>-&gt;</operator><name>aRegion</name><index>[<expr><literal type="number">2</literal></expr>]</index></name><operator>.</operator><name>iStart</name></expr></argument>, <argument><expr><operator>(</operator><name>int</name><operator>)</operator><name><name>pLog</name><operator>-&gt;</operator><name>aRegion</name><index>[<expr><literal type="number">2</literal></expr>]</index></name><operator>.</operator><name>iEnd</name></expr></argument>
+    )</argument_list></call></expr>;</expr_stmt>
+    <if_stmt><if>if<condition>( <expr><operator>!</operator><name>zVal</name></expr> )</condition><block type="pseudo"><block_content> <expr_stmt><expr><name>rc</name> <operator>=</operator> <name>LSM_NOMEM_BKPT</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+  </block_content>}</block></if></if_stmt>
+
+  <expr_stmt><expr><operator>*</operator><name>pzVal</name> <operator>=</operator> <name>zVal</name></expr>;</expr_stmt>
+  <return>return <expr><name>rc</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block" format="doxygen">/*************************************************************************
+** Begin code for log recovery.
+*/</comment>
+
+<typedef>typedef <type><name><name>struct</name> <name>LogReader</name></name></type> <name>LogReader</name>;</typedef>
+<struct>struct <name>LogReader</name> <block>{
+  <decl_stmt><decl><type><name>FileSystem</name> <modifier>*</modifier></type><name>pFS</name></decl>;</decl_stmt>                <comment type="block">/* File system to read from */</comment>
+  <decl_stmt><decl><type><name>i64</name></type> <name>iOff</name></decl>;</decl_stmt>                       <comment type="block">/* File offset at end of buf content */</comment>
+  <decl_stmt><decl><type><name>int</name></type> <name>iBuf</name></decl>;</decl_stmt>                       <comment type="block">/* Current read offset in buf */</comment>
+  <decl_stmt><decl><type><name>LsmString</name></type> <name>buf</name></decl>;</decl_stmt>                  <comment type="block">/* Buffer containing file content */</comment>
+
+  <decl_stmt><decl><type><name>int</name></type> <name>iCksumBuf</name></decl>;</decl_stmt>                  <comment type="block">/* Offset in buf corresponding to cksum[01] */</comment>
+  <decl_stmt><decl><type><name>u32</name></type> <name>cksum0</name></decl>;</decl_stmt>                     <comment type="block">/* Checksum 0 at offset iCksumBuf */</comment>
+  <decl_stmt><decl><type><name>u32</name></type> <name>cksum1</name></decl>;</decl_stmt>                     <comment type="block">/* Checksum 1 at offset iCksumBuf */</comment>
+}</block>;</struct>
+
+<function><type><specifier>static</specifier> <name>void</name></type> <name>logReaderBlob</name><parameter_list>(
+  <parameter><decl><type><name>LogReader</name> <modifier>*</modifier></type><name>p</name></decl></parameter>,                   <comment type="block">/* Log reader object */</comment>
+  <parameter><decl><type><name>LsmString</name> <modifier>*</modifier></type><name>pBuf</name></decl></parameter>,                <comment type="block">/* Dynamic storage, if required */</comment>
+  <parameter><decl><type><name>int</name></type> <name>nBlob</name></decl></parameter>,                      <comment type="block">/* Number of bytes to read */</comment>
+  <parameter><decl><type><name>u8</name> <modifier>*</modifier><modifier>*</modifier></type><name>ppBlob</name></decl></parameter>,                    <comment type="block">/* OUT: Pointer to blob read */</comment>
+  <parameter><decl><type><name>int</name> <modifier>*</modifier></type><name>pRc</name></decl></parameter>                        <comment type="block">/* IN/OUT: Error code */</comment>
+)</parameter_list><block>{<block_content>
+  <decl_stmt><decl><type><specifier>static</specifier> <specifier>const</specifier> <name>int</name></type> <name>LOG_READ_SIZE</name> <init>= <expr><literal type="number">512</literal></expr></init></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>int</name></type> <name>rc</name> <init>= <expr><operator>*</operator><name>pRc</name></expr></init></decl>;</decl_stmt>                  <comment type="block">/* Return code */</comment>
+  <decl_stmt><decl><type><name>int</name></type> <name>nReq</name> <init>= <expr><name>nBlob</name></expr></init></decl>;</decl_stmt>               <comment type="block">/* Bytes required */</comment>
+
+  <while>while<condition>( <expr><name>rc</name><operator>==</operator><name>LSM_OK</name> <operator>&amp;&amp;</operator> <name>nReq</name><operator>&gt;</operator><literal type="number">0</literal></expr> )</condition><block>{<block_content>
+    <decl_stmt><decl><type><name>int</name></type> <name>nAvail</name></decl>;</decl_stmt>                   <comment type="block">/* Bytes of data available in p-&gt;buf */</comment>
+    <if_stmt><if>if<condition>( <expr><name><name>p</name><operator>-&gt;</operator><name>buf</name><operator>.</operator><name>n</name></name><operator>==</operator><name><name>p</name><operator>-&gt;</operator><name>iBuf</name></name></expr> )</condition><block>{<block_content>
+      <decl_stmt><decl><type><name>int</name></type> <name>nCksum</name></decl>;</decl_stmt>                 <comment type="block">/* Total bytes requiring checksum */</comment>
+      <decl_stmt><decl><type><name>int</name></type> <name>nCarry</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>             <comment type="block">/* Total bytes requiring checksum */</comment>
+
+      <expr_stmt><expr><name>nCksum</name> <operator>=</operator> <name><name>p</name><operator>-&gt;</operator><name>iBuf</name></name> <operator>-</operator> <name><name>p</name><operator>-&gt;</operator><name>iCksumBuf</name></name></expr>;</expr_stmt>
+      <if_stmt><if>if<condition>( <expr><name>nCksum</name><operator>&gt;</operator><literal type="number">0</literal></expr> )</condition><block>{<block_content>
+        <expr_stmt><expr><name>nCarry</name> <operator>=</operator> <name>nCksum</name> <operator>%</operator> <literal type="number">8</literal></expr>;</expr_stmt>
+        <expr_stmt><expr><name>nCksum</name> <operator>=</operator> <operator>(</operator><operator>(</operator><name>nCksum</name> <operator>/</operator> <literal type="number">8</literal><operator>)</operator> <operator>*</operator> <literal type="number">8</literal><operator>)</operator></expr>;</expr_stmt>
+        <if_stmt><if>if<condition>( <expr><name>nCksum</name><operator>&gt;</operator><literal type="number">0</literal></expr> )</condition><block>{<block_content>
+          <expr_stmt><expr><call><name>logCksumUnaligned</name><argument_list>(
+              <argument><expr><operator>&amp;</operator><name><name>p</name><operator>-&gt;</operator><name>buf</name><operator>.</operator><name>z</name><index>[<expr><name><name>p</name><operator>-&gt;</operator><name>iCksumBuf</name></name></expr>]</index></name></expr></argument>, <argument><expr><name>nCksum</name></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>p</name><operator>-&gt;</operator><name>cksum0</name></name></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>p</name><operator>-&gt;</operator><name>cksum1</name></name></expr></argument>
+          )</argument_list></call></expr>;</expr_stmt>
+        </block_content>}</block></if></if_stmt>
+      </block_content>}</block></if></if_stmt>
+      <if_stmt><if>if<condition>( <expr><name>nCarry</name><operator>&gt;</operator><literal type="number">0</literal></expr> )</condition><block type="pseudo"><block_content> <expr_stmt><expr><call><name>memcpy</name><argument_list>(<argument><expr><name><name>p</name><operator>-&gt;</operator><name>buf</name><operator>.</operator><name>z</name></name></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>p</name><operator>-&gt;</operator><name>buf</name><operator>.</operator><name>z</name><index>[<expr><name><name>p</name><operator>-&gt;</operator><name>iBuf</name></name><operator>-</operator><name>nCarry</name></expr>]</index></name></expr></argument>, <argument><expr><name>nCarry</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+      <expr_stmt><expr><name><name>p</name><operator>-&gt;</operator><name>buf</name><operator>.</operator><name>n</name></name> <operator>=</operator> <name>nCarry</name></expr>;</expr_stmt>
+      <expr_stmt><expr><name><name>p</name><operator>-&gt;</operator><name>iBuf</name></name> <operator>=</operator> <name>nCarry</name></expr>;</expr_stmt>
+
+      <expr_stmt><expr><name>rc</name> <operator>=</operator> <call><name>lsmFsReadLog</name><argument_list>(<argument><expr><name><name>p</name><operator>-&gt;</operator><name>pFS</name></name></expr></argument>, <argument><expr><name><name>p</name><operator>-&gt;</operator><name>iOff</name></name></expr></argument>, <argument><expr><name>LOG_READ_SIZE</name></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>p</name><operator>-&gt;</operator><name>buf</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+      <if_stmt><if>if<condition>( <expr><name>rc</name><operator>!=</operator><name>LSM_OK</name></expr> )</condition><block type="pseudo"><block_content> <break>break;</break></block_content></block></if></if_stmt>
+      <expr_stmt><expr><name><name>p</name><operator>-&gt;</operator><name>iCksumBuf</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+      <expr_stmt><expr><name><name>p</name><operator>-&gt;</operator><name>iOff</name></name> <operator>+=</operator> <name>LOG_READ_SIZE</name></expr>;</expr_stmt>
+    </block_content>}</block></if></if_stmt>
+
+    <expr_stmt><expr><name>nAvail</name> <operator>=</operator> <name><name>p</name><operator>-&gt;</operator><name>buf</name><operator>.</operator><name>n</name></name> <operator>-</operator> <name><name>p</name><operator>-&gt;</operator><name>iBuf</name></name></expr>;</expr_stmt>
+    <if_stmt><if>if<condition>( <expr><name>ppBlob</name> <operator>&amp;&amp;</operator> <name>nReq</name><operator>==</operator><name>nBlob</name> <operator>&amp;&amp;</operator> <name>nBlob</name><operator>&lt;=</operator><name>nAvail</name></expr> )</condition><block>{<block_content>
+      <expr_stmt><expr><operator>*</operator><name>ppBlob</name> <operator>=</operator> <operator>(</operator><name>u8</name> <operator>*</operator><operator>)</operator><operator>&amp;</operator><name><name>p</name><operator>-&gt;</operator><name>buf</name><operator>.</operator><name>z</name><index>[<expr><name><name>p</name><operator>-&gt;</operator><name>iBuf</name></name></expr>]</index></name></expr>;</expr_stmt>
+      <expr_stmt><expr><name><name>p</name><operator>-&gt;</operator><name>iBuf</name></name> <operator>+=</operator> <name>nBlob</name></expr>;</expr_stmt>
+      <expr_stmt><expr><name>nReq</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+    </block_content>}</block></if><else>else<block>{<block_content>
+      <decl_stmt><decl><type><name>int</name></type> <name>nCopy</name> <init>= <expr><call><name>LSM_MIN</name><argument_list>(<argument><expr><name>nAvail</name></expr></argument>, <argument><expr><name>nReq</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+      <if_stmt><if>if<condition>( <expr><name>nBlob</name><operator>==</operator><name>nReq</name></expr> )</condition><block>{<block_content>
+        <expr_stmt><expr><name><name>pBuf</name><operator>-&gt;</operator><name>n</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+      </block_content>}</block></if></if_stmt>
+      <expr_stmt><expr><name>rc</name> <operator>=</operator> <call><name>lsmStringBinAppend</name><argument_list>(<argument><expr><name>pBuf</name></expr></argument>, <argument><expr><operator>(</operator><name>u8</name> <operator>*</operator><operator>)</operator><operator>&amp;</operator><name><name>p</name><operator>-&gt;</operator><name>buf</name><operator>.</operator><name>z</name><index>[<expr><name><name>p</name><operator>-&gt;</operator><name>iBuf</name></name></expr>]</index></name></expr></argument>, <argument><expr><name>nCopy</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+      <expr_stmt><expr><name>nReq</name> <operator>-=</operator> <name>nCopy</name></expr>;</expr_stmt>
+      <expr_stmt><expr><name><name>p</name><operator>-&gt;</operator><name>iBuf</name></name> <operator>+=</operator> <name>nCopy</name></expr>;</expr_stmt>
+      <if_stmt><if>if<condition>( <expr><name>nReq</name><operator>==</operator><literal type="number">0</literal> <operator>&amp;&amp;</operator> <name>ppBlob</name></expr> )</condition><block>{<block_content>
+        <expr_stmt><expr><operator>*</operator><name>ppBlob</name> <operator>=</operator> <operator>(</operator><name>u8</name><operator>*</operator><operator>)</operator><name><name>pBuf</name><operator>-&gt;</operator><name>z</name></name></expr>;</expr_stmt>
+      </block_content>}</block></if></if_stmt>
+    </block_content>}</block></else></if_stmt>
+  </block_content>}</block></while>
+
+  <expr_stmt><expr><operator>*</operator><name>pRc</name> <operator>=</operator> <name>rc</name></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<function><type><specifier>static</specifier> <name>void</name></type> <name>logReaderVarint</name><parameter_list>(
+  <parameter><decl><type><name>LogReader</name> <modifier>*</modifier></type><name>p</name></decl></parameter>, 
+  <parameter><decl><type><name>LsmString</name> <modifier>*</modifier></type><name>pBuf</name></decl></parameter>,
+  <parameter><decl><type><name>int</name> <modifier>*</modifier></type><name>piVal</name></decl></parameter>,                     <comment type="block">/* OUT: Value read from log */</comment>
+  <parameter><decl><type><name>int</name> <modifier>*</modifier></type><name>pRc</name></decl></parameter>                        <comment type="block">/* IN/OUT: Error code */</comment>
+)</parameter_list><block>{<block_content>
+  <if_stmt><if>if<condition>( <expr><operator>*</operator><name>pRc</name><operator>==</operator><name>LSM_OK</name></expr> )</condition><block>{<block_content>
+    <decl_stmt><decl><type><name>u8</name> <modifier>*</modifier></type><name>aVarint</name></decl>;</decl_stmt>
+    <if_stmt><if>if<condition>( <expr><name><name>p</name><operator>-&gt;</operator><name>buf</name><operator>.</operator><name>n</name></name><operator>==</operator><name><name>p</name><operator>-&gt;</operator><name>iBuf</name></name></expr> )</condition><block>{<block_content>
+      <expr_stmt><expr><call><name>logReaderBlob</name><argument_list>(<argument><expr><name>p</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><literal type="number">10</literal></expr></argument>, <argument><expr><operator>&amp;</operator><name>aVarint</name></expr></argument>, <argument><expr><name>pRc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+      <if_stmt><if>if<condition>( <expr><name>LSM_OK</name><operator>==</operator><operator>*</operator><name>pRc</name></expr> )</condition><block type="pseudo"><block_content> <expr_stmt><expr><name><name>p</name><operator>-&gt;</operator><name>iBuf</name></name> <operator>-=</operator> <operator>(</operator><literal type="number">10</literal> <operator>-</operator> <call><name>lsmVarintGet32</name><argument_list>(<argument><expr><name>aVarint</name></expr></argument>, <argument><expr><name>piVal</name></expr></argument>)</argument_list></call><operator>)</operator></expr>;</expr_stmt></block_content></block></if></if_stmt>
+    </block_content>}</block></if><else>else<block>{<block_content>
+      <expr_stmt><expr><call><name>logReaderBlob</name><argument_list>(<argument><expr><name>p</name></expr></argument>, <argument><expr><name>pBuf</name></expr></argument>, <argument><expr><call><name>lsmVarintSize</name><argument_list>(<argument><expr><name><name>p</name><operator>-&gt;</operator><name>buf</name><operator>.</operator><name>z</name><index>[<expr><name><name>p</name><operator>-&gt;</operator><name>iBuf</name></name></expr>]</index></name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><operator>&amp;</operator><name>aVarint</name></expr></argument>, <argument><expr><name>pRc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+      <if_stmt><if>if<condition>( <expr><name>LSM_OK</name><operator>==</operator><operator>*</operator><name>pRc</name></expr> )</condition><block type="pseudo"><block_content> <expr_stmt><expr><call><name>lsmVarintGet32</name><argument_list>(<argument><expr><name>aVarint</name></expr></argument>, <argument><expr><name>piVal</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+    </block_content>}</block></else></if_stmt>
+  </block_content>}</block></if></if_stmt>
+</block_content>}</block></function>
+
+<function><type><specifier>static</specifier> <name>void</name></type> <name>logReaderByte</name><parameter_list>(<parameter><decl><type><name>LogReader</name> <modifier>*</modifier></type><name>p</name></decl></parameter>, <parameter><decl><type><name>u8</name> <modifier>*</modifier></type><name>pByte</name></decl></parameter>, <parameter><decl><type><name>int</name> <modifier>*</modifier></type><name>pRc</name></decl></parameter>)</parameter_list><block>{<block_content>
+  <decl_stmt><decl><type><name>u8</name> <modifier>*</modifier></type><name>pPtr</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+  <expr_stmt><expr><call><name>logReaderBlob</name><argument_list>(<argument><expr><name>p</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><literal type="number">1</literal></expr></argument>, <argument><expr><operator>&amp;</operator><name>pPtr</name></expr></argument>, <argument><expr><name>pRc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <if_stmt><if>if<condition>( <expr><name>pPtr</name></expr> )</condition><block type="pseudo"><block_content> <expr_stmt><expr><operator>*</operator><name>pByte</name> <operator>=</operator> <operator>*</operator><name>pPtr</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+</block_content>}</block></function>
+
+<function><type><specifier>static</specifier> <name>void</name></type> <name>logReaderCksum</name><parameter_list>(<parameter><decl><type><name>LogReader</name> <modifier>*</modifier></type><name>p</name></decl></parameter>, <parameter><decl><type><name>LsmString</name> <modifier>*</modifier></type><name>pBuf</name></decl></parameter>, <parameter><decl><type><name>int</name> <modifier>*</modifier></type><name>pbEof</name></decl></parameter>, <parameter><decl><type><name>int</name> <modifier>*</modifier></type><name>pRc</name></decl></parameter>)</parameter_list><block>{<block_content>
+  <if_stmt><if>if<condition>( <expr><operator>*</operator><name>pRc</name><operator>==</operator><name>LSM_OK</name></expr> )</condition><block>{<block_content>
+    <decl_stmt><decl><type><name>u8</name> <modifier>*</modifier></type><name>pPtr</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>u32</name></type> <name>cksum0</name></decl>, <decl><type ref="prev"/><name>cksum1</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>int</name></type> <name>nCksum</name> <init>= <expr><name><name>p</name><operator>-&gt;</operator><name>iBuf</name></name> <operator>-</operator> <name><name>p</name><operator>-&gt;</operator><name>iCksumBuf</name></name></expr></init></decl>;</decl_stmt>
+
+    <comment type="block">/* Update in-memory (expected) checksums */</comment>
+    <expr_stmt><expr><call><name>assert</name><argument_list>( <argument><expr><name>nCksum</name><operator>&gt;=</operator><literal type="number">0</literal></expr></argument> )</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><call><name>logCksumUnaligned</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>p</name><operator>-&gt;</operator><name>buf</name><operator>.</operator><name>z</name><index>[<expr><name><name>p</name><operator>-&gt;</operator><name>iCksumBuf</name></name></expr>]</index></name></expr></argument>, <argument><expr><name>nCksum</name></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>p</name><operator>-&gt;</operator><name>cksum0</name></name></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>p</name><operator>-&gt;</operator><name>cksum1</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>p</name><operator>-&gt;</operator><name>iCksumBuf</name></name> <operator>=</operator> <name><name>p</name><operator>-&gt;</operator><name>iBuf</name></name> <operator>+</operator> <literal type="number">8</literal></expr>;</expr_stmt>
+    <expr_stmt><expr><call><name>logReaderBlob</name><argument_list>(<argument><expr><name>p</name></expr></argument>, <argument><expr><name>pBuf</name></expr></argument>, <argument><expr><literal type="number">8</literal></expr></argument>, <argument><expr><operator>&amp;</operator><name>pPtr</name></expr></argument>, <argument><expr><name>pRc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><call><name>assert</name><argument_list>( <argument><expr><name>pPtr</name> <operator>||</operator> <operator>*</operator><name>pRc</name></expr></argument> )</argument_list></call></expr>;</expr_stmt>
+
+    <comment type="block">/* Read the checksums from the log file. Set *pbEof if they do not match. */</comment>
+    <if_stmt><if>if<condition>( <expr><name>pPtr</name></expr> )</condition><block>{<block_content>
+      <expr_stmt><expr><name>cksum0</name> <operator>=</operator> <call><name>lsmGetU32</name><argument_list>(<argument><expr><name>pPtr</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+      <expr_stmt><expr><name>cksum1</name> <operator>=</operator> <call><name>lsmGetU32</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>pPtr</name><index>[<expr><literal type="number">4</literal></expr>]</index></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+      <expr_stmt><expr><operator>*</operator><name>pbEof</name> <operator>=</operator> <operator>(</operator><name>cksum0</name><operator>!=</operator><name><name>p</name><operator>-&gt;</operator><name>cksum0</name></name> <operator>||</operator> <name>cksum1</name><operator>!=</operator><name><name>p</name><operator>-&gt;</operator><name>cksum1</name></name><operator>)</operator></expr>;</expr_stmt>
+      <expr_stmt><expr><name><name>p</name><operator>-&gt;</operator><name>iCksumBuf</name></name> <operator>=</operator> <name><name>p</name><operator>-&gt;</operator><name>iBuf</name></name></expr>;</expr_stmt>
+    </block_content>}</block></if></if_stmt>
+  </block_content>}</block></if></if_stmt>
+</block_content>}</block></function>
+
+<function><type><specifier>static</specifier> <name>void</name></type> <name>logReaderInit</name><parameter_list>(
+  <parameter><decl><type><name>lsm_db</name> <modifier>*</modifier></type><name>pDb</name></decl></parameter>,                    <comment type="block">/* Database handle */</comment>
+  <parameter><decl><type><name>DbLog</name> <modifier>*</modifier></type><name>pLog</name></decl></parameter>,                    <comment type="block">/* Log object associated with pDb */</comment>
+  <parameter><decl><type><name>int</name></type> <name>bInitBuf</name></decl></parameter>,                   <comment type="block">/* True if p-&gt;buf is uninitialized */</comment>
+  <parameter><decl><type><name>LogReader</name> <modifier>*</modifier></type><name>p</name></decl></parameter>                    <comment type="block">/* Initialize this LogReader object */</comment>
+)</parameter_list><block>{<block_content>
+  <expr_stmt><expr><name><name>p</name><operator>-&gt;</operator><name>pFS</name></name> <operator>=</operator> <name><name>pDb</name><operator>-&gt;</operator><name>pFS</name></name></expr>;</expr_stmt>
+  <expr_stmt><expr><name><name>p</name><operator>-&gt;</operator><name>iOff</name></name> <operator>=</operator> <name><name>pLog</name><operator>-&gt;</operator><name>aRegion</name><index>[<expr><literal type="number">2</literal></expr>]</index></name><operator>.</operator><name>iStart</name></expr>;</expr_stmt>
+  <expr_stmt><expr><name><name>p</name><operator>-&gt;</operator><name>cksum0</name></name> <operator>=</operator> <name><name>pLog</name><operator>-&gt;</operator><name>cksum0</name></name></expr>;</expr_stmt>
+  <expr_stmt><expr><name><name>p</name><operator>-&gt;</operator><name>cksum1</name></name> <operator>=</operator> <name><name>pLog</name><operator>-&gt;</operator><name>cksum1</name></name></expr>;</expr_stmt>
+  <if_stmt><if>if<condition>( <expr><name>bInitBuf</name></expr> )</condition><block>{<block_content> <expr_stmt><expr><call><name>lsmStringInit</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>p</name><operator>-&gt;</operator><name>buf</name></name></expr></argument>, <argument><expr><name><name>pDb</name><operator>-&gt;</operator><name>pEnv</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt> </block_content>}</block></if></if_stmt>
+  <expr_stmt><expr><name><name>p</name><operator>-&gt;</operator><name>buf</name><operator>.</operator><name>n</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+  <expr_stmt><expr><name><name>p</name><operator>-&gt;</operator><name>iCksumBuf</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+  <expr_stmt><expr><name><name>p</name><operator>-&gt;</operator><name>iBuf</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+** This function is called after reading the header of a LOG_DELETE or
+** LOG_WRITE record. Parameter nByte is the total size of the key and
+** value that follow the header just read. Return true if the size and
+** position of the record indicate that it should contain a checksum.
+*/</comment>
+<function><type><specifier>static</specifier> <name>int</name></type> <name>logRequireCksum</name><parameter_list>(<parameter><decl><type><name>LogReader</name> <modifier>*</modifier></type><name>p</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>nByte</name></decl></parameter>)</parameter_list><block>{<block_content>
+  <return>return <expr><operator>(</operator><operator>(</operator><name><name>p</name><operator>-&gt;</operator><name>iBuf</name></name> <operator>+</operator> <name>nByte</name> <operator>-</operator> <name><name>p</name><operator>-&gt;</operator><name>iCksumBuf</name></name><operator>)</operator> <operator>&gt;</operator> <name>LSM_CKSUM_MAXDATA</name><operator>)</operator></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+** Recover the contents of the log file.
+*/</comment>
+<function><type><name>int</name></type> <name>lsmLogRecover</name><parameter_list>(<parameter><decl><type><name>lsm_db</name> <modifier>*</modifier></type><name>pDb</name></decl></parameter>)</parameter_list><block>{<block_content>
+  <decl_stmt><decl><type><name>LsmString</name></type> <name>buf1</name></decl>;</decl_stmt>                 <comment type="block">/* Key buffer */</comment>
+  <decl_stmt><decl><type><name>LsmString</name></type> <name>buf2</name></decl>;</decl_stmt>                 <comment type="block">/* Value buffer */</comment>
+  <decl_stmt><decl><type><name>LogReader</name></type> <name>reader</name></decl>;</decl_stmt>               <comment type="block">/* Log reader object */</comment>
+  <decl_stmt><decl><type><name>int</name></type> <name>rc</name> <init>= <expr><name>LSM_OK</name></expr></init></decl>;</decl_stmt>                <comment type="block">/* Return code */</comment>
+  <decl_stmt><decl><type><name>int</name></type> <name>nCommit</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>                <comment type="block">/* Number of transactions to recover */</comment>
+  <decl_stmt><decl><type><name>int</name></type> <name>iPass</name></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>int</name></type> <name>nJump</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>                  <comment type="block">/* Number of LSM_LOG_JUMP records in pass 0 */</comment>
+  <decl_stmt><decl><type><name>DbLog</name> <modifier>*</modifier></type><name>pLog</name></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>int</name></type> <name>bOpen</name></decl>;</decl_stmt>
+
+  <expr_stmt><expr><name>rc</name> <operator>=</operator> <call><name>lsmFsOpenLog</name><argument_list>(<argument><expr><name>pDb</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>bOpen</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <if_stmt><if>if<condition>( <expr><name>rc</name><operator>!=</operator><name>LSM_OK</name></expr> )</condition><block type="pseudo"><block_content> <return>return <expr><name>rc</name></expr>;</return></block_content></block></if></if_stmt>
+
+  <expr_stmt><expr><name>rc</name> <operator>=</operator> <call><name>lsmTreeInit</name><argument_list>(<argument><expr><name>pDb</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <if_stmt><if>if<condition>( <expr><name>rc</name><operator>!=</operator><name>LSM_OK</name></expr> )</condition><block type="pseudo"><block_content> <return>return <expr><name>rc</name></expr>;</return></block_content></block></if></if_stmt>
+
+  <expr_stmt><expr><name>pLog</name> <operator>=</operator> <operator>&amp;</operator><name><name>pDb</name><operator>-&gt;</operator><name>treehdr</name><operator>.</operator><name>log</name></name></expr>;</expr_stmt>
+  <expr_stmt><expr><call><name>lsmCheckpointLogoffset</name><argument_list>(<argument><expr><name><name>pDb</name><operator>-&gt;</operator><name>pShmhdr</name><operator>-&gt;</operator><name>aSnap2</name></name></expr></argument>, <argument><expr><name>pLog</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+  <expr_stmt><expr><call><name>logReaderInit</name><argument_list>(<argument><expr><name>pDb</name></expr></argument>, <argument><expr><name>pLog</name></expr></argument>, <argument><expr><literal type="number">1</literal></expr></argument>, <argument><expr><operator>&amp;</operator><name>reader</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><call><name>lsmStringInit</name><argument_list>(<argument><expr><operator>&amp;</operator><name>buf1</name></expr></argument>, <argument><expr><name><name>pDb</name><operator>-&gt;</operator><name>pEnv</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><call><name>lsmStringInit</name><argument_list>(<argument><expr><operator>&amp;</operator><name>buf2</name></expr></argument>, <argument><expr><name><name>pDb</name><operator>-&gt;</operator><name>pEnv</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+  <comment type="block">/* The outer for() loop runs at most twice. The first iteration is to 
+  ** count the number of committed transactions in the log. The second 
+  ** iterates through those transactions and updates the in-memory tree 
+  ** structure with their contents.  */</comment>
+  <if_stmt><if>if<condition>( <expr><name>bOpen</name></expr> )</condition><block>{<block_content>
+    <for>for<control>(<init><expr><name>iPass</name><operator>=</operator><literal type="number">0</literal></expr>;</init> <condition><expr><name>iPass</name><operator>&lt;</operator><literal type="number">2</literal> <operator>&amp;&amp;</operator> <name>rc</name><operator>==</operator><name>LSM_OK</name></expr>;</condition> <incr><expr><name>iPass</name><operator>++</operator></expr></incr>)</control><block>{<block_content>
+      <decl_stmt><decl><type><name>int</name></type> <name>bEof</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+
+      <while>while<condition>( <expr><name>rc</name><operator>==</operator><name>LSM_OK</name> <operator>&amp;&amp;</operator> <operator>!</operator><name>bEof</name></expr> )</condition><block>{<block_content>
+        <decl_stmt><decl><type><name>u8</name></type> <name>eType</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+        <expr_stmt><expr><call><name>logReaderByte</name><argument_list>(<argument><expr><operator>&amp;</operator><name>reader</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>eType</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>rc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+        <switch>switch<condition>( <expr><name>eType</name></expr> )</condition><block>{<block_content>
+          <case>case <expr><name>LSM_LOG_PAD1</name></expr>:</case>
+            <break>break;</break>
+
+          <case>case <expr><name>LSM_LOG_PAD2</name></expr>:</case> <block>{<block_content>
+            <decl_stmt><decl><type><name>int</name></type> <name>nPad</name></decl>;</decl_stmt>
+            <expr_stmt><expr><call><name>logReaderVarint</name><argument_list>(<argument><expr><operator>&amp;</operator><name>reader</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>buf1</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>nPad</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>rc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+            <expr_stmt><expr><call><name>logReaderBlob</name><argument_list>(<argument><expr><operator>&amp;</operator><name>reader</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>buf1</name></expr></argument>, <argument><expr><name>nPad</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><operator>&amp;</operator><name>rc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+            <break>break;</break>
+          </block_content>}</block>
+
+          <case>case <expr><name>LSM_LOG_DRANGE</name></expr>:</case>
+          <case>case <expr><name>LSM_LOG_DRANGE_CKSUM</name></expr>:</case>
+          <case>case <expr><name>LSM_LOG_WRITE</name></expr>:</case>
+          <case>case <expr><name>LSM_LOG_WRITE_CKSUM</name></expr>:</case> <block>{<block_content>
+            <decl_stmt><decl><type><name>int</name></type> <name>nKey</name></decl>;</decl_stmt>
+            <decl_stmt><decl><type><name>int</name></type> <name>nVal</name></decl>;</decl_stmt>
+            <decl_stmt><decl><type><name>u8</name> <modifier>*</modifier></type><name>aVal</name></decl>;</decl_stmt>
+            <expr_stmt><expr><call><name>logReaderVarint</name><argument_list>(<argument><expr><operator>&amp;</operator><name>reader</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>buf1</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>nKey</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>rc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+            <expr_stmt><expr><call><name>logReaderVarint</name><argument_list>(<argument><expr><operator>&amp;</operator><name>reader</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>buf2</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>nVal</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>rc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+            <if_stmt><if>if<condition>( <expr><name>eType</name><operator>==</operator><name>LSM_LOG_WRITE_CKSUM</name> <operator>||</operator> <name>eType</name><operator>==</operator><name>LSM_LOG_DRANGE_CKSUM</name></expr> )</condition><block>{<block_content>
+              <expr_stmt><expr><call><name>logReaderCksum</name><argument_list>(<argument><expr><operator>&amp;</operator><name>reader</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>buf1</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>bEof</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>rc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+            </block_content>}</block></if><else>else<block>{<block_content>
+              <expr_stmt><expr><name>bEof</name> <operator>=</operator> <call><name>logRequireCksum</name><argument_list>(<argument><expr><operator>&amp;</operator><name>reader</name></expr></argument>, <argument><expr><name>nKey</name><operator>+</operator><name>nVal</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+            </block_content>}</block></else></if_stmt>
+            <if_stmt><if>if<condition>( <expr><name>bEof</name></expr> )</condition><block type="pseudo"><block_content> <break>break;</break></block_content></block></if></if_stmt>
+
+            <expr_stmt><expr><call><name>logReaderBlob</name><argument_list>(<argument><expr><operator>&amp;</operator><name>reader</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>buf1</name></expr></argument>, <argument><expr><name>nKey</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><operator>&amp;</operator><name>rc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+            <expr_stmt><expr><call><name>logReaderBlob</name><argument_list>(<argument><expr><operator>&amp;</operator><name>reader</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>buf2</name></expr></argument>, <argument><expr><name>nVal</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>aVal</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>rc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+            <if_stmt><if>if<condition>( <expr><name>iPass</name><operator>==</operator><literal type="number">1</literal> <operator>&amp;&amp;</operator> <name>rc</name><operator>==</operator><name>LSM_OK</name></expr> )</condition><block>{<block_content> 
+              <if_stmt><if>if<condition>( <expr><name>eType</name><operator>==</operator><name>LSM_LOG_WRITE</name> <operator>||</operator> <name>eType</name><operator>==</operator><name>LSM_LOG_WRITE_CKSUM</name></expr> )</condition><block>{<block_content>
+                <expr_stmt><expr><name>rc</name> <operator>=</operator> <call><name>lsmTreeInsert</name><argument_list>(<argument><expr><name>pDb</name></expr></argument>, <argument><expr><operator>(</operator><name>u8</name> <operator>*</operator><operator>)</operator><name><name>buf1</name><operator>.</operator><name>z</name></name></expr></argument>, <argument><expr><name>nKey</name></expr></argument>, <argument><expr><name>aVal</name></expr></argument>, <argument><expr><name>nVal</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+              </block_content>}</block></if><else>else<block>{<block_content>
+                <expr_stmt><expr><name>rc</name> <operator>=</operator> <call><name>lsmTreeDelete</name><argument_list>(<argument><expr><name>pDb</name></expr></argument>, <argument><expr><operator>(</operator><name>u8</name> <operator>*</operator><operator>)</operator><name><name>buf1</name><operator>.</operator><name>z</name></name></expr></argument>, <argument><expr><name>nKey</name></expr></argument>, <argument><expr><name>aVal</name></expr></argument>, <argument><expr><name>nVal</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+              </block_content>}</block></else></if_stmt>
+            </block_content>}</block></if></if_stmt>
+            <break>break;</break>
+          </block_content>}</block>
+
+          <case>case <expr><name>LSM_LOG_DELETE</name></expr>:</case>
+          <case>case <expr><name>LSM_LOG_DELETE_CKSUM</name></expr>:</case> <block>{<block_content>
+            <decl_stmt><decl><type><name>int</name></type> <name>nKey</name></decl>;</decl_stmt> <decl_stmt><decl><type><name>u8</name> <modifier>*</modifier></type><name>aKey</name></decl>;</decl_stmt>
+            <expr_stmt><expr><call><name>logReaderVarint</name><argument_list>(<argument><expr><operator>&amp;</operator><name>reader</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>buf1</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>nKey</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>rc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+            <if_stmt><if>if<condition>( <expr><name>eType</name><operator>==</operator><name>LSM_LOG_DELETE_CKSUM</name></expr> )</condition><block>{<block_content>
+              <expr_stmt><expr><call><name>logReaderCksum</name><argument_list>(<argument><expr><operator>&amp;</operator><name>reader</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>buf1</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>bEof</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>rc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+            </block_content>}</block></if><else>else<block>{<block_content>
+              <expr_stmt><expr><name>bEof</name> <operator>=</operator> <call><name>logRequireCksum</name><argument_list>(<argument><expr><operator>&amp;</operator><name>reader</name></expr></argument>, <argument><expr><name>nKey</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+            </block_content>}</block></else></if_stmt>
+            <if_stmt><if>if<condition>( <expr><name>bEof</name></expr> )</condition><block type="pseudo"><block_content> <break>break;</break></block_content></block></if></if_stmt>
+
+            <expr_stmt><expr><call><name>logReaderBlob</name><argument_list>(<argument><expr><operator>&amp;</operator><name>reader</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>buf1</name></expr></argument>, <argument><expr><name>nKey</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>aKey</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>rc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+            <if_stmt><if>if<condition>( <expr><name>iPass</name><operator>==</operator><literal type="number">1</literal> <operator>&amp;&amp;</operator> <name>rc</name><operator>==</operator><name>LSM_OK</name></expr> )</condition><block>{<block_content> 
+              <expr_stmt><expr><name>rc</name> <operator>=</operator> <call><name>lsmTreeInsert</name><argument_list>(<argument><expr><name>pDb</name></expr></argument>, <argument><expr><name>aKey</name></expr></argument>, <argument><expr><name>nKey</name></expr></argument>, <argument><expr><name>NULL</name></expr></argument>, <argument><expr><operator>-</operator><literal type="number">1</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+            </block_content>}</block></if></if_stmt>
+            <break>break;</break>
+          </block_content>}</block>
+
+          <case>case <expr><name>LSM_LOG_COMMIT</name></expr>:</case>
+            <expr_stmt><expr><call><name>logReaderCksum</name><argument_list>(<argument><expr><operator>&amp;</operator><name>reader</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>buf1</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>bEof</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>rc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+            <if_stmt><if>if<condition>( <expr><name>bEof</name><operator>==</operator><literal type="number">0</literal></expr> )</condition><block>{<block_content>
+              <expr_stmt><expr><name>nCommit</name><operator>++</operator></expr>;</expr_stmt>
+              <expr_stmt><expr><call><name>assert</name><argument_list>( <argument><expr><name>nCommit</name><operator>&gt;</operator><literal type="number">0</literal> <operator>||</operator> <name>iPass</name><operator>==</operator><literal type="number">1</literal></expr></argument> )</argument_list></call></expr>;</expr_stmt>
+              <if_stmt><if>if<condition>( <expr><name>nCommit</name><operator>==</operator><literal type="number">0</literal></expr> )</condition><block type="pseudo"><block_content> <expr_stmt><expr><name>bEof</name> <operator>=</operator> <literal type="number">1</literal></expr>;</expr_stmt></block_content></block></if></if_stmt>
+            </block_content>}</block></if></if_stmt>
+            <break>break;</break>
+
+          <case>case <expr><name>LSM_LOG_JUMP</name></expr>:</case> <block>{<block_content>
+            <decl_stmt><decl><type><name>int</name></type> <name>iOff</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+            <expr_stmt><expr><call><name>logReaderVarint</name><argument_list>(<argument><expr><operator>&amp;</operator><name>reader</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>buf1</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>iOff</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>rc</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+            <if_stmt><if>if<condition>( <expr><name>rc</name><operator>==</operator><name>LSM_OK</name></expr> )</condition><block>{<block_content>
+              <if_stmt><if>if<condition>( <expr><name>iPass</name><operator>==</operator><literal type="number">1</literal></expr> )</condition><block>{<block_content>
+                <if_stmt><if>if<condition>( <expr><name><name>pLog</name><operator>-&gt;</operator><name>aRegion</name><index>[<expr><literal type="number">2</literal></expr>]</index></name><operator>.</operator><name>iStart</name><operator>==</operator><literal type="number">0</literal></expr> )</condition><block>{<block_content>
+                  <expr_stmt><expr><call><name>assert</name><argument_list>( <argument><expr><name><name>pLog</name><operator>-&gt;</operator><name>aRegion</name><index>[<expr><literal type="number">1</literal></expr>]</index></name><operator>.</operator><name>iStart</name><operator>==</operator><literal type="number">0</literal></expr></argument> )</argument_list></call></expr>;</expr_stmt>
+                  <expr_stmt><expr><name><name>pLog</name><operator>-&gt;</operator><name>aRegion</name><index>[<expr><literal type="number">1</literal></expr>]</index></name><operator>.</operator><name>iEnd</name> <operator>=</operator> <name><name>reader</name><operator>.</operator><name>iOff</name></name></expr>;</expr_stmt>
+                </block_content>}</block></if><else>else<block>{<block_content>
+                  <expr_stmt><expr><call><name>assert</name><argument_list>( <argument><expr><name><name>pLog</name><operator>-&gt;</operator><name>aRegion</name><index>[<expr><literal type="number">0</literal></expr>]</index></name><operator>.</operator><name>iStart</name><operator>==</operator><literal type="number">0</literal></expr></argument> )</argument_list></call></expr>;</expr_stmt>
+                  <expr_stmt><expr><name><name>pLog</name><operator>-&gt;</operator><name>aRegion</name><index>[<expr><literal type="number">0</literal></expr>]</index></name><operator>.</operator><name>iStart</name> <operator>=</operator> <name><name>pLog</name><operator>-&gt;</operator><name>aRegion</name><index>[<expr><literal type="number">2</literal></expr>]</index></name><operator>.</operator><name>iStart</name></expr>;</expr_stmt>
+                  <expr_stmt><expr><name><name>pLog</name><operator>-&gt;</operator><name>aRegion</name><index>[<expr><literal type="number">0</literal></expr>]</index></name><operator>.</operator><name>iEnd</name> <operator>=</operator> <name><name>reader</name><operator>.</operator><name>iOff</name></name><operator>-</operator><name><name>reader</name><operator>.</operator><name>buf</name><operator>.</operator><name>n</name></name><operator>+</operator><name><name>reader</name><operator>.</operator><name>iBuf</name></name></expr>;</expr_stmt>
+                </block_content>}</block></else></if_stmt>
+                <expr_stmt><expr><name><name>pLog</name><operator>-&gt;</operator><name>aRegion</name><index>[<expr><literal type="number">2</literal></expr>]</index></name><operator>.</operator><name>iStart</name> <operator>=</operator> <name>iOff</name></expr>;</expr_stmt>
+              </block_content>}</block></if><else>else<block>{<block_content>
+                <if_stmt><if>if<condition>( <expr><operator>(</operator><name>nJump</name><operator>++</operator><operator>)</operator><operator>==</operator><literal type="number">2</literal></expr> )</condition><block>{<block_content>
+                  <expr_stmt><expr><name>bEof</name> <operator>=</operator> <literal type="number">1</literal></expr>;</expr_stmt>
+                </block_content>}</block></if></if_stmt>
+              </block_content>}</block></else></if_stmt>
+
+              <expr_stmt><expr><name><name>reader</name><operator>.</operator><name>iOff</name></name> <operator>=</operator> <name>iOff</name></expr>;</expr_stmt>
+              <expr_stmt><expr><name><name>reader</name><operator>.</operator><name>buf</name><operator>.</operator><name>n</name></name> <operator>=</operator> <name><name>reader</name><operator>.</operator><name>iBuf</name></name></expr>;</expr_stmt>
+            </block_content>}</block></if></if_stmt>
+            <break>break;</break>
+          </block_content>}</block>
+
+          <default>default:</default>
+            <comment type="block">/* Including LSM_LOG_EOF */</comment>
+            <expr_stmt><expr><name>bEof</name> <operator>=</operator> <literal type="number">1</literal></expr>;</expr_stmt>
+            <break>break;</break>
+        </block_content>}</block></switch>
+      </block_content>}</block></while>
+
+      <if_stmt><if>if<condition>( <expr><name>rc</name><operator>==</operator><name>LSM_OK</name> <operator>&amp;&amp;</operator> <name>iPass</name><operator>==</operator><literal type="number">0</literal></expr> )</condition><block>{<block_content>
+        <if_stmt><if>if<condition>( <expr><name>nCommit</name><operator>==</operator><literal type="number">0</literal></expr> )</condition><block>{<block_content>
+          <if_stmt><if>if<condition>( <expr><name><name>pLog</name><operator>-&gt;</operator><name>aRegion</name><index>[<expr><literal type="number">2</literal></expr>]</index></name><operator>.</operator><name>iStart</name><operator>==</operator><literal type="number">0</literal></expr> )</condition><block>{<block_content>
+            <expr_stmt><expr><name>iPass</name> <operator>=</operator> <literal type="number">1</literal></expr>;</expr_stmt>
+          </block_content>}</block></if><else>else<block>{<block_content>
+            <expr_stmt><expr><name><name>pLog</name><operator>-&gt;</operator><name>aRegion</name><index>[<expr><literal type="number">2</literal></expr>]</index></name><operator>.</operator><name>iStart</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+            <expr_stmt><expr><name>iPass</name> <operator>=</operator> <operator>-</operator><literal type="number">1</literal></expr>;</expr_stmt>
+            <expr_stmt><expr><call><name>lsmCheckpointZeroLogoffset</name><argument_list>(<argument><expr><name>pDb</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+          </block_content>}</block></else></if_stmt>
+        </block_content>}</block></if></if_stmt>
+        <expr_stmt><expr><call><name>logReaderInit</name><argument_list>(<argument><expr><name>pDb</name></expr></argument>, <argument><expr><name>pLog</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><operator>&amp;</operator><name>reader</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <expr_stmt><expr><name>nCommit</name> <operator>=</operator> <name>nCommit</name> <operator>*</operator> <operator>-</operator><literal type="number">1</literal></expr>;</expr_stmt>
+      </block_content>}</block></if></if_stmt>
+    </block_content>}</block></for>
+  </block_content>}</block></if></if_stmt>
+
+  <comment type="block">/* Initialize DbLog object */</comment>
+  <if_stmt><if>if<condition>( <expr><name>rc</name><operator>==</operator><name>LSM_OK</name></expr> )</condition><block>{<block_content>
+    <expr_stmt><expr><name><name>pLog</name><operator>-&gt;</operator><name>aRegion</name><index>[<expr><literal type="number">2</literal></expr>]</index></name><operator>.</operator><name>iEnd</name> <operator>=</operator> <name><name>reader</name><operator>.</operator><name>iOff</name></name> <operator>-</operator> <name><name>reader</name><operator>.</operator><name>buf</name><operator>.</operator><name>n</name></name> <operator>+</operator> <name><name>reader</name><operator>.</operator><name>iBuf</name></name></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>pLog</name><operator>-&gt;</operator><name>cksum0</name></name> <operator>=</operator> <name><name>reader</name><operator>.</operator><name>cksum0</name></name></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>pLog</name><operator>-&gt;</operator><name>cksum1</name></name> <operator>=</operator> <name><name>reader</name><operator>.</operator><name>cksum1</name></name></expr>;</expr_stmt>
+  </block_content>}</block></if></if_stmt>
+
+  <if_stmt><if>if<condition>( <expr><name>rc</name><operator>==</operator><name>LSM_OK</name></expr> )</condition><block>{<block_content>
+    <expr_stmt><expr><name>rc</name> <operator>=</operator> <call><name>lsmFinishRecovery</name><argument_list>(<argument><expr><name>pDb</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  </block_content>}</block></if><else>else<block>{<block_content>
+    <expr_stmt><expr><call><name>lsmFinishRecovery</name><argument_list>(<argument><expr><name>pDb</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  </block_content>}</block></else></if_stmt>
+
+  <if_stmt><if>if<condition>( <expr><name><name>pDb</name><operator>-&gt;</operator><name>bRoTrans</name></name></expr> )</condition><block>{<block_content>
+    <expr_stmt><expr><call><name>lsmFsCloseLog</name><argument_list>(<argument><expr><name>pDb</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  </block_content>}</block></if></if_stmt>
+
+  <expr_stmt><expr><call><name>lsmStringClear</name><argument_list>(<argument><expr><operator>&amp;</operator><name>buf1</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><call><name>lsmStringClear</name><argument_list>(<argument><expr><operator>&amp;</operator><name>buf2</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><call><name>lsmStringClear</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>reader</name><operator>.</operator><name>buf</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <return>return <expr><name>rc</name></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><name>void</name></type> <name>lsmLogClose</name><parameter_list>(<parameter><decl><type><name>lsm_db</name> <modifier>*</modifier></type><name>db</name></decl></parameter>)</parameter_list><block>{<block_content>
+  <if_stmt><if>if<condition>( <expr><name><name>db</name><operator>-&gt;</operator><name>pLogWriter</name></name></expr> )</condition><block>{<block_content>
+    <expr_stmt><expr><call><name>lsmFree</name><argument_list>(<argument><expr><name><name>db</name><operator>-&gt;</operator><name>pEnv</name></name></expr></argument>, <argument><expr><name><name>db</name><operator>-&gt;</operator><name>pLogWriter</name><operator>-&gt;</operator><name>buf</name><operator>.</operator><name>z</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><call><name>lsmFree</name><argument_list>(<argument><expr><name><name>db</name><operator>-&gt;</operator><name>pEnv</name></name></expr></argument>, <argument><expr><name><name>db</name><operator>-&gt;</operator><name>pLogWriter</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>db</name><operator>-&gt;</operator><name>pLogWriter</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+  </block_content>}</block></if></if_stmt>
+</block_content>}</block></function>
+</unit>

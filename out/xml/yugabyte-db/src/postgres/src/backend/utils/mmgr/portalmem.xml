@@ -1,0 +1,1281 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<unit xmlns="http://www.srcML.org/srcML/src" xmlns:cpp="http://www.srcML.org/srcML/cpp" revision="1.0.0" language="C" filename="/cloned_projects/yugabyte-db/src/postgres/src/backend/utils/mmgr/portalmem.c"><comment type="block">/*-------------------------------------------------------------------------
+ *
+ * portalmem.c
+ *	  backend portal memory management
+ *
+ * Portals are objects representing the execution state of a query.
+ * This module provides memory management services for portals, but it
+ * doesn't actually run the executor for them.
+ *
+ *
+ * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1994, Regents of the University of California
+ *
+ * IDENTIFICATION
+ *	  src/backend/utils/mmgr/portalmem.c
+ *
+ *-------------------------------------------------------------------------
+ */</comment>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"postgres.h"</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"access/xact.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"catalog/pg_type.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"commands/portalcmds.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"miscadmin.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/ipc.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/builtins.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/memutils.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/snapmgr.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/timestamp.h"</cpp:file></cpp:include>
+
+<comment type="block">/*
+ * Estimate of the maximum number of open portals a user would have,
+ * used in initially sizing the PortalHashTable in EnablePortalManager().
+ * Since the hash table can expand, there's no need to make this overly
+ * generous, and keeping it small avoids unnecessary overhead in the
+ * hash_seq_search() calls executed during transaction end.
+ */</comment>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>PORTALS_PER_USER</name></cpp:macro>	   <cpp:value>16</cpp:value></cpp:define>
+
+
+<comment type="block">/* ----------------
+ *		Global state
+ * ----------------
+ */</comment>
+
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>MAX_PORTALNAME_LEN</name></cpp:macro>		<cpp:value>NAMEDATALEN</cpp:value></cpp:define>
+
+<typedef>typedef <type><struct>struct <name>portalhashent</name>
+<block>{
+	<decl_stmt><decl><type><name>char</name></type>		<name><name>portalname</name><index>[<expr><name>MAX_PORTALNAME_LEN</name></expr>]</index></name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Portal</name></type>		<name>portal</name></decl>;</decl_stmt>
+}</block></struct></type> <name>PortalHashEnt</name>;</typedef>
+
+<decl_stmt><decl><type><specifier>static</specifier> <name>HTAB</name> <modifier>*</modifier></type><name>PortalHashTable</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>PortalHashTableLookup</name><parameter_list>(<parameter><type><name>NAME</name></type></parameter>, <parameter><type><name>PORTAL</name></type></parameter>)</parameter_list></cpp:macro> \
+<cpp:value>do { \
+	PortalHashEnt *hentry; \
+	\
+	hentry = (PortalHashEnt *) hash_search(PortalHashTable, \
+										   (NAME), HASH_FIND, NULL); \
+	if (hentry) \
+		PORTAL = hentry-&gt;portal; \
+	else \
+		PORTAL = NULL; \
+} while(0)</cpp:value></cpp:define>
+
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>PortalHashTableInsert</name><parameter_list>(<parameter><type><name>PORTAL</name></type></parameter>, <parameter><type><name>NAME</name></type></parameter>)</parameter_list></cpp:macro> \
+<cpp:value>do { \
+	PortalHashEnt *hentry; bool found; \
+	\
+	hentry = (PortalHashEnt *) hash_search(PortalHashTable, \
+										   (NAME), HASH_ENTER, &amp;found); \
+	if (found) \
+		elog(ERROR, "duplicate portal name"); \
+	hentry-&gt;portal = PORTAL; \
+	<comment type="block">/* To avoid duplicate storage, make PORTAL-&gt;name point to htab entry */</comment> \
+	PORTAL-&gt;name = hentry-&gt;portalname; \
+} while(0)</cpp:value></cpp:define>
+
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>PortalHashTableDelete</name><parameter_list>(<parameter><type><name>PORTAL</name></type></parameter>)</parameter_list></cpp:macro> \
+<cpp:value>do { \
+	PortalHashEnt *hentry; \
+	\
+	hentry = (PortalHashEnt *) hash_search(PortalHashTable, \
+										   PORTAL-&gt;name, HASH_REMOVE, NULL); \
+	if (hentry == NULL) \
+		elog(WARNING, "trying to delete portal name that does not exist"); \
+} while(0)</cpp:value></cpp:define>
+
+<decl_stmt><decl><type><specifier>static</specifier> <name>MemoryContext</name></type> <name>TopPortalContext</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+
+
+<comment type="block">/* ----------------------------------------------------------------
+ *				   public portal interface functions
+ * ----------------------------------------------------------------
+ */</comment>
+
+<comment type="block">/*
+ * EnablePortalManager
+ *		Enables the portal management module at backend startup.
+ */</comment>
+<function><type><name>void</name></type>
+<name>EnablePortalManager</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>HASHCTL</name></type>		<name>ctl</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>TopPortalContext</name> <operator>==</operator> <name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>TopPortalContext</name> <operator>=</operator> <call><name>AllocSetContextCreate</name><argument_list>(<argument><expr><name>TopMemoryContext</name></expr></argument>,
+											 <argument><expr><literal type="string">"TopPortalContext"</literal></expr></argument>,
+											 <argument><expr><name>ALLOCSET_DEFAULT_SIZES</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name><name>ctl</name><operator>.</operator><name>keysize</name></name> <operator>=</operator> <name>MAX_PORTALNAME_LEN</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>ctl</name><operator>.</operator><name>entrysize</name></name> <operator>=</operator> <sizeof>sizeof<argument_list>(<argument><expr><name>PortalHashEnt</name></expr></argument>)</argument_list></sizeof></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * use PORTALS_PER_USER as a guess of how many hash table entries to
+	 * create, initially
+	 */</comment>
+	<expr_stmt><expr><name>PortalHashTable</name> <operator>=</operator> <call><name>hash_create</name><argument_list>(<argument><expr><literal type="string">"Portal hash"</literal></expr></argument>, <argument><expr><name>PORTALS_PER_USER</name></expr></argument>,
+								  <argument><expr><operator>&amp;</operator><name>ctl</name></expr></argument>, <argument><expr><name>HASH_ELEM</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * GetPortalByName
+ *		Returns a portal given a portal name, or NULL if name not found.
+ */</comment>
+<function><type><name>Portal</name></type>
+<name>GetPortalByName</name><parameter_list>(<parameter><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>name</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>Portal</name></type>		<name>portal</name></decl>;</decl_stmt>
+
+	<if_stmt><if>if <condition>(<expr><call><name>PointerIsValid</name><argument_list>(<argument><expr><name>name</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>PortalHashTableLookup</name><argument_list>(<argument><expr><name>name</name></expr></argument>, <argument><expr><name>portal</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if>
+	<else>else<block type="pseudo"><block_content>
+		<expr_stmt><expr><name>portal</name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt></block_content></block></else></if_stmt>
+
+	<return>return <expr><name>portal</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * PortalGetPrimaryStmt
+ *		Get the "primary" stmt within a portal, ie, the one marked canSetTag.
+ *
+ * Returns NULL if no such stmt.  If multiple PlannedStmt structs within the
+ * portal are marked canSetTag, returns the first one.  Neither of these
+ * cases should occur in present usages of this function.
+ */</comment>
+<function><type><name>PlannedStmt</name> <modifier>*</modifier></type>
+<name>PortalGetPrimaryStmt</name><parameter_list>(<parameter><decl><type><name>Portal</name></type> <name>portal</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>ListCell</name>   <modifier>*</modifier></type><name>lc</name></decl>;</decl_stmt>
+
+	<macro><name>foreach</name><argument_list>(<argument>lc</argument>, <argument>portal-&gt;stmts</argument>)</argument_list></macro>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>PlannedStmt</name> <modifier>*</modifier></type><name>stmt</name> <init>= <expr><call><name>lfirst_node</name><argument_list>(<argument><expr><name>PlannedStmt</name></expr></argument>, <argument><expr><name>lc</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name><name>stmt</name><operator>-&gt;</operator><name>canSetTag</name></name></expr>)</condition><block type="pseudo"><block_content>
+			<return>return <expr><name>stmt</name></expr>;</return></block_content></block></if></if_stmt>
+	</block_content>}</block>
+	<return>return <expr><name>NULL</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * CreatePortal
+ *		Returns a new portal given a name.
+ *
+ * allowDup: if true, automatically drop any pre-existing portal of the
+ * same name (if false, an error is raised).
+ *
+ * dupSilent: if true, don't even emit a WARNING.
+ */</comment>
+<function><type><name>Portal</name></type>
+<name>CreatePortal</name><parameter_list>(<parameter><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>name</name></decl></parameter>, <parameter><decl><type><name>bool</name></type> <name>allowDup</name></decl></parameter>, <parameter><decl><type><name>bool</name></type> <name>dupSilent</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>Portal</name></type>		<name>portal</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>AssertArg</name><argument_list>(<argument><expr><call><name>PointerIsValid</name><argument_list>(<argument><expr><name>name</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>portal</name> <operator>=</operator> <call><name>GetPortalByName</name><argument_list>(<argument><expr><name>name</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><call><name>PortalIsValid</name><argument_list>(<argument><expr><name>portal</name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><name>allowDup</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+					<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_DUPLICATE_CURSOR</name></expr></argument>)</argument_list></call><operator>,</operator>
+					 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"cursor \"%s\" already exists"</literal></expr></argument>, <argument><expr><name>name</name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><name>dupSilent</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>WARNING</name></expr></argument>,
+					<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_DUPLICATE_CURSOR</name></expr></argument>)</argument_list></call><operator>,</operator>
+					 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"closing existing cursor \"%s\""</literal></expr></argument>,
+							<argument><expr><name>name</name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+		<expr_stmt><expr><call><name>PortalDrop</name><argument_list>(<argument><expr><name>portal</name></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/* make new portal structure */</comment>
+	<expr_stmt><expr><name>portal</name> <operator>=</operator> <operator>(</operator><name>Portal</name><operator>)</operator> <call><name>MemoryContextAllocZero</name><argument_list>(<argument><expr><name>TopPortalContext</name></expr></argument>, <argument><expr><sizeof>sizeof <name/></sizeof>*<name>portal</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Initialize portal context; typically it won't store much.
+	 * - portalContext lasts for the lifetime of the portal thru multiple portal runs.
+	 * - runContext only lasts for the lifetime of one portal run, and one portal may run many
+	 *   times. When SELECT is fetches in multiple batches, each batch is associated with one
+	 *   portal run.  Some memory allocated in the portal run should only last till the end of
+	 *   each run and should be allocated by runContext.
+	 */</comment>
+	<expr_stmt><expr><name><name>portal</name><operator>-&gt;</operator><name>portalContext</name></name> <operator>=</operator> <call><name>AllocSetContextCreate</name><argument_list>(<argument><expr><name>TopPortalContext</name></expr></argument>,
+												  <argument><expr><literal type="string">"PortalContext"</literal></expr></argument>,
+												  <argument><expr><name>ALLOCSET_SMALL_SIZES</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>portal</name><operator>-&gt;</operator><name>ybRunContext</name></name> <operator>=</operator> <call><name>AllocSetContextCreate</name><argument_list>(<argument><expr><name><name>portal</name><operator>-&gt;</operator><name>portalContext</name></name></expr></argument>,
+												 <argument><expr><literal type="string">"PortalRunContext"</literal></expr></argument>,
+												 <argument><expr><name>ALLOCSET_SMALL_SIZES</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* create a resource owner for the portal */</comment>
+	<expr_stmt><expr><name><name>portal</name><operator>-&gt;</operator><name>resowner</name></name> <operator>=</operator> <call><name>ResourceOwnerCreate</name><argument_list>(<argument><expr><name>CurTransactionResourceOwner</name></expr></argument>,
+										   <argument><expr><literal type="string">"Portal"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* initialize portal fields that don't start off zero */</comment>
+	<expr_stmt><expr><name><name>portal</name><operator>-&gt;</operator><name>status</name></name> <operator>=</operator> <name>PORTAL_NEW</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>portal</name><operator>-&gt;</operator><name>cleanup</name></name> <operator>=</operator> <name>PortalCleanup</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>portal</name><operator>-&gt;</operator><name>createSubid</name></name> <operator>=</operator> <call><name>GetCurrentSubTransactionId</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>portal</name><operator>-&gt;</operator><name>activeSubid</name></name> <operator>=</operator> <name><name>portal</name><operator>-&gt;</operator><name>createSubid</name></name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>portal</name><operator>-&gt;</operator><name>strategy</name></name> <operator>=</operator> <name>PORTAL_MULTI_QUERY</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>portal</name><operator>-&gt;</operator><name>cursorOptions</name></name> <operator>=</operator> <name>CURSOR_OPT_NO_SCROLL</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>portal</name><operator>-&gt;</operator><name>atStart</name></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>portal</name><operator>-&gt;</operator><name>atEnd</name></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>		<comment type="block">/* disallow fetches until query is set */</comment>
+	<expr_stmt><expr><name><name>portal</name><operator>-&gt;</operator><name>visible</name></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>portal</name><operator>-&gt;</operator><name>creation_time</name></name> <operator>=</operator> <call><name>GetCurrentStatementStartTimestamp</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* put portal in table (sets portal-&gt;name) */</comment>
+	<expr_stmt><expr><call><name>PortalHashTableInsert</name><argument_list>(<argument><expr><name>portal</name></expr></argument>, <argument><expr><name>name</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* reuse portal-&gt;name copy */</comment>
+	<expr_stmt><expr><call><name>MemoryContextSetIdentifier</name><argument_list>(<argument><expr><name><name>portal</name><operator>-&gt;</operator><name>portalContext</name></name></expr></argument>, <argument><expr><name><name>portal</name><operator>-&gt;</operator><name>name</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<return>return <expr><name>portal</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * CreateNewPortal
+ *		Create a new portal, assigning it a random nonconflicting name.
+ */</comment>
+<function><type><name>Portal</name></type>
+<name>CreateNewPortal</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><specifier>static</specifier> <name>unsigned</name> <name>int</name></type> <name>unnamed_portal_count</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+
+	<decl_stmt><decl><type><name>char</name></type>		<name><name>portalname</name><index>[<expr><name>MAX_PORTALNAME_LEN</name></expr>]</index></name></decl>;</decl_stmt>
+
+	<comment type="block">/* Select a nonconflicting name */</comment>
+	<for>for <control>(<init>;</init><condition>;</condition><incr/>)</control>
+	<block>{<block_content>
+		<expr_stmt><expr><name>unnamed_portal_count</name><operator>++</operator></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>sprintf</name><argument_list>(<argument><expr><name>portalname</name></expr></argument>, <argument><expr><literal type="string">"&lt;unnamed portal %u&gt;"</literal></expr></argument>, <argument><expr><name>unnamed_portal_count</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<if_stmt><if>if <condition>(<expr><call><name>GetPortalByName</name><argument_list>(<argument><expr><name>portalname</name></expr></argument>)</argument_list></call> <operator>==</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+			<break>break;</break></block_content></block></if></if_stmt>
+	</block_content>}</block></for>
+
+	<return>return <expr><call><name>CreatePortal</name><argument_list>(<argument><expr><name>portalname</name></expr></argument>, <argument><expr><name>false</name></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * PortalDefineQuery
+ *		A simple subroutine to establish a portal's query.
+ *
+ * Notes: as of PG 8.4, caller MUST supply a sourceText string; it is not
+ * allowed anymore to pass NULL.  (If you really don't have source text,
+ * you can pass a constant string, perhaps "(query not available)".)
+ *
+ * commandTag shall be NULL if and only if the original query string
+ * (before rewriting) was an empty string.  Also, the passed commandTag must
+ * be a pointer to a constant string, since it is not copied.
+ *
+ * If cplan is provided, then it is a cached plan containing the stmts, and
+ * the caller must have done GetCachedPlan(), causing a refcount increment.
+ * The refcount will be released when the portal is destroyed.
+ *
+ * If cplan is NULL, then it is the caller's responsibility to ensure that
+ * the passed plan trees have adequate lifetime.  Typically this is done by
+ * copying them into the portal's context.
+ *
+ * The caller is also responsible for ensuring that the passed prepStmtName
+ * (if not NULL) and sourceText have adequate lifetime.
+ *
+ * NB: this function mustn't do much beyond storing the passed values; in
+ * particular don't do anything that risks elog(ERROR).  If that were to
+ * happen here before storing the cplan reference, we'd leak the plancache
+ * refcount that the caller is trying to hand off to us.
+ */</comment>
+<function><type><name>void</name></type>
+<name>PortalDefineQuery</name><parameter_list>(<parameter><decl><type><name>Portal</name></type> <name>portal</name></decl></parameter>,
+				  <parameter><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>prepStmtName</name></decl></parameter>,
+				  <parameter><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>sourceText</name></decl></parameter>,
+				  <parameter><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>commandTag</name></decl></parameter>,
+				  <parameter><decl><type><name>List</name> <modifier>*</modifier></type><name>stmts</name></decl></parameter>,
+				  <parameter><decl><type><name>CachedPlan</name> <modifier>*</modifier></type><name>cplan</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>AssertArg</name><argument_list>(<argument><expr><call><name>PortalIsValid</name><argument_list>(<argument><expr><name>portal</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>AssertState</name><argument_list>(<argument><expr><name><name>portal</name><operator>-&gt;</operator><name>status</name></name> <operator>==</operator> <name>PORTAL_NEW</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>AssertArg</name><argument_list>(<argument><expr><name>sourceText</name> <operator>!=</operator> <name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>AssertArg</name><argument_list>(<argument><expr><name>commandTag</name> <operator>!=</operator> <name>NULL</name> <operator>||</operator> <name>stmts</name> <operator>==</operator> <name>NIL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name><name>portal</name><operator>-&gt;</operator><name>prepStmtName</name></name> <operator>=</operator> <name>prepStmtName</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>portal</name><operator>-&gt;</operator><name>sourceText</name></name> <operator>=</operator> <name>sourceText</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>portal</name><operator>-&gt;</operator><name>commandTag</name></name> <operator>=</operator> <name>commandTag</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>portal</name><operator>-&gt;</operator><name>stmts</name></name> <operator>=</operator> <name>stmts</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>portal</name><operator>-&gt;</operator><name>cplan</name></name> <operator>=</operator> <name>cplan</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>portal</name><operator>-&gt;</operator><name>status</name></name> <operator>=</operator> <name>PORTAL_DEFINED</name></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * PortalReleaseCachedPlan
+ *		Release a portal's reference to its cached plan, if any.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>PortalReleaseCachedPlan</name><parameter_list>(<parameter><decl><type><name>Portal</name></type> <name>portal</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<if_stmt><if>if <condition>(<expr><name><name>portal</name><operator>-&gt;</operator><name>cplan</name></name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>ReleaseCachedPlan</name><argument_list>(<argument><expr><name><name>portal</name><operator>-&gt;</operator><name>cplan</name></name></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>portal</name><operator>-&gt;</operator><name>cplan</name></name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+
+		<comment type="block">/*
+		 * We must also clear portal-&gt;stmts which is now a dangling reference
+		 * to the cached plan's plan list.  This protects any code that might
+		 * try to examine the Portal later.
+		 */</comment>
+		<expr_stmt><expr><name><name>portal</name><operator>-&gt;</operator><name>stmts</name></name> <operator>=</operator> <name>NIL</name></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * PortalCreateHoldStore
+ *		Create the tuplestore for a portal.
+ */</comment>
+<function><type><name>void</name></type>
+<name>PortalCreateHoldStore</name><parameter_list>(<parameter><decl><type><name>Portal</name></type> <name>portal</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>MemoryContext</name></type> <name>oldcxt</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>portal</name><operator>-&gt;</operator><name>holdContext</name></name> <operator>==</operator> <name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>portal</name><operator>-&gt;</operator><name>holdStore</name></name> <operator>==</operator> <name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>portal</name><operator>-&gt;</operator><name>holdSnapshot</name></name> <operator>==</operator> <name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Create the memory context that is used for storage of the tuple set.
+	 * Note this is NOT a child of the portal's portalContext.
+	 */</comment>
+	<expr_stmt><expr><name><name>portal</name><operator>-&gt;</operator><name>holdContext</name></name> <operator>=</operator>
+		<call><name>AllocSetContextCreate</name><argument_list>(<argument><expr><name>TopPortalContext</name></expr></argument>,
+							  <argument><expr><literal type="string">"PortalHoldContext"</literal></expr></argument>,
+							  <argument><expr><name>ALLOCSET_DEFAULT_SIZES</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Create the tuple store, selecting cross-transaction temp files, and
+	 * enabling random access only if cursor requires scrolling.
+	 *
+	 * XXX: Should maintenance_work_mem be used for the portal size?
+	 */</comment>
+	<expr_stmt><expr><name>oldcxt</name> <operator>=</operator> <call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name><name>portal</name><operator>-&gt;</operator><name>holdContext</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name><name>portal</name><operator>-&gt;</operator><name>holdStore</name></name> <operator>=</operator>
+		<call><name>tuplestore_begin_heap</name><argument_list>(<argument><expr><name><name>portal</name><operator>-&gt;</operator><name>cursorOptions</name></name> <operator>&amp;</operator> <name>CURSOR_OPT_SCROLL</name></expr></argument>,
+							  <argument><expr><name>true</name></expr></argument>, <argument><expr><name>work_mem</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>oldcxt</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * PinPortal
+ *		Protect a portal from dropping.
+ *
+ * A pinned portal is still unpinned and dropped at transaction or
+ * subtransaction abort.
+ */</comment>
+<function><type><name>void</name></type>
+<name>PinPortal</name><parameter_list>(<parameter><decl><type><name>Portal</name></type> <name>portal</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<if_stmt><if>if <condition>(<expr><name><name>portal</name><operator>-&gt;</operator><name>portalPinned</name></name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"portal already pinned"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><name><name>portal</name><operator>-&gt;</operator><name>portalPinned</name></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<function><type><name>void</name></type>
+<name>UnpinPortal</name><parameter_list>(<parameter><decl><type><name>Portal</name></type> <name>portal</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><name><name>portal</name><operator>-&gt;</operator><name>portalPinned</name></name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"portal not pinned"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><name><name>portal</name><operator>-&gt;</operator><name>portalPinned</name></name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * MarkPortalActive
+ *		Transition a portal from READY to ACTIVE state.
+ *
+ * NOTE: never set portal-&gt;status = PORTAL_ACTIVE directly; call this instead.
+ */</comment>
+<function><type><name>void</name></type>
+<name>MarkPortalActive</name><parameter_list>(<parameter><decl><type><name>Portal</name></type> <name>portal</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<comment type="block">/* For safety, this is a runtime test not just an Assert */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>portal</name><operator>-&gt;</operator><name>status</name></name> <operator>!=</operator> <name>PORTAL_READY</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE</name></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"portal \"%s\" cannot be run"</literal></expr></argument>, <argument><expr><name><name>portal</name><operator>-&gt;</operator><name>name</name></name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	<comment type="block">/* Perform the state transition */</comment>
+	<expr_stmt><expr><name><name>portal</name><operator>-&gt;</operator><name>status</name></name> <operator>=</operator> <name>PORTAL_ACTIVE</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>portal</name><operator>-&gt;</operator><name>activeSubid</name></name> <operator>=</operator> <call><name>GetCurrentSubTransactionId</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * MarkPortalDone
+ *		Transition a portal from ACTIVE to DONE state.
+ *
+ * NOTE: never set portal-&gt;status = PORTAL_DONE directly; call this instead.
+ */</comment>
+<function><type><name>void</name></type>
+<name>MarkPortalDone</name><parameter_list>(<parameter><decl><type><name>Portal</name></type> <name>portal</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<comment type="block">/* Perform the state transition */</comment>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>portal</name><operator>-&gt;</operator><name>status</name></name> <operator>==</operator> <name>PORTAL_ACTIVE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>portal</name><operator>-&gt;</operator><name>status</name></name> <operator>=</operator> <name>PORTAL_DONE</name></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Allow portalcmds.c to clean up the state it knows about.  We might as
+	 * well do that now, since the portal can't be executed any more.
+	 *
+	 * In some cases involving execution of a ROLLBACK command in an already
+	 * aborted transaction, this is necessary, or we'd reach AtCleanup_Portals
+	 * with the cleanup hook still unexecuted.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><call><name>PointerIsValid</name><argument_list>(<argument><expr><name><name>portal</name><operator>-&gt;</operator><name>cleanup</name></name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name><name>portal</name><operator>-&gt;</operator><name>cleanup</name></name><argument_list>(<argument><expr><name>portal</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>portal</name><operator>-&gt;</operator><name>cleanup</name></name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * MarkPortalFailed
+ *		Transition a portal into FAILED state.
+ *
+ * NOTE: never set portal-&gt;status = PORTAL_FAILED directly; call this instead.
+ */</comment>
+<function><type><name>void</name></type>
+<name>MarkPortalFailed</name><parameter_list>(<parameter><decl><type><name>Portal</name></type> <name>portal</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<comment type="block">/* Perform the state transition */</comment>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>portal</name><operator>-&gt;</operator><name>status</name></name> <operator>!=</operator> <name>PORTAL_DONE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>portal</name><operator>-&gt;</operator><name>status</name></name> <operator>=</operator> <name>PORTAL_FAILED</name></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Allow portalcmds.c to clean up the state it knows about.  We might as
+	 * well do that now, since the portal can't be executed any more.
+	 *
+	 * In some cases involving cleanup of an already aborted transaction, this
+	 * is necessary, or we'd reach AtCleanup_Portals with the cleanup hook
+	 * still unexecuted.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><call><name>PointerIsValid</name><argument_list>(<argument><expr><name><name>portal</name><operator>-&gt;</operator><name>cleanup</name></name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name><name>portal</name><operator>-&gt;</operator><name>cleanup</name></name><argument_list>(<argument><expr><name>portal</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>portal</name><operator>-&gt;</operator><name>cleanup</name></name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * PortalDrop
+ *		Destroy the portal.
+ */</comment>
+<function><type><name>void</name></type>
+<name>PortalDrop</name><parameter_list>(<parameter><decl><type><name>Portal</name></type> <name>portal</name></decl></parameter>, <parameter><decl><type><name>bool</name></type> <name>isTopCommit</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<expr_stmt><expr><call><name>AssertArg</name><argument_list>(<argument><expr><call><name>PortalIsValid</name><argument_list>(<argument><expr><name>portal</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Don't allow dropping a pinned portal, it's still needed by whoever
+	 * pinned it.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>portal</name><operator>-&gt;</operator><name>portalPinned</name></name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_INVALID_CURSOR_STATE</name></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"cannot drop pinned portal \"%s\""</literal></expr></argument>, <argument><expr><name><name>portal</name><operator>-&gt;</operator><name>name</name></name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<comment type="block">/*
+	 * Not sure if the PORTAL_ACTIVE case can validly happen or not...
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>portal</name><operator>-&gt;</operator><name>status</name></name> <operator>==</operator> <name>PORTAL_ACTIVE</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_INVALID_CURSOR_STATE</name></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"cannot drop active portal \"%s\""</literal></expr></argument>, <argument><expr><name><name>portal</name><operator>-&gt;</operator><name>name</name></name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<comment type="block">/*
+	 * Allow portalcmds.c to clean up the state it knows about, in particular
+	 * shutting down the executor if still active.  This step potentially runs
+	 * user-defined code so failure has to be expected.  It's the cleanup
+	 * hook's responsibility to not try to do that more than once, in the case
+	 * that failure occurs and then we come back to drop the portal again
+	 * during transaction abort.
+	 *
+	 * Note: in most paths of control, this will have been done already in
+	 * MarkPortalDone or MarkPortalFailed.  We're just making sure.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><call><name>PointerIsValid</name><argument_list>(<argument><expr><name><name>portal</name><operator>-&gt;</operator><name>cleanup</name></name></expr></argument>)</argument_list></call></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name><name>portal</name><operator>-&gt;</operator><name>cleanup</name></name><argument_list>(<argument><expr><name>portal</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>portal</name><operator>-&gt;</operator><name>cleanup</name></name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/*
+	 * Remove portal from hash table.  Because we do this here, we will not
+	 * come back to try to remove the portal again if there's any error in the
+	 * subsequent steps.  Better to leak a little memory than to get into an
+	 * infinite error-recovery loop.
+	 */</comment>
+	<expr_stmt><expr><call><name>PortalHashTableDelete</name><argument_list>(<argument><expr><name>portal</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* drop cached plan reference, if any */</comment>
+	<expr_stmt><expr><call><name>PortalReleaseCachedPlan</name><argument_list>(<argument><expr><name>portal</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * If portal has a snapshot protecting its data, release that.  This needs
+	 * a little care since the registration will be attached to the portal's
+	 * resowner; if the portal failed, we will already have released the
+	 * resowner (and the snapshot) during transaction abort.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>portal</name><operator>-&gt;</operator><name>holdSnapshot</name></name></expr>)</condition>
+	<block>{<block_content>
+		<if_stmt><if>if <condition>(<expr><name><name>portal</name><operator>-&gt;</operator><name>resowner</name></name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>UnregisterSnapshotFromOwner</name><argument_list>(<argument><expr><name><name>portal</name><operator>-&gt;</operator><name>holdSnapshot</name></name></expr></argument>,
+										<argument><expr><name><name>portal</name><operator>-&gt;</operator><name>resowner</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+		<expr_stmt><expr><name><name>portal</name><operator>-&gt;</operator><name>holdSnapshot</name></name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/*
+	 * Release any resources still attached to the portal.  There are several
+	 * cases being covered here:
+	 *
+	 * Top transaction commit (indicated by isTopCommit): normally we should
+	 * do nothing here and let the regular end-of-transaction resource
+	 * releasing mechanism handle these resources too.  However, if we have a
+	 * FAILED portal (eg, a cursor that got an error), we'd better clean up
+	 * its resources to avoid resource-leakage warning messages.
+	 *
+	 * Sub transaction commit: never comes here at all, since we don't kill
+	 * any portals in AtSubCommit_Portals().
+	 *
+	 * Main or sub transaction abort: we will do nothing here because
+	 * portal-&gt;resowner was already set NULL; the resources were already
+	 * cleaned up in transaction abort.
+	 *
+	 * Ordinary portal drop: must release resources.  However, if the portal
+	 * is not FAILED then we do not release its locks.  The locks become the
+	 * responsibility of the transaction's ResourceOwner (since it is the
+	 * parent of the portal's owner) and will be released when the transaction
+	 * eventually ends.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>portal</name><operator>-&gt;</operator><name>resowner</name></name> <operator>&amp;&amp;</operator>
+		<operator>(</operator><operator>!</operator><name>isTopCommit</name> <operator>||</operator> <name><name>portal</name><operator>-&gt;</operator><name>status</name></name> <operator>==</operator> <name>PORTAL_FAILED</name><operator>)</operator></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>bool</name></type>		<name>isCommit</name> <init>= <expr><operator>(</operator><name><name>portal</name><operator>-&gt;</operator><name>status</name></name> <operator>!=</operator> <name>PORTAL_FAILED</name><operator>)</operator></expr></init></decl>;</decl_stmt>
+
+		<expr_stmt><expr><call><name>ResourceOwnerRelease</name><argument_list>(<argument><expr><name><name>portal</name><operator>-&gt;</operator><name>resowner</name></name></expr></argument>,
+							 <argument><expr><name>RESOURCE_RELEASE_BEFORE_LOCKS</name></expr></argument>,
+							 <argument><expr><name>isCommit</name></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>ResourceOwnerRelease</name><argument_list>(<argument><expr><name><name>portal</name><operator>-&gt;</operator><name>resowner</name></name></expr></argument>,
+							 <argument><expr><name>RESOURCE_RELEASE_LOCKS</name></expr></argument>,
+							 <argument><expr><name>isCommit</name></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>ResourceOwnerRelease</name><argument_list>(<argument><expr><name><name>portal</name><operator>-&gt;</operator><name>resowner</name></name></expr></argument>,
+							 <argument><expr><name>RESOURCE_RELEASE_AFTER_LOCKS</name></expr></argument>,
+							 <argument><expr><name>isCommit</name></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>ResourceOwnerDelete</name><argument_list>(<argument><expr><name><name>portal</name><operator>-&gt;</operator><name>resowner</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+	<expr_stmt><expr><name><name>portal</name><operator>-&gt;</operator><name>resowner</name></name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Delete tuplestore if present.  We should do this even under error
+	 * conditions; since the tuplestore would have been using cross-
+	 * transaction storage, its temp files need to be explicitly deleted.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>portal</name><operator>-&gt;</operator><name>holdStore</name></name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>MemoryContext</name></type> <name>oldcontext</name></decl>;</decl_stmt>
+
+		<expr_stmt><expr><name>oldcontext</name> <operator>=</operator> <call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name><name>portal</name><operator>-&gt;</operator><name>holdContext</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>tuplestore_end</name><argument_list>(<argument><expr><name><name>portal</name><operator>-&gt;</operator><name>holdStore</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>oldcontext</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>portal</name><operator>-&gt;</operator><name>holdStore</name></name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/* delete tuplestore storage, if any */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>portal</name><operator>-&gt;</operator><name>holdContext</name></name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>MemoryContextDelete</name><argument_list>(<argument><expr><name><name>portal</name><operator>-&gt;</operator><name>holdContext</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<comment type="block">/* release subsidiary storage */</comment>
+	<expr_stmt><expr><call><name>MemoryContextDelete</name><argument_list>(<argument><expr><name><name>portal</name><operator>-&gt;</operator><name>portalContext</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* release portal struct (it's in TopPortalContext) */</comment>
+	<expr_stmt><expr><call><name>pfree</name><argument_list>(<argument><expr><name>portal</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Delete all declared cursors.
+ *
+ * Used by commands: CLOSE ALL, DISCARD ALL
+ */</comment>
+<function><type><name>void</name></type>
+<name>PortalHashTableDeleteAll</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>HASH_SEQ_STATUS</name></type> <name>status</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>PortalHashEnt</name> <modifier>*</modifier></type><name>hentry</name></decl>;</decl_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>PortalHashTable</name> <operator>==</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return;</return></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><call><name>hash_seq_init</name><argument_list>(<argument><expr><operator>&amp;</operator><name>status</name></expr></argument>, <argument><expr><name>PortalHashTable</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<while>while <condition>(<expr><operator>(</operator><name>hentry</name> <operator>=</operator> <call><name>hash_seq_search</name><argument_list>(<argument><expr><operator>&amp;</operator><name>status</name></expr></argument>)</argument_list></call><operator>)</operator> <operator>!=</operator> <name>NULL</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>Portal</name></type>		<name>portal</name> <init>= <expr><name><name>hentry</name><operator>-&gt;</operator><name>portal</name></name></expr></init></decl>;</decl_stmt>
+
+		<comment type="block">/* Can't close the active portal (the one running the command) */</comment>
+		<if_stmt><if>if <condition>(<expr><name><name>portal</name><operator>-&gt;</operator><name>status</name></name> <operator>==</operator> <name>PORTAL_ACTIVE</name></expr>)</condition><block type="pseudo"><block_content>
+			<continue>continue;</continue></block_content></block></if></if_stmt>
+
+		<expr_stmt><expr><call><name>PortalDrop</name><argument_list>(<argument><expr><name>portal</name></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/* Restart the iteration in case that led to other drops */</comment>
+		<expr_stmt><expr><call><name>hash_seq_term</name><argument_list>(<argument><expr><operator>&amp;</operator><name>status</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>hash_seq_init</name><argument_list>(<argument><expr><operator>&amp;</operator><name>status</name></expr></argument>, <argument><expr><name>PortalHashTable</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></while>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * "Hold" a portal.  Prepare it for access by later transactions.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>HoldPortal</name><parameter_list>(<parameter><decl><type><name>Portal</name></type> <name>portal</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<comment type="block">/*
+	 * Note that PersistHoldablePortal() must release all resources used by
+	 * the portal that are local to the creating transaction.
+	 */</comment>
+	<expr_stmt><expr><call><name>PortalCreateHoldStore</name><argument_list>(<argument><expr><name>portal</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>PersistHoldablePortal</name><argument_list>(<argument><expr><name>portal</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* drop cached plan reference, if any */</comment>
+	<expr_stmt><expr><call><name>PortalReleaseCachedPlan</name><argument_list>(<argument><expr><name>portal</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Any resources belonging to the portal will be released in the upcoming
+	 * transaction-wide cleanup; the portal will no longer have its own
+	 * resources.
+	 */</comment>
+	<expr_stmt><expr><name><name>portal</name><operator>-&gt;</operator><name>resowner</name></name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Having successfully exported the holdable cursor, mark it as not
+	 * belonging to this transaction.
+	 */</comment>
+	<expr_stmt><expr><name><name>portal</name><operator>-&gt;</operator><name>createSubid</name></name> <operator>=</operator> <name>InvalidSubTransactionId</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>portal</name><operator>-&gt;</operator><name>activeSubid</name></name> <operator>=</operator> <name>InvalidSubTransactionId</name></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Pre-commit processing for portals.
+ *
+ * Holdable cursors created in this transaction need to be converted to
+ * materialized form, since we are going to close down the executor and
+ * release locks.  Non-holdable portals created in this transaction are
+ * simply removed.  Portals remaining from prior transactions should be
+ * left untouched.
+ *
+ * Returns true if any portals changed state (possibly causing user-defined
+ * code to be run), false if not.
+ */</comment>
+<function><type><name>bool</name></type>
+<name>PreCommit_Portals</name><parameter_list>(<parameter><decl><type><name>bool</name></type> <name>isPrepare</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>bool</name></type>		<name>result</name> <init>= <expr><name>false</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>HASH_SEQ_STATUS</name></type> <name>status</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>PortalHashEnt</name> <modifier>*</modifier></type><name>hentry</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>hash_seq_init</name><argument_list>(<argument><expr><operator>&amp;</operator><name>status</name></expr></argument>, <argument><expr><name>PortalHashTable</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<while>while <condition>(<expr><operator>(</operator><name>hentry</name> <operator>=</operator> <operator>(</operator><name>PortalHashEnt</name> <operator>*</operator><operator>)</operator> <call><name>hash_seq_search</name><argument_list>(<argument><expr><operator>&amp;</operator><name>status</name></expr></argument>)</argument_list></call><operator>)</operator> <operator>!=</operator> <name>NULL</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>Portal</name></type>		<name>portal</name> <init>= <expr><name><name>hentry</name><operator>-&gt;</operator><name>portal</name></name></expr></init></decl>;</decl_stmt>
+
+		<comment type="block">/*
+		 * There should be no pinned portals anymore. Complain if someone
+		 * leaked one. Auto-held portals are allowed; we assume that whoever
+		 * pinned them is managing them.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><name><name>portal</name><operator>-&gt;</operator><name>portalPinned</name></name> <operator>&amp;&amp;</operator> <operator>!</operator><name><name>portal</name><operator>-&gt;</operator><name>autoHeld</name></name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"cannot commit while a portal is pinned"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+		<comment type="block">/*
+		 * Do not touch active portals --- this can only happen in the case of
+		 * a multi-transaction utility command, such as VACUUM, or a commit in
+		 * a procedure.
+		 *
+		 * Note however that any resource owner attached to such a portal is
+		 * still going to go away, so don't leave a dangling pointer.  Also
+		 * unregister any snapshots held by the portal, mainly to avoid
+		 * snapshot leak warnings from ResourceOwnerRelease().
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><name><name>portal</name><operator>-&gt;</operator><name>status</name></name> <operator>==</operator> <name>PORTAL_ACTIVE</name></expr>)</condition>
+		<block>{<block_content>
+			<if_stmt><if>if <condition>(<expr><name><name>portal</name><operator>-&gt;</operator><name>holdSnapshot</name></name></expr>)</condition>
+			<block>{<block_content>
+				<if_stmt><if>if <condition>(<expr><name><name>portal</name><operator>-&gt;</operator><name>resowner</name></name></expr>)</condition><block type="pseudo"><block_content>
+					<expr_stmt><expr><call><name>UnregisterSnapshotFromOwner</name><argument_list>(<argument><expr><name><name>portal</name><operator>-&gt;</operator><name>holdSnapshot</name></name></expr></argument>,
+												<argument><expr><name><name>portal</name><operator>-&gt;</operator><name>resowner</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+				<expr_stmt><expr><name><name>portal</name><operator>-&gt;</operator><name>holdSnapshot</name></name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+			</block_content>}</block></if></if_stmt>
+			<expr_stmt><expr><name><name>portal</name><operator>-&gt;</operator><name>resowner</name></name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+			<continue>continue;</continue>
+		</block_content>}</block></if></if_stmt>
+
+		<comment type="block">/* Is it a holdable portal created in the current xact? */</comment>
+		<if_stmt><if>if <condition>(<expr><operator>(</operator><name><name>portal</name><operator>-&gt;</operator><name>cursorOptions</name></name> <operator>&amp;</operator> <name>CURSOR_OPT_HOLD</name><operator>)</operator> <operator>&amp;&amp;</operator>
+			<name><name>portal</name><operator>-&gt;</operator><name>createSubid</name></name> <operator>!=</operator> <name>InvalidSubTransactionId</name> <operator>&amp;&amp;</operator>
+			<name><name>portal</name><operator>-&gt;</operator><name>status</name></name> <operator>==</operator> <name>PORTAL_READY</name></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/*
+			 * We are exiting the transaction that created a holdable cursor.
+			 * Instead of dropping the portal, prepare it for access by later
+			 * transactions.
+			 *
+			 * However, if this is PREPARE TRANSACTION rather than COMMIT,
+			 * refuse PREPARE, because the semantics seem pretty unclear.
+			 */</comment>
+			<if_stmt><if>if <condition>(<expr><name>isPrepare</name></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+						<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_FEATURE_NOT_SUPPORTED</name></expr></argument>)</argument_list></call><operator>,</operator>
+						 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"cannot PREPARE a transaction that has created a cursor WITH HOLD"</literal></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+			<expr_stmt><expr><call><name>HoldPortal</name><argument_list>(<argument><expr><name>portal</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+			<comment type="block">/* Report we changed state */</comment>
+			<expr_stmt><expr><name>result</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+		</block_content>}</block></if>
+		<if type="elseif">else if <condition>(<expr><name><name>portal</name><operator>-&gt;</operator><name>createSubid</name></name> <operator>==</operator> <name>InvalidSubTransactionId</name></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/*
+			 * Do nothing to cursors held over from a previous transaction
+			 * (including ones we just froze in a previous cycle of this loop)
+			 */</comment>
+			<continue>continue;</continue>
+		</block_content>}</block></if>
+		<else>else
+		<block>{<block_content>
+			<comment type="block">/* Zap all non-holdable portals */</comment>
+			<expr_stmt><expr><call><name>PortalDrop</name><argument_list>(<argument><expr><name>portal</name></expr></argument>, <argument><expr><name>true</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+			<comment type="block">/* Report we changed state */</comment>
+			<expr_stmt><expr><name>result</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+		</block_content>}</block></else></if_stmt>
+
+		<comment type="block">/*
+		 * After either freezing or dropping a portal, we have to restart the
+		 * iteration, because we could have invoked user-defined code that
+		 * caused a drop of the next portal in the hash chain.
+		 */</comment>
+		<expr_stmt><expr><call><name>hash_seq_term</name><argument_list>(<argument><expr><operator>&amp;</operator><name>status</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>hash_seq_init</name><argument_list>(<argument><expr><operator>&amp;</operator><name>status</name></expr></argument>, <argument><expr><name>PortalHashTable</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></while>
+
+	<return>return <expr><name>result</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Abort processing for portals.
+ *
+ * At this point we run the cleanup hook if present, but we can't release the
+ * portal's memory until the cleanup call.
+ */</comment>
+<function><type><name>void</name></type>
+<name>AtAbort_Portals</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>HASH_SEQ_STATUS</name></type> <name>status</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>PortalHashEnt</name> <modifier>*</modifier></type><name>hentry</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>hash_seq_init</name><argument_list>(<argument><expr><operator>&amp;</operator><name>status</name></expr></argument>, <argument><expr><name>PortalHashTable</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<while>while <condition>(<expr><operator>(</operator><name>hentry</name> <operator>=</operator> <operator>(</operator><name>PortalHashEnt</name> <operator>*</operator><operator>)</operator> <call><name>hash_seq_search</name><argument_list>(<argument><expr><operator>&amp;</operator><name>status</name></expr></argument>)</argument_list></call><operator>)</operator> <operator>!=</operator> <name>NULL</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>Portal</name></type>		<name>portal</name> <init>= <expr><name><name>hentry</name><operator>-&gt;</operator><name>portal</name></name></expr></init></decl>;</decl_stmt>
+
+		<comment type="block">/*
+		 * When elog(FATAL) is progress, we need to set the active portal to
+		 * failed, so that PortalCleanup() doesn't run the executor shutdown.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><name><name>portal</name><operator>-&gt;</operator><name>status</name></name> <operator>==</operator> <name>PORTAL_ACTIVE</name> <operator>&amp;&amp;</operator> <name>shmem_exit_inprogress</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>MarkPortalFailed</name><argument_list>(<argument><expr><name>portal</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+		<comment type="block">/*
+		 * Do nothing else to cursors held over from a previous transaction.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><name><name>portal</name><operator>-&gt;</operator><name>createSubid</name></name> <operator>==</operator> <name>InvalidSubTransactionId</name></expr>)</condition><block type="pseudo"><block_content>
+			<continue>continue;</continue></block_content></block></if></if_stmt>
+
+		<comment type="block">/*
+		 * Do nothing to auto-held cursors.  This is similar to the case of a
+		 * cursor from a previous transaction, but it could also be that the
+		 * cursor was auto-held in this transaction, so it wants to live on.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><name><name>portal</name><operator>-&gt;</operator><name>autoHeld</name></name></expr>)</condition><block type="pseudo"><block_content>
+			<continue>continue;</continue></block_content></block></if></if_stmt>
+
+		<comment type="block">/*
+		 * If it was created in the current transaction, we can't do normal
+		 * shutdown on a READY portal either; it might refer to objects
+		 * created in the failed transaction.  See comments in
+		 * AtSubAbort_Portals.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><name><name>portal</name><operator>-&gt;</operator><name>status</name></name> <operator>==</operator> <name>PORTAL_READY</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>MarkPortalFailed</name><argument_list>(<argument><expr><name>portal</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+		<comment type="block">/*
+		 * Allow portalcmds.c to clean up the state it knows about, if we
+		 * haven't already.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><call><name>PointerIsValid</name><argument_list>(<argument><expr><name><name>portal</name><operator>-&gt;</operator><name>cleanup</name></name></expr></argument>)</argument_list></call></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><call><name><name>portal</name><operator>-&gt;</operator><name>cleanup</name></name><argument_list>(<argument><expr><name>portal</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><name><name>portal</name><operator>-&gt;</operator><name>cleanup</name></name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+
+		<comment type="block">/* drop cached plan reference, if any */</comment>
+		<expr_stmt><expr><call><name>PortalReleaseCachedPlan</name><argument_list>(<argument><expr><name>portal</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/*
+		 * Any resources belonging to the portal will be released in the
+		 * upcoming transaction-wide cleanup; they will be gone before we run
+		 * PortalDrop.
+		 */</comment>
+		<expr_stmt><expr><name><name>portal</name><operator>-&gt;</operator><name>resowner</name></name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+
+		<comment type="block">/*
+		 * Although we can't delete the portal data structure proper, we can
+		 * release any memory in subsidiary contexts, such as executor state.
+		 * The cleanup hook was the last thing that might have needed data
+		 * there.  But leave active portals alone.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><name><name>portal</name><operator>-&gt;</operator><name>status</name></name> <operator>!=</operator> <name>PORTAL_ACTIVE</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>MemoryContextDeleteChildren</name><argument_list>(<argument><expr><name><name>portal</name><operator>-&gt;</operator><name>portalContext</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	</block_content>}</block></while>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Post-abort cleanup for portals.
+ *
+ * Delete all portals not held over from prior transactions.  */</comment>
+<function><type><name>void</name></type>
+<name>AtCleanup_Portals</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>HASH_SEQ_STATUS</name></type> <name>status</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>PortalHashEnt</name> <modifier>*</modifier></type><name>hentry</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>hash_seq_init</name><argument_list>(<argument><expr><operator>&amp;</operator><name>status</name></expr></argument>, <argument><expr><name>PortalHashTable</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<while>while <condition>(<expr><operator>(</operator><name>hentry</name> <operator>=</operator> <operator>(</operator><name>PortalHashEnt</name> <operator>*</operator><operator>)</operator> <call><name>hash_seq_search</name><argument_list>(<argument><expr><operator>&amp;</operator><name>status</name></expr></argument>)</argument_list></call><operator>)</operator> <operator>!=</operator> <name>NULL</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>Portal</name></type>		<name>portal</name> <init>= <expr><name><name>hentry</name><operator>-&gt;</operator><name>portal</name></name></expr></init></decl>;</decl_stmt>
+
+		<comment type="block">/*
+		 * Do not touch active portals --- this can only happen in the case of
+		 * a multi-transaction command.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><name><name>portal</name><operator>-&gt;</operator><name>status</name></name> <operator>==</operator> <name>PORTAL_ACTIVE</name></expr>)</condition><block type="pseudo"><block_content>
+			<continue>continue;</continue></block_content></block></if></if_stmt>
+
+		<comment type="block">/*
+		 * Do nothing to cursors held over from a previous transaction or
+		 * auto-held ones.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><name><name>portal</name><operator>-&gt;</operator><name>createSubid</name></name> <operator>==</operator> <name>InvalidSubTransactionId</name> <operator>||</operator> <name><name>portal</name><operator>-&gt;</operator><name>autoHeld</name></name></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>portal</name><operator>-&gt;</operator><name>status</name></name> <operator>!=</operator> <name>PORTAL_ACTIVE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>portal</name><operator>-&gt;</operator><name>resowner</name></name> <operator>==</operator> <name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<continue>continue;</continue>
+		</block_content>}</block></if></if_stmt>
+
+		<comment type="block">/*
+		 * If a portal is still pinned, forcibly unpin it. PortalDrop will not
+		 * let us drop the portal otherwise. Whoever pinned the portal was
+		 * interrupted by the abort too and won't try to use it anymore.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><name><name>portal</name><operator>-&gt;</operator><name>portalPinned</name></name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><name><name>portal</name><operator>-&gt;</operator><name>portalPinned</name></name> <operator>=</operator> <name>false</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+		<comment type="block">/*
+		 * We had better not call any user-defined code during cleanup, so if
+		 * the cleanup hook hasn't been run yet, too bad; we'll just skip it.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><call><name>PointerIsValid</name><argument_list>(<argument><expr><name><name>portal</name><operator>-&gt;</operator><name>cleanup</name></name></expr></argument>)</argument_list></call></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>WARNING</name></expr></argument>, <argument><expr><literal type="string">"skipping cleanup for portal \"%s\""</literal></expr></argument>, <argument><expr><name><name>portal</name><operator>-&gt;</operator><name>name</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><name><name>portal</name><operator>-&gt;</operator><name>cleanup</name></name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+
+		<comment type="block">/* Zap it. */</comment>
+		<expr_stmt><expr><call><name>PortalDrop</name><argument_list>(<argument><expr><name>portal</name></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></while>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Portal-related cleanup when we return to the main loop on error.
+ *
+ * This is different from the cleanup at transaction abort.  Auto-held portals
+ * are cleaned up on error but not on transaction abort.
+ */</comment>
+<function><type><name>void</name></type>
+<name>PortalErrorCleanup</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>HASH_SEQ_STATUS</name></type> <name>status</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>PortalHashEnt</name> <modifier>*</modifier></type><name>hentry</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>hash_seq_init</name><argument_list>(<argument><expr><operator>&amp;</operator><name>status</name></expr></argument>, <argument><expr><name>PortalHashTable</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<while>while <condition>(<expr><operator>(</operator><name>hentry</name> <operator>=</operator> <operator>(</operator><name>PortalHashEnt</name> <operator>*</operator><operator>)</operator> <call><name>hash_seq_search</name><argument_list>(<argument><expr><operator>&amp;</operator><name>status</name></expr></argument>)</argument_list></call><operator>)</operator> <operator>!=</operator> <name>NULL</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>Portal</name></type>		<name>portal</name> <init>= <expr><name><name>hentry</name><operator>-&gt;</operator><name>portal</name></name></expr></init></decl>;</decl_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name><name>portal</name><operator>-&gt;</operator><name>autoHeld</name></name></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><name><name>portal</name><operator>-&gt;</operator><name>portalPinned</name></name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>PortalDrop</name><argument_list>(<argument><expr><name>portal</name></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+	</block_content>}</block></while>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Pre-subcommit processing for portals.
+ *
+ * Reassign portals created or used in the current subtransaction to the
+ * parent subtransaction.
+ */</comment>
+<function><type><name>void</name></type>
+<name>AtSubCommit_Portals</name><parameter_list>(<parameter><decl><type><name>SubTransactionId</name></type> <name>mySubid</name></decl></parameter>,
+					<parameter><decl><type><name>SubTransactionId</name></type> <name>parentSubid</name></decl></parameter>,
+					<parameter><decl><type><name>ResourceOwner</name></type> <name>parentXactOwner</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>HASH_SEQ_STATUS</name></type> <name>status</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>PortalHashEnt</name> <modifier>*</modifier></type><name>hentry</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>hash_seq_init</name><argument_list>(<argument><expr><operator>&amp;</operator><name>status</name></expr></argument>, <argument><expr><name>PortalHashTable</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<while>while <condition>(<expr><operator>(</operator><name>hentry</name> <operator>=</operator> <operator>(</operator><name>PortalHashEnt</name> <operator>*</operator><operator>)</operator> <call><name>hash_seq_search</name><argument_list>(<argument><expr><operator>&amp;</operator><name>status</name></expr></argument>)</argument_list></call><operator>)</operator> <operator>!=</operator> <name>NULL</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>Portal</name></type>		<name>portal</name> <init>= <expr><name><name>hentry</name><operator>-&gt;</operator><name>portal</name></name></expr></init></decl>;</decl_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name><name>portal</name><operator>-&gt;</operator><name>createSubid</name></name> <operator>==</operator> <name>mySubid</name></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><name><name>portal</name><operator>-&gt;</operator><name>createSubid</name></name> <operator>=</operator> <name>parentSubid</name></expr>;</expr_stmt>
+			<if_stmt><if>if <condition>(<expr><name><name>portal</name><operator>-&gt;</operator><name>resowner</name></name></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><call><name>ResourceOwnerNewParent</name><argument_list>(<argument><expr><name><name>portal</name><operator>-&gt;</operator><name>resowner</name></name></expr></argument>, <argument><expr><name>parentXactOwner</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+		</block_content>}</block></if></if_stmt>
+		<if_stmt><if>if <condition>(<expr><name><name>portal</name><operator>-&gt;</operator><name>activeSubid</name></name> <operator>==</operator> <name>mySubid</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><name><name>portal</name><operator>-&gt;</operator><name>activeSubid</name></name> <operator>=</operator> <name>parentSubid</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	</block_content>}</block></while>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Subtransaction abort handling for portals.
+ *
+ * Deactivate portals created or used during the failed subtransaction.
+ * Note that per AtSubCommit_Portals, this will catch portals created/used
+ * in descendants of the subtransaction too.
+ *
+ * We don't destroy any portals here; that's done in AtSubCleanup_Portals.
+ */</comment>
+<function><type><name>void</name></type>
+<name>AtSubAbort_Portals</name><parameter_list>(<parameter><decl><type><name>SubTransactionId</name></type> <name>mySubid</name></decl></parameter>,
+				   <parameter><decl><type><name>SubTransactionId</name></type> <name>parentSubid</name></decl></parameter>,
+				   <parameter><decl><type><name>ResourceOwner</name></type> <name>myXactOwner</name></decl></parameter>,
+				   <parameter><decl><type><name>ResourceOwner</name></type> <name>parentXactOwner</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>HASH_SEQ_STATUS</name></type> <name>status</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>PortalHashEnt</name> <modifier>*</modifier></type><name>hentry</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>hash_seq_init</name><argument_list>(<argument><expr><operator>&amp;</operator><name>status</name></expr></argument>, <argument><expr><name>PortalHashTable</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<while>while <condition>(<expr><operator>(</operator><name>hentry</name> <operator>=</operator> <operator>(</operator><name>PortalHashEnt</name> <operator>*</operator><operator>)</operator> <call><name>hash_seq_search</name><argument_list>(<argument><expr><operator>&amp;</operator><name>status</name></expr></argument>)</argument_list></call><operator>)</operator> <operator>!=</operator> <name>NULL</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>Portal</name></type>		<name>portal</name> <init>= <expr><name><name>hentry</name><operator>-&gt;</operator><name>portal</name></name></expr></init></decl>;</decl_stmt>
+
+		<comment type="block">/* Was it created in this subtransaction? */</comment>
+		<if_stmt><if>if <condition>(<expr><name><name>portal</name><operator>-&gt;</operator><name>createSubid</name></name> <operator>!=</operator> <name>mySubid</name></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/* No, but maybe it was used in this subtransaction? */</comment>
+			<if_stmt><if>if <condition>(<expr><name><name>portal</name><operator>-&gt;</operator><name>activeSubid</name></name> <operator>==</operator> <name>mySubid</name></expr>)</condition>
+			<block>{<block_content>
+				<comment type="block">/* Maintain activeSubid until the portal is removed */</comment>
+				<expr_stmt><expr><name><name>portal</name><operator>-&gt;</operator><name>activeSubid</name></name> <operator>=</operator> <name>parentSubid</name></expr>;</expr_stmt>
+
+				<comment type="block">/*
+				 * A MarkPortalActive() caller ran an upper-level portal in
+				 * this subtransaction and left the portal ACTIVE.  This can't
+				 * happen, but force the portal into FAILED state for the same
+				 * reasons discussed below.
+				 *
+				 * We assume we can get away without forcing upper-level READY
+				 * portals to fail, even if they were run and then suspended.
+				 * In theory a suspended upper-level portal could have
+				 * acquired some references to objects that are about to be
+				 * destroyed, but there should be sufficient defenses against
+				 * such cases: the portal's original query cannot contain such
+				 * references, and any references within, say, cached plans of
+				 * PL/pgSQL functions are not from active queries and should
+				 * be protected by revalidation logic.
+				 */</comment>
+				<if_stmt><if>if <condition>(<expr><name><name>portal</name><operator>-&gt;</operator><name>status</name></name> <operator>==</operator> <name>PORTAL_ACTIVE</name></expr>)</condition><block type="pseudo"><block_content>
+					<expr_stmt><expr><call><name>MarkPortalFailed</name><argument_list>(<argument><expr><name>portal</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+				<comment type="block">/*
+				 * Also, if we failed it during the current subtransaction
+				 * (either just above, or earlier), reattach its resource
+				 * owner to the current subtransaction's resource owner, so
+				 * that any resources it still holds will be released while
+				 * cleaning up this subtransaction.  This prevents some corner
+				 * cases wherein we might get Asserts or worse while cleaning
+				 * up objects created during the current subtransaction
+				 * (because they're still referenced within this portal).
+				 */</comment>
+				<if_stmt><if>if <condition>(<expr><name><name>portal</name><operator>-&gt;</operator><name>status</name></name> <operator>==</operator> <name>PORTAL_FAILED</name> <operator>&amp;&amp;</operator> <name><name>portal</name><operator>-&gt;</operator><name>resowner</name></name></expr>)</condition>
+				<block>{<block_content>
+					<expr_stmt><expr><call><name>ResourceOwnerNewParent</name><argument_list>(<argument><expr><name><name>portal</name><operator>-&gt;</operator><name>resowner</name></name></expr></argument>, <argument><expr><name>myXactOwner</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+					<expr_stmt><expr><name><name>portal</name><operator>-&gt;</operator><name>resowner</name></name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+				</block_content>}</block></if></if_stmt>
+			</block_content>}</block></if></if_stmt>
+			<comment type="block">/* Done if it wasn't created in this subtransaction */</comment>
+			<continue>continue;</continue>
+		</block_content>}</block></if></if_stmt>
+
+		<comment type="block">/*
+		 * Force any live portals of my own subtransaction into FAILED state.
+		 * We have to do this because they might refer to objects created or
+		 * changed in the failed subtransaction, leading to crashes within
+		 * ExecutorEnd when portalcmds.c tries to close down the portal.
+		 * Currently, every MarkPortalActive() caller ensures it updates the
+		 * portal status again before relinquishing control, so ACTIVE can't
+		 * happen here.  If it does happen, dispose the portal like existing
+		 * MarkPortalActive() callers would.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><name><name>portal</name><operator>-&gt;</operator><name>status</name></name> <operator>==</operator> <name>PORTAL_READY</name> <operator>||</operator>
+			<name><name>portal</name><operator>-&gt;</operator><name>status</name></name> <operator>==</operator> <name>PORTAL_ACTIVE</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>MarkPortalFailed</name><argument_list>(<argument><expr><name>portal</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+		<comment type="block">/*
+		 * Allow portalcmds.c to clean up the state it knows about, if we
+		 * haven't already.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><call><name>PointerIsValid</name><argument_list>(<argument><expr><name><name>portal</name><operator>-&gt;</operator><name>cleanup</name></name></expr></argument>)</argument_list></call></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><call><name><name>portal</name><operator>-&gt;</operator><name>cleanup</name></name><argument_list>(<argument><expr><name>portal</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><name><name>portal</name><operator>-&gt;</operator><name>cleanup</name></name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+
+		<comment type="block">/* drop cached plan reference, if any */</comment>
+		<expr_stmt><expr><call><name>PortalReleaseCachedPlan</name><argument_list>(<argument><expr><name>portal</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/*
+		 * Any resources belonging to the portal will be released in the
+		 * upcoming transaction-wide cleanup; they will be gone before we run
+		 * PortalDrop.
+		 */</comment>
+		<expr_stmt><expr><name><name>portal</name><operator>-&gt;</operator><name>resowner</name></name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+
+		<comment type="block">/*
+		 * Although we can't delete the portal data structure proper, we can
+		 * release any memory in subsidiary contexts, such as executor state.
+		 * The cleanup hook was the last thing that might have needed data
+		 * there.
+		 */</comment>
+		<expr_stmt><expr><call><name>MemoryContextDeleteChildren</name><argument_list>(<argument><expr><name><name>portal</name><operator>-&gt;</operator><name>portalContext</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></while>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Post-subabort cleanup for portals.
+ *
+ * Drop all portals created in the failed subtransaction (but note that
+ * we will not drop any that were reassigned to the parent above).
+ */</comment>
+<function><type><name>void</name></type>
+<name>AtSubCleanup_Portals</name><parameter_list>(<parameter><decl><type><name>SubTransactionId</name></type> <name>mySubid</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>HASH_SEQ_STATUS</name></type> <name>status</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>PortalHashEnt</name> <modifier>*</modifier></type><name>hentry</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>hash_seq_init</name><argument_list>(<argument><expr><operator>&amp;</operator><name>status</name></expr></argument>, <argument><expr><name>PortalHashTable</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<while>while <condition>(<expr><operator>(</operator><name>hentry</name> <operator>=</operator> <operator>(</operator><name>PortalHashEnt</name> <operator>*</operator><operator>)</operator> <call><name>hash_seq_search</name><argument_list>(<argument><expr><operator>&amp;</operator><name>status</name></expr></argument>)</argument_list></call><operator>)</operator> <operator>!=</operator> <name>NULL</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>Portal</name></type>		<name>portal</name> <init>= <expr><name><name>hentry</name><operator>-&gt;</operator><name>portal</name></name></expr></init></decl>;</decl_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name><name>portal</name><operator>-&gt;</operator><name>createSubid</name></name> <operator>!=</operator> <name>mySubid</name></expr>)</condition><block type="pseudo"><block_content>
+			<continue>continue;</continue></block_content></block></if></if_stmt>
+
+		<comment type="block">/*
+		 * If a portal is still pinned, forcibly unpin it. PortalDrop will not
+		 * let us drop the portal otherwise. Whoever pinned the portal was
+		 * interrupted by the abort too and won't try to use it anymore.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><name><name>portal</name><operator>-&gt;</operator><name>portalPinned</name></name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><name><name>portal</name><operator>-&gt;</operator><name>portalPinned</name></name> <operator>=</operator> <name>false</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+		<comment type="block">/*
+		 * We had better not call any user-defined code during cleanup, so if
+		 * the cleanup hook hasn't been run yet, too bad; we'll just skip it.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><call><name>PointerIsValid</name><argument_list>(<argument><expr><name><name>portal</name><operator>-&gt;</operator><name>cleanup</name></name></expr></argument>)</argument_list></call></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>WARNING</name></expr></argument>, <argument><expr><literal type="string">"skipping cleanup for portal \"%s\""</literal></expr></argument>, <argument><expr><name><name>portal</name><operator>-&gt;</operator><name>name</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<expr_stmt><expr><name><name>portal</name><operator>-&gt;</operator><name>cleanup</name></name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+
+		<comment type="block">/* Zap it. */</comment>
+		<expr_stmt><expr><call><name>PortalDrop</name><argument_list>(<argument><expr><name>portal</name></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></while>
+</block_content>}</block></function>
+
+<comment type="block">/* Find all available cursors */</comment>
+<function><type><name>Datum</name></type>
+<name>pg_cursor</name><parameter_list>(<parameter><decl><type><name>PG_FUNCTION_ARGS</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>ReturnSetInfo</name> <modifier>*</modifier></type><name>rsinfo</name> <init>= <expr><operator>(</operator><name>ReturnSetInfo</name> <operator>*</operator><operator>)</operator> <name><name>fcinfo</name><operator>-&gt;</operator><name>resultinfo</name></name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>TupleDesc</name></type>	<name>tupdesc</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Tuplestorestate</name> <modifier>*</modifier></type><name>tupstore</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>MemoryContext</name></type> <name>per_query_ctx</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>MemoryContext</name></type> <name>oldcontext</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>HASH_SEQ_STATUS</name></type> <name>hash_seq</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>PortalHashEnt</name> <modifier>*</modifier></type><name>hentry</name></decl>;</decl_stmt>
+
+	<comment type="block">/* check to see if caller supports us returning a tuplestore */</comment>
+	<if_stmt><if>if <condition>(<expr><name>rsinfo</name> <operator>==</operator> <name>NULL</name> <operator>||</operator> <operator>!</operator><call><name>IsA</name><argument_list>(<argument><expr><name>rsinfo</name></expr></argument>, <argument><expr><name>ReturnSetInfo</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_FEATURE_NOT_SUPPORTED</name></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"set-valued function called in context that cannot accept a set"</literal></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><operator>(</operator><name><name>rsinfo</name><operator>-&gt;</operator><name>allowedModes</name></name> <operator>&amp;</operator> <name>SFRM_Materialize</name><operator>)</operator></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_FEATURE_NOT_SUPPORTED</name></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"materialize mode required, but it is not "</literal> \
+						<literal type="string">"allowed in this context"</literal></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<comment type="block">/* need to build tuplestore in query context */</comment>
+	<expr_stmt><expr><name>per_query_ctx</name> <operator>=</operator> <name><name>rsinfo</name><operator>-&gt;</operator><name>econtext</name><operator>-&gt;</operator><name>ecxt_per_query_memory</name></name></expr>;</expr_stmt>
+	<expr_stmt><expr><name>oldcontext</name> <operator>=</operator> <call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>per_query_ctx</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * build tupdesc for result tuples. This must match the definition of the
+	 * pg_cursors view in system_views.sql
+	 */</comment>
+	<expr_stmt><expr><name>tupdesc</name> <operator>=</operator> <call><name>CreateTemplateTupleDesc</name><argument_list>(<argument><expr><literal type="number">6</literal></expr></argument>, <argument><expr><name>false</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>TupleDescInitEntry</name><argument_list>(<argument><expr><name>tupdesc</name></expr></argument>, <argument><expr><operator>(</operator><name>AttrNumber</name><operator>)</operator> <literal type="number">1</literal></expr></argument>, <argument><expr><literal type="string">"name"</literal></expr></argument>,
+					   <argument><expr><name>TEXTOID</name></expr></argument>, <argument><expr><operator>-</operator><literal type="number">1</literal></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>TupleDescInitEntry</name><argument_list>(<argument><expr><name>tupdesc</name></expr></argument>, <argument><expr><operator>(</operator><name>AttrNumber</name><operator>)</operator> <literal type="number">2</literal></expr></argument>, <argument><expr><literal type="string">"statement"</literal></expr></argument>,
+					   <argument><expr><name>TEXTOID</name></expr></argument>, <argument><expr><operator>-</operator><literal type="number">1</literal></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>TupleDescInitEntry</name><argument_list>(<argument><expr><name>tupdesc</name></expr></argument>, <argument><expr><operator>(</operator><name>AttrNumber</name><operator>)</operator> <literal type="number">3</literal></expr></argument>, <argument><expr><literal type="string">"is_holdable"</literal></expr></argument>,
+					   <argument><expr><name>BOOLOID</name></expr></argument>, <argument><expr><operator>-</operator><literal type="number">1</literal></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>TupleDescInitEntry</name><argument_list>(<argument><expr><name>tupdesc</name></expr></argument>, <argument><expr><operator>(</operator><name>AttrNumber</name><operator>)</operator> <literal type="number">4</literal></expr></argument>, <argument><expr><literal type="string">"is_binary"</literal></expr></argument>,
+					   <argument><expr><name>BOOLOID</name></expr></argument>, <argument><expr><operator>-</operator><literal type="number">1</literal></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>TupleDescInitEntry</name><argument_list>(<argument><expr><name>tupdesc</name></expr></argument>, <argument><expr><operator>(</operator><name>AttrNumber</name><operator>)</operator> <literal type="number">5</literal></expr></argument>, <argument><expr><literal type="string">"is_scrollable"</literal></expr></argument>,
+					   <argument><expr><name>BOOLOID</name></expr></argument>, <argument><expr><operator>-</operator><literal type="number">1</literal></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>TupleDescInitEntry</name><argument_list>(<argument><expr><name>tupdesc</name></expr></argument>, <argument><expr><operator>(</operator><name>AttrNumber</name><operator>)</operator> <literal type="number">6</literal></expr></argument>, <argument><expr><literal type="string">"creation_time"</literal></expr></argument>,
+					   <argument><expr><name>TIMESTAMPTZOID</name></expr></argument>, <argument><expr><operator>-</operator><literal type="number">1</literal></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * We put all the tuples into a tuplestore in one scan of the hashtable.
+	 * This avoids any issue of the hashtable possibly changing between calls.
+	 */</comment>
+	<expr_stmt><expr><name>tupstore</name> <operator>=</operator>
+		<call><name>tuplestore_begin_heap</name><argument_list>(<argument><expr><name><name>rsinfo</name><operator>-&gt;</operator><name>allowedModes</name></name> <operator>&amp;</operator> <name>SFRM_Materialize_Random</name></expr></argument>,
+							  <argument><expr><name>false</name></expr></argument>, <argument><expr><name>work_mem</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* generate junk in short-term context */</comment>
+	<expr_stmt><expr><call><name>MemoryContextSwitchTo</name><argument_list>(<argument><expr><name>oldcontext</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>hash_seq_init</name><argument_list>(<argument><expr><operator>&amp;</operator><name>hash_seq</name></expr></argument>, <argument><expr><name>PortalHashTable</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<while>while <condition>(<expr><operator>(</operator><name>hentry</name> <operator>=</operator> <call><name>hash_seq_search</name><argument_list>(<argument><expr><operator>&amp;</operator><name>hash_seq</name></expr></argument>)</argument_list></call><operator>)</operator> <operator>!=</operator> <name>NULL</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>Portal</name></type>		<name>portal</name> <init>= <expr><name><name>hentry</name><operator>-&gt;</operator><name>portal</name></name></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>Datum</name></type>		<name><name>values</name><index>[<expr><literal type="number">6</literal></expr>]</index></name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>bool</name></type>		<name><name>nulls</name><index>[<expr><literal type="number">6</literal></expr>]</index></name></decl>;</decl_stmt>
+
+		<comment type="block">/* report only "visible" entries */</comment>
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><name><name>portal</name><operator>-&gt;</operator><name>visible</name></name></expr>)</condition><block type="pseudo"><block_content>
+			<continue>continue;</continue></block_content></block></if></if_stmt>
+
+		<expr_stmt><expr><call><name>MemSet</name><argument_list>(<argument><expr><name>nulls</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>nulls</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><name><name>values</name><index>[<expr><literal type="number">0</literal></expr>]</index></name> <operator>=</operator> <call><name>CStringGetTextDatum</name><argument_list>(<argument><expr><name><name>portal</name><operator>-&gt;</operator><name>name</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>values</name><index>[<expr><literal type="number">1</literal></expr>]</index></name> <operator>=</operator> <call><name>CStringGetTextDatum</name><argument_list>(<argument><expr><name><name>portal</name><operator>-&gt;</operator><name>sourceText</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>values</name><index>[<expr><literal type="number">2</literal></expr>]</index></name> <operator>=</operator> <call><name>BoolGetDatum</name><argument_list>(<argument><expr><name><name>portal</name><operator>-&gt;</operator><name>cursorOptions</name></name> <operator>&amp;</operator> <name>CURSOR_OPT_HOLD</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>values</name><index>[<expr><literal type="number">3</literal></expr>]</index></name> <operator>=</operator> <call><name>BoolGetDatum</name><argument_list>(<argument><expr><name><name>portal</name><operator>-&gt;</operator><name>cursorOptions</name></name> <operator>&amp;</operator> <name>CURSOR_OPT_BINARY</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>values</name><index>[<expr><literal type="number">4</literal></expr>]</index></name> <operator>=</operator> <call><name>BoolGetDatum</name><argument_list>(<argument><expr><name><name>portal</name><operator>-&gt;</operator><name>cursorOptions</name></name> <operator>&amp;</operator> <name>CURSOR_OPT_SCROLL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>values</name><index>[<expr><literal type="number">5</literal></expr>]</index></name> <operator>=</operator> <call><name>TimestampTzGetDatum</name><argument_list>(<argument><expr><name><name>portal</name><operator>-&gt;</operator><name>creation_time</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><call><name>tuplestore_putvalues</name><argument_list>(<argument><expr><name>tupstore</name></expr></argument>, <argument><expr><name>tupdesc</name></expr></argument>, <argument><expr><name>values</name></expr></argument>, <argument><expr><name>nulls</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></while>
+
+	<comment type="block">/* clean up and return the tuplestore */</comment>
+	<expr_stmt><expr><call><name>tuplestore_donestoring</name><argument_list>(<argument><expr><name>tupstore</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name><name>rsinfo</name><operator>-&gt;</operator><name>returnMode</name></name> <operator>=</operator> <name>SFRM_Materialize</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>rsinfo</name><operator>-&gt;</operator><name>setResult</name></name> <operator>=</operator> <name>tupstore</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>rsinfo</name><operator>-&gt;</operator><name>setDesc</name></name> <operator>=</operator> <name>tupdesc</name></expr>;</expr_stmt>
+
+	<return>return <expr><operator>(</operator><name>Datum</name><operator>)</operator> <literal type="number">0</literal></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><name>bool</name></type>
+<name>ThereAreNoReadyPortals</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>HASH_SEQ_STATUS</name></type> <name>status</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>PortalHashEnt</name> <modifier>*</modifier></type><name>hentry</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>hash_seq_init</name><argument_list>(<argument><expr><operator>&amp;</operator><name>status</name></expr></argument>, <argument><expr><name>PortalHashTable</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<while>while <condition>(<expr><operator>(</operator><name>hentry</name> <operator>=</operator> <operator>(</operator><name>PortalHashEnt</name> <operator>*</operator><operator>)</operator> <call><name>hash_seq_search</name><argument_list>(<argument><expr><operator>&amp;</operator><name>status</name></expr></argument>)</argument_list></call><operator>)</operator> <operator>!=</operator> <name>NULL</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>Portal</name></type>		<name>portal</name> <init>= <expr><name><name>hentry</name><operator>-&gt;</operator><name>portal</name></name></expr></init></decl>;</decl_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name><name>portal</name><operator>-&gt;</operator><name>status</name></name> <operator>==</operator> <name>PORTAL_READY</name></expr>)</condition><block type="pseudo"><block_content>
+			<return>return <expr><name>false</name></expr>;</return></block_content></block></if></if_stmt>
+	</block_content>}</block></while>
+
+	<return>return <expr><name>true</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Hold all pinned portals.
+ *
+ * A procedural language implementation that uses pinned portals for its
+ * internally generated cursors can call this in its COMMIT command to convert
+ * those cursors to held cursors, so that they survive the transaction end.
+ * We mark those portals as "auto-held" so that exception exit knows to clean
+ * them up.  (In normal, non-exception code paths, the PL needs to clean those
+ * portals itself, since transaction end won't do it anymore, but that should
+ * be normal practice anyway.)
+ */</comment>
+<function><type><name>void</name></type>
+<name>HoldPinnedPortals</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>HASH_SEQ_STATUS</name></type> <name>status</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>PortalHashEnt</name> <modifier>*</modifier></type><name>hentry</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>hash_seq_init</name><argument_list>(<argument><expr><operator>&amp;</operator><name>status</name></expr></argument>, <argument><expr><name>PortalHashTable</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<while>while <condition>(<expr><operator>(</operator><name>hentry</name> <operator>=</operator> <operator>(</operator><name>PortalHashEnt</name> <operator>*</operator><operator>)</operator> <call><name>hash_seq_search</name><argument_list>(<argument><expr><operator>&amp;</operator><name>status</name></expr></argument>)</argument_list></call><operator>)</operator> <operator>!=</operator> <name>NULL</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>Portal</name></type>		<name>portal</name> <init>= <expr><name><name>hentry</name><operator>-&gt;</operator><name>portal</name></name></expr></init></decl>;</decl_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name><name>portal</name><operator>-&gt;</operator><name>portalPinned</name></name> <operator>&amp;&amp;</operator> <operator>!</operator><name><name>portal</name><operator>-&gt;</operator><name>autoHeld</name></name></expr>)</condition>
+		<block>{<block_content>
+			<comment type="block">/*
+			 * Doing transaction control, especially abort, inside a cursor
+			 * loop that is not read-only, for example using UPDATE ...
+			 * RETURNING, has weird semantics issues.  Also, this
+			 * implementation wouldn't work, because such portals cannot be
+			 * held.  (The core grammar enforces that only SELECT statements
+			 * can drive a cursor, but for example PL/pgSQL does not restrict
+			 * it.)
+			 */</comment>
+			<if_stmt><if>if <condition>(<expr><name><name>portal</name><operator>-&gt;</operator><name>strategy</name></name> <operator>!=</operator> <name>PORTAL_ONE_SELECT</name></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+						<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_INVALID_TRANSACTION_TERMINATION</name></expr></argument>)</argument_list></call><operator>,</operator>
+						 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"cannot perform transaction commands inside a cursor loop that is not read-only"</literal></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+			<expr_stmt><expr><name><name>portal</name><operator>-&gt;</operator><name>autoHeld</name></name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+			<expr_stmt><expr><call><name>HoldPortal</name><argument_list>(<argument><expr><name>portal</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		</block_content>}</block></if></if_stmt>
+	</block_content>}</block></while>
+</block_content>}</block></function>
+</unit>

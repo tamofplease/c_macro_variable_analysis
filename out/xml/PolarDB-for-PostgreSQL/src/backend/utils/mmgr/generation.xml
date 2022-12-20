@@ -1,0 +1,857 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<unit xmlns="http://www.srcML.org/srcML/src" xmlns:cpp="http://www.srcML.org/srcML/cpp" revision="1.0.0" language="C" filename="/cloned_projects/PolarDB-for-PostgreSQL/src/backend/utils/mmgr/generation.c"><comment type="block">/*-------------------------------------------------------------------------
+ *
+ * generation.c
+ *	  Generational allocator definitions.
+ *
+ * Generation is a custom MemoryContext implementation designed for cases of
+ * chunks with similar lifespan.
+ *
+ * Portions Copyright (c) 2017-2018, PostgreSQL Global Development Group
+ *
+ * IDENTIFICATION
+ *	  src/backend/utils/mmgr/generation.c
+ *
+ *
+ *	This memory context is based on the assumption that the chunks are freed
+ *	roughly in the same order as they were allocated (FIFO), or in groups with
+ *	similar lifespan (generations - hence the name of the context). This is
+ *	typical for various queue-like use cases, i.e. when tuples are constructed,
+ *	processed and then thrown away.
+ *
+ *	The memory context uses a very simple approach to free space management.
+ *	Instead of a complex global freelist, each block tracks a number
+ *	of allocated and freed chunks. Freed chunks are not reused, and once all
+ *	chunks in a block are freed, the whole block is thrown away. When the
+ *	chunks allocated in the same block have similar lifespan, this works
+ *	very well and is very cheap.
+ *
+ *	The current implementation only uses a fixed block size - maybe it should
+ *	adapt a min/max block size range, and grow the blocks automatically.
+ *	It already uses dedicated blocks for oversized chunks.
+ *
+ *	XXX It might be possible to improve this by keeping a small freelist for
+ *	only a small number of recent blocks, but it's not clear it's worth the
+ *	additional complexity.
+ *
+ *-------------------------------------------------------------------------
+ */</comment>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"postgres.h"</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"lib/ilist.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/memdebug.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/memutils.h"</cpp:file></cpp:include>
+
+
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>Generation_BLOCKHDRSZ</name></cpp:macro>	<cpp:value>MAXALIGN(sizeof(GenerationBlock))</cpp:value></cpp:define>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>Generation_CHUNKHDRSZ</name></cpp:macro>	<cpp:value>sizeof(GenerationChunk)</cpp:value></cpp:define>
+
+<typedef>typedef <type><name><name>struct</name> <name>GenerationBlock</name></name></type> <name>GenerationBlock</name>;</typedef> <comment type="block">/* forward reference */</comment>
+<typedef>typedef <type><name><name>struct</name> <name>GenerationChunk</name></name></type> <name>GenerationChunk</name>;</typedef>
+
+<typedef>typedef <type><name>void</name> <modifier>*</modifier></type><name>GenerationPointer</name>;</typedef>
+
+<comment type="block">/*
+ * GenerationContext is a simple memory context not reusing allocated chunks,
+ * and freeing blocks once all chunks are freed.
+ */</comment>
+<typedef>typedef <type><struct>struct <name>GenerationContext</name>
+<block>{
+	<decl_stmt><decl><type><name>MemoryContextData</name></type> <name>header</name></decl>;</decl_stmt>	<comment type="block">/* Standard memory-context fields */</comment>
+
+	<comment type="block">/* Generational context parameters */</comment>
+	<decl_stmt><decl><type><name>Size</name></type>		<name>blockSize</name></decl>;</decl_stmt>		<comment type="block">/* standard block size */</comment>
+
+	<decl_stmt><decl><type><name>GenerationBlock</name> <modifier>*</modifier></type><name>block</name></decl>;</decl_stmt>		<comment type="block">/* current (most recently allocated) block */</comment>
+	<decl_stmt><decl><type><name>dlist_head</name></type>	<name>blocks</name></decl>;</decl_stmt>			<comment type="block">/* list of blocks */</comment>
+}</block></struct></type> <name>GenerationContext</name>;</typedef>
+
+<comment type="block">/*
+ * GenerationBlock
+ *		GenerationBlock is the unit of memory that is obtained by generation.c
+ *		from malloc().  It contains one or more GenerationChunks, which are
+ *		the units requested by palloc() and freed by pfree().  GenerationChunks
+ *		cannot be returned to malloc() individually, instead pfree()
+ *		updates the free counter of the block and when all chunks in a block
+ *		are free the whole block is returned to malloc().
+ *
+ *		GenerationBlock is the header data for a block --- the usable space
+ *		within the block begins at the next alignment boundary.
+ */</comment>
+<struct>struct <name>GenerationBlock</name>
+<block>{
+	<decl_stmt><decl><type><name>dlist_node</name></type>	<name>node</name></decl>;</decl_stmt>			<comment type="block">/* doubly-linked list of blocks */</comment>
+	<decl_stmt><decl><type><name>Size</name></type>		<name>blksize</name></decl>;</decl_stmt>		<comment type="block">/* allocated size of this block */</comment>
+	<decl_stmt><decl><type><name>int</name></type>			<name>nchunks</name></decl>;</decl_stmt>		<comment type="block">/* number of chunks in the block */</comment>
+	<decl_stmt><decl><type><name>int</name></type>			<name>nfree</name></decl>;</decl_stmt>			<comment type="block">/* number of free chunks */</comment>
+	<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>freeptr</name></decl>;</decl_stmt>		<comment type="block">/* start of free space in this block */</comment>
+	<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>endptr</name></decl>;</decl_stmt>			<comment type="block">/* end of space in this block */</comment>
+}</block>;</struct>
+
+<comment type="block">/*
+ * GenerationChunk
+ *		The prefix of each piece of memory in a GenerationBlock
+ *
+ * Note: to meet the memory context APIs, the payload area of the chunk must
+ * be maxaligned, and the "context" link must be immediately adjacent to the
+ * payload area (cf. GetMemoryChunkContext).  We simplify matters for this
+ * module by requiring sizeof(GenerationChunk) to be maxaligned, and then
+ * we can ensure things work by adding any required alignment padding before
+ * the pointer fields.  There is a static assertion below that the alignment
+ * is done correctly.
+ */</comment>
+<struct>struct <name>GenerationChunk</name>
+<block>{
+	<comment type="block">/* size is always the size of the usable space in the chunk */</comment>
+	<decl_stmt><decl><type><name>Size</name></type>		<name>size</name></decl>;</decl_stmt>
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>MEMORY_CONTEXT_CHECKING</name></cpp:ifdef>
+	<comment type="block">/* when debugging memory usage, also store actual requested size */</comment>
+	<comment type="block">/* this is zero in a free chunk */</comment>
+	<decl_stmt><decl><type><name>Size</name></type>		<name>requested_size</name></decl>;</decl_stmt>
+
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>GENERATIONCHUNK_RAWSIZE</name></cpp:macro>  <cpp:value>(SIZEOF_SIZE_T * 2 + SIZEOF_VOID_P * 2)</cpp:value></cpp:define>
+<cpp:else>#<cpp:directive>else</cpp:directive></cpp:else>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>GENERATIONCHUNK_RAWSIZE</name></cpp:macro>  <cpp:value>(SIZEOF_SIZE_T + SIZEOF_VOID_P * 2)</cpp:value></cpp:define>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>							<comment type="block">/* MEMORY_CONTEXT_CHECKING */</comment>
+
+	<comment type="block">/* ensure proper alignment by adding padding if needed */</comment>
+<cpp:if>#<cpp:directive>if</cpp:directive> <expr><operator>(</operator><name>GENERATIONCHUNK_RAWSIZE</name> <operator>%</operator> <name>MAXIMUM_ALIGNOF</name><operator>)</operator> <operator>!=</operator> <literal type="number">0</literal></expr></cpp:if>
+	<decl_stmt><decl><type><name>char</name></type>		<name><name>padding</name><index>[<expr><name>MAXIMUM_ALIGNOF</name> <operator>-</operator> <name>GENERATIONCHUNK_RAWSIZE</name> <operator>%</operator> <name>MAXIMUM_ALIGNOF</name></expr>]</index></name></decl>;</decl_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+	<decl_stmt><decl><type><name>GenerationBlock</name> <modifier>*</modifier></type><name>block</name></decl>;</decl_stmt>		<comment type="block">/* block owning this chunk */</comment>
+	<decl_stmt><decl><type><name>GenerationContext</name> <modifier>*</modifier></type><name>context</name></decl>;</decl_stmt> <comment type="block">/* owning context, or NULL if freed chunk */</comment>
+	<comment type="block">/* there must not be any padding to reach a MAXALIGN boundary here! */</comment>
+}</block>;</struct>
+
+<comment type="block">/*
+ * Only the "context" field should be accessed outside this module.
+ * We keep the rest of an allocated chunk's header marked NOACCESS when using
+ * valgrind.  But note that freed chunk headers are kept accessible, for
+ * simplicity.
+ */</comment>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>GENERATIONCHUNK_PRIVATE_LEN</name></cpp:macro>	<cpp:value>offsetof(GenerationChunk, context)</cpp:value></cpp:define>
+
+<comment type="block">/*
+ * GenerationIsValid
+ *		True iff set is valid allocation set.
+ */</comment>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>GenerationIsValid</name><parameter_list>(<parameter><type><name>set</name></type></parameter>)</parameter_list></cpp:macro> <cpp:value>PointerIsValid(set)</cpp:value></cpp:define>
+
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>GenerationPointerGetChunk</name><parameter_list>(<parameter><type><name>ptr</name></type></parameter>)</parameter_list></cpp:macro> \
+	<cpp:value>((GenerationChunk *)(((char *)(ptr)) - Generation_CHUNKHDRSZ))</cpp:value></cpp:define>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>GenerationChunkGetPointer</name><parameter_list>(<parameter><type><name>chk</name></type></parameter>)</parameter_list></cpp:macro> \
+	<cpp:value>((GenerationPointer *)(((char *)(chk)) + Generation_CHUNKHDRSZ))</cpp:value></cpp:define>
+
+<comment type="block">/*
+ * These functions implement the MemoryContext API for Generation contexts.
+ */</comment>
+<function_decl><type><specifier>static</specifier> <name>void</name> <modifier>*</modifier></type><name>GenerationAlloc</name><parameter_list>(<parameter><decl><type><name>MemoryContext</name></type> <name>context</name></decl></parameter>, <parameter><decl><type><name>Size</name></type> <name>size</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>GenerationFree</name><parameter_list>(<parameter><decl><type><name>MemoryContext</name></type> <name>context</name></decl></parameter>, <parameter><decl><type><name>void</name> <modifier>*</modifier></type><name>pointer</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name> <modifier>*</modifier></type><name>GenerationRealloc</name><parameter_list>(<parameter><decl><type><name>MemoryContext</name></type> <name>context</name></decl></parameter>, <parameter><decl><type><name>void</name> <modifier>*</modifier></type><name>pointer</name></decl></parameter>, <parameter><decl><type><name>Size</name></type> <name>size</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>GenerationReset</name><parameter_list>(<parameter><decl><type><name>MemoryContext</name></type> <name>context</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>GenerationDelete</name><parameter_list>(<parameter><decl><type><name>MemoryContext</name></type> <name>context</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>Size</name></type> <name>GenerationGetChunkSpace</name><parameter_list>(<parameter><decl><type><name>MemoryContext</name></type> <name>context</name></decl></parameter>, <parameter><decl><type><name>void</name> <modifier>*</modifier></type><name>pointer</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>bool</name></type> <name>GenerationIsEmpty</name><parameter_list>(<parameter><decl><type><name>MemoryContext</name></type> <name>context</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>GenerationStats</name><parameter_list>(<parameter><decl><type><name>MemoryContext</name></type> <name>context</name></decl></parameter>,
+				<parameter><decl><type><name>MemoryStatsPrintFunc</name></type> <name>printfunc</name></decl></parameter>, <parameter><decl><type><name>void</name> <modifier>*</modifier></type><name>passthru</name></decl></parameter>,
+				<parameter><decl><type><name>MemoryContextCounters</name> <modifier>*</modifier></type><name>totals</name></decl></parameter>)</parameter_list>;</function_decl>
+
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>MEMORY_CONTEXT_CHECKING</name></cpp:ifdef>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>GenerationCheck</name><parameter_list>(<parameter><decl><type><name>MemoryContext</name></type> <name>context</name></decl></parameter>)</parameter_list>;</function_decl>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+<comment type="block">/*
+ * This is the virtual function table for Generation contexts.
+ */</comment>
+<decl_stmt><decl><type><specifier>static</specifier> <specifier>const</specifier> <name>MemoryContextMethods</name></type> <name>GenerationMethods</name> <init>= <expr><block>{
+	<expr><name>GenerationAlloc</name></expr>,
+	<expr><name>GenerationFree</name></expr>,
+	<expr><name>GenerationRealloc</name></expr>,
+	<expr><name>GenerationReset</name></expr>,
+	<expr><name>GenerationDelete</name></expr>,
+	<expr><name>GenerationGetChunkSpace</name></expr>,
+	<expr><name>GenerationIsEmpty</name></expr>,
+	<expr><name>GenerationStats</name></expr>
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>MEMORY_CONTEXT_CHECKING</name></cpp:ifdef>
+	,<expr><name>GenerationCheck</name></expr>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+}</block></expr></init></decl>;</decl_stmt>
+
+<comment type="block">/* ----------
+ * Debug macros
+ * ----------
+ */</comment>
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>HAVE_ALLOCINFO</name></cpp:ifdef>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>GenerationFreeInfo</name><parameter_list>(<parameter><type><name>_cxt</name></type></parameter>, <parameter><type><name>_chunk</name></type></parameter>)</parameter_list></cpp:macro> \
+			<cpp:value>fprintf(stderr, "GenerationFree: %s: %p, %lu\n", \
+				(_cxt)-&gt;name, (_chunk), (_chunk)-&gt;size)</cpp:value></cpp:define>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>GenerationAllocInfo</name><parameter_list>(<parameter><type><name>_cxt</name></type></parameter>, <parameter><type><name>_chunk</name></type></parameter>)</parameter_list></cpp:macro> \
+			<cpp:value>fprintf(stderr, "GenerationAlloc: %s: %p, %lu\n", \
+				(_cxt)-&gt;name, (_chunk), (_chunk)-&gt;size)</cpp:value></cpp:define>
+<cpp:else>#<cpp:directive>else</cpp:directive></cpp:else>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>GenerationFreeInfo</name><parameter_list>(<parameter><type><name>_cxt</name></type></parameter>, <parameter><type><name>_chunk</name></type></parameter>)</parameter_list></cpp:macro></cpp:define>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>GenerationAllocInfo</name><parameter_list>(<parameter><type><name>_cxt</name></type></parameter>, <parameter><type><name>_chunk</name></type></parameter>)</parameter_list></cpp:macro></cpp:define>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+
+<comment type="block">/*
+ * Public routines
+ */</comment>
+
+
+<comment type="block">/*
+ * GenerationContextCreate
+ *		Create a new Generation context.
+ *
+ * parent: parent context, or NULL if top-level context
+ * name: name of context (must be statically allocated)
+ * blockSize: generation block size
+ */</comment>
+<function><type><name>MemoryContext</name></type>
+<name>GenerationContextCreate</name><parameter_list>(<parameter><decl><type><name>MemoryContext</name></type> <name>parent</name></decl></parameter>,
+						<parameter><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>name</name></decl></parameter>,
+						<parameter><decl><type><name>Size</name></type> <name>blockSize</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>GenerationContext</name> <modifier>*</modifier></type><name>set</name></decl>;</decl_stmt>
+
+	<comment type="block">/* Assert we padded GenerationChunk properly */</comment>
+	<expr_stmt><expr><call><name>StaticAssertStmt</name><argument_list>(<argument><expr><name>Generation_CHUNKHDRSZ</name> <operator>==</operator> <call><name>MAXALIGN</name><argument_list>(<argument><expr><name>Generation_CHUNKHDRSZ</name></expr></argument>)</argument_list></call></expr></argument>,
+					 <argument><expr><literal type="string">"sizeof(GenerationChunk) is not maxaligned"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>StaticAssertStmt</name><argument_list>(<argument><expr><call><name>offsetof</name><argument_list>(<argument><expr><name>GenerationChunk</name></expr></argument>, <argument><expr><name>context</name></expr></argument>)</argument_list></call> <operator>+</operator> <sizeof>sizeof<argument_list>(<argument><expr><name>MemoryContext</name></expr></argument>)</argument_list></sizeof> <operator>==</operator>
+					 <name>Generation_CHUNKHDRSZ</name></expr></argument>,
+					 <argument><expr><literal type="string">"padding calculation in GenerationChunk is wrong"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * First, validate allocation parameters.  (If we're going to throw an
+	 * error, we should do so before the context is created, not after.)  We
+	 * somewhat arbitrarily enforce a minimum 1K block size, mostly because
+	 * that's what AllocSet does.
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name>blockSize</name> <operator>!=</operator> <call><name>MAXALIGN</name><argument_list>(<argument><expr><name>blockSize</name></expr></argument>)</argument_list></call> <operator>||</operator>
+		<name>blockSize</name> <operator>&lt;</operator> <literal type="number">1024</literal> <operator>||</operator>
+		<operator>!</operator><call><name>AllocHugeSizeIsValid</name><argument_list>(<argument><expr><name>blockSize</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"invalid blockSize for memory context: %zu"</literal></expr></argument>,
+			 <argument><expr><name>blockSize</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<comment type="block">/*
+	 * Allocate the context header.  Unlike aset.c, we never try to combine
+	 * this with the first regular block, since that would prevent us from
+	 * freeing the first generation of allocations.
+	 */</comment>
+
+	<expr_stmt><expr><name>set</name> <operator>=</operator> <operator>(</operator><name>GenerationContext</name> <operator>*</operator><operator>)</operator> <call><name>malloc</name><argument_list>(<argument><expr><call><name>MAXALIGN</name><argument_list>(<argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>GenerationContext</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><name>set</name> <operator>==</operator> <name>NULL</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>MemoryContextStats</name><argument_list>(<argument><expr><name>TopMemoryContext</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_OUT_OF_MEMORY</name></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"out of memory"</literal></expr></argument>)</argument_list></call><operator>,</operator>
+				 <call><name>errdetail</name><argument_list>(<argument><expr><literal type="string">"Failed while creating memory context \"%s\"."</literal></expr></argument>,
+						   <argument><expr><name>name</name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/*
+	 * Avoid writing code that can fail between here and MemoryContextCreate;
+	 * we'd leak the header if we ereport in this stretch.
+	 */</comment>
+
+	<comment type="block">/* Fill in GenerationContext-specific header fields */</comment>
+	<expr_stmt><expr><name><name>set</name><operator>-&gt;</operator><name>blockSize</name></name> <operator>=</operator> <name>blockSize</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>set</name><operator>-&gt;</operator><name>block</name></name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>dlist_init</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>set</name><operator>-&gt;</operator><name>blocks</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Finally, do the type-independent part of context creation */</comment>
+	<expr_stmt><expr><call><name>MemoryContextCreate</name><argument_list>(<argument><expr><operator>(</operator><name>MemoryContext</name><operator>)</operator> <name>set</name></expr></argument>,
+						<argument><expr><name>T_GenerationContext</name></expr></argument>,
+						<argument><expr><operator>&amp;</operator><name>GenerationMethods</name></expr></argument>,
+						<argument><expr><name>parent</name></expr></argument>,
+						<argument><expr><name>name</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<return>return <expr><operator>(</operator><name>MemoryContext</name><operator>)</operator> <name>set</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * GenerationReset
+ *		Frees all memory which is allocated in the given set.
+ *
+ * The code simply frees all the blocks in the context - we don't keep any
+ * keeper blocks or anything like that.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>GenerationReset</name><parameter_list>(<parameter><decl><type><name>MemoryContext</name></type> <name>context</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>GenerationContext</name> <modifier>*</modifier></type><name>set</name> <init>= <expr><operator>(</operator><name>GenerationContext</name> <operator>*</operator><operator>)</operator> <name>context</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>dlist_mutable_iter</name></type> <name>miter</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>AssertArg</name><argument_list>(<argument><expr><call><name>GenerationIsValid</name><argument_list>(<argument><expr><name>set</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>MEMORY_CONTEXT_CHECKING</name></cpp:ifdef>
+	<comment type="block">/* Check for corruption and leaks before freeing */</comment>
+	<expr_stmt><expr><call><name>GenerationCheck</name><argument_list>(<argument><expr><name>context</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+	<macro><name>dlist_foreach_modify</name><argument_list>(<argument>miter</argument>, <argument>&amp;set-&gt;blocks</argument>)</argument_list></macro>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>GenerationBlock</name> <modifier>*</modifier></type><name>block</name> <init>= <expr><call><name>dlist_container</name><argument_list>(<argument><expr><name>GenerationBlock</name></expr></argument>, <argument><expr><name>node</name></expr></argument>, <argument><expr><name><name>miter</name><operator>.</operator><name>cur</name></name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+		<expr_stmt><expr><call><name>dlist_delete</name><argument_list>(<argument><expr><name><name>miter</name><operator>.</operator><name>cur</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><name><name>context</name><operator>-&gt;</operator><name>mem_allocated</name></name> <operator>-=</operator> <name><name>block</name><operator>-&gt;</operator><name>blksize</name></name></expr>;</expr_stmt>
+
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>CLOBBER_FREED_MEMORY</name></cpp:ifdef>
+		<expr_stmt><expr><call><name>wipe_mem</name><argument_list>(<argument><expr><name>block</name></expr></argument>, <argument><expr><name><name>block</name><operator>-&gt;</operator><name>blksize</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+		<expr_stmt><expr><call><name>free</name><argument_list>(<argument><expr><name>block</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block>
+
+	<expr_stmt><expr><name><name>set</name><operator>-&gt;</operator><name>block</name></name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><call><name>dlist_is_empty</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>set</name><operator>-&gt;</operator><name>blocks</name></name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * GenerationDelete
+ *		Free all memory which is allocated in the given context.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>GenerationDelete</name><parameter_list>(<parameter><decl><type><name>MemoryContext</name></type> <name>context</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<comment type="block">/* Reset to release all the GenerationBlocks */</comment>
+	<expr_stmt><expr><call><name>GenerationReset</name><argument_list>(<argument><expr><name>context</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<comment type="block">/* And free the context header */</comment>
+	<expr_stmt><expr><call><name>free</name><argument_list>(<argument><expr><name>context</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * GenerationAlloc
+ *		Returns pointer to allocated memory of given size or NULL if
+ *		request could not be completed; memory is added to the set.
+ *
+ * No request may exceed:
+ *		MAXALIGN_DOWN(SIZE_MAX) - Generation_BLOCKHDRSZ - Generation_CHUNKHDRSZ
+ * All callers use a much-lower limit.
+ *
+ * Note: when using valgrind, it doesn't matter how the returned allocation
+ * is marked, as mcxt.c will set it to UNDEFINED.  In some paths we will
+ * return space that is marked NOACCESS - GenerationRealloc has to beware!
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name> <modifier>*</modifier></type>
+<name>GenerationAlloc</name><parameter_list>(<parameter><decl><type><name>MemoryContext</name></type> <name>context</name></decl></parameter>, <parameter><decl><type><name>Size</name></type> <name>size</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>GenerationContext</name> <modifier>*</modifier></type><name>set</name> <init>= <expr><operator>(</operator><name>GenerationContext</name> <operator>*</operator><operator>)</operator> <name>context</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>GenerationBlock</name> <modifier>*</modifier></type><name>block</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>GenerationChunk</name> <modifier>*</modifier></type><name>chunk</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Size</name></type>		<name>chunk_size</name> <init>= <expr><call><name>MAXALIGN</name><argument_list>(<argument><expr><name>size</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+	<comment type="block">/* is it an over-sized chunk? if yes, allocate special block */</comment>
+	<if_stmt><if>if <condition>(<expr><name>chunk_size</name> <operator>&gt;</operator> <name><name>set</name><operator>-&gt;</operator><name>blockSize</name></name> <operator>/</operator> <literal type="number">8</literal></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>Size</name></type>		<name>blksize</name> <init>= <expr><name>chunk_size</name> <operator>+</operator> <name>Generation_BLOCKHDRSZ</name> <operator>+</operator> <name>Generation_CHUNKHDRSZ</name></expr></init></decl>;</decl_stmt>
+
+		<expr_stmt><expr><name>block</name> <operator>=</operator> <operator>(</operator><name>GenerationBlock</name> <operator>*</operator><operator>)</operator> <call><name>malloc</name><argument_list>(<argument><expr><name>blksize</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<if_stmt><if>if <condition>(<expr><name>block</name> <operator>==</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+			<return>return <expr><name>NULL</name></expr>;</return></block_content></block></if></if_stmt>
+
+		<expr_stmt><expr><name><name>context</name><operator>-&gt;</operator><name>mem_allocated</name></name> <operator>+=</operator> <name>blksize</name></expr>;</expr_stmt>
+
+		<comment type="block">/* block with a single (used) chunk */</comment>
+		<expr_stmt><expr><name><name>block</name><operator>-&gt;</operator><name>blksize</name></name> <operator>=</operator> <name>blksize</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>block</name><operator>-&gt;</operator><name>nchunks</name></name> <operator>=</operator> <literal type="number">1</literal></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>block</name><operator>-&gt;</operator><name>nfree</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+
+		<comment type="block">/* the block is completely full */</comment>
+		<expr_stmt><expr><name><name>block</name><operator>-&gt;</operator><name>freeptr</name></name> <operator>=</operator> <name><name>block</name><operator>-&gt;</operator><name>endptr</name></name> <operator>=</operator> <operator>(</operator><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <name>block</name><operator>)</operator> <operator>+</operator> <name>blksize</name></expr>;</expr_stmt>
+
+		<expr_stmt><expr><name>chunk</name> <operator>=</operator> <operator>(</operator><name>GenerationChunk</name> <operator>*</operator><operator>)</operator> <operator>(</operator><operator>(</operator><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <name>block</name><operator>)</operator> <operator>+</operator> <name>Generation_BLOCKHDRSZ</name><operator>)</operator></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>chunk</name><operator>-&gt;</operator><name>block</name></name> <operator>=</operator> <name>block</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>chunk</name><operator>-&gt;</operator><name>context</name></name> <operator>=</operator> <name>set</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>chunk</name><operator>-&gt;</operator><name>size</name></name> <operator>=</operator> <name>chunk_size</name></expr>;</expr_stmt>
+
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>MEMORY_CONTEXT_CHECKING</name></cpp:ifdef>
+		<expr_stmt><expr><name><name>chunk</name><operator>-&gt;</operator><name>requested_size</name></name> <operator>=</operator> <name>size</name></expr>;</expr_stmt>
+		<comment type="block">/* set mark to catch clobber of "unused" space */</comment>
+		<if_stmt><if>if <condition>(<expr><name>size</name> <operator>&lt;</operator> <name>chunk_size</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>set_sentinel</name><argument_list>(<argument><expr><call><name>GenerationChunkGetPointer</name><argument_list>(<argument><expr><name>chunk</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>size</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>RANDOMIZE_ALLOCATED_MEMORY</name></cpp:ifdef>
+		<comment type="block">/* fill the allocated space with junk */</comment>
+		<expr_stmt><expr><call><name>randomize_mem</name><argument_list>(<argument><expr><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <call><name>GenerationChunkGetPointer</name><argument_list>(<argument><expr><name>chunk</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>size</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+		<comment type="block">/* add the block to the list of allocated blocks */</comment>
+		<expr_stmt><expr><call><name>dlist_push_head</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>set</name><operator>-&gt;</operator><name>blocks</name></name></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>block</name><operator>-&gt;</operator><name>node</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<expr_stmt><expr><call><name>GenerationAllocInfo</name><argument_list>(<argument><expr><name>set</name></expr></argument>, <argument><expr><name>chunk</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/* Ensure any padding bytes are marked NOACCESS. */</comment>
+		<expr_stmt><expr><call><name>MEMDEBUG_MAKE_MEM_NOACCESS</name><argument_list>(<argument><expr><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <call><name>GenerationChunkGetPointer</name><argument_list>(<argument><expr><name>chunk</name></expr></argument>)</argument_list></call> <operator>+</operator> <name>size</name></expr></argument>,
+								   <argument><expr><name>chunk_size</name> <operator>-</operator> <name>size</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/* Disallow external access to private part of chunk header. */</comment>
+		<expr_stmt><expr><call><name>MEMDEBUG_MAKE_MEM_NOACCESS</name><argument_list>(<argument><expr><name>chunk</name></expr></argument>, <argument><expr><name>GENERATIONCHUNK_PRIVATE_LEN</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<return>return <expr><call><name>GenerationChunkGetPointer</name><argument_list>(<argument><expr><name>chunk</name></expr></argument>)</argument_list></call></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/*
+	 * Not an over-sized chunk. Is there enough space in the current block? If
+	 * not, allocate a new "regular" block.
+	 */</comment>
+	<expr_stmt><expr><name>block</name> <operator>=</operator> <name><name>set</name><operator>-&gt;</operator><name>block</name></name></expr>;</expr_stmt>
+
+	<if_stmt><if>if <condition>(<expr><operator>(</operator><name>block</name> <operator>==</operator> <name>NULL</name><operator>)</operator> <operator>||</operator>
+		<operator>(</operator><name><name>block</name><operator>-&gt;</operator><name>endptr</name></name> <operator>-</operator> <name><name>block</name><operator>-&gt;</operator><name>freeptr</name></name><operator>)</operator> <operator>&lt;</operator> <name>Generation_CHUNKHDRSZ</name> <operator>+</operator> <name>chunk_size</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>Size</name></type>		<name>blksize</name> <init>= <expr><name><name>set</name><operator>-&gt;</operator><name>blockSize</name></name></expr></init></decl>;</decl_stmt>
+
+		<expr_stmt><expr><name>block</name> <operator>=</operator> <operator>(</operator><name>GenerationBlock</name> <operator>*</operator><operator>)</operator> <call><name>malloc</name><argument_list>(<argument><expr><name>blksize</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name>block</name> <operator>==</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+			<return>return <expr><name>NULL</name></expr>;</return></block_content></block></if></if_stmt>
+
+		<expr_stmt><expr><name><name>context</name><operator>-&gt;</operator><name>mem_allocated</name></name> <operator>+=</operator> <name>blksize</name></expr>;</expr_stmt>
+
+		<expr_stmt><expr><name><name>block</name><operator>-&gt;</operator><name>blksize</name></name> <operator>=</operator> <name>blksize</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>block</name><operator>-&gt;</operator><name>nchunks</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>block</name><operator>-&gt;</operator><name>nfree</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+
+		<expr_stmt><expr><name><name>block</name><operator>-&gt;</operator><name>freeptr</name></name> <operator>=</operator> <operator>(</operator><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <name>block</name><operator>)</operator> <operator>+</operator> <name>Generation_BLOCKHDRSZ</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>block</name><operator>-&gt;</operator><name>endptr</name></name> <operator>=</operator> <operator>(</operator><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <name>block</name><operator>)</operator> <operator>+</operator> <name>blksize</name></expr>;</expr_stmt>
+
+		<comment type="block">/* Mark unallocated space NOACCESS. */</comment>
+		<expr_stmt><expr><call><name>MEMDEBUG_MAKE_MEM_NOACCESS</name><argument_list>(<argument><expr><name><name>block</name><operator>-&gt;</operator><name>freeptr</name></name></expr></argument>,
+								   <argument><expr><name>blksize</name> <operator>-</operator> <name>Generation_BLOCKHDRSZ</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/* add it to the doubly-linked list of blocks */</comment>
+		<expr_stmt><expr><call><name>dlist_push_head</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>set</name><operator>-&gt;</operator><name>blocks</name></name></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>block</name><operator>-&gt;</operator><name>node</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<comment type="block">/* and also use it as the current allocation block */</comment>
+		<expr_stmt><expr><name><name>set</name><operator>-&gt;</operator><name>block</name></name> <operator>=</operator> <name>block</name></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/* we're supposed to have a block with enough free space now */</comment>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>block</name> <operator>!=</operator> <name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><operator>(</operator><name><name>block</name><operator>-&gt;</operator><name>endptr</name></name> <operator>-</operator> <name><name>block</name><operator>-&gt;</operator><name>freeptr</name></name><operator>)</operator> <operator>&gt;=</operator> <name>Generation_CHUNKHDRSZ</name> <operator>+</operator> <name>chunk_size</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>chunk</name> <operator>=</operator> <operator>(</operator><name>GenerationChunk</name> <operator>*</operator><operator>)</operator> <name><name>block</name><operator>-&gt;</operator><name>freeptr</name></name></expr>;</expr_stmt>
+
+	<comment type="block">/* Prepare to initialize the chunk header. */</comment>
+	<expr_stmt><expr><call><name>MEMDEBUG_MAKE_MEM_UNDEFINED</name><argument_list>(<argument><expr><name>chunk</name></expr></argument>, <argument><expr><name>Generation_CHUNKHDRSZ</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name><name>block</name><operator>-&gt;</operator><name>nchunks</name></name> <operator>+=</operator> <literal type="number">1</literal></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>block</name><operator>-&gt;</operator><name>freeptr</name></name> <operator>+=</operator> <operator>(</operator><name>Generation_CHUNKHDRSZ</name> <operator>+</operator> <name>chunk_size</name><operator>)</operator></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>block</name><operator>-&gt;</operator><name>freeptr</name></name> <operator>&lt;=</operator> <name><name>block</name><operator>-&gt;</operator><name>endptr</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name><name>chunk</name><operator>-&gt;</operator><name>block</name></name> <operator>=</operator> <name>block</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>chunk</name><operator>-&gt;</operator><name>context</name></name> <operator>=</operator> <name>set</name></expr>;</expr_stmt>
+	<expr_stmt><expr><name><name>chunk</name><operator>-&gt;</operator><name>size</name></name> <operator>=</operator> <name>chunk_size</name></expr>;</expr_stmt>
+
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>MEMORY_CONTEXT_CHECKING</name></cpp:ifdef>
+	<expr_stmt><expr><name><name>chunk</name><operator>-&gt;</operator><name>requested_size</name></name> <operator>=</operator> <name>size</name></expr>;</expr_stmt>
+	<comment type="block">/* set mark to catch clobber of "unused" space */</comment>
+	<if_stmt><if>if <condition>(<expr><name>size</name> <operator>&lt;</operator> <name><name>chunk</name><operator>-&gt;</operator><name>size</name></name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><call><name>set_sentinel</name><argument_list>(<argument><expr><call><name>GenerationChunkGetPointer</name><argument_list>(<argument><expr><name>chunk</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>size</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>RANDOMIZE_ALLOCATED_MEMORY</name></cpp:ifdef>
+	<comment type="block">/* fill the allocated space with junk */</comment>
+	<expr_stmt><expr><call><name>randomize_mem</name><argument_list>(<argument><expr><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <call><name>GenerationChunkGetPointer</name><argument_list>(<argument><expr><name>chunk</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>size</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+	<expr_stmt><expr><call><name>GenerationAllocInfo</name><argument_list>(<argument><expr><name>set</name></expr></argument>, <argument><expr><name>chunk</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Ensure any padding bytes are marked NOACCESS. */</comment>
+	<expr_stmt><expr><call><name>MEMDEBUG_MAKE_MEM_NOACCESS</name><argument_list>(<argument><expr><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <call><name>GenerationChunkGetPointer</name><argument_list>(<argument><expr><name>chunk</name></expr></argument>)</argument_list></call> <operator>+</operator> <name>size</name></expr></argument>,
+							   <argument><expr><name>chunk_size</name> <operator>-</operator> <name>size</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Disallow external access to private part of chunk header. */</comment>
+	<expr_stmt><expr><call><name>MEMDEBUG_MAKE_MEM_NOACCESS</name><argument_list>(<argument><expr><name>chunk</name></expr></argument>, <argument><expr><name>GENERATIONCHUNK_PRIVATE_LEN</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<return>return <expr><call><name>GenerationChunkGetPointer</name><argument_list>(<argument><expr><name>chunk</name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * GenerationFree
+ *		Update number of chunks in the block, and if all chunks in the block
+ *		are now free then discard the block.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>GenerationFree</name><parameter_list>(<parameter><decl><type><name>MemoryContext</name></type> <name>context</name></decl></parameter>, <parameter><decl><type><name>void</name> <modifier>*</modifier></type><name>pointer</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>GenerationContext</name> <modifier>*</modifier></type><name>set</name> <init>= <expr><operator>(</operator><name>GenerationContext</name> <operator>*</operator><operator>)</operator> <name>context</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>GenerationChunk</name> <modifier>*</modifier></type><name>chunk</name> <init>= <expr><call><name>GenerationPointerGetChunk</name><argument_list>(<argument><expr><name>pointer</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>GenerationBlock</name> <modifier>*</modifier></type><name>block</name></decl>;</decl_stmt>
+
+	<comment type="block">/* Allow access to private part of chunk header. */</comment>
+	<expr_stmt><expr><call><name>MEMDEBUG_MAKE_MEM_DEFINED</name><argument_list>(<argument><expr><name>chunk</name></expr></argument>, <argument><expr><name>GENERATIONCHUNK_PRIVATE_LEN</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>block</name> <operator>=</operator> <name><name>chunk</name><operator>-&gt;</operator><name>block</name></name></expr>;</expr_stmt>
+
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>MEMORY_CONTEXT_CHECKING</name></cpp:ifdef>
+	<comment type="block">/* Test for someone scribbling on unused space in chunk */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>chunk</name><operator>-&gt;</operator><name>requested_size</name></name> <operator>&lt;</operator> <name><name>chunk</name><operator>-&gt;</operator><name>size</name></name></expr>)</condition><block type="pseudo"><block_content>
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>sentinel_ok</name><argument_list>(<argument><expr><name>pointer</name></expr></argument>, <argument><expr><name><name>chunk</name><operator>-&gt;</operator><name>requested_size</name></name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>WARNING</name></expr></argument>, <argument><expr><literal type="string">"detected write past chunk end in %s %p"</literal></expr></argument>,
+				 <argument><expr><operator>(</operator><operator>(</operator><name>MemoryContext</name><operator>)</operator> <name>set</name><operator>)</operator><operator>-&gt;</operator><name>name</name></expr></argument>, <argument><expr><name>chunk</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt></block_content></block></if></if_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>CLOBBER_FREED_MEMORY</name></cpp:ifdef>
+	<expr_stmt><expr><call><name>wipe_mem</name><argument_list>(<argument><expr><name>pointer</name></expr></argument>, <argument><expr><name><name>chunk</name><operator>-&gt;</operator><name>size</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+<cpp:if>#<cpp:directive>if</cpp:directive> <expr><call><name>defined</name><argument_list>(<argument><expr><name>__SANITIZE_ADDRESS__</name></expr></argument>)</argument_list></call></expr></cpp:if>
+	<comment type="block">/* POLAR: Mark freed memory noaccess explicitly. */</comment>
+	<expr_stmt><expr><call><name>MEMDEBUG_MAKE_MEM_NOACCESS</name><argument_list>(<argument><expr><name>pointer</name></expr></argument>, <argument><expr><name><name>chunk</name><operator>-&gt;</operator><name>size</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+	<comment type="block">/* Reset context to NULL in freed chunks */</comment>
+	<expr_stmt><expr><name><name>chunk</name><operator>-&gt;</operator><name>context</name></name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>MEMORY_CONTEXT_CHECKING</name></cpp:ifdef>
+	<comment type="block">/* Reset requested_size to 0 in freed chunks */</comment>
+	<expr_stmt><expr><name><name>chunk</name><operator>-&gt;</operator><name>requested_size</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+	<expr_stmt><expr><name><name>block</name><operator>-&gt;</operator><name>nfree</name></name> <operator>+=</operator> <literal type="number">1</literal></expr>;</expr_stmt>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>block</name><operator>-&gt;</operator><name>nchunks</name></name> <operator>&gt;</operator> <literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>block</name><operator>-&gt;</operator><name>nfree</name></name> <operator>&lt;=</operator> <name><name>block</name><operator>-&gt;</operator><name>nchunks</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* If there are still allocated chunks in the block, we're done. */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>block</name><operator>-&gt;</operator><name>nfree</name></name> <operator>&lt;</operator> <name><name>block</name><operator>-&gt;</operator><name>nchunks</name></name></expr>)</condition><block type="pseudo"><block_content>
+		<return>return;</return></block_content></block></if></if_stmt>
+
+	<comment type="block">/*
+	 * The block is empty, so let's get rid of it. First remove it from the
+	 * list of blocks, then return it to malloc().
+	 */</comment>
+	<expr_stmt><expr><call><name>dlist_delete</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>block</name><operator>-&gt;</operator><name>node</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* Also make sure the block is not marked as the current block. */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>set</name><operator>-&gt;</operator><name>block</name></name> <operator>==</operator> <name>block</name></expr>)</condition><block type="pseudo"><block_content>
+		<expr_stmt><expr><name><name>set</name><operator>-&gt;</operator><name>block</name></name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+	<expr_stmt><expr><name><name>context</name><operator>-&gt;</operator><name>mem_allocated</name></name> <operator>-=</operator> <name><name>block</name><operator>-&gt;</operator><name>blksize</name></name></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>free</name><argument_list>(<argument><expr><name>block</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * GenerationRealloc
+ *		When handling repalloc, we simply allocate a new chunk, copy the data
+ *		and discard the old one. The only exception is when the new size fits
+ *		into the old chunk - in that case we just update chunk header.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name> <modifier>*</modifier></type>
+<name>GenerationRealloc</name><parameter_list>(<parameter><decl><type><name>MemoryContext</name></type> <name>context</name></decl></parameter>, <parameter><decl><type><name>void</name> <modifier>*</modifier></type><name>pointer</name></decl></parameter>, <parameter><decl><type><name>Size</name></type> <name>size</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>GenerationContext</name> <modifier>*</modifier></type><name>set</name> <init>= <expr><operator>(</operator><name>GenerationContext</name> <operator>*</operator><operator>)</operator> <name>context</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>GenerationChunk</name> <modifier>*</modifier></type><name>chunk</name> <init>= <expr><call><name>GenerationPointerGetChunk</name><argument_list>(<argument><expr><name>pointer</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>GenerationPointer</name></type> <name>newPointer</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Size</name></type>		<name>oldsize</name></decl>;</decl_stmt>
+
+	<comment type="block">/* Allow access to private part of chunk header. */</comment>
+	<expr_stmt><expr><call><name>MEMDEBUG_MAKE_MEM_DEFINED</name><argument_list>(<argument><expr><name>chunk</name></expr></argument>, <argument><expr><name>GENERATIONCHUNK_PRIVATE_LEN</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<expr_stmt><expr><name>oldsize</name> <operator>=</operator> <name><name>chunk</name><operator>-&gt;</operator><name>size</name></name></expr>;</expr_stmt>
+
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>MEMORY_CONTEXT_CHECKING</name></cpp:ifdef>
+	<comment type="block">/* Test for someone scribbling on unused space in chunk */</comment>
+	<if_stmt><if>if <condition>(<expr><name><name>chunk</name><operator>-&gt;</operator><name>requested_size</name></name> <operator>&lt;</operator> <name>oldsize</name></expr>)</condition><block type="pseudo"><block_content>
+		<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>sentinel_ok</name><argument_list>(<argument><expr><name>pointer</name></expr></argument>, <argument><expr><name><name>chunk</name><operator>-&gt;</operator><name>requested_size</name></name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>WARNING</name></expr></argument>, <argument><expr><literal type="string">"detected write past chunk end in %s %p"</literal></expr></argument>,
+				 <argument><expr><operator>(</operator><operator>(</operator><name>MemoryContext</name><operator>)</operator> <name>set</name><operator>)</operator><operator>-&gt;</operator><name>name</name></expr></argument>, <argument><expr><name>chunk</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt></block_content></block></if></if_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+	<comment type="block">/*
+	 * Maybe the allocated area already is &gt;= the new size.  (In particular,
+	 * we always fall out here if the requested size is a decrease.)
+	 *
+	 * This memory context does not use power-of-2 chunk sizing and instead
+	 * carves the chunks to be as small as possible, so most repalloc() calls
+	 * will end up in the palloc/memcpy/pfree branch.
+	 *
+	 * XXX Perhaps we should annotate this condition with unlikely()?
+	 */</comment>
+	<if_stmt><if>if <condition>(<expr><name>oldsize</name> <operator>&gt;=</operator> <name>size</name></expr>)</condition>
+	<block>{<block_content>
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>MEMORY_CONTEXT_CHECKING</name></cpp:ifdef>
+		<decl_stmt><decl><type><name>Size</name></type>		<name>oldrequest</name> <init>= <expr><name><name>chunk</name><operator>-&gt;</operator><name>requested_size</name></name></expr></init></decl>;</decl_stmt>
+
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>RANDOMIZE_ALLOCATED_MEMORY</name></cpp:ifdef>
+		<comment type="block">/* We can only fill the extra space if we know the prior request */</comment>
+		<if_stmt><if>if <condition>(<expr><name>size</name> <operator>&gt;</operator> <name>oldrequest</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>randomize_mem</name><argument_list>(<argument><expr><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <name>pointer</name> <operator>+</operator> <name>oldrequest</name></expr></argument>,
+						  <argument><expr><name>size</name> <operator>-</operator> <name>oldrequest</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+		<expr_stmt><expr><name><name>chunk</name><operator>-&gt;</operator><name>requested_size</name></name> <operator>=</operator> <name>size</name></expr>;</expr_stmt>
+
+		<comment type="block">/*
+		 * If this is an increase, mark any newly-available part UNDEFINED.
+		 * Otherwise, mark the obsolete part NOACCESS.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><name>size</name> <operator>&gt;</operator> <name>oldrequest</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>MEMDEBUG_MAKE_MEM_UNDEFINED</name><argument_list>(<argument><expr><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <name>pointer</name> <operator>+</operator> <name>oldrequest</name></expr></argument>,
+										<argument><expr><name>size</name> <operator>-</operator> <name>oldrequest</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if>
+		<else>else<block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>MEMDEBUG_MAKE_MEM_NOACCESS</name><argument_list>(<argument><expr><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <name>pointer</name> <operator>+</operator> <name>size</name></expr></argument>,
+									   <argument><expr><name>oldsize</name> <operator>-</operator> <name>size</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></else></if_stmt>
+
+		<comment type="block">/* set mark to catch clobber of "unused" space */</comment>
+		<if_stmt><if>if <condition>(<expr><name>size</name> <operator>&lt;</operator> <name>oldsize</name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>set_sentinel</name><argument_list>(<argument><expr><name>pointer</name></expr></argument>, <argument><expr><name>size</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+<cpp:else>#<cpp:directive>else</cpp:directive></cpp:else>							<comment type="block">/* !MEMORY_CONTEXT_CHECKING */</comment>
+
+		<comment type="block">/*
+		 * We don't have the information to determine whether we're growing
+		 * the old request or shrinking it, so we conservatively mark the
+		 * entire new allocation DEFINED.
+		 */</comment>
+		<expr_stmt><expr><call><name>MEMDEBUG_MAKE_MEM_NOACCESS</name><argument_list>(<argument><expr><name>pointer</name></expr></argument>, <argument><expr><name>oldsize</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>MEMDEBUG_MAKE_MEM_DEFINED</name><argument_list>(<argument><expr><name>pointer</name></expr></argument>, <argument><expr><name>size</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+		<comment type="block">/* Disallow external access to private part of chunk header. */</comment>
+		<expr_stmt><expr><call><name>MEMDEBUG_MAKE_MEM_NOACCESS</name><argument_list>(<argument><expr><name>chunk</name></expr></argument>, <argument><expr><name>GENERATIONCHUNK_PRIVATE_LEN</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<return>return <expr><name>pointer</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/* allocate new chunk */</comment>
+	<expr_stmt><expr><name>newPointer</name> <operator>=</operator> <call><name>GenerationAlloc</name><argument_list>(<argument><expr><operator>(</operator><name>MemoryContext</name><operator>)</operator> <name>set</name></expr></argument>, <argument><expr><name>size</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* leave immediately if request was not completed */</comment>
+	<if_stmt><if>if <condition>(<expr><name>newPointer</name> <operator>==</operator> <name>NULL</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/* Disallow external access to private part of chunk header. */</comment>
+		<expr_stmt><expr><call><name>MEMDEBUG_MAKE_MEM_NOACCESS</name><argument_list>(<argument><expr><name>chunk</name></expr></argument>, <argument><expr><name>GENERATIONCHUNK_PRIVATE_LEN</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<return>return <expr><name>NULL</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+
+	<comment type="block">/*
+	 * GenerationAlloc() may have returned a region that is still NOACCESS.
+	 * Change it to UNDEFINED for the moment; memcpy() will then transfer
+	 * definedness from the old allocation to the new.  If we know the old
+	 * allocation, copy just that much.  Otherwise, make the entire old chunk
+	 * defined to avoid errors as we copy the currently-NOACCESS trailing
+	 * bytes.
+	 */</comment>
+	<expr_stmt><expr><call><name>MEMDEBUG_MAKE_MEM_UNDEFINED</name><argument_list>(<argument><expr><name>newPointer</name></expr></argument>, <argument><expr><name>size</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>MEMORY_CONTEXT_CHECKING</name></cpp:ifdef>
+	<expr_stmt><expr><name>oldsize</name> <operator>=</operator> <name><name>chunk</name><operator>-&gt;</operator><name>requested_size</name></name></expr>;</expr_stmt>
+<cpp:else>#<cpp:directive>else</cpp:directive></cpp:else>
+	<expr_stmt><expr><call><name>MEMDEBUG_MAKE_MEM_DEFINED</name><argument_list>(<argument><expr><name>pointer</name></expr></argument>, <argument><expr><name>oldsize</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+	<comment type="block">/* transfer existing data (certain to fit) */</comment>
+	<expr_stmt><expr><call><name>memcpy</name><argument_list>(<argument><expr><name>newPointer</name></expr></argument>, <argument><expr><name>pointer</name></expr></argument>, <argument><expr><name>oldsize</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/* free old chunk */</comment>
+	<expr_stmt><expr><call><name>GenerationFree</name><argument_list>(<argument><expr><operator>(</operator><name>MemoryContext</name><operator>)</operator> <name>set</name></expr></argument>, <argument><expr><name>pointer</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<return>return <expr><name>newPointer</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * GenerationGetChunkSpace
+ *		Given a currently-allocated chunk, determine the total space
+ *		it occupies (including all memory-allocation overhead).
+ */</comment>
+<function><type><specifier>static</specifier> <name>Size</name></type>
+<name>GenerationGetChunkSpace</name><parameter_list>(<parameter><decl><type><name>MemoryContext</name></type> <name>context</name></decl></parameter>, <parameter><decl><type><name>void</name> <modifier>*</modifier></type><name>pointer</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>GenerationChunk</name> <modifier>*</modifier></type><name>chunk</name> <init>= <expr><call><name>GenerationPointerGetChunk</name><argument_list>(<argument><expr><name>pointer</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Size</name></type>		<name>result</name></decl>;</decl_stmt>
+
+	<expr_stmt><expr><call><name>MEMDEBUG_MAKE_MEM_DEFINED</name><argument_list>(<argument><expr><name>chunk</name></expr></argument>, <argument><expr><name>GENERATIONCHUNK_PRIVATE_LEN</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>result</name> <operator>=</operator> <name><name>chunk</name><operator>-&gt;</operator><name>size</name></name> <operator>+</operator> <name>Generation_CHUNKHDRSZ</name></expr>;</expr_stmt>
+	<expr_stmt><expr><call><name>MEMDEBUG_MAKE_MEM_NOACCESS</name><argument_list>(<argument><expr><name>chunk</name></expr></argument>, <argument><expr><name>GENERATIONCHUNK_PRIVATE_LEN</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<return>return <expr><name>result</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * GenerationIsEmpty
+ *		Is a GenerationContext empty of any allocated space?
+ */</comment>
+<function><type><specifier>static</specifier> <name>bool</name></type>
+<name>GenerationIsEmpty</name><parameter_list>(<parameter><decl><type><name>MemoryContext</name></type> <name>context</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>GenerationContext</name> <modifier>*</modifier></type><name>set</name> <init>= <expr><operator>(</operator><name>GenerationContext</name> <operator>*</operator><operator>)</operator> <name>context</name></expr></init></decl>;</decl_stmt>
+
+	<return>return <expr><call><name>dlist_is_empty</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>set</name><operator>-&gt;</operator><name>blocks</name></name></expr></argument>)</argument_list></call></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * GenerationStats
+ *		Compute stats about memory consumption of a Generation context.
+ *
+ * printfunc: if not NULL, pass a human-readable stats string to this.
+ * passthru: pass this pointer through to printfunc.
+ * totals: if not NULL, add stats about this context into *totals.
+ *
+ * XXX freespace only accounts for empty space at the end of the block, not
+ * space of freed chunks (which is unknown).
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>GenerationStats</name><parameter_list>(<parameter><decl><type><name>MemoryContext</name></type> <name>context</name></decl></parameter>,
+				<parameter><decl><type><name>MemoryStatsPrintFunc</name></type> <name>printfunc</name></decl></parameter>, <parameter><decl><type><name>void</name> <modifier>*</modifier></type><name>passthru</name></decl></parameter>,
+				<parameter><decl><type><name>MemoryContextCounters</name> <modifier>*</modifier></type><name>totals</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>GenerationContext</name> <modifier>*</modifier></type><name>set</name> <init>= <expr><operator>(</operator><name>GenerationContext</name> <operator>*</operator><operator>)</operator> <name>context</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Size</name></type>		<name>nblocks</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Size</name></type>		<name>nchunks</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Size</name></type>		<name>nfreechunks</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Size</name></type>		<name>totalspace</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Size</name></type>		<name>freespace</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>dlist_iter</name></type>	<name>iter</name></decl>;</decl_stmt>
+
+	<comment type="block">/* Include context header in totalspace */</comment>
+	<expr_stmt><expr><name>totalspace</name> <operator>=</operator> <call><name>MAXALIGN</name><argument_list>(<argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>GenerationContext</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<macro><name>dlist_foreach</name><argument_list>(<argument>iter</argument>, <argument>&amp;set-&gt;blocks</argument>)</argument_list></macro>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>GenerationBlock</name> <modifier>*</modifier></type><name>block</name> <init>= <expr><call><name>dlist_container</name><argument_list>(<argument><expr><name>GenerationBlock</name></expr></argument>, <argument><expr><name>node</name></expr></argument>, <argument><expr><name><name>iter</name><operator>.</operator><name>cur</name></name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+		<expr_stmt><expr><name>nblocks</name><operator>++</operator></expr>;</expr_stmt>
+		<expr_stmt><expr><name>nchunks</name> <operator>+=</operator> <name><name>block</name><operator>-&gt;</operator><name>nchunks</name></name></expr>;</expr_stmt>
+		<expr_stmt><expr><name>nfreechunks</name> <operator>+=</operator> <name><name>block</name><operator>-&gt;</operator><name>nfree</name></name></expr>;</expr_stmt>
+		<expr_stmt><expr><name>totalspace</name> <operator>+=</operator> <name><name>block</name><operator>-&gt;</operator><name>blksize</name></name></expr>;</expr_stmt>
+		<expr_stmt><expr><name>freespace</name> <operator>+=</operator> <operator>(</operator><name><name>block</name><operator>-&gt;</operator><name>endptr</name></name> <operator>-</operator> <name><name>block</name><operator>-&gt;</operator><name>freeptr</name></name><operator>)</operator></expr>;</expr_stmt>
+	</block_content>}</block>
+
+	<if_stmt><if>if <condition>(<expr><name>printfunc</name></expr>)</condition>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>char</name></type>		<name><name>stats_string</name><index>[<expr><literal type="number">200</literal></expr>]</index></name></decl>;</decl_stmt>
+
+		<expr_stmt><expr><call><name>snprintf</name><argument_list>(<argument><expr><name>stats_string</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>stats_string</name></expr></argument>)</argument_list></sizeof></expr></argument>,
+				 <argument><expr><literal type="string">"%zu total in %zd blocks (%zd chunks); %zu free (%zd chunks); %zu used"</literal></expr></argument>,
+				 <argument><expr><name>totalspace</name></expr></argument>, <argument><expr><name>nblocks</name></expr></argument>, <argument><expr><name>nchunks</name></expr></argument>, <argument><expr><name>freespace</name></expr></argument>,
+				 <argument><expr><name>nfreechunks</name></expr></argument>, <argument><expr><name>totalspace</name> <operator>-</operator> <name>freespace</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<expr_stmt><expr><call><name>printfunc</name><argument_list>(<argument><expr><name>context</name></expr></argument>, <argument><expr><name>passthru</name></expr></argument>, <argument><expr><name>stats_string</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><name>totals</name></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><name><name>totals</name><operator>-&gt;</operator><name>nblocks</name></name> <operator>+=</operator> <name>nblocks</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>totals</name><operator>-&gt;</operator><name>freechunks</name></name> <operator>+=</operator> <name>nfreechunks</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>totals</name><operator>-&gt;</operator><name>totalspace</name></name> <operator>+=</operator> <name>totalspace</name></expr>;</expr_stmt>
+		<expr_stmt><expr><name><name>totals</name><operator>-&gt;</operator><name>freespace</name></name> <operator>+=</operator> <name>freespace</name></expr>;</expr_stmt>
+	</block_content>}</block></if></if_stmt>
+</block_content>}</block></function>
+
+
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>MEMORY_CONTEXT_CHECKING</name></cpp:ifdef>
+
+<comment type="block">/*
+ * GenerationCheck
+ *		Walk through chunks and check consistency of memory.
+ *
+ * NOTE: report errors as WARNING, *not* ERROR or FATAL.  Otherwise you'll
+ * find yourself in an infinite loop when trouble occurs, because this
+ * routine will be entered again when elog cleanup tries to release memory!
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>GenerationCheck</name><parameter_list>(<parameter><decl><type><name>MemoryContext</name></type> <name>context</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<decl_stmt><decl><type><name>GenerationContext</name> <modifier>*</modifier></type><name>gen</name> <init>= <expr><operator>(</operator><name>GenerationContext</name> <operator>*</operator><operator>)</operator> <name>context</name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>name</name> <init>= <expr><name><name>context</name><operator>-&gt;</operator><name>name</name></name></expr></init></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>dlist_iter</name></type>	<name>iter</name></decl>;</decl_stmt>
+	<decl_stmt><decl><type><name>Size</name></type>		<name>total_allocated</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+
+	<comment type="block">/* walk all blocks in this context */</comment>
+	<macro><name>dlist_foreach</name><argument_list>(<argument>iter</argument>, <argument>&amp;gen-&gt;blocks</argument>)</argument_list></macro>
+	<block>{<block_content>
+		<decl_stmt><decl><type><name>GenerationBlock</name> <modifier>*</modifier></type><name>block</name> <init>= <expr><call><name>dlist_container</name><argument_list>(<argument><expr><name>GenerationBlock</name></expr></argument>, <argument><expr><name>node</name></expr></argument>, <argument><expr><name><name>iter</name><operator>.</operator><name>cur</name></name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>int</name></type>			<name>nfree</name></decl>,
+					<decl><type ref="prev"/><name>nchunks</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>ptr</name></decl>;</decl_stmt>
+
+		<expr_stmt><expr><name>total_allocated</name> <operator>+=</operator> <name><name>block</name><operator>-&gt;</operator><name>blksize</name></name></expr>;</expr_stmt>
+
+		<comment type="block">/*
+		 * nfree &gt; nchunks is surely wrong, and we don't expect to see
+		 * equality either, because such a block should have gotten freed.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><name><name>block</name><operator>-&gt;</operator><name>nfree</name></name> <operator>&gt;=</operator> <name><name>block</name><operator>-&gt;</operator><name>nchunks</name></name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>WARNING</name></expr></argument>, <argument><expr><literal type="string">"problem in Generation %s: number of free chunks %d in block %p exceeds %d allocated"</literal></expr></argument>,
+				 <argument><expr><name>name</name></expr></argument>, <argument><expr><name><name>block</name><operator>-&gt;</operator><name>nfree</name></name></expr></argument>, <argument><expr><name>block</name></expr></argument>, <argument><expr><name><name>block</name><operator>-&gt;</operator><name>nchunks</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+		<comment type="block">/* Now walk through the chunks and count them. */</comment>
+		<expr_stmt><expr><name>nfree</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+		<expr_stmt><expr><name>nchunks</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+		<expr_stmt><expr><name>ptr</name> <operator>=</operator> <operator>(</operator><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <name>block</name><operator>)</operator> <operator>+</operator> <name>Generation_BLOCKHDRSZ</name></expr>;</expr_stmt>
+
+		<while>while <condition>(<expr><name>ptr</name> <operator>&lt;</operator> <name><name>block</name><operator>-&gt;</operator><name>freeptr</name></name></expr>)</condition>
+		<block>{<block_content>
+			<decl_stmt><decl><type><name>GenerationChunk</name> <modifier>*</modifier></type><name>chunk</name> <init>= <expr><operator>(</operator><name>GenerationChunk</name> <operator>*</operator><operator>)</operator> <name>ptr</name></expr></init></decl>;</decl_stmt>
+
+			<comment type="block">/* Allow access to private part of chunk header. */</comment>
+			<expr_stmt><expr><call><name>MEMDEBUG_MAKE_MEM_DEFINED</name><argument_list>(<argument><expr><name>chunk</name></expr></argument>, <argument><expr><name>GENERATIONCHUNK_PRIVATE_LEN</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+			<comment type="block">/* move to the next chunk */</comment>
+			<expr_stmt><expr><name>ptr</name> <operator>+=</operator> <operator>(</operator><name><name>chunk</name><operator>-&gt;</operator><name>size</name></name> <operator>+</operator> <name>Generation_CHUNKHDRSZ</name><operator>)</operator></expr>;</expr_stmt>
+
+			<expr_stmt><expr><name>nchunks</name> <operator>+=</operator> <literal type="number">1</literal></expr>;</expr_stmt>
+
+			<comment type="block">/* chunks have both block and context pointers, so check both */</comment>
+			<if_stmt><if>if <condition>(<expr><name><name>chunk</name><operator>-&gt;</operator><name>block</name></name> <operator>!=</operator> <name>block</name></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>WARNING</name></expr></argument>, <argument><expr><literal type="string">"problem in Generation %s: bogus block link in block %p, chunk %p"</literal></expr></argument>,
+					 <argument><expr><name>name</name></expr></argument>, <argument><expr><name>block</name></expr></argument>, <argument><expr><name>chunk</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+			<comment type="block">/*
+			 * Check for valid context pointer.  Note this is an incomplete
+			 * test, since palloc(0) produces an allocated chunk with
+			 * requested_size == 0.
+			 */</comment>
+			<if_stmt><if>if <condition>(<expr><operator>(</operator><name><name>chunk</name><operator>-&gt;</operator><name>requested_size</name></name> <operator>&gt;</operator> <literal type="number">0</literal> <operator>&amp;&amp;</operator> <name><name>chunk</name><operator>-&gt;</operator><name>context</name></name> <operator>!=</operator> <name>gen</name><operator>)</operator> <operator>||</operator>
+				<operator>(</operator><name><name>chunk</name><operator>-&gt;</operator><name>context</name></name> <operator>!=</operator> <name>gen</name> <operator>&amp;&amp;</operator> <name><name>chunk</name><operator>-&gt;</operator><name>context</name></name> <operator>!=</operator> <name>NULL</name><operator>)</operator></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>WARNING</name></expr></argument>, <argument><expr><literal type="string">"problem in Generation %s: bogus context link in block %p, chunk %p"</literal></expr></argument>,
+					 <argument><expr><name>name</name></expr></argument>, <argument><expr><name>block</name></expr></argument>, <argument><expr><name>chunk</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+			<comment type="block">/* now make sure the chunk size is correct */</comment>
+			<if_stmt><if>if <condition>(<expr><name><name>chunk</name><operator>-&gt;</operator><name>size</name></name> <operator>&lt;</operator> <name><name>chunk</name><operator>-&gt;</operator><name>requested_size</name></name> <operator>||</operator>
+				<name><name>chunk</name><operator>-&gt;</operator><name>size</name></name> <operator>!=</operator> <call><name>MAXALIGN</name><argument_list>(<argument><expr><name><name>chunk</name><operator>-&gt;</operator><name>size</name></name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>WARNING</name></expr></argument>, <argument><expr><literal type="string">"problem in Generation %s: bogus chunk size in block %p, chunk %p"</literal></expr></argument>,
+					 <argument><expr><name>name</name></expr></argument>, <argument><expr><name>block</name></expr></argument>, <argument><expr><name>chunk</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+			<comment type="block">/* is chunk allocated? */</comment>
+			<if_stmt><if>if <condition>(<expr><name><name>chunk</name><operator>-&gt;</operator><name>context</name></name> <operator>!=</operator> <name>NULL</name></expr>)</condition>
+			<block>{<block_content>
+				<comment type="block">/* check sentinel, but only in allocated blocks */</comment>
+				<if_stmt><if>if <condition>(<expr><name><name>chunk</name><operator>-&gt;</operator><name>requested_size</name></name> <operator>&lt;</operator> <name><name>chunk</name><operator>-&gt;</operator><name>size</name></name> <operator>&amp;&amp;</operator>
+					<operator>!</operator><call><name>sentinel_ok</name><argument_list>(<argument><expr><name>chunk</name></expr></argument>, <argument><expr><name>Generation_CHUNKHDRSZ</name> <operator>+</operator> <name><name>chunk</name><operator>-&gt;</operator><name>requested_size</name></name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+					<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>WARNING</name></expr></argument>, <argument><expr><literal type="string">"problem in Generation %s: detected write past chunk end in block %p, chunk %p"</literal></expr></argument>,
+						 <argument><expr><name>name</name></expr></argument>, <argument><expr><name>block</name></expr></argument>, <argument><expr><name>chunk</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+			</block_content>}</block></if>
+			<else>else<block type="pseudo"><block_content>
+				<expr_stmt><expr><name>nfree</name> <operator>+=</operator> <literal type="number">1</literal></expr>;</expr_stmt></block_content></block></else></if_stmt>
+
+			<comment type="block">/*
+			 * If chunk is allocated, disallow external access to private part
+			 * of chunk header.
+			 */</comment>
+			<if_stmt><if>if <condition>(<expr><name><name>chunk</name><operator>-&gt;</operator><name>context</name></name> <operator>!=</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+				<expr_stmt><expr><call><name>MEMDEBUG_MAKE_MEM_NOACCESS</name><argument_list>(<argument><expr><name>chunk</name></expr></argument>, <argument><expr><name>GENERATIONCHUNK_PRIVATE_LEN</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+		</block_content>}</block></while>
+
+		<comment type="block">/*
+		 * Make sure we got the expected number of allocated and free chunks
+		 * (as tracked in the block header).
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><name>nchunks</name> <operator>!=</operator> <name><name>block</name><operator>-&gt;</operator><name>nchunks</name></name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>WARNING</name></expr></argument>, <argument><expr><literal type="string">"problem in Generation %s: number of allocated chunks %d in block %p does not match header %d"</literal></expr></argument>,
+				 <argument><expr><name>name</name></expr></argument>, <argument><expr><name>nchunks</name></expr></argument>, <argument><expr><name>block</name></expr></argument>, <argument><expr><name><name>block</name><operator>-&gt;</operator><name>nchunks</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+		<if_stmt><if>if <condition>(<expr><name>nfree</name> <operator>!=</operator> <name><name>block</name><operator>-&gt;</operator><name>nfree</name></name></expr>)</condition><block type="pseudo"><block_content>
+			<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>WARNING</name></expr></argument>, <argument><expr><literal type="string">"problem in Generation %s: number of free chunks %d in block %p does not match header %d"</literal></expr></argument>,
+				 <argument><expr><name>name</name></expr></argument>, <argument><expr><name>nfree</name></expr></argument>, <argument><expr><name>block</name></expr></argument>, <argument><expr><name><name>block</name><operator>-&gt;</operator><name>nfree</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	</block_content>}</block>
+
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>total_allocated</name> <operator>==</operator> <name><name>context</name><operator>-&gt;</operator><name>mem_allocated</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>							<comment type="block">/* MEMORY_CONTEXT_CHECKING */</comment>
+</unit>

@@ -1,0 +1,453 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<unit xmlns="http://www.srcML.org/srcML/src" xmlns:cpp="http://www.srcML.org/srcML/cpp" revision="1.0.0" language="C" filename="/cloned_projects/sysbench/third_party/luajit/luajit/src/lj_opt_loop.c"><comment type="block">/*
+** LOOP: Loop Optimizations.
+** Copyright (C) 2005-2020 Mike Pall. See Copyright Notice in luajit.h
+*/</comment>
+
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>lj_opt_loop_c</name></cpp:macro></cpp:define>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>LUA_CORE</name></cpp:macro></cpp:define>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"lj_obj.h"</cpp:file></cpp:include>
+
+<cpp:if>#<cpp:directive>if</cpp:directive> <expr><name>LJ_HASJIT</name></expr></cpp:if>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"lj_err.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"lj_buf.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"lj_ir.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"lj_jit.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"lj_iropt.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"lj_trace.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"lj_snap.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"lj_vm.h"</cpp:file></cpp:include>
+
+<comment type="block">/* Loop optimization:
+**
+** Traditional Loop-Invariant Code Motion (LICM) splits the instructions
+** of a loop into invariant and variant instructions. The invariant
+** instructions are hoisted out of the loop and only the variant
+** instructions remain inside the loop body.
+**
+** Unfortunately LICM is mostly useless for compiling dynamic languages.
+** The IR has many guards and most of the subsequent instructions are
+** control-dependent on them. The first non-hoistable guard would
+** effectively prevent hoisting of all subsequent instructions.
+**
+** That's why we use a special form of unrolling using copy-substitution,
+** combined with redundancy elimination:
+**
+** The recorded instruction stream is re-emitted to the compiler pipeline
+** with substituted operands. The substitution table is filled with the
+** refs returned by re-emitting each instruction. This can be done
+** on-the-fly, because the IR is in strict SSA form, where every ref is
+** defined before its use.
+**
+** This aproach generates two code sections, separated by the LOOP
+** instruction:
+**
+** 1. The recorded instructions form a kind of pre-roll for the loop. It
+** contains a mix of invariant and variant instructions and performs
+** exactly one loop iteration (but not necessarily the 1st iteration).
+**
+** 2. The loop body contains only the variant instructions and performs
+** all remaining loop iterations.
+**
+** On first sight that looks like a waste of space, because the variant
+** instructions are present twice. But the key insight is that the
+** pre-roll honors the control-dependencies for *both* the pre-roll itself
+** *and* the loop body!
+**
+** It also means one doesn't have to explicitly model control-dependencies
+** (which, BTW, wouldn't help LICM much). And it's much easier to
+** integrate sparse snapshotting with this approach.
+**
+** One of the nicest aspects of this approach is that all of the
+** optimizations of the compiler pipeline (FOLD, CSE, FWD, etc.) can be
+** reused with only minor restrictions (e.g. one should not fold
+** instructions across loop-carried dependencies).
+**
+** But in general all optimizations can be applied which only need to look
+** backwards into the generated instruction stream. At any point in time
+** during the copy-substitution process this contains both a static loop
+** iteration (the pre-roll) and a dynamic one (from the to-be-copied
+** instruction up to the end of the partial loop body).
+**
+** Since control-dependencies are implicitly kept, CSE also applies to all
+** kinds of guards. The major advantage is that all invariant guards can
+** be hoisted, too.
+**
+** Load/store forwarding works across loop iterations, too. This is
+** important if loop-carried dependencies are kept in upvalues or tables.
+** E.g. 'self.idx = self.idx + 1' deep down in some OO-style method may
+** become a forwarded loop-recurrence after inlining.
+**
+** Since the IR is in SSA form, loop-carried dependencies have to be
+** modeled with PHI instructions. The potential candidates for PHIs are
+** collected on-the-fly during copy-substitution. After eliminating the
+** redundant ones, PHI instructions are emitted *below* the loop body.
+**
+** Note that this departure from traditional SSA form doesn't change the
+** semantics of the PHI instructions themselves. But it greatly simplifies
+** on-the-fly generation of the IR and the machine code.
+*/</comment>
+
+<comment type="block">/* Some local macros to save typing. Undef'd at the end. */</comment>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>IR</name><parameter_list>(<parameter><type><name>ref</name></type></parameter>)</parameter_list></cpp:macro>		<cpp:value>(&amp;J-&gt;cur.ir[(ref)])</cpp:value></cpp:define>
+
+<comment type="block">/* Pass IR on to next optimization in chain (FOLD). */</comment>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>emitir</name><parameter_list>(<parameter><type><name>ot</name></type></parameter>, <parameter><type><name>a</name></type></parameter>, <parameter><type><name>b</name></type></parameter>)</parameter_list></cpp:macro>	<cpp:value>(lj_ir_set(J, (ot), (a), (b)), lj_opt_fold(J))</cpp:value></cpp:define>
+
+<comment type="block">/* Emit raw IR without passing through optimizations. */</comment>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>emitir_raw</name><parameter_list>(<parameter><type><name>ot</name></type></parameter>, <parameter><type><name>a</name></type></parameter>, <parameter><type><name>b</name></type></parameter>)</parameter_list></cpp:macro>	<cpp:value>(lj_ir_set(J, (ot), (a), (b)), lj_ir_emit(J))</cpp:value></cpp:define>
+
+<comment type="block">/* -- PHI elimination ----------------------------------------------------- */</comment>
+
+<comment type="block">/* Emit or eliminate collected PHIs. */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type> <name>loop_emit_phi</name><parameter_list>(<parameter><decl><type><name>jit_State</name> <modifier>*</modifier></type><name>J</name></decl></parameter>, <parameter><decl><type><name>IRRef1</name> <modifier>*</modifier></type><name>subst</name></decl></parameter>, <parameter><decl><type><name>IRRef1</name> <modifier>*</modifier></type><name>phi</name></decl></parameter>, <parameter><decl><type><name>IRRef</name></type> <name>nphi</name></decl></parameter>,
+			  <parameter><decl><type><name>SnapNo</name></type> <name>onsnap</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+  <decl_stmt><decl><type><name>int</name></type> <name>passx</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>IRRef</name></type> <name>i</name></decl>, <decl><type ref="prev"/><name>j</name></decl>, <decl><type ref="prev"/><name>nslots</name></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>IRRef</name></type> <name>invar</name> <init>= <expr><name><name>J</name><operator>-&gt;</operator><name>chain</name><index>[<expr><name>IR_LOOP</name></expr>]</index></name></expr></init></decl>;</decl_stmt>
+  <comment type="block">/* Pass #1: mark redundant and potentially redundant PHIs. */</comment>
+  <for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr><operator>,</operator> <expr><name>j</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name>nphi</name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control> <block>{<block_content>
+    <decl_stmt><decl><type><name>IRRef</name></type> <name>lref</name> <init>= <expr><name><name>phi</name><index>[<expr><name>i</name></expr>]</index></name></expr></init></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>IRRef</name></type> <name>rref</name> <init>= <expr><name><name>subst</name><index>[<expr><name>lref</name></expr>]</index></name></expr></init></decl>;</decl_stmt>
+    <if_stmt><if>if <condition>(<expr><name>lref</name> <operator>==</operator> <name>rref</name> <operator>||</operator> <name>rref</name> <operator>==</operator> <name>REF_DROP</name></expr>)</condition> <block>{<block_content>  <comment type="block">/* Invariants are redundant. */</comment>
+      <expr_stmt><expr><call><name>irt_clearphi</name><argument_list>(<argument><expr><call><name>IR</name><argument_list>(<argument><expr><name>lref</name></expr></argument>)</argument_list></call><operator>-&gt;</operator><name>t</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    </block_content>}</block></if> <else>else <block>{<block_content>
+      <expr_stmt><expr><name><name>phi</name><index>[<expr><name>j</name><operator>++</operator></expr>]</index></name> <operator>=</operator> <operator>(</operator><name>IRRef1</name><operator>)</operator><name>lref</name></expr>;</expr_stmt>
+      <if_stmt><if>if <condition>(<expr><operator>!</operator><operator>(</operator><call><name>IR</name><argument_list>(<argument><expr><name>rref</name></expr></argument>)</argument_list></call><operator>-&gt;</operator><name>op1</name> <operator>==</operator> <name>lref</name> <operator>||</operator> <call><name>IR</name><argument_list>(<argument><expr><name>rref</name></expr></argument>)</argument_list></call><operator>-&gt;</operator><name>op2</name> <operator>==</operator> <name>lref</name><operator>)</operator></expr>)</condition> <block>{<block_content>
+	<comment type="block">/* Quick check for simple recurrences failed, need pass2. */</comment>
+	<expr_stmt><expr><call><name>irt_setmark</name><argument_list>(<argument><expr><call><name>IR</name><argument_list>(<argument><expr><name>lref</name></expr></argument>)</argument_list></call><operator>-&gt;</operator><name>t</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<expr_stmt><expr><name>passx</name> <operator>=</operator> <literal type="number">1</literal></expr>;</expr_stmt>
+      </block_content>}</block></if></if_stmt>
+    </block_content>}</block></else></if_stmt>
+  </block_content>}</block></for>
+  <expr_stmt><expr><name>nphi</name> <operator>=</operator> <name>j</name></expr>;</expr_stmt>
+  <comment type="block">/* Pass #2: traverse variant part and clear marks of non-redundant PHIs. */</comment>
+  <if_stmt><if>if <condition>(<expr><name>passx</name></expr>)</condition> <block>{<block_content>
+    <decl_stmt><decl><type><name>SnapNo</name></type> <name>s</name></decl>;</decl_stmt>
+    <for>for <control>(<init><expr><name>i</name> <operator>=</operator> <name><name>J</name><operator>-&gt;</operator><name>cur</name><operator>.</operator><name>nins</name></name><operator>-</operator><literal type="number">1</literal></expr>;</init> <condition><expr><name>i</name> <operator>&gt;</operator> <name>invar</name></expr>;</condition> <incr><expr><name>i</name><operator>--</operator></expr></incr>)</control> <block>{<block_content>
+      <decl_stmt><decl><type><name>IRIns</name> <modifier>*</modifier></type><name>ir</name> <init>= <expr><call><name>IR</name><argument_list>(<argument><expr><name>i</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+      <if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>irref_isk</name><argument_list>(<argument><expr><name><name>ir</name><operator>-&gt;</operator><name>op2</name></name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content> <expr_stmt><expr><call><name>irt_clearmark</name><argument_list>(<argument><expr><call><name>IR</name><argument_list>(<argument><expr><name><name>ir</name><operator>-&gt;</operator><name>op2</name></name></expr></argument>)</argument_list></call><operator>-&gt;</operator><name>t</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+      <if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>irref_isk</name><argument_list>(<argument><expr><name><name>ir</name><operator>-&gt;</operator><name>op1</name></name></expr></argument>)</argument_list></call></expr>)</condition> <block>{<block_content>
+	<expr_stmt><expr><call><name>irt_clearmark</name><argument_list>(<argument><expr><call><name>IR</name><argument_list>(<argument><expr><name><name>ir</name><operator>-&gt;</operator><name>op1</name></name></expr></argument>)</argument_list></call><operator>-&gt;</operator><name>t</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><name><name>ir</name><operator>-&gt;</operator><name>op1</name></name> <operator>&lt;</operator> <name>invar</name> <operator>&amp;&amp;</operator>
+	    <name><name>ir</name><operator>-&gt;</operator><name>o</name></name> <operator>&gt;=</operator> <name>IR_CALLN</name> <operator>&amp;&amp;</operator> <name><name>ir</name><operator>-&gt;</operator><name>o</name></name> <operator>&lt;=</operator> <name>IR_CARG</name></expr>)</condition> <block>{<block_content>  <comment type="block">/* ORDER IR */</comment>
+	  <expr_stmt><expr><name>ir</name> <operator>=</operator> <call><name>IR</name><argument_list>(<argument><expr><name><name>ir</name><operator>-&gt;</operator><name>op1</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	  <while>while <condition>(<expr><name><name>ir</name><operator>-&gt;</operator><name>o</name></name> <operator>==</operator> <name>IR_CARG</name></expr>)</condition> <block>{<block_content>
+	    <if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>irref_isk</name><argument_list>(<argument><expr><name><name>ir</name><operator>-&gt;</operator><name>op2</name></name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content> <expr_stmt><expr><call><name>irt_clearmark</name><argument_list>(<argument><expr><call><name>IR</name><argument_list>(<argument><expr><name><name>ir</name><operator>-&gt;</operator><name>op2</name></name></expr></argument>)</argument_list></call><operator>-&gt;</operator><name>t</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	    <if_stmt><if>if <condition>(<expr><call><name>irref_isk</name><argument_list>(<argument><expr><name><name>ir</name><operator>-&gt;</operator><name>op1</name></name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content> <break>break;</break></block_content></block></if></if_stmt>
+	    <expr_stmt><expr><name>ir</name> <operator>=</operator> <call><name>IR</name><argument_list>(<argument><expr><name><name>ir</name><operator>-&gt;</operator><name>op1</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	    <expr_stmt><expr><call><name>irt_clearmark</name><argument_list>(<argument><expr><name><name>ir</name><operator>-&gt;</operator><name>t</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	  </block_content>}</block></while>
+	</block_content>}</block></if></if_stmt>
+      </block_content>}</block></if></if_stmt>
+    </block_content>}</block></for>
+    <for>for <control>(<init><expr><name>s</name> <operator>=</operator> <name><name>J</name><operator>-&gt;</operator><name>cur</name><operator>.</operator><name>nsnap</name></name><operator>-</operator><literal type="number">1</literal></expr>;</init> <condition><expr><name>s</name> <operator>&gt;=</operator> <name>onsnap</name></expr>;</condition> <incr><expr><name>s</name><operator>--</operator></expr></incr>)</control> <block>{<block_content>
+      <decl_stmt><decl><type><name>SnapShot</name> <modifier>*</modifier></type><name>snap</name> <init>= <expr><operator>&amp;</operator><name><name>J</name><operator>-&gt;</operator><name>cur</name><operator>.</operator><name>snap</name><index>[<expr><name>s</name></expr>]</index></name></expr></init></decl>;</decl_stmt>
+      <decl_stmt><decl><type><name>SnapEntry</name> <modifier>*</modifier></type><name>map</name> <init>= <expr><operator>&amp;</operator><name><name>J</name><operator>-&gt;</operator><name>cur</name><operator>.</operator><name>snapmap</name><index>[<expr><name><name>snap</name><operator>-&gt;</operator><name>mapofs</name></name></expr>]</index></name></expr></init></decl>;</decl_stmt>
+      <decl_stmt><decl><type><name>MSize</name></type> <name>n</name></decl>, <decl><type ref="prev"/><name>nent</name> <init>= <expr><name><name>snap</name><operator>-&gt;</operator><name>nent</name></name></expr></init></decl>;</decl_stmt>
+      <for>for <control>(<init><expr><name>n</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>n</name> <operator>&lt;</operator> <name>nent</name></expr>;</condition> <incr><expr><name>n</name><operator>++</operator></expr></incr>)</control> <block>{<block_content>
+	<decl_stmt><decl><type><name>IRRef</name></type> <name>ref</name> <init>= <expr><call><name>snap_ref</name><argument_list>(<argument><expr><name><name>map</name><index>[<expr><name>n</name></expr>]</index></name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>irref_isk</name><argument_list>(<argument><expr><name>ref</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content> <expr_stmt><expr><call><name>irt_clearmark</name><argument_list>(<argument><expr><call><name>IR</name><argument_list>(<argument><expr><name>ref</name></expr></argument>)</argument_list></call><operator>-&gt;</operator><name>t</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+      </block_content>}</block></for>
+    </block_content>}</block></for>
+  </block_content>}</block></if></if_stmt>
+  <comment type="block">/* Pass #3: add PHIs for variant slots without a corresponding SLOAD. */</comment>
+  <expr_stmt><expr><name>nslots</name> <operator>=</operator> <name><name>J</name><operator>-&gt;</operator><name>baseslot</name></name><operator>+</operator><name><name>J</name><operator>-&gt;</operator><name>maxslot</name></name></expr>;</expr_stmt>
+  <for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">1</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name>nslots</name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control> <block>{<block_content>
+    <decl_stmt><decl><type><name>IRRef</name></type> <name>ref</name> <init>= <expr><call><name>tref_ref</name><argument_list>(<argument><expr><name><name>J</name><operator>-&gt;</operator><name>slot</name><index>[<expr><name>i</name></expr>]</index></name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+    <while>while <condition>(<expr><operator>!</operator><call><name>irref_isk</name><argument_list>(<argument><expr><name>ref</name></expr></argument>)</argument_list></call> <operator>&amp;&amp;</operator> <name>ref</name> <operator>!=</operator> <name><name>subst</name><index>[<expr><name>ref</name></expr>]</index></name></expr>)</condition> <block>{<block_content>
+      <decl_stmt><decl><type><name>IRIns</name> <modifier>*</modifier></type><name>ir</name> <init>= <expr><call><name>IR</name><argument_list>(<argument><expr><name>ref</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+      <expr_stmt><expr><call><name>irt_clearmark</name><argument_list>(<argument><expr><name><name>ir</name><operator>-&gt;</operator><name>t</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>  <comment type="block">/* Unmark potential uses, too. */</comment>
+      <if_stmt><if>if <condition>(<expr><call><name>irt_isphi</name><argument_list>(<argument><expr><name><name>ir</name><operator>-&gt;</operator><name>t</name></name></expr></argument>)</argument_list></call> <operator>||</operator> <call><name>irt_ispri</name><argument_list>(<argument><expr><name><name>ir</name><operator>-&gt;</operator><name>t</name></name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+	<break>break;</break></block_content></block></if></if_stmt>
+      <expr_stmt><expr><call><name>irt_setphi</name><argument_list>(<argument><expr><name><name>ir</name><operator>-&gt;</operator><name>t</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+      <if_stmt><if>if <condition>(<expr><name>nphi</name> <operator>&gt;=</operator> <name>LJ_MAX_PHI</name></expr>)</condition><block type="pseudo"><block_content>
+	<expr_stmt><expr><call><name>lj_trace_err</name><argument_list>(<argument><expr><name>J</name></expr></argument>, <argument><expr><name>LJ_TRERR_PHIOV</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+      <expr_stmt><expr><name><name>phi</name><index>[<expr><name>nphi</name><operator>++</operator></expr>]</index></name> <operator>=</operator> <operator>(</operator><name>IRRef1</name><operator>)</operator><name>ref</name></expr>;</expr_stmt>
+      <expr_stmt><expr><name>ref</name> <operator>=</operator> <name><name>subst</name><index>[<expr><name>ref</name></expr>]</index></name></expr>;</expr_stmt>
+      <if_stmt><if>if <condition>(<expr><name>ref</name> <operator>&gt;</operator> <name>invar</name></expr>)</condition><block type="pseudo"><block_content>
+	<break>break;</break></block_content></block></if></if_stmt>
+    </block_content>}</block></while>
+  </block_content>}</block></for>
+  <comment type="block">/* Pass #4: propagate non-redundant PHIs. */</comment>
+  <while>while <condition>(<expr><name>passx</name></expr>)</condition> <block>{<block_content>
+    <expr_stmt><expr><name>passx</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+    <for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name>nphi</name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control> <block>{<block_content>
+      <decl_stmt><decl><type><name>IRRef</name></type> <name>lref</name> <init>= <expr><name><name>phi</name><index>[<expr><name>i</name></expr>]</index></name></expr></init></decl>;</decl_stmt>
+      <decl_stmt><decl><type><name>IRIns</name> <modifier>*</modifier></type><name>ir</name> <init>= <expr><call><name>IR</name><argument_list>(<argument><expr><name>lref</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+      <if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>irt_ismarked</name><argument_list>(<argument><expr><name><name>ir</name><operator>-&gt;</operator><name>t</name></name></expr></argument>)</argument_list></call></expr>)</condition> <block>{<block_content>  <comment type="block">/* Propagate only from unmarked PHIs. */</comment>
+	<decl_stmt><decl><type><name>IRIns</name> <modifier>*</modifier></type><name>irr</name> <init>= <expr><call><name>IR</name><argument_list>(<argument><expr><name><name>subst</name><index>[<expr><name>lref</name></expr>]</index></name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<if_stmt><if>if <condition>(<expr><call><name>irt_ismarked</name><argument_list>(<argument><expr><name><name>irr</name><operator>-&gt;</operator><name>t</name></name></expr></argument>)</argument_list></call></expr>)</condition> <block>{<block_content>  <comment type="block">/* Right ref points to other PHI? */</comment>
+	  <expr_stmt><expr><call><name>irt_clearmark</name><argument_list>(<argument><expr><name><name>irr</name><operator>-&gt;</operator><name>t</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>  <comment type="block">/* Mark that PHI as non-redundant. */</comment>
+	  <expr_stmt><expr><name>passx</name> <operator>=</operator> <literal type="number">1</literal></expr>;</expr_stmt>  <comment type="block">/* Retry. */</comment>
+	</block_content>}</block></if></if_stmt>
+      </block_content>}</block></if></if_stmt>
+    </block_content>}</block></for>
+  </block_content>}</block></while>
+  <comment type="block">/* Pass #5: emit PHI instructions or eliminate PHIs. */</comment>
+  <for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name>nphi</name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control> <block>{<block_content>
+    <decl_stmt><decl><type><name>IRRef</name></type> <name>lref</name> <init>= <expr><name><name>phi</name><index>[<expr><name>i</name></expr>]</index></name></expr></init></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>IRIns</name> <modifier>*</modifier></type><name>ir</name> <init>= <expr><call><name>IR</name><argument_list>(<argument><expr><name>lref</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+    <if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>irt_ismarked</name><argument_list>(<argument><expr><name><name>ir</name><operator>-&gt;</operator><name>t</name></name></expr></argument>)</argument_list></call></expr>)</condition> <block>{<block_content>  <comment type="block">/* Emit PHI if not marked. */</comment>
+      <decl_stmt><decl><type><name>IRRef</name></type> <name>rref</name> <init>= <expr><name><name>subst</name><index>[<expr><name>lref</name></expr>]</index></name></expr></init></decl>;</decl_stmt>
+      <if_stmt><if>if <condition>(<expr><name>rref</name> <operator>&gt;</operator> <name>invar</name></expr>)</condition><block type="pseudo"><block_content>
+	<expr_stmt><expr><call><name>irt_setphi</name><argument_list>(<argument><expr><call><name>IR</name><argument_list>(<argument><expr><name>rref</name></expr></argument>)</argument_list></call><operator>-&gt;</operator><name>t</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+      <expr_stmt><expr><call><name>emitir_raw</name><argument_list>(<argument><expr><call><name>IRT</name><argument_list>(<argument><expr><name>IR_PHI</name></expr></argument>, <argument><expr><call><name>irt_type</name><argument_list>(<argument><expr><name><name>ir</name><operator>-&gt;</operator><name>t</name></name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>lref</name></expr></argument>, <argument><expr><name>rref</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    </block_content>}</block></if> <else>else <block>{<block_content>  <comment type="block">/* Otherwise eliminate PHI. */</comment>
+      <expr_stmt><expr><call><name>irt_clearmark</name><argument_list>(<argument><expr><name><name>ir</name><operator>-&gt;</operator><name>t</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+      <expr_stmt><expr><call><name>irt_clearphi</name><argument_list>(<argument><expr><name><name>ir</name><operator>-&gt;</operator><name>t</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    </block_content>}</block></else></if_stmt>
+  </block_content>}</block></for>
+</block_content>}</block></function>
+
+<comment type="block">/* -- Loop unrolling using copy-substitution ------------------------------ */</comment>
+
+<comment type="block">/* Copy-substitute snapshot. */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type> <name>loop_subst_snap</name><parameter_list>(<parameter><decl><type><name>jit_State</name> <modifier>*</modifier></type><name>J</name></decl></parameter>, <parameter><decl><type><name>SnapShot</name> <modifier>*</modifier></type><name>osnap</name></decl></parameter>,
+			    <parameter><decl><type><name>SnapEntry</name> <modifier>*</modifier></type><name>loopmap</name></decl></parameter>, <parameter><decl><type><name>IRRef1</name> <modifier>*</modifier></type><name>subst</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+  <decl_stmt><decl><type><name>SnapEntry</name> <modifier>*</modifier></type><name>nmap</name></decl>, <decl><type ref="prev"><modifier>*</modifier></type><name>omap</name> <init>= <expr><operator>&amp;</operator><name><name>J</name><operator>-&gt;</operator><name>cur</name><operator>.</operator><name>snapmap</name><index>[<expr><name><name>osnap</name><operator>-&gt;</operator><name>mapofs</name></name></expr>]</index></name></expr></init></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>SnapEntry</name> <modifier>*</modifier></type><name>nextmap</name> <init>= <expr><operator>&amp;</operator><name><name>J</name><operator>-&gt;</operator><name>cur</name><operator>.</operator><name>snapmap</name><index>[<expr><call><name>snap_nextofs</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>J</name><operator>-&gt;</operator><name>cur</name></name></expr></argument>, <argument><expr><name>osnap</name></expr></argument>)</argument_list></call></expr>]</index></name></expr></init></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>MSize</name></type> <name>nmapofs</name></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>MSize</name></type> <name>on</name></decl>, <decl><type ref="prev"/><name>ln</name></decl>, <decl><type ref="prev"/><name>nn</name></decl>, <decl><type ref="prev"/><name>onent</name> <init>= <expr><name><name>osnap</name><operator>-&gt;</operator><name>nent</name></name></expr></init></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>BCReg</name></type> <name>nslots</name> <init>= <expr><name><name>osnap</name><operator>-&gt;</operator><name>nslots</name></name></expr></init></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>SnapShot</name> <modifier>*</modifier></type><name>snap</name> <init>= <expr><operator>&amp;</operator><name><name>J</name><operator>-&gt;</operator><name>cur</name><operator>.</operator><name>snap</name><index>[<expr><name><name>J</name><operator>-&gt;</operator><name>cur</name><operator>.</operator><name>nsnap</name></name></expr>]</index></name></expr></init></decl>;</decl_stmt>
+  <if_stmt><if>if <condition>(<expr><call><name>irt_isguard</name><argument_list>(<argument><expr><name><name>J</name><operator>-&gt;</operator><name>guardemit</name></name></expr></argument>)</argument_list></call></expr>)</condition> <block>{<block_content>  <comment type="block">/* Guard inbetween? */</comment>
+    <expr_stmt><expr><name>nmapofs</name> <operator>=</operator> <name><name>J</name><operator>-&gt;</operator><name>cur</name><operator>.</operator><name>nsnapmap</name></name></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>J</name><operator>-&gt;</operator><name>cur</name><operator>.</operator><name>nsnap</name></name><operator>++</operator></expr>;</expr_stmt>  <comment type="block">/* Add new snapshot. */</comment>
+  </block_content>}</block></if> <else>else <block>{<block_content>  <comment type="block">/* Otherwise overwrite previous snapshot. */</comment>
+    <expr_stmt><expr><name>snap</name><operator>--</operator></expr>;</expr_stmt>
+    <expr_stmt><expr><name>nmapofs</name> <operator>=</operator> <name><name>snap</name><operator>-&gt;</operator><name>mapofs</name></name></expr>;</expr_stmt>
+  </block_content>}</block></else></if_stmt>
+  <expr_stmt><expr><name><name>J</name><operator>-&gt;</operator><name>guardemit</name><operator>.</operator><name>irt</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+  <comment type="block">/* Setup new snapshot. */</comment>
+  <expr_stmt><expr><name><name>snap</name><operator>-&gt;</operator><name>mapofs</name></name> <operator>=</operator> <operator>(</operator><name>uint32_t</name><operator>)</operator><name>nmapofs</name></expr>;</expr_stmt>
+  <expr_stmt><expr><name><name>snap</name><operator>-&gt;</operator><name>ref</name></name> <operator>=</operator> <operator>(</operator><name>IRRef1</name><operator>)</operator><name><name>J</name><operator>-&gt;</operator><name>cur</name><operator>.</operator><name>nins</name></name></expr>;</expr_stmt>
+  <expr_stmt><expr><name><name>snap</name><operator>-&gt;</operator><name>nslots</name></name> <operator>=</operator> <name>nslots</name></expr>;</expr_stmt>
+  <expr_stmt><expr><name><name>snap</name><operator>-&gt;</operator><name>topslot</name></name> <operator>=</operator> <name><name>osnap</name><operator>-&gt;</operator><name>topslot</name></name></expr>;</expr_stmt>
+  <expr_stmt><expr><name><name>snap</name><operator>-&gt;</operator><name>count</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+  <expr_stmt><expr><name>nmap</name> <operator>=</operator> <operator>&amp;</operator><name><name>J</name><operator>-&gt;</operator><name>cur</name><operator>.</operator><name>snapmap</name><index>[<expr><name>nmapofs</name></expr>]</index></name></expr>;</expr_stmt>
+  <comment type="block">/* Substitute snapshot slots. */</comment>
+  <expr_stmt><expr><name>on</name> <operator>=</operator> <name>ln</name> <operator>=</operator> <name>nn</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+  <while>while <condition>(<expr><name>on</name> <operator>&lt;</operator> <name>onent</name></expr>)</condition> <block>{<block_content>
+    <decl_stmt><decl><type><name>SnapEntry</name></type> <name>osn</name> <init>= <expr><name><name>omap</name><index>[<expr><name>on</name></expr>]</index></name></expr></init></decl>, <decl><type ref="prev"/><name>lsn</name> <init>= <expr><name><name>loopmap</name><index>[<expr><name>ln</name></expr>]</index></name></expr></init></decl>;</decl_stmt>
+    <if_stmt><if>if <condition>(<expr><call><name>snap_slot</name><argument_list>(<argument><expr><name>lsn</name></expr></argument>)</argument_list></call> <operator>&lt;</operator> <call><name>snap_slot</name><argument_list>(<argument><expr><name>osn</name></expr></argument>)</argument_list></call></expr>)</condition> <block>{<block_content>  <comment type="block">/* Copy slot from loop map. */</comment>
+      <expr_stmt><expr><name><name>nmap</name><index>[<expr><name>nn</name><operator>++</operator></expr>]</index></name> <operator>=</operator> <name>lsn</name></expr>;</expr_stmt>
+      <expr_stmt><expr><name>ln</name><operator>++</operator></expr>;</expr_stmt>
+    </block_content>}</block></if> <else>else <block>{<block_content>  <comment type="block">/* Copy substituted slot from snapshot map. */</comment>
+      <if_stmt><if>if <condition>(<expr><call><name>snap_slot</name><argument_list>(<argument><expr><name>lsn</name></expr></argument>)</argument_list></call> <operator>==</operator> <call><name>snap_slot</name><argument_list>(<argument><expr><name>osn</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content> <expr_stmt><expr><name>ln</name><operator>++</operator></expr>;</expr_stmt></block_content></block></if></if_stmt>  <comment type="block">/* Shadowed loop slot. */</comment>
+      <if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>irref_isk</name><argument_list>(<argument><expr><call><name>snap_ref</name><argument_list>(<argument><expr><name>osn</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+	<expr_stmt><expr><name>osn</name> <operator>=</operator> <call><name>snap_setref</name><argument_list>(<argument><expr><name>osn</name></expr></argument>, <argument><expr><name><name>subst</name><index>[<expr><call><name>snap_ref</name><argument_list>(<argument><expr><name>osn</name></expr></argument>)</argument_list></call></expr>]</index></name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+      <expr_stmt><expr><name><name>nmap</name><index>[<expr><name>nn</name><operator>++</operator></expr>]</index></name> <operator>=</operator> <name>osn</name></expr>;</expr_stmt>
+      <expr_stmt><expr><name>on</name><operator>++</operator></expr>;</expr_stmt>
+    </block_content>}</block></else></if_stmt>
+  </block_content>}</block></while>
+  <while>while <condition>(<expr><call><name>snap_slot</name><argument_list>(<argument><expr><name><name>loopmap</name><index>[<expr><name>ln</name></expr>]</index></name></expr></argument>)</argument_list></call> <operator>&lt;</operator> <name>nslots</name></expr>)</condition><block type="pseudo"><block_content>  <comment type="block">/* Copy remaining loop slots. */</comment>
+    <expr_stmt><expr><name><name>nmap</name><index>[<expr><name>nn</name><operator>++</operator></expr>]</index></name> <operator>=</operator> <name><name>loopmap</name><index>[<expr><name>ln</name><operator>++</operator></expr>]</index></name></expr>;</expr_stmt></block_content></block></while>
+  <expr_stmt><expr><name><name>snap</name><operator>-&gt;</operator><name>nent</name></name> <operator>=</operator> <operator>(</operator><name>uint8_t</name><operator>)</operator><name>nn</name></expr>;</expr_stmt>
+  <expr_stmt><expr><name>omap</name> <operator>+=</operator> <name>onent</name></expr>;</expr_stmt>
+  <expr_stmt><expr><name>nmap</name> <operator>+=</operator> <name>nn</name></expr>;</expr_stmt>
+  <while>while <condition>(<expr><name>omap</name> <operator>&lt;</operator> <name>nextmap</name></expr>)</condition><block type="pseudo"><block_content>  <comment type="block">/* Copy PC + frame links. */</comment>
+    <expr_stmt><expr><operator>*</operator><name>nmap</name><operator>++</operator> <operator>=</operator> <operator>*</operator><name>omap</name><operator>++</operator></expr>;</expr_stmt></block_content></block></while>
+  <expr_stmt><expr><name><name>J</name><operator>-&gt;</operator><name>cur</name><operator>.</operator><name>nsnapmap</name></name> <operator>=</operator> <operator>(</operator><name>uint32_t</name><operator>)</operator><operator>(</operator><name>nmap</name> <operator>-</operator> <name><name>J</name><operator>-&gt;</operator><name>cur</name><operator>.</operator><name>snapmap</name></name><operator>)</operator></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<typedef>typedef <type><struct>struct <name>LoopState</name> <block>{
+  <decl_stmt><decl><type><name>jit_State</name> <modifier>*</modifier></type><name>J</name></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>IRRef1</name> <modifier>*</modifier></type><name>subst</name></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>MSize</name></type> <name>sizesubst</name></decl>;</decl_stmt>
+}</block></struct></type> <name>LoopState</name>;</typedef>
+
+<comment type="block">/* Unroll loop. */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type> <name>loop_unroll</name><parameter_list>(<parameter><decl><type><name>LoopState</name> <modifier>*</modifier></type><name>lps</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+  <decl_stmt><decl><type><name>jit_State</name> <modifier>*</modifier></type><name>J</name> <init>= <expr><name><name>lps</name><operator>-&gt;</operator><name>J</name></name></expr></init></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>IRRef1</name></type> <name><name>phi</name><index>[<expr><name>LJ_MAX_PHI</name></expr>]</index></name></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>uint32_t</name></type> <name>nphi</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>IRRef1</name> <modifier>*</modifier></type><name>subst</name></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>SnapNo</name></type> <name>onsnap</name></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>SnapShot</name> <modifier>*</modifier></type><name>osnap</name></decl>, <decl><type ref="prev"><modifier>*</modifier></type><name>loopsnap</name></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>SnapEntry</name> <modifier>*</modifier></type><name>loopmap</name></decl>, <decl><type ref="prev"><modifier>*</modifier></type><name>psentinel</name></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>IRRef</name></type> <name>ins</name></decl>, <decl><type ref="prev"/><name>invar</name></decl>;</decl_stmt>
+
+  <comment type="block">/* Allocate substitution table.
+  ** Only non-constant refs in [REF_BIAS,invar) are valid indexes.
+  */</comment>
+  <expr_stmt><expr><name>invar</name> <operator>=</operator> <name><name>J</name><operator>-&gt;</operator><name>cur</name><operator>.</operator><name>nins</name></name></expr>;</expr_stmt>
+  <expr_stmt><expr><name><name>lps</name><operator>-&gt;</operator><name>sizesubst</name></name> <operator>=</operator> <name>invar</name> <operator>-</operator> <name>REF_BIAS</name></expr>;</expr_stmt>
+  <expr_stmt><expr><name><name>lps</name><operator>-&gt;</operator><name>subst</name></name> <operator>=</operator> <call><name>lj_mem_newvec</name><argument_list>(<argument><expr><name><name>J</name><operator>-&gt;</operator><name>L</name></name></expr></argument>, <argument><expr><name><name>lps</name><operator>-&gt;</operator><name>sizesubst</name></name></expr></argument>, <argument><expr><name>IRRef1</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><name>subst</name> <operator>=</operator> <name><name>lps</name><operator>-&gt;</operator><name>subst</name></name> <operator>-</operator> <name>REF_BIAS</name></expr>;</expr_stmt>
+  <expr_stmt><expr><name><name>subst</name><index>[<expr><name>REF_BASE</name></expr>]</index></name> <operator>=</operator> <name>REF_BASE</name></expr>;</expr_stmt>
+
+  <comment type="block">/* LOOP separates the pre-roll from the loop body. */</comment>
+  <expr_stmt><expr><call><name>emitir_raw</name><argument_list>(<argument><expr><call><name>IRTG</name><argument_list>(<argument><expr><name>IR_LOOP</name></expr></argument>, <argument><expr><name>IRT_NIL</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+  <comment type="block">/* Grow snapshot buffer and map for copy-substituted snapshots.
+  ** Need up to twice the number of snapshots minus #0 and loop snapshot.
+  ** Need up to twice the number of entries plus fallback substitutions
+  ** from the loop snapshot entries for each new snapshot.
+  ** Caveat: both calls may reallocate J-&gt;cur.snap and J-&gt;cur.snapmap!
+  */</comment>
+  <expr_stmt><expr><name>onsnap</name> <operator>=</operator> <name><name>J</name><operator>-&gt;</operator><name>cur</name><operator>.</operator><name>nsnap</name></name></expr>;</expr_stmt>
+  <expr_stmt><expr><call><name>lj_snap_grow_buf</name><argument_list>(<argument><expr><name>J</name></expr></argument>, <argument><expr><literal type="number">2</literal><operator>*</operator><name>onsnap</name><operator>-</operator><literal type="number">2</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><call><name>lj_snap_grow_map</name><argument_list>(<argument><expr><name>J</name></expr></argument>, <argument><expr><name><name>J</name><operator>-&gt;</operator><name>cur</name><operator>.</operator><name>nsnapmap</name></name><operator>*</operator><literal type="number">2</literal><operator>+</operator><operator>(</operator><name>onsnap</name><operator>-</operator><literal type="number">2</literal><operator>)</operator><operator>*</operator><name><name>J</name><operator>-&gt;</operator><name>cur</name><operator>.</operator><name>snap</name><index>[<expr><name>onsnap</name><operator>-</operator><literal type="number">1</literal></expr>]</index></name><operator>.</operator><name>nent</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+  <comment type="block">/* The loop snapshot is used for fallback substitutions. */</comment>
+  <expr_stmt><expr><name>loopsnap</name> <operator>=</operator> <operator>&amp;</operator><name><name>J</name><operator>-&gt;</operator><name>cur</name><operator>.</operator><name>snap</name><index>[<expr><name>onsnap</name><operator>-</operator><literal type="number">1</literal></expr>]</index></name></expr>;</expr_stmt>
+  <expr_stmt><expr><name>loopmap</name> <operator>=</operator> <operator>&amp;</operator><name><name>J</name><operator>-&gt;</operator><name>cur</name><operator>.</operator><name>snapmap</name><index>[<expr><name><name>loopsnap</name><operator>-&gt;</operator><name>mapofs</name></name></expr>]</index></name></expr>;</expr_stmt>
+  <comment type="block">/* The PC of snapshot #0 and the loop snapshot must match. */</comment>
+  <expr_stmt><expr><name>psentinel</name> <operator>=</operator> <operator>&amp;</operator><name><name>loopmap</name><index>[<expr><name><name>loopsnap</name><operator>-&gt;</operator><name>nent</name></name></expr>]</index></name></expr>;</expr_stmt>
+  <expr_stmt><expr><call><name>lua_assert</name><argument_list>(<argument><expr><operator>*</operator><name>psentinel</name> <operator>==</operator> <name><name>J</name><operator>-&gt;</operator><name>cur</name><operator>.</operator><name>snapmap</name><index>[<expr><name><name>J</name><operator>-&gt;</operator><name>cur</name><operator>.</operator><name>snap</name><index>[<expr><literal type="number">0</literal></expr>]</index></name><operator>.</operator><name>nent</name></expr>]</index></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><operator>*</operator><name>psentinel</name> <operator>=</operator> <call><name>SNAP</name><argument_list>(<argument><expr><literal type="number">255</literal></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>  <comment type="block">/* Replace PC with temporary sentinel. */</comment>
+
+  <comment type="block">/* Start substitution with snapshot #1 (#0 is empty for root traces). */</comment>
+  <expr_stmt><expr><name>osnap</name> <operator>=</operator> <operator>&amp;</operator><name><name>J</name><operator>-&gt;</operator><name>cur</name><operator>.</operator><name>snap</name><index>[<expr><literal type="number">1</literal></expr>]</index></name></expr>;</expr_stmt>
+
+  <comment type="block">/* Copy and substitute all recorded instructions and snapshots. */</comment>
+  <for>for <control>(<init><expr><name>ins</name> <operator>=</operator> <name>REF_FIRST</name></expr>;</init> <condition><expr><name>ins</name> <operator>&lt;</operator> <name>invar</name></expr>;</condition> <incr><expr><name>ins</name><operator>++</operator></expr></incr>)</control> <block>{<block_content>
+    <decl_stmt><decl><type><name>IRIns</name> <modifier>*</modifier></type><name>ir</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>IRRef</name></type> <name>op1</name></decl>, <decl><type ref="prev"/><name>op2</name></decl>;</decl_stmt>
+
+    <if_stmt><if>if <condition>(<expr><name>ins</name> <operator>&gt;=</operator> <name><name>osnap</name><operator>-&gt;</operator><name>ref</name></name></expr>)</condition><block type="pseudo"><block_content>  <comment type="block">/* Instruction belongs to next snapshot? */</comment>
+      <expr_stmt><expr><call><name>loop_subst_snap</name><argument_list>(<argument><expr><name>J</name></expr></argument>, <argument><expr><name>osnap</name><operator>++</operator></expr></argument>, <argument><expr><name>loopmap</name></expr></argument>, <argument><expr><name>subst</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>  <comment type="block">/* Copy-substitute it. */</comment>
+
+    <comment type="block">/* Substitute instruction operands. */</comment>
+    <expr_stmt><expr><name>ir</name> <operator>=</operator> <call><name>IR</name><argument_list>(<argument><expr><name>ins</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><name>op1</name> <operator>=</operator> <name><name>ir</name><operator>-&gt;</operator><name>op1</name></name></expr>;</expr_stmt>
+    <if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>irref_isk</name><argument_list>(<argument><expr><name>op1</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content> <expr_stmt><expr><name>op1</name> <operator>=</operator> <name><name>subst</name><index>[<expr><name>op1</name></expr>]</index></name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+    <expr_stmt><expr><name>op2</name> <operator>=</operator> <name><name>ir</name><operator>-&gt;</operator><name>op2</name></name></expr>;</expr_stmt>
+    <if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>irref_isk</name><argument_list>(<argument><expr><name>op2</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content> <expr_stmt><expr><name>op2</name> <operator>=</operator> <name><name>subst</name><index>[<expr><name>op2</name></expr>]</index></name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+    <if_stmt><if>if <condition>(<expr><call><name>irm_kind</name><argument_list>(<argument><expr><name><name>lj_ir_mode</name><index>[<expr><name><name>ir</name><operator>-&gt;</operator><name>o</name></name></expr>]</index></name></expr></argument>)</argument_list></call> <operator>==</operator> <name>IRM_N</name> <operator>&amp;&amp;</operator>
+	<name>op1</name> <operator>==</operator> <name><name>ir</name><operator>-&gt;</operator><name>op1</name></name> <operator>&amp;&amp;</operator> <name>op2</name> <operator>==</operator> <name><name>ir</name><operator>-&gt;</operator><name>op2</name></name></expr>)</condition> <block>{<block_content>  <comment type="block">/* Regular invariant ins? */</comment>
+      <expr_stmt><expr><name><name>subst</name><index>[<expr><name>ins</name></expr>]</index></name> <operator>=</operator> <operator>(</operator><name>IRRef1</name><operator>)</operator><name>ins</name></expr>;</expr_stmt>  <comment type="block">/* Shortcut. */</comment>
+    </block_content>}</block></if> <else>else <block>{<block_content>
+      <comment type="block">/* Re-emit substituted instruction to the FOLD/CSE/etc. pipeline. */</comment>
+      <decl_stmt><decl><type><name>IRType1</name></type> <name>t</name> <init>= <expr><name><name>ir</name><operator>-&gt;</operator><name>t</name></name></expr></init></decl>;</decl_stmt>  <comment type="block">/* Get this first, since emitir may invalidate ir. */</comment>
+      <decl_stmt><decl><type><name>IRRef</name></type> <name>ref</name> <init>= <expr><call><name>tref_ref</name><argument_list>(<argument><expr><call><name>emitir</name><argument_list>(<argument><expr><name><name>ir</name><operator>-&gt;</operator><name>ot</name></name> <operator>&amp;</operator> <operator>~</operator><name>IRT_ISPHI</name></expr></argument>, <argument><expr><name>op1</name></expr></argument>, <argument><expr><name>op2</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+      <expr_stmt><expr><name><name>subst</name><index>[<expr><name>ins</name></expr>]</index></name> <operator>=</operator> <operator>(</operator><name>IRRef1</name><operator>)</operator><name>ref</name></expr>;</expr_stmt>
+      <if_stmt><if>if <condition>(<expr><name>ref</name> <operator>!=</operator> <name>ins</name></expr>)</condition> <block>{<block_content>
+	<decl_stmt><decl><type><name>IRIns</name> <modifier>*</modifier></type><name>irr</name> <init>= <expr><call><name>IR</name><argument_list>(<argument><expr><name>ref</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+	<if_stmt><if>if <condition>(<expr><name>ref</name> <operator>&lt;</operator> <name>invar</name></expr>)</condition> <block>{<block_content>  <comment type="block">/* Loop-carried dependency? */</comment>
+	  <comment type="block">/* Potential PHI? */</comment>
+	  <if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>irref_isk</name><argument_list>(<argument><expr><name>ref</name></expr></argument>)</argument_list></call> <operator>&amp;&amp;</operator> <operator>!</operator><call><name>irt_isphi</name><argument_list>(<argument><expr><name><name>irr</name><operator>-&gt;</operator><name>t</name></name></expr></argument>)</argument_list></call> <operator>&amp;&amp;</operator> <operator>!</operator><call><name>irt_ispri</name><argument_list>(<argument><expr><name><name>irr</name><operator>-&gt;</operator><name>t</name></name></expr></argument>)</argument_list></call></expr>)</condition> <block>{<block_content>
+	    <expr_stmt><expr><call><name>irt_setphi</name><argument_list>(<argument><expr><name><name>irr</name><operator>-&gt;</operator><name>t</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	    <if_stmt><if>if <condition>(<expr><name>nphi</name> <operator>&gt;=</operator> <name>LJ_MAX_PHI</name></expr>)</condition><block type="pseudo"><block_content>
+	      <expr_stmt><expr><call><name>lj_trace_err</name><argument_list>(<argument><expr><name>J</name></expr></argument>, <argument><expr><name>LJ_TRERR_PHIOV</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	    <expr_stmt><expr><name><name>phi</name><index>[<expr><name>nphi</name><operator>++</operator></expr>]</index></name> <operator>=</operator> <operator>(</operator><name>IRRef1</name><operator>)</operator><name>ref</name></expr>;</expr_stmt>
+	  </block_content>}</block></if></if_stmt>
+	  <comment type="block">/* Check all loop-carried dependencies for type instability. */</comment>
+	  <if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>irt_sametype</name><argument_list>(<argument><expr><name>t</name></expr></argument>, <argument><expr><name><name>irr</name><operator>-&gt;</operator><name>t</name></name></expr></argument>)</argument_list></call></expr>)</condition> <block>{<block_content>
+	    <if_stmt><if>if <condition>(<expr><call><name>irt_isinteger</name><argument_list>(<argument><expr><name>t</name></expr></argument>)</argument_list></call> <operator>&amp;&amp;</operator> <call><name>irt_isinteger</name><argument_list>(<argument><expr><name><name>irr</name><operator>-&gt;</operator><name>t</name></name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+	      <continue>continue;</continue></block_content></block></if>
+	    <if type="elseif">else if <condition>(<expr><call><name>irt_isnum</name><argument_list>(<argument><expr><name>t</name></expr></argument>)</argument_list></call> <operator>&amp;&amp;</operator> <call><name>irt_isinteger</name><argument_list>(<argument><expr><name><name>irr</name><operator>-&gt;</operator><name>t</name></name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>  <comment type="block">/* Fix int-&gt;num. */</comment>
+	      <expr_stmt><expr><name>ref</name> <operator>=</operator> <call><name>tref_ref</name><argument_list>(<argument><expr><call><name>emitir</name><argument_list>(<argument><expr><call><name>IRTN</name><argument_list>(<argument><expr><name>IR_CONV</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>ref</name></expr></argument>, <argument><expr><name>IRCONV_NUM_INT</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if>
+	    <if type="elseif">else if <condition>(<expr><call><name>irt_isnum</name><argument_list>(<argument><expr><name><name>irr</name><operator>-&gt;</operator><name>t</name></name></expr></argument>)</argument_list></call> <operator>&amp;&amp;</operator> <call><name>irt_isinteger</name><argument_list>(<argument><expr><name>t</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>  <comment type="block">/* Fix num-&gt;int. */</comment>
+	      <expr_stmt><expr><name>ref</name> <operator>=</operator> <call><name>tref_ref</name><argument_list>(<argument><expr><call><name>emitir</name><argument_list>(<argument><expr><call><name>IRTGI</name><argument_list>(<argument><expr><name>IR_CONV</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name>ref</name></expr></argument>,
+				    <argument><expr><name>IRCONV_INT_NUM</name><operator>|</operator><name>IRCONV_CHECK</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if>
+	    <else>else<block type="pseudo"><block_content>
+	      <expr_stmt><expr><call><name>lj_trace_err</name><argument_list>(<argument><expr><name>J</name></expr></argument>, <argument><expr><name>LJ_TRERR_TYPEINS</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></else></if_stmt>
+	    <expr_stmt><expr><name><name>subst</name><index>[<expr><name>ins</name></expr>]</index></name> <operator>=</operator> <operator>(</operator><name>IRRef1</name><operator>)</operator><name>ref</name></expr>;</expr_stmt>
+	    <expr_stmt><expr><name>irr</name> <operator>=</operator> <call><name>IR</name><argument_list>(<argument><expr><name>ref</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	    <goto>goto <name>phiconv</name>;</goto>
+	  </block_content>}</block></if></if_stmt>
+	</block_content>}</block></if> <if type="elseif">else if <condition>(<expr><name>ref</name> <operator>!=</operator> <name>REF_DROP</name> <operator>&amp;&amp;</operator> <name>ref</name> <operator>&gt;</operator> <name>invar</name> <operator>&amp;&amp;</operator>
+		   <operator>(</operator><operator>(</operator><name><name>irr</name><operator>-&gt;</operator><name>o</name></name> <operator>==</operator> <name>IR_CONV</name> <operator>&amp;&amp;</operator> <name><name>irr</name><operator>-&gt;</operator><name>op1</name></name> <operator>&lt;</operator> <name>invar</name><operator>)</operator> <operator>||</operator>
+		    <operator>(</operator><name><name>irr</name><operator>-&gt;</operator><name>o</name></name> <operator>==</operator> <name>IR_ALEN</name> <operator>&amp;&amp;</operator> <name><name>irr</name><operator>-&gt;</operator><name>op2</name></name> <operator>&lt;</operator> <name>invar</name> <operator>&amp;&amp;</operator>
+					  <name><name>irr</name><operator>-&gt;</operator><name>op2</name></name> <operator>!=</operator> <name>REF_NIL</name><operator>)</operator><operator>)</operator></expr>)</condition> <block>{<block_content>
+	  <comment type="block">/* May need an extra PHI for a CONV or ALEN hint. */</comment>
+	  <expr_stmt><expr><name>ref</name> <operator>=</operator> <ternary><condition><expr><name><name>irr</name><operator>-&gt;</operator><name>o</name></name> <operator>==</operator> <name>IR_CONV</name></expr> ?</condition><then> <expr><name><name>irr</name><operator>-&gt;</operator><name>op1</name></name></expr> </then><else>: <expr><name><name>irr</name><operator>-&gt;</operator><name>op2</name></name></expr></else></ternary></expr>;</expr_stmt>
+	  <expr_stmt><expr><name>irr</name> <operator>=</operator> <call><name>IR</name><argument_list>(<argument><expr><name>ref</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<label><name>phiconv</name>:</label>
+	  <if_stmt><if>if <condition>(<expr><name>ref</name> <operator>&lt;</operator> <name>invar</name> <operator>&amp;&amp;</operator> <operator>!</operator><call><name>irref_isk</name><argument_list>(<argument><expr><name>ref</name></expr></argument>)</argument_list></call> <operator>&amp;&amp;</operator> <operator>!</operator><call><name>irt_isphi</name><argument_list>(<argument><expr><name><name>irr</name><operator>-&gt;</operator><name>t</name></name></expr></argument>)</argument_list></call></expr>)</condition> <block>{<block_content>
+	    <expr_stmt><expr><call><name>irt_setphi</name><argument_list>(<argument><expr><name><name>irr</name><operator>-&gt;</operator><name>t</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	    <if_stmt><if>if <condition>(<expr><name>nphi</name> <operator>&gt;=</operator> <name>LJ_MAX_PHI</name></expr>)</condition><block type="pseudo"><block_content>
+	      <expr_stmt><expr><call><name>lj_trace_err</name><argument_list>(<argument><expr><name>J</name></expr></argument>, <argument><expr><name>LJ_TRERR_PHIOV</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+	    <expr_stmt><expr><name><name>phi</name><index>[<expr><name>nphi</name><operator>++</operator></expr>]</index></name> <operator>=</operator> <operator>(</operator><name>IRRef1</name><operator>)</operator><name>ref</name></expr>;</expr_stmt>
+	  </block_content>}</block></if></if_stmt>
+	</block_content>}</block></if></if_stmt>
+      </block_content>}</block></if></if_stmt>
+    </block_content>}</block></else></if_stmt>
+  </block_content>}</block></for>
+  <if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>irt_isguard</name><argument_list>(<argument><expr><name><name>J</name><operator>-&gt;</operator><name>guardemit</name></name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>  <comment type="block">/* Drop redundant snapshot. */</comment>
+    <expr_stmt><expr><name><name>J</name><operator>-&gt;</operator><name>cur</name><operator>.</operator><name>nsnapmap</name></name> <operator>=</operator> <operator>(</operator><name>uint32_t</name><operator>)</operator><name><name>J</name><operator>-&gt;</operator><name>cur</name><operator>.</operator><name>snap</name><index>[<expr><operator>--</operator><name><name>J</name><operator>-&gt;</operator><name>cur</name><operator>.</operator><name>nsnap</name></name></expr>]</index></name><operator>.</operator><name>mapofs</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+  <expr_stmt><expr><call><name>lua_assert</name><argument_list>(<argument><expr><name><name>J</name><operator>-&gt;</operator><name>cur</name><operator>.</operator><name>nsnapmap</name></name> <operator>&lt;=</operator> <name><name>J</name><operator>-&gt;</operator><name>sizesnapmap</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><operator>*</operator><name>psentinel</name> <operator>=</operator> <name><name>J</name><operator>-&gt;</operator><name>cur</name><operator>.</operator><name>snapmap</name><index>[<expr><name><name>J</name><operator>-&gt;</operator><name>cur</name><operator>.</operator><name>snap</name><index>[<expr><literal type="number">0</literal></expr>]</index></name><operator>.</operator><name>nent</name></expr>]</index></name></expr>;</expr_stmt>  <comment type="block">/* Restore PC. */</comment>
+
+  <expr_stmt><expr><call><name>loop_emit_phi</name><argument_list>(<argument><expr><name>J</name></expr></argument>, <argument><expr><name>subst</name></expr></argument>, <argument><expr><name>phi</name></expr></argument>, <argument><expr><name>nphi</name></expr></argument>, <argument><expr><name>onsnap</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/* Undo any partial changes made by the loop optimization. */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type> <name>loop_undo</name><parameter_list>(<parameter><decl><type><name>jit_State</name> <modifier>*</modifier></type><name>J</name></decl></parameter>, <parameter><decl><type><name>IRRef</name></type> <name>ins</name></decl></parameter>, <parameter><decl><type><name>SnapNo</name></type> <name>nsnap</name></decl></parameter>, <parameter><decl><type><name>MSize</name></type> <name>nsnapmap</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+  <decl_stmt><decl><type><name>ptrdiff_t</name></type> <name>i</name></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>SnapShot</name> <modifier>*</modifier></type><name>snap</name> <init>= <expr><operator>&amp;</operator><name><name>J</name><operator>-&gt;</operator><name>cur</name><operator>.</operator><name>snap</name><index>[<expr><name>nsnap</name><operator>-</operator><literal type="number">1</literal></expr>]</index></name></expr></init></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>SnapEntry</name> <modifier>*</modifier></type><name>map</name> <init>= <expr><name><name>J</name><operator>-&gt;</operator><name>cur</name><operator>.</operator><name>snapmap</name></name></expr></init></decl>;</decl_stmt>
+  <expr_stmt><expr><name><name>map</name><index>[<expr><name><name>snap</name><operator>-&gt;</operator><name>mapofs</name></name> <operator>+</operator> <name><name>snap</name><operator>-&gt;</operator><name>nent</name></name></expr>]</index></name> <operator>=</operator> <name><name>map</name><index>[<expr><name><name>J</name><operator>-&gt;</operator><name>cur</name><operator>.</operator><name>snap</name><index>[<expr><literal type="number">0</literal></expr>]</index></name><operator>.</operator><name>nent</name></expr>]</index></name></expr>;</expr_stmt>  <comment type="block">/* Restore PC. */</comment>
+  <expr_stmt><expr><name><name>J</name><operator>-&gt;</operator><name>cur</name><operator>.</operator><name>nsnapmap</name></name> <operator>=</operator> <operator>(</operator><name>uint32_t</name><operator>)</operator><name>nsnapmap</name></expr>;</expr_stmt>
+  <expr_stmt><expr><name><name>J</name><operator>-&gt;</operator><name>cur</name><operator>.</operator><name>nsnap</name></name> <operator>=</operator> <name>nsnap</name></expr>;</expr_stmt>
+  <expr_stmt><expr><name><name>J</name><operator>-&gt;</operator><name>guardemit</name><operator>.</operator><name>irt</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+  <expr_stmt><expr><call><name>lj_ir_rollback</name><argument_list>(<argument><expr><name>J</name></expr></argument>, <argument><expr><name>ins</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name>BPROP_SLOTS</name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control> <block>{<block_content>  <comment type="block">/* Remove backprop. cache entries. */</comment>
+    <decl_stmt><decl><type><name>BPropEntry</name> <modifier>*</modifier></type><name>bp</name> <init>= <expr><operator>&amp;</operator><name><name>J</name><operator>-&gt;</operator><name>bpropcache</name><index>[<expr><name>i</name></expr>]</index></name></expr></init></decl>;</decl_stmt>
+    <if_stmt><if>if <condition>(<expr><name><name>bp</name><operator>-&gt;</operator><name>val</name></name> <operator>&gt;=</operator> <name>ins</name></expr>)</condition><block type="pseudo"><block_content>
+      <expr_stmt><expr><name><name>bp</name><operator>-&gt;</operator><name>key</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt></block_content></block></if></if_stmt>
+  </block_content>}</block></for>
+  <for>for <control>(<init><expr><name>ins</name><operator>--</operator></expr>;</init> <condition><expr><name>ins</name> <operator>&gt;=</operator> <name>REF_FIRST</name></expr>;</condition> <incr><expr><name>ins</name><operator>--</operator></expr></incr>)</control> <block>{<block_content>  <comment type="block">/* Remove flags. */</comment>
+    <decl_stmt><decl><type><name>IRIns</name> <modifier>*</modifier></type><name>ir</name> <init>= <expr><call><name>IR</name><argument_list>(<argument><expr><name>ins</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+    <expr_stmt><expr><call><name>irt_clearphi</name><argument_list>(<argument><expr><name><name>ir</name><operator>-&gt;</operator><name>t</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><call><name>irt_clearmark</name><argument_list>(<argument><expr><name><name>ir</name><operator>-&gt;</operator><name>t</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  </block_content>}</block></for>
+</block_content>}</block></function>
+
+<comment type="block">/* Protected callback for loop optimization. */</comment>
+<function><type><specifier>static</specifier> <name>TValue</name> <modifier>*</modifier></type><name>cploop_opt</name><parameter_list>(<parameter><decl><type><name>lua_State</name> <modifier>*</modifier></type><name>L</name></decl></parameter>, <parameter><decl><type><name>lua_CFunction</name></type> <name>dummy</name></decl></parameter>, <parameter><decl><type><name>void</name> <modifier>*</modifier></type><name>ud</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+  <expr_stmt><expr><call><name>UNUSED</name><argument_list>(<argument><expr><name>L</name></expr></argument>)</argument_list></call></expr>;</expr_stmt> <expr_stmt><expr><call><name>UNUSED</name><argument_list>(<argument><expr><name>dummy</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><call><name>loop_unroll</name><argument_list>(<argument><expr><operator>(</operator><name>LoopState</name> <operator>*</operator><operator>)</operator><name>ud</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <return>return <expr><name>NULL</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/* Loop optimization. */</comment>
+<function><type><name>int</name></type> <name>lj_opt_loop</name><parameter_list>(<parameter><decl><type><name>jit_State</name> <modifier>*</modifier></type><name>J</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+  <decl_stmt><decl><type><name>IRRef</name></type> <name>nins</name> <init>= <expr><name><name>J</name><operator>-&gt;</operator><name>cur</name><operator>.</operator><name>nins</name></name></expr></init></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>SnapNo</name></type> <name>nsnap</name> <init>= <expr><name><name>J</name><operator>-&gt;</operator><name>cur</name><operator>.</operator><name>nsnap</name></name></expr></init></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>MSize</name></type> <name>nsnapmap</name> <init>= <expr><name><name>J</name><operator>-&gt;</operator><name>cur</name><operator>.</operator><name>nsnapmap</name></name></expr></init></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>LoopState</name></type> <name>lps</name></decl>;</decl_stmt>
+  <decl_stmt><decl><type><name>int</name></type> <name>errcode</name></decl>;</decl_stmt>
+  <expr_stmt><expr><name><name>lps</name><operator>.</operator><name>J</name></name> <operator>=</operator> <name>J</name></expr>;</expr_stmt>
+  <expr_stmt><expr><name><name>lps</name><operator>.</operator><name>subst</name></name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+  <expr_stmt><expr><name><name>lps</name><operator>.</operator><name>sizesubst</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+  <expr_stmt><expr><name>errcode</name> <operator>=</operator> <call><name>lj_vm_cpcall</name><argument_list>(<argument><expr><name><name>J</name><operator>-&gt;</operator><name>L</name></name></expr></argument>, <argument><expr><name>NULL</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>lps</name></expr></argument>, <argument><expr><name>cploop_opt</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <expr_stmt><expr><call><name>lj_mem_freevec</name><argument_list>(<argument><expr><call><name>J2G</name><argument_list>(<argument><expr><name>J</name></expr></argument>)</argument_list></call></expr></argument>, <argument><expr><name><name>lps</name><operator>.</operator><name>subst</name></name></expr></argument>, <argument><expr><name><name>lps</name><operator>.</operator><name>sizesubst</name></name></expr></argument>, <argument><expr><name>IRRef1</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+  <if_stmt><if>if <condition>(<expr><call><name>LJ_UNLIKELY</name><argument_list>(<argument><expr><name>errcode</name></expr></argument>)</argument_list></call></expr>)</condition> <block>{<block_content>
+    <decl_stmt><decl><type><name>lua_State</name> <modifier>*</modifier></type><name>L</name> <init>= <expr><name><name>J</name><operator>-&gt;</operator><name>L</name></name></expr></init></decl>;</decl_stmt>
+    <if_stmt><if>if <condition>(<expr><name>errcode</name> <operator>==</operator> <name>LUA_ERRRUN</name> <operator>&amp;&amp;</operator> <call><name>tvisnumber</name><argument_list>(<argument><expr><name><name>L</name><operator>-&gt;</operator><name>top</name></name><operator>-</operator><literal type="number">1</literal></expr></argument>)</argument_list></call></expr>)</condition> <block>{<block_content>  <comment type="block">/* Trace error? */</comment>
+      <decl_stmt><decl><type><name>int32_t</name></type> <name>e</name> <init>= <expr><call><name>numberVint</name><argument_list>(<argument><expr><name><name>L</name><operator>-&gt;</operator><name>top</name></name><operator>-</operator><literal type="number">1</literal></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+      <switch>switch <condition>(<expr><operator>(</operator><name>TraceError</name><operator>)</operator><name>e</name></expr>)</condition> <block>{<block_content>
+      <case>case <expr><name>LJ_TRERR_TYPEINS</name></expr>:</case>  <comment type="block">/* Type instability. */</comment>
+      <case>case <expr><name>LJ_TRERR_GFAIL</name></expr>:</case>  <comment type="block">/* Guard would always fail. */</comment>
+	<comment type="block">/* Unrolling via recording fixes many cases, e.g. a flipped boolean. */</comment>
+	<if_stmt><if>if <condition>(<expr><operator>--</operator><name><name>J</name><operator>-&gt;</operator><name>instunroll</name></name> <operator>&lt;</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>  <comment type="block">/* But do not unroll forever. */</comment>
+	  <break>break;</break></block_content></block></if></if_stmt>
+	<expr_stmt><expr><name><name>L</name><operator>-&gt;</operator><name>top</name></name><operator>--</operator></expr>;</expr_stmt>  <comment type="block">/* Remove error object. */</comment>
+	<expr_stmt><expr><call><name>loop_undo</name><argument_list>(<argument><expr><name>J</name></expr></argument>, <argument><expr><name>nins</name></expr></argument>, <argument><expr><name>nsnap</name></expr></argument>, <argument><expr><name>nsnapmap</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<return>return <expr><literal type="number">1</literal></expr>;</return>  <comment type="block">/* Loop optimization failed, continue recording. */</comment>
+      <default>default:</default>
+	<break>break;</break>
+      </block_content>}</block></switch>
+    </block_content>}</block></if></if_stmt>
+    <expr_stmt><expr><call><name>lj_err_throw</name><argument_list>(<argument><expr><name>L</name></expr></argument>, <argument><expr><name>errcode</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>  <comment type="block">/* Propagate all other errors. */</comment>
+  </block_content>}</block></if></if_stmt>
+  <return>return <expr><literal type="number">0</literal></expr>;</return>  <comment type="block">/* Loop optimization is ok. */</comment>
+</block_content>}</block></function>
+
+<cpp:undef>#<cpp:directive>undef</cpp:directive> <name>IR</name></cpp:undef>
+<cpp:undef>#<cpp:directive>undef</cpp:directive> <name>emitir</name></cpp:undef>
+<cpp:undef>#<cpp:directive>undef</cpp:directive> <name>emitir_raw</name></cpp:undef>
+
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+</unit>

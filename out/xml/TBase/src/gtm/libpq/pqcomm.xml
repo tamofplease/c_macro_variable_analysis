@@ -1,0 +1,1398 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<unit xmlns="http://www.srcML.org/srcML/src" xmlns:cpp="http://www.srcML.org/srcML/cpp" revision="1.0.0" language="C" filename="/cloned_projects/TBase/src/gtm/libpq/pqcomm.c"><comment type="block">/*-------------------------------------------------------------------------
+ *
+ * pqcomm.c
+ *      Communication functions between the Frontend and the Backend
+ *
+ * These routines handle the low-level details of communication between
+ * frontend and backend.  They just shove data across the communication
+ * channel, and are ignorant of the semantics of the data --- or would be,
+ * except for major brain damage in the design of the old COPY OUT protocol.
+ * Unfortunately, COPY OUT was designed to commandeer the communication
+ * channel (it just transfers data without wrapping it into messages).
+ * No other messages can be sent while COPY OUT is in progress; and if the
+ * copy is aborted by an ereport(ERROR), we need to close out the copy so that
+ * the frontend gets back into sync.  Therefore, these routines have to be
+ * aware of COPY OUT state.  (New COPY-OUT is message-based and does *not*
+ * set the DoingCopyOut flag.)
+ *
+ * NOTE: generally, it's a bad idea to emit outgoing messages directly with
+ * pq_putbytes(), especially if the message would require multiple calls
+ * to send.  Instead, use the routines in pqformat.c to construct the message
+ * in a buffer and then emit it in one call to pq_putmessage.  This ensures
+ * that the channel will not be clogged by an incomplete message if execution
+ * is aborted by ereport(ERROR) partway through the message.  The only
+ * non-libpq code that should call pq_putbytes directly is old-style COPY OUT.
+ *
+ * At one time, libpq was shared between frontend and backend, but now
+ * the backend's "backend/libpq" is quite separate from "interfaces/libpq".
+ * All that remains is similarities of names to trap the unwary...
+ *
+ * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1994, Regents of the University of California
+ * Portions Copyright (c) 2010-2012 Postgres-XC Development Group
+ *
+ *    $PostgreSQL: pgsql/src/backend/libpq/pqcomm.c,v 1.198 2008/01/01 19:45:49 momjian Exp $
+ *
+ *-------------------------------------------------------------------------
+ */</comment>
+
+<comment type="block">/*------------------------
+ * INTERFACE ROUTINES
+ *
+ * setup/teardown:
+ *        StreamServerPort    - Open postmaster's server port
+ *        StreamConnection    - Create new connection with client
+ *        StreamClose            - Close a client/backend connection
+ *        TouchSocketFile        - Protect socket file against /tmp cleaners
+ *        pq_init            - initialize libpq at backend startup
+ *        pq_comm_reset    - reset libpq during error recovery
+ *        pq_close        - shutdown libpq at backend exit
+ *
+ * low-level I/O:
+ *        pq_getbytes        - get a known number of bytes from connection
+ *        pq_getstring    - get a null terminated string from connection
+ *        pq_getmessage    - get a message with length word from connection
+ *        pq_getbyte        - get next byte from connection
+ *        pq_peekbyte        - peek at next byte from connection
+ *        pq_putbytes        - send bytes to connection (not flushed until pq_flush)
+ *        pq_flush        - flush pending output
+ *
+ * message-level I/O (and old-style-COPY-OUT cruft):
+ *        pq_putmessage    - send a normal message (suppressed in COPY OUT mode)
+ *        pq_startcopyout - inform libpq that a COPY OUT transfer is beginning
+ *        pq_endcopyout    - end a COPY OUT transfer
+ *
+ *------------------------
+ */</comment>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"pg_config.h"</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;signal.h&gt;</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;fcntl.h&gt;</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;grp.h&gt;</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;unistd.h&gt;</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;sys/file.h&gt;</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;sys/socket.h&gt;</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;sys/stat.h&gt;</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;sys/time.h&gt;</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;sys/types.h&gt;</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;netdb.h&gt;</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;netinet/in.h&gt;</cpp:file></cpp:include>
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>HAVE_NETINET_TCP_H</name></cpp:ifdef>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;netinet/tcp.h&gt;</cpp:file></cpp:include>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;arpa/inet.h&gt;</cpp:file></cpp:include>
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>HAVE_UTIME_H</name></cpp:ifdef>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;utime.h&gt;</cpp:file></cpp:include>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"gtm/gtm_c.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"gtm/ip.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"gtm/libpq.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"gtm/libpq-be.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"gtm/elog.h"</cpp:file></cpp:include>
+
+
+<comment type="block">/* Where the Unix socket file is */</comment>
+<decl_stmt><decl><type><specifier>static</specifier> <name>char</name></type> <name><name>sock_path</name><index>[<expr><name>MAXGTMPATH</name></expr>]</index></name></decl>;</decl_stmt>
+
+<decl_stmt><decl><type><specifier>extern</specifier> <name>int</name></type>         <name>tcp_keepalives_idle</name></decl>;</decl_stmt>
+<decl_stmt><decl><type><specifier>extern</specifier> <name>int</name></type>         <name>tcp_keepalives_interval</name></decl>;</decl_stmt>
+<decl_stmt><decl><type><specifier>extern</specifier> <name>int</name></type>         <name>tcp_keepalives_count</name></decl>;</decl_stmt>
+
+
+<comment type="block">/*
+ * Buffers for low-level I/O
+ */</comment>
+
+<comment type="block">/* Internal functions */</comment>
+<function_decl><type><specifier>static</specifier> <name>int</name></type>    <name>internal_putbytes</name><parameter_list>(<parameter><decl><type><name>Port</name> <modifier>*</modifier></type><name>myport</name></decl></parameter>, <parameter><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>s</name></decl></parameter>, <parameter><decl><type><name>size_t</name></type> <name>len</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>int</name></type>    <name>internal_flush</name><parameter_list>(<parameter><decl><type><name>Port</name> <modifier>*</modifier></type><name>myport</name></decl></parameter>)</parameter_list>;</function_decl>
+
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>HAVE_UNIX_SOCKETS</name></cpp:ifdef>
+<function_decl><type><specifier>static</specifier> <name>int</name></type>	<name>Lock_AF_UNIX</name><parameter_list>(<parameter><decl><type><name>char</name> <modifier>*</modifier></type><name>unixSocketDir</name></decl></parameter>, <parameter><decl><type><name>char</name> <modifier>*</modifier></type><name>unixSocketPath</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>int</name></type>	<name>Setup_AF_UNIX</name><parameter_list>(<parameter><decl><type><name>char</name> <modifier>*</modifier></type><name>sock_path</name></decl></parameter>)</parameter_list>;</function_decl>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>							<comment type="block">/* HAVE_UNIX_SOCKETS */</comment>
+
+<function_decl><type><specifier>extern</specifier> <name>void</name></type> <name>CreateLockFile</name><parameter_list>(<parameter><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>filename</name></decl></parameter>, <parameter><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>refName</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>extern</specifier> <name>void</name></type> <name>DeleteLockFile</name><parameter_list>(<parameter><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>filename</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>extern</specifier> <name>void</name></type> <name>RemoveSocketFile</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>;</function_decl>
+<comment type="block">/*
+ * Configuration options
+ */</comment>
+<decl_stmt><decl><type><name>int</name></type>			<name>unix_socket_permissions</name> <init>= <expr><literal type="number">0777</literal></expr></init></decl>;</decl_stmt>
+<decl_stmt><decl><type><name>char</name>	    <modifier>*</modifier></type><name>unix_socket_group</name> <init>= <expr><literal type="string">""</literal></expr></init></decl>;</decl_stmt>
+
+<comment type="block">/*
+ * Streams -- wrapper around Unix socket system calls
+ *
+ *
+ *        Stream functions are used for vanilla TCP connection protocol.
+ */</comment>
+
+
+<comment type="block">/*
+ * StreamServerPort -- open a "listening" port to accept connections.
+ *
+ * Successfully opened sockets are added to the ListenSocket[] array,
+ * at the first position that isn't -1.
+ *
+ * RETURNS: STATUS_OK or STATUS_ERROR
+ */</comment>
+<function><type><name>int</name></type>
+<name>StreamServerPort</name><parameter_list>(<parameter><decl><type><name>int</name></type> <name>family</name></decl></parameter>, <parameter><decl><type><name>char</name> <modifier>*</modifier></type><name>hostName</name></decl></parameter>, <parameter><decl><type><name>unsigned</name> <name>short</name></type> <name>portNumber</name></decl></parameter>, <parameter><decl><type><name>char</name> <modifier>*</modifier></type><name>unixSocketDir</name></decl></parameter>,
+                 <parameter><decl><type><name>int</name></type> <name><name>ListenSocket</name><index>[]</index></name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>MaxListen</name></decl></parameter>)</parameter_list>
+<block>{<block_content><comment type="line">// #lizard forgives</comment>
+    <decl_stmt><decl><type><name>int</name></type>            <name>fd</name></decl>,
+                <decl><type ref="prev"/><name>err</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>int</name></type>            <name>ret</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>char</name></type>        <name><name>portNumberStr</name><index>[<expr><literal type="number">32</literal></expr>]</index></name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>familyDesc</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>char</name></type>        <name><name>familyDescBuf</name><index>[<expr><literal type="number">64</literal></expr>]</index></name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>char</name>       <modifier>*</modifier></type><name>service</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name><name>struct</name> <name>addrinfo</name></name> <modifier>*</modifier></type><name>addrs</name> <init>= <expr><name>NULL</name></expr></init></decl>,
+               <decl><type ref="prev"><modifier>*</modifier></type><name>addr</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name><name>struct</name> <name>addrinfo</name></name></type> <name>hint</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>int</name></type>            <name>listen_index</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>int</name></type>            <name>added</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+    <decl_stmt><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>addrDesc</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>char</name></type>		<name><name>addrBuf</name><index>[<expr><name>NI_MAXHOST</name></expr>]</index></name></decl>;</decl_stmt>
+
+<cpp:if>#<cpp:directive>if</cpp:directive> <expr><operator>!</operator><call><name>defined</name><argument_list>(<argument><expr><name>WIN32</name></expr></argument>)</argument_list></call> <operator>||</operator> <call><name>defined</name><argument_list>(<argument><expr><name>IPV6_V6ONLY</name></expr></argument>)</argument_list></call></expr></cpp:if>
+    <decl_stmt><decl><type><name>int</name></type>            <name>one</name> <init>= <expr><literal type="number">1</literal></expr></init></decl>;</decl_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+    <comment type="block">/* Initialize hint structure */</comment>
+    <expr_stmt><expr><call><name>MemSet</name><argument_list>(<argument><expr><operator>&amp;</operator><name>hint</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>hint</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>hint</name><operator>.</operator><name>ai_family</name></name> <operator>=</operator> <name>family</name></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>hint</name><operator>.</operator><name>ai_flags</name></name> <operator>=</operator> <name>AI_PASSIVE</name></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>hint</name><operator>.</operator><name>ai_socktype</name></name> <operator>=</operator> <name>SOCK_STREAM</name></expr>;</expr_stmt>
+
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>HAVE_UNIX_SOCKETS</name></cpp:ifdef>
+	<if_stmt><if>if <condition>(<expr><name>family</name> <operator>==</operator> <name>AF_UNIX</name></expr>)</condition>
+	<block>{<block_content>
+		<comment type="block">/*
+		 * Create unixSocketPath from portNumber and unixSocketDir and lock
+		 * that file path
+		 */</comment>
+		<expr_stmt><expr><call><name>UNIXSOCK_PATH</name><argument_list>(<argument><expr><name>sock_path</name></expr></argument>, <argument><expr><name>portNumber</name></expr></argument>, <argument><expr><name>unixSocketDir</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<if_stmt><if>if <condition>(<expr><call><name>strlen</name><argument_list>(<argument><expr><name>sock_path</name></expr></argument>)</argument_list></call> <operator>&gt;=</operator> <name>UNIXSOCK_PATH_BUFLEN</name></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>LOG</name></expr></argument>,
+					<argument><expr><operator>(</operator><call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"Unix-domain socket path \"%s\" is too long (maximum %d bytes)"</literal></expr></argument>,
+                            <argument><expr><name>sock_path</name></expr></argument>,
+							<argument><expr><operator>(</operator><name>int</name><operator>)</operator> <operator>(</operator><name>UNIXSOCK_PATH_BUFLEN</name> <operator>-</operator> <literal type="number">1</literal><operator>)</operator></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<return>return <expr><name>STATUS_ERROR</name></expr>;</return>
+		</block_content>}</block></if></if_stmt>
+		<if_stmt><if>if <condition>(<expr><call><name>Lock_AF_UNIX</name><argument_list>(<argument><expr><name>unixSocketDir</name></expr></argument>, <argument><expr><name>sock_path</name></expr></argument>)</argument_list></call> <operator>!=</operator> <name>STATUS_OK</name></expr>)</condition><block type="pseudo"><block_content>
+			<return>return <expr><name>STATUS_ERROR</name></expr>;</return></block_content></block></if></if_stmt>
+		<expr_stmt><expr><name>service</name> <operator>=</operator> <name>sock_path</name></expr>;</expr_stmt>
+	</block_content>}</block></if>
+	<else>else
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>							<comment type="block">/* HAVE_UNIX_SOCKETS */</comment>
+    <block>{<block_content>
+        <expr_stmt><expr><call><name>snprintf</name><argument_list>(<argument><expr><name>portNumberStr</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>portNumberStr</name></expr></argument>)</argument_list></sizeof></expr></argument>, <argument><expr><literal type="string">"%d"</literal></expr></argument>, <argument><expr><name>portNumber</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <expr_stmt><expr><name>service</name> <operator>=</operator> <name>portNumberStr</name></expr>;</expr_stmt>
+    </block_content>}</block></else></if_stmt>
+
+    <expr_stmt><expr><name>ret</name> <operator>=</operator> <call><name>pg_getaddrinfo_all</name><argument_list>(<argument><expr><name>hostName</name></expr></argument>, <argument><expr><name>service</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>hint</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>addrs</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <if_stmt><if>if <condition>(<expr><name>ret</name> <operator>||</operator> <operator>!</operator><name>addrs</name></expr>)</condition>
+    <block>{<block_content>
+        <if_stmt><if>if <condition>(<expr><name>hostName</name></expr>)</condition><block type="pseudo"><block_content>
+            <expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>LOG</name></expr></argument>,
+                    <argument><expr><operator>(</operator><call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"could not translate host name \"%s\", service \"%s\" to address: %s"</literal></expr></argument>,
+                            <argument><expr><name>hostName</name></expr></argument>, <argument><expr><name>service</name></expr></argument>, <argument><expr><call><name>gai_strerror</name><argument_list>(<argument><expr><name>ret</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if>
+        <else>else<block type="pseudo"><block_content>
+            <expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>LOG</name></expr></argument>,
+                 <argument><expr><operator>(</operator><call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"could not translate service \"%s\" to address: %s"</literal></expr></argument>,
+                         <argument><expr><name>service</name></expr></argument>, <argument><expr><call><name>gai_strerror</name><argument_list>(<argument><expr><name>ret</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></else></if_stmt>
+        <if_stmt><if>if <condition>(<expr><name>addrs</name></expr>)</condition><block type="pseudo"><block_content>
+            <expr_stmt><expr><call><name>pg_freeaddrinfo_all</name><argument_list>(<argument><expr><name><name>hint</name><operator>.</operator><name>ai_family</name></name></expr></argument>, <argument><expr><name>addrs</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+        <return>return <expr><name>STATUS_ERROR</name></expr>;</return>
+    </block_content>}</block></if></if_stmt>
+
+    <for>for <control>(<init><expr><name>addr</name> <operator>=</operator> <name>addrs</name></expr>;</init> <condition><expr><name>addr</name></expr>;</condition> <incr><expr><name>addr</name> <operator>=</operator> <name><name>addr</name><operator>-&gt;</operator><name>ai_next</name></name></expr></incr>)</control>
+    <block>{<block_content>
+        <if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>IS_AF_UNIX</name><argument_list>(<argument><expr><name>family</name></expr></argument>)</argument_list></call> <operator>&amp;&amp;</operator> <call><name>IS_AF_UNIX</name><argument_list>(<argument><expr><name><name>addr</name><operator>-&gt;</operator><name>ai_family</name></name></expr></argument>)</argument_list></call></expr>)</condition>
+        <block>{<block_content>
+            <comment type="block">/*
+             * Only set up a unix domain socket when they really asked for it.
+             * The service/port is different in that case.
+             */</comment>
+            <continue>continue;</continue>
+        </block_content>}</block></if></if_stmt>
+
+        <comment type="block">/* See if there is still room to add 1 more socket. */</comment>
+        <for>for <control>(<init>;</init> <condition><expr><name>listen_index</name> <operator>&lt;</operator> <name>MaxListen</name></expr>;</condition> <incr><expr><name>listen_index</name><operator>++</operator></expr></incr>)</control>
+        <block>{<block_content>
+            <if_stmt><if>if <condition>(<expr><name><name>ListenSocket</name><index>[<expr><name>listen_index</name></expr>]</index></name> <operator>==</operator> <operator>-</operator><literal type="number">1</literal></expr>)</condition><block type="pseudo"><block_content>
+                <break>break;</break></block_content></block></if></if_stmt>
+        </block_content>}</block></for>
+        <if_stmt><if>if <condition>(<expr><name>listen_index</name> <operator>&gt;=</operator> <name>MaxListen</name></expr>)</condition>
+        <block>{<block_content>
+            <expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>LOG</name></expr></argument>,
+                    <argument><expr><operator>(</operator><call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"could not bind to all requested addresses: MAXLISTEN (%d) exceeded"</literal></expr></argument>,
+                            <argument><expr><name>MaxListen</name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+            <break>break;</break>
+        </block_content>}</block></if></if_stmt>
+
+        <comment type="block">/* set up family name for possible error messages */</comment>
+        <switch>switch <condition>(<expr><name><name>addr</name><operator>-&gt;</operator><name>ai_family</name></name></expr>)</condition>
+        <block>{<block_content>
+            <case>case <expr><name>AF_INET</name></expr>:</case>
+                <expr_stmt><expr><name>familyDesc</name> <operator>=</operator> <literal type="string">"IPv4"</literal></expr>;</expr_stmt>
+                <break>break;</break>
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>HAVE_IPV6</name></cpp:ifdef>
+            <case>case <expr><name>AF_INET6</name></expr>:</case>
+                <expr_stmt><expr><name>familyDesc</name> <operator>=</operator> <literal type="string">"IPv6"</literal></expr>;</expr_stmt>
+                <break>break;</break>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>HAVE_UNIX_SOCKETS</name></cpp:ifdef>
+			<case>case <expr><name>AF_UNIX</name></expr>:</case>
+				<expr_stmt><expr><name>familyDesc</name> <operator>=</operator> <literal type="string">"Unix"</literal></expr>;</expr_stmt>
+				<break>break;</break>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+            <default>default:</default>
+                <expr_stmt><expr><call><name>snprintf</name><argument_list>(<argument><expr><name>familyDescBuf</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>familyDescBuf</name></expr></argument>)</argument_list></sizeof></expr></argument>,
+                         <argument><expr><literal type="string">"unrecognized address family %d"</literal></expr></argument>,
+                         <argument><expr><name><name>addr</name><operator>-&gt;</operator><name>ai_family</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+                <expr_stmt><expr><name>familyDesc</name> <operator>=</operator> <name>familyDescBuf</name></expr>;</expr_stmt>
+                <break>break;</break>
+        </block_content>}</block></switch>
+
+        <comment type="block">/* set up text form of address for log messages */</comment>
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>HAVE_UNIX_SOCKETS</name></cpp:ifdef>
+        <if_stmt><if>if <condition>(<expr><name><name>addr</name><operator>-&gt;</operator><name>ai_family</name></name> <operator>==</operator> <name>AF_UNIX</name></expr>)</condition><block type="pseudo"><block_content>
+            <expr_stmt><expr><name>addrDesc</name> <operator>=</operator> <name>sock_path</name></expr>;</expr_stmt></block_content></block></if>
+        <else>else
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+        <block>{<block_content>
+            <expr_stmt><expr><call><name>pg_getnameinfo_all</name><argument_list>(<argument><expr><operator>(</operator><specifier>const</specifier> struct <name>sockaddr_storage</name> <operator>*</operator><operator>)</operator> <name><name>addr</name><operator>-&gt;</operator><name>ai_addr</name></name></expr></argument>,
+                               <argument><expr><name><name>addr</name><operator>-&gt;</operator><name>ai_addrlen</name></name></expr></argument>,
+                               <argument><expr><name>addrBuf</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>addrBuf</name></expr></argument>)</argument_list></sizeof></expr></argument>,
+                               <argument><expr><name>NULL</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>,
+                               <argument><expr><name>NI_NUMERICHOST</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+            <expr_stmt><expr><name>addrDesc</name> <operator>=</operator> <name>addrBuf</name></expr>;</expr_stmt>
+        </block_content>}</block></else></if_stmt>
+
+		<if_stmt><if>if <condition>(<expr><operator>(</operator><name>fd</name> <operator>=</operator> <call><name>socket</name><argument_list>(<argument><expr><name><name>addr</name><operator>-&gt;</operator><name>ai_family</name></name></expr></argument>, <argument><expr><name>SOCK_STREAM</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call><operator>)</operator> <operator>&lt;</operator> <literal type="number">0</literal></expr>)</condition>
+        <block>{<block_content>
+            <expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>LOG</name></expr></argument>,
+                    <argument><expr><operator>(</operator><name>EACCES</name><operator>,</operator>
+            <comment type="block">/* translator: %s is IPv4, IPv6, or Unix */</comment>
+                     <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"could not create %s socket: %m"</literal></expr></argument>,
+                            <argument><expr><name>familyDesc</name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+            <continue>continue;</continue>
+        </block_content>}</block></if></if_stmt>
+
+<cpp:ifndef>#<cpp:directive>ifndef</cpp:directive> <name>WIN32</name></cpp:ifndef>
+
+        <comment type="block">/*
+         * Without the SO_REUSEADDR flag, a new postmaster can't be started
+         * right away after a stop or crash, giving "address already in use"
+         * error on TCP ports.
+         *
+         * On win32, however, this behavior only happens if the
+         * SO_EXLUSIVEADDRUSE is set. With SO_REUSEADDR, win32 allows multiple
+         * servers to listen on the same address, resulting in unpredictable
+         * behavior. With no flags at all, win32 behaves as Unix with
+         * SO_REUSEADDR.
+         */</comment>
+        <if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>IS_AF_UNIX</name><argument_list>(<argument><expr><name><name>addr</name><operator>-&gt;</operator><name>ai_family</name></name></expr></argument>)</argument_list></call></expr>)</condition>
+        <block>{<block_content>
+            <if_stmt><if>if <condition>(<expr><operator>(</operator><call><name>setsockopt</name><argument_list>(<argument><expr><name>fd</name></expr></argument>, <argument><expr><name>SOL_SOCKET</name></expr></argument>, <argument><expr><name>SO_REUSEADDR</name></expr></argument>,
+                            <argument><expr><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <operator>&amp;</operator><name>one</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>one</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call><operator>)</operator> <operator>==</operator> <operator>-</operator><literal type="number">1</literal></expr>)</condition>
+            <block>{<block_content>
+                <expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>LOG</name></expr></argument>,
+                        <argument><expr><operator>(</operator><name>EACCES</name><operator>,</operator>
+                         <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"setsockopt(SO_REUSEADDR) failed: %m"</literal></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+                <expr_stmt><expr><call><name>close</name><argument_list>(<argument><expr><name>fd</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+                <continue>continue;</continue>
+            </block_content>}</block></if></if_stmt>
+        </block_content>}</block></if></if_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>IPV6_V6ONLY</name></cpp:ifdef>
+        <if_stmt><if>if <condition>(<expr><name><name>addr</name><operator>-&gt;</operator><name>ai_family</name></name> <operator>==</operator> <name>AF_INET6</name></expr>)</condition>
+        <block>{<block_content>
+            <if_stmt><if>if <condition>(<expr><call><name>setsockopt</name><argument_list>(<argument><expr><name>fd</name></expr></argument>, <argument><expr><name>IPPROTO_IPV6</name></expr></argument>, <argument><expr><name>IPV6_V6ONLY</name></expr></argument>,
+                           <argument><expr><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <operator>&amp;</operator><name>one</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>one</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call> <operator>==</operator> <operator>-</operator><literal type="number">1</literal></expr>)</condition>
+            <block>{<block_content>
+                <expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>LOG</name></expr></argument>,
+                        <argument><expr><operator>(</operator><name>EACCES</name><operator>,</operator>
+                         <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"setsockopt(IPV6_V6ONLY) failed: %m"</literal></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+                <expr_stmt><expr><call><name>close</name><argument_list>(<argument><expr><name>fd</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+                <continue>continue;</continue>
+            </block_content>}</block></if></if_stmt>
+        </block_content>}</block></if></if_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+        <comment type="block">/*
+         * Note: This might fail on some OS's, like Linux older than
+         * 2.4.21-pre3, that don't have the IPV6_V6ONLY socket option, and map
+         * ipv4 addresses to ipv6.    It will show ::ffff:ipv4 for all ipv4
+         * connections.
+         */</comment>
+        <expr_stmt><expr><name>err</name> <operator>=</operator> <call><name>bind</name><argument_list>(<argument><expr><name>fd</name></expr></argument>, <argument><expr><name><name>addr</name><operator>-&gt;</operator><name>ai_addr</name></name></expr></argument>, <argument><expr><name><name>addr</name><operator>-&gt;</operator><name>ai_addrlen</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <if_stmt><if>if <condition>(<expr><name>err</name> <operator>&lt;</operator> <literal type="number">0</literal></expr>)</condition>
+        <block>{<block_content>
+            <expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>LOG</name></expr></argument>,
+                    <argument><expr><operator>(</operator><name>EACCES</name><operator>,</operator>
+            <comment type="block">/* translator: %s is IPv4, IPv6, or Unix */</comment>
+                     <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"could not bind %s socket: %m"</literal></expr></argument>,
+                            <argument><expr><name>familyDesc</name></expr></argument>)</argument_list></call><operator>,</operator>
+                     <ternary><condition><expr><operator>(</operator><call><name>IS_AF_UNIX</name><argument_list>(<argument><expr><name><name>addr</name><operator>-&gt;</operator><name>ai_family</name></name></expr></argument>)</argument_list></call><operator>)</operator></expr> ?</condition><then>
+                  <expr><call><name>errhint</name><argument_list>(<argument><expr><literal type="string">"Is another postmaster already running on port %d?"</literal>
+                          <literal type="string">" If not, remove socket file \"%s\" and retry."</literal></expr></argument>,
+                          <argument><expr><operator>(</operator><name>int</name><operator>)</operator> <name>portNumber</name></expr></argument>, <argument><expr><name>sock_path</name></expr></argument>)</argument_list></call></expr> </then><else>:
+                  <expr><call><name>errhint</name><argument_list>(<argument><expr><literal type="string">"Is another postmaster already running on port %d?"</literal>
+                          <literal type="string">" If not, wait a few seconds and retry."</literal></expr></argument>,
+                          <argument><expr><operator>(</operator><name>int</name><operator>)</operator> <name>portNumber</name></expr></argument>)</argument_list></call></expr></else></ternary><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+            <expr_stmt><expr><call><name>close</name><argument_list>(<argument><expr><name>fd</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+            <continue>continue;</continue>
+        </block_content>}</block></if></if_stmt>
+
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>HAVE_UNIX_SOCKETS</name></cpp:ifdef>
+		<if_stmt><if>if <condition>(<expr><name><name>addr</name><operator>-&gt;</operator><name>ai_family</name></name> <operator>==</operator> <name>AF_UNIX</name></expr>)</condition>
+		<block>{<block_content>
+			<if_stmt><if>if <condition>(<expr><call><name>Setup_AF_UNIX</name><argument_list>(<argument><expr><name>service</name></expr></argument>)</argument_list></call> <operator>!=</operator> <name>STATUS_OK</name></expr>)</condition>
+			<block>{<block_content>
+                <expr_stmt><expr><call><name>close</name><argument_list>(<argument><expr><name>fd</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<break>break;</break>
+			</block_content>}</block></if></if_stmt>
+		</block_content>}</block></if></if_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>GTM_MAX_CONNECTIONS</name></cpp:macro>        <cpp:value>4096</cpp:value></cpp:define>
+
+        <comment type="block">/*
+         * Select appropriate accept-queue length limit.  PG_SOMAXCONN is only
+         * intended to provide a clamp on the request on platforms where an
+         * overly large request provokes a kernel error (are there any?).
+         */</comment>
+        <expr_stmt><expr><name>err</name> <operator>=</operator> <call><name>listen</name><argument_list>(<argument><expr><name>fd</name></expr></argument>, <argument><expr><name>GTM_MAX_CONNECTIONS</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <if_stmt><if>if <condition>(<expr><name>err</name> <operator>&lt;</operator> <literal type="number">0</literal></expr>)</condition>
+        <block>{<block_content>
+            <expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>LOG</name></expr></argument>,
+                    <argument><expr><operator>(</operator><name>EACCES</name><operator>,</operator>
+            <comment type="block">/* translator: %s is IPv4, IPv6, or Unix */</comment>
+                     <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"could not listen on %s socket: %m"</literal></expr></argument>,
+                            <argument><expr><name>familyDesc</name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+            <expr_stmt><expr><call><name>close</name><argument_list>(<argument><expr><name>fd</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+            <continue>continue;</continue>
+        </block_content>}</block></if></if_stmt>
+
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>HAVE_UNIX_SOCKETS</name></cpp:ifdef>
+        <if_stmt><if>if <condition>(<expr><name><name>addr</name><operator>-&gt;</operator><name>ai_family</name></name> <operator>==</operator> <name>AF_UNIX</name></expr>)</condition><block type="pseudo"><block_content>
+            <expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>LOG</name></expr></argument>,
+                    <argument><expr><operator>(</operator><call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"listening on Unix socket \"%s\""</literal></expr></argument>,
+                            <argument><expr><name>addrDesc</name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if>
+        <else>else<block type="pseudo"><block_content>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+            <expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>LOG</name></expr></argument>,
+            <comment type="block">/* translator: first %s is IPv4 or IPv6 */</comment>
+                    <argument><expr><operator>(</operator><call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"listening on %s address \"%s\", port %d"</literal></expr></argument>,
+                            <argument><expr><name>familyDesc</name></expr></argument>, <argument><expr><name>addrDesc</name></expr></argument>, <argument><expr><operator>(</operator><name>int</name><operator>)</operator> <name>portNumber</name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></else></if_stmt>
+
+        <expr_stmt><expr><name><name>ListenSocket</name><index>[<expr><name>listen_index</name></expr>]</index></name> <operator>=</operator> <name>fd</name></expr>;</expr_stmt>
+        <expr_stmt><expr><name>added</name><operator>++</operator></expr>;</expr_stmt>
+    </block_content>}</block></for>
+
+    <expr_stmt><expr><call><name>pg_freeaddrinfo_all</name><argument_list>(<argument><expr><name><name>hint</name><operator>.</operator><name>ai_family</name></name></expr></argument>, <argument><expr><name>addrs</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+    <if_stmt><if>if <condition>(<expr><operator>!</operator><name>added</name></expr>)</condition><block type="pseudo"><block_content>
+        <return>return <expr><name>STATUS_ERROR</name></expr>;</return></block_content></block></if></if_stmt>
+
+    <return>return <expr><name>STATUS_OK</name></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * Create a lockfile for the specified Unix socket file.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>CreateSocketLockFile</name><parameter_list>(<parameter><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>socketfile</name></decl></parameter>, <parameter><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>socketDir</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <decl_stmt><decl><type><name>char</name></type>		<name><name>lockfile</name><index>[<expr><name>MAXPGPATH</name></expr>]</index></name></decl>;</decl_stmt>
+
+    <expr_stmt><expr><call><name>snprintf</name><argument_list>(<argument><expr><name>lockfile</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>lockfile</name></expr></argument>)</argument_list></sizeof></expr></argument>, <argument><expr><literal type="string">"%s.lock"</literal></expr></argument>, <argument><expr><name>socketfile</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><call><name>CreateLockFile</name><argument_list>(<argument><expr><name>lockfile</name></expr></argument>, <argument><expr><name>socketDir</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Remove a lockfile and Unix socket file.
+ */</comment>
+<function><type><name>void</name></type>
+<name>RemoveSocketFile</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <decl_stmt><decl><type><name>char</name></type>		<name><name>lockfile</name><index>[<expr><name>MAXPGPATH</name></expr>]</index></name></decl>;</decl_stmt>
+
+    <expr_stmt><expr><call><name>snprintf</name><argument_list>(<argument><expr><name>lockfile</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>lockfile</name></expr></argument>)</argument_list></sizeof></expr></argument>, <argument><expr><literal type="string">"%s.lock"</literal></expr></argument>, <argument><expr><name>sock_path</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><call><name>DeleteLockFile</name><argument_list>(<argument><expr><name>lockfile</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+    <expr_stmt><expr><operator>(</operator><name>void</name><operator>)</operator> <call><name>unlink</name><argument_list>(<argument><expr><name>sock_path</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>HAVE_UNIX_SOCKETS</name></cpp:ifdef>
+
+<comment type="block">/*
+ * Lock_AF_UNIX -- configure unix socket file path
+ */</comment>
+<function><type><specifier>static</specifier> <name>int</name></type>
+<name>Lock_AF_UNIX</name><parameter_list>(<parameter><decl><type><name>char</name> <modifier>*</modifier></type><name>unixSocketDir</name></decl></parameter>, <parameter><decl><type><name>char</name> <modifier>*</modifier></type><name>unixSocketPath</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<comment type="block">/*
+	 * Grab an interlock file associated with the socket file.
+	 *
+	 * Note: there are two reasons for using a socket lock file, rather than
+	 * trying to interlock directly on the socket itself.  First, it's a lot
+	 * more portable, and second, it lets us remove any pre-existing socket
+	 * file without race conditions.
+	 */</comment>
+	<expr_stmt><expr><call><name>CreateSocketLockFile</name><argument_list>(<argument><expr><name>unixSocketPath</name></expr></argument>, <argument><expr><name>unixSocketDir</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<comment type="block">/*
+	 * Once we have the interlock, we can safely delete any pre-existing
+	 * socket file to avoid failure at bind() time.
+	 */</comment>
+	<expr_stmt><expr><operator>(</operator><name>void</name><operator>)</operator> <call><name>unlink</name><argument_list>(<argument><expr><name>unixSocketPath</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+	<return>return <expr><name>STATUS_OK</name></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * Setup_AF_UNIX -- configure unix socket permissions
+ */</comment>
+<function><type><specifier>static</specifier> <name>int</name></type>
+<name>Setup_AF_UNIX</name><parameter_list>(<parameter><decl><type><name>char</name> <modifier>*</modifier></type><name>sock_path</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+	<comment type="block">/*
+	 * Fix socket ownership/permission if requested.  Note we must do this
+	 * before we listen() to avoid a window where unwanted connections could
+	 * get accepted.
+	 */</comment>
+	<expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>unix_socket_group</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+	<if_stmt><if>if <condition>(<expr><name><name>unix_socket_group</name><index>[<expr><literal type="number">0</literal></expr>]</index></name> <operator>!=</operator> <literal type="char">'\0'</literal></expr>)</condition>
+	<block>{<block_content>
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>WIN32</name></cpp:ifdef>
+		<expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>WARNING</name></expr></argument>, <argument><expr><literal type="string">"configuration item unix_socket_group is not supported on this platform"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+<cpp:else>#<cpp:directive>else</cpp:directive></cpp:else>
+		<decl_stmt><decl><type><name>char</name>	   <modifier>*</modifier></type><name>endptr</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>unsigned</name> <name>long</name></type> <name>val</name></decl>;</decl_stmt>
+		<decl_stmt><decl><type><name>gid_t</name></type>		<name>gid</name></decl>;</decl_stmt>
+
+		<expr_stmt><expr><name>val</name> <operator>=</operator> <call><name>strtoul</name><argument_list>(<argument><expr><name>unix_socket_group</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>endptr</name></expr></argument>, <argument><expr><literal type="number">10</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<if_stmt><if>if <condition>(<expr><operator>*</operator><name>endptr</name> <operator>==</operator> <literal type="char">'\0'</literal></expr>)</condition>
+		<block>{<block_content>						<comment type="block">/* numeric group id */</comment>
+			<expr_stmt><expr><name>gid</name> <operator>=</operator> <name>val</name></expr>;</expr_stmt>
+		</block_content>}</block></if>
+		<else>else
+		<block>{<block_content>						<comment type="block">/* convert group name to id */</comment>
+			<decl_stmt><decl><type><name><name>struct</name> <name>group</name></name> <modifier>*</modifier></type><name>gr</name></decl>;</decl_stmt>
+
+			<expr_stmt><expr><name>gr</name> <operator>=</operator> <call><name>getgrnam</name><argument_list>(<argument><expr><name>unix_socket_group</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<if_stmt><if>if <condition>(<expr><operator>!</operator><name>gr</name></expr>)</condition>
+			<block>{<block_content>
+				<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>LOG</name></expr></argument>,
+						<argument><expr><operator>(</operator><call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"group \"%s\" does not exist"</literal></expr></argument>,
+								<argument><expr><name>unix_socket_group</name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+				<return>return <expr><name>STATUS_ERROR</name></expr>;</return>
+			</block_content>}</block></if></if_stmt>
+			<expr_stmt><expr><name>gid</name> <operator>=</operator> <name><name>gr</name><operator>-&gt;</operator><name>gr_gid</name></name></expr>;</expr_stmt>
+		</block_content>}</block></else></if_stmt>
+		<if_stmt><if>if <condition>(<expr><call><name>chown</name><argument_list>(<argument><expr><name>sock_path</name></expr></argument>, <argument><expr><operator>-</operator><literal type="number">1</literal></expr></argument>, <argument><expr><name>gid</name></expr></argument>)</argument_list></call> <operator>==</operator> <operator>-</operator><literal type="number">1</literal></expr>)</condition>
+		<block>{<block_content>
+			<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>LOG</name></expr></argument>,
+					<argument><expr><operator>(</operator><call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"could not set group of file \"%s\": %m"</literal></expr></argument>,
+							<argument><expr><name>sock_path</name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+			<return>return <expr><name>STATUS_ERROR</name></expr>;</return>
+		</block_content>}</block></if></if_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+	</block_content>}</block></if></if_stmt>
+
+	<if_stmt><if>if <condition>(<expr><call><name>chmod</name><argument_list>(<argument><expr><name>sock_path</name></expr></argument>, <argument><expr><name>unix_socket_permissions</name></expr></argument>)</argument_list></call> <operator>==</operator> <operator>-</operator><literal type="number">1</literal></expr>)</condition>
+	<block>{<block_content>
+		<expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>LOG</name></expr></argument>,
+				<argument><expr><operator>(</operator><call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"could not set permissions of file \"%s\": %m"</literal></expr></argument>,
+						<argument><expr><name>sock_path</name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+		<return>return <expr><name>STATUS_ERROR</name></expr>;</return>
+	</block_content>}</block></if></if_stmt>
+	<return>return <expr><name>STATUS_OK</name></expr>;</return>
+</block_content>}</block></function>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>							<comment type="block">/* HAVE_UNIX_SOCKETS */</comment>
+
+
+<comment type="block">/*
+ * StreamConnection -- create a new connection with client using
+ *        server port.  Set port-&gt;sock to the FD of the new connection.
+ *
+ * ASSUME: that this doesn't need to be non-blocking because
+ *        the Postmaster uses select() to tell when the server master
+ *        socket is ready for accept().
+ *
+ * RETURNS: STATUS_OK or STATUS_ERROR
+ */</comment>
+<function><type><name>int</name></type>
+<name>StreamConnection</name><parameter_list>(<parameter><decl><type><name>int</name></type> <name>server_fd</name></decl></parameter>, <parameter><decl><type><name>Port</name> <modifier>*</modifier></type><name>port</name></decl></parameter>)</parameter_list>
+<block>{<block_content><comment type="line">// #lizard forgives</comment>
+<cpp:ifndef>#<cpp:directive>ifndef</cpp:directive> <name>__TBASE__</name></cpp:ifndef>
+    <decl_stmt><decl><type><name>char</name></type>        <name><name>remote_host</name><index>[<expr><name>NI_MAXHOST</name></expr>]</index></name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>char</name></type>        <name><name>remote_port</name><index>[<expr><name>NI_MAXSERV</name></expr>]</index></name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>char</name></type>        <name><name>remote_ps_data</name><index>[<expr><name>NI_MAXHOST</name></expr>]</index></name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>int</name></type> <name>ret</name></decl>;</decl_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+    
+    <comment type="block">/* accept connection and fill in the client (remote) address */</comment>
+    <expr_stmt><expr><name><name>port</name><operator>-&gt;</operator><name>raddr</name><operator>.</operator><name>salen</name></name> <operator>=</operator> <sizeof>sizeof<argument_list>(<argument><expr><name><name>port</name><operator>-&gt;</operator><name>raddr</name><operator>.</operator><name>addr</name></name></expr></argument>)</argument_list></sizeof></expr>;</expr_stmt>
+    <if_stmt><if>if <condition>(<expr><operator>(</operator><name><name>port</name><operator>-&gt;</operator><name>sock</name></name> <operator>=</operator> <call><name>accept</name><argument_list>(<argument><expr><name>server_fd</name></expr></argument>,
+                             <argument><expr><operator>(</operator>struct <name>sockaddr</name> <operator>*</operator><operator>)</operator> <operator>&amp;</operator> <name><name>port</name><operator>-&gt;</operator><name>raddr</name><operator>.</operator><name>addr</name></name></expr></argument>,
+                             <argument><expr><operator>(</operator><name>socklen_t</name> <operator>*</operator><operator>)</operator><operator>&amp;</operator><name><name>port</name><operator>-&gt;</operator><name>raddr</name><operator>.</operator><name>salen</name></name></expr></argument>)</argument_list></call><operator>)</operator> <operator>&lt;</operator> <literal type="number">0</literal></expr>)</condition>
+    <block>{<block_content>
+        <expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>LOG</name></expr></argument>,
+                <argument><expr><operator>(</operator><name>EACCES</name><operator>,</operator>
+                 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"could not accept new connection: %m"</literal></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+        <comment type="block">/*
+         * If accept() fails then postmaster.c will still see the server
+         * socket as read-ready, and will immediately try again.  To avoid
+         * uselessly sucking lots of CPU, delay a bit before trying again.
+         * (The most likely reason for failure is being out of kernel file
+         * table slots; we can do little except hope some will get freed up.)
+         */</comment>
+        <expr_stmt><expr><call><name>pg_usleep</name><argument_list>(<argument><expr><literal type="number">100000L</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>         <comment type="block">/* wait 0.1 sec */</comment>
+        <return>return <expr><name>STATUS_ERROR</name></expr>;</return>
+    </block_content>}</block></if></if_stmt>
+
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>SCO_ACCEPT_BUG</name></cpp:ifdef>
+
+    <comment type="block">/*
+     * UnixWare 7+ and OpenServer 5.0.4 are known to have this bug, but it
+     * shouldn't hurt to catch it for all versions of those platforms.
+     */</comment>
+    <if_stmt><if>if <condition>(<expr><name><name>port</name><operator>-&gt;</operator><name>raddr</name><operator>.</operator><name>addr</name><operator>.</operator><name>ss_family</name></name> <operator>==</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+        <expr_stmt><expr><name><name>port</name><operator>-&gt;</operator><name>raddr</name><operator>.</operator><name>addr</name><operator>.</operator><name>ss_family</name></name> <operator>=</operator> <name>AF_UNIX</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+    <comment type="block">/* fill in the server (local) address */</comment>
+    <expr_stmt><expr><name><name>port</name><operator>-&gt;</operator><name>laddr</name><operator>.</operator><name>salen</name></name> <operator>=</operator> <sizeof>sizeof<argument_list>(<argument><expr><name><name>port</name><operator>-&gt;</operator><name>laddr</name><operator>.</operator><name>addr</name></name></expr></argument>)</argument_list></sizeof></expr>;</expr_stmt>
+    <if_stmt><if>if <condition>(<expr><call><name>getsockname</name><argument_list>(<argument><expr><name><name>port</name><operator>-&gt;</operator><name>sock</name></name></expr></argument>,
+                    <argument><expr><operator>(</operator>struct <name>sockaddr</name> <operator>*</operator><operator>)</operator> <operator>&amp;</operator> <name><name>port</name><operator>-&gt;</operator><name>laddr</name><operator>.</operator><name>addr</name></name></expr></argument>,
+                    <argument><expr><operator>(</operator><name>socklen_t</name> <operator>*</operator><operator>)</operator><operator>&amp;</operator><name><name>port</name><operator>-&gt;</operator><name>laddr</name><operator>.</operator><name>salen</name></name></expr></argument>)</argument_list></call> <operator>&lt;</operator> <literal type="number">0</literal></expr>)</condition>
+    <block>{<block_content>
+        <expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>LOG</name></expr></argument>, <argument><expr><literal type="string">"getsockname() failed: %m"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <return>return <expr><name>STATUS_ERROR</name></expr>;</return>
+    </block_content>}</block></if></if_stmt>
+
+    <comment type="block">/* select NODELAY and KEEPALIVE options if it's a TCP connection */</comment>
+    <if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>IS_AF_UNIX</name><argument_list>(<argument><expr><name><name>port</name><operator>-&gt;</operator><name>laddr</name><operator>.</operator><name>addr</name><operator>.</operator><name>ss_family</name></name></expr></argument>)</argument_list></call></expr>)</condition>
+    <block>{<block_content>
+        <decl_stmt><decl><type><name>int</name></type>            <name>on</name></decl>;</decl_stmt>
+
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive>    <name>TCP_NODELAY</name></cpp:ifdef>
+        <expr_stmt><expr><name>on</name> <operator>=</operator> <literal type="number">1</literal></expr>;</expr_stmt>
+        <if_stmt><if>if <condition>(<expr><call><name>setsockopt</name><argument_list>(<argument><expr><name><name>port</name><operator>-&gt;</operator><name>sock</name></name></expr></argument>, <argument><expr><name>IPPROTO_TCP</name></expr></argument>, <argument><expr><name>TCP_NODELAY</name></expr></argument>,
+                       <argument><expr><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <operator>&amp;</operator><name>on</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>on</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call> <operator>&lt;</operator> <literal type="number">0</literal></expr>)</condition>
+        <block>{<block_content>
+            <expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>LOG</name></expr></argument>, <argument><expr><literal type="string">"setsockopt(TCP_NODELAY) failed: %m"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+            <return>return <expr><name>STATUS_ERROR</name></expr>;</return>
+        </block_content>}</block></if></if_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+        <expr_stmt><expr><name>on</name> <operator>=</operator> <literal type="number">1</literal></expr>;</expr_stmt>
+        <if_stmt><if>if <condition>(<expr><call><name>setsockopt</name><argument_list>(<argument><expr><name><name>port</name><operator>-&gt;</operator><name>sock</name></name></expr></argument>, <argument><expr><name>SOL_SOCKET</name></expr></argument>, <argument><expr><name>SO_KEEPALIVE</name></expr></argument>,
+                       <argument><expr><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <operator>&amp;</operator><name>on</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>on</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call> <operator>&lt;</operator> <literal type="number">0</literal></expr>)</condition>
+        <block>{<block_content>
+            <expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>LOG</name></expr></argument>, <argument><expr><literal type="string">"setsockopt(SO_KEEPALIVE) failed: %m"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+            <return>return <expr><name>STATUS_ERROR</name></expr>;</return>
+        </block_content>}</block></if></if_stmt>
+
+        <comment type="block">/*
+         * Also apply the current keepalive parameters.  If we fail to set a
+         * parameter, don't error out, because these aren't universally
+         * supported.  (Note: you might think we need to reset the GUC
+         * variables to 0 in such a case, but it's not necessary because the
+         * show hooks for these variables report the truth anyway.)
+         */</comment>
+        <expr_stmt><expr><operator>(</operator><name>void</name><operator>)</operator> <call><name>pq_setkeepalivesidle</name><argument_list>(<argument><expr><name>tcp_keepalives_idle</name></expr></argument>, <argument><expr><name>port</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <expr_stmt><expr><operator>(</operator><name>void</name><operator>)</operator> <call><name>pq_setkeepalivesinterval</name><argument_list>(<argument><expr><name>tcp_keepalives_interval</name></expr></argument>, <argument><expr><name>port</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <expr_stmt><expr><operator>(</operator><name>void</name><operator>)</operator> <call><name>pq_setkeepalivescount</name><argument_list>(<argument><expr><name>tcp_keepalives_count</name></expr></argument>, <argument><expr><name>port</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    </block_content>}</block></if></if_stmt>
+    <comment type="block">/* remove dns query in case of dns block */</comment>
+<cpp:ifndef>#<cpp:directive>ifndef</cpp:directive> <name>__TBASE__</name></cpp:ifndef>
+    <expr_stmt><expr><name><name>remote_host</name><index>[<expr><literal type="number">0</literal></expr>]</index></name> <operator>=</operator> <literal type="char">'\0'</literal></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>remote_port</name><index>[<expr><literal type="number">0</literal></expr>]</index></name> <operator>=</operator> <literal type="char">'\0'</literal></expr>;</expr_stmt>
+
+    <comment type="block">/*
+     * Get the remote host name and port for logging and status display.
+      */</comment>
+
+    <if_stmt><if>if <condition>(<expr><operator>(</operator><name>ret</name> <operator>=</operator> <call><name>pg_getnameinfo_all</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>port</name><operator>-&gt;</operator><name>raddr</name><operator>.</operator><name>addr</name></name></expr></argument>, <argument><expr><name><name>port</name><operator>-&gt;</operator><name>raddr</name><operator>.</operator><name>salen</name></name></expr></argument>,
+                                  <argument><expr><name>remote_host</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>remote_host</name></expr></argument>)</argument_list></sizeof></expr></argument>,
+                                  <argument><expr><name>remote_port</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>remote_port</name></expr></argument>)</argument_list></sizeof></expr></argument>,
+                                  <argument><expr><name>NI_NUMERICSERV</name></expr></argument>)</argument_list></call> <operator>!=</operator> <literal type="number">0</literal><operator>)</operator></expr>)</condition>
+    <block>{<block_content>
+        <expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>WARNING</name></expr></argument>,
+                <argument><expr><operator>(</operator><call><name>errmsg_internal</name><argument_list>(<argument><expr><literal type="string">"pg_getnameinfo_all() failed: %s"</literal></expr></argument>,
+                                 <argument><expr><call><name>gai_strerror</name><argument_list>(<argument><expr><name>ret</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    </block_content>}</block></if></if_stmt>
+
+    <if_stmt><if>if <condition>(<expr><name><name>remote_port</name><index>[<expr><literal type="number">0</literal></expr>]</index></name> <operator>==</operator> <literal type="char">'\0'</literal></expr>)</condition><block type="pseudo"><block_content>
+        <expr_stmt><expr><call><name>snprintf</name><argument_list>(<argument><expr><name>remote_ps_data</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>remote_ps_data</name></expr></argument>)</argument_list></sizeof></expr></argument>, <argument><expr><literal type="string">"%s"</literal></expr></argument>, <argument><expr><name>remote_host</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if>
+    <else>else<block type="pseudo"><block_content>
+        <expr_stmt><expr><call><name>snprintf</name><argument_list>(<argument><expr><name>remote_ps_data</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>remote_ps_data</name></expr></argument>)</argument_list></sizeof></expr></argument>, <argument><expr><literal type="string">"%s(%s)"</literal></expr></argument>, <argument><expr><name>remote_host</name></expr></argument>, <argument><expr><name>remote_port</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></else></if_stmt>
+
+    <comment type="block">/*
+     * Save remote_host and remote_port in port structure 
+     */</comment>
+
+    <expr_stmt><expr><name><name>port</name><operator>-&gt;</operator><name>remote_host</name></name> <operator>=</operator> <call><name>strdup</name><argument_list>(<argument><expr><name>remote_host</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>port</name><operator>-&gt;</operator><name>remote_port</name></name> <operator>=</operator> <call><name>strdup</name><argument_list>(<argument><expr><name>remote_port</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+    <return>return <expr><name>STATUS_OK</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * StreamClose -- close a client/backend connection
+ *
+ * NOTE: this is NOT used to terminate a session; it is just used to release
+ * the file descriptor in a process that should no longer have the socket
+ * open.  (For example, the postmaster calls this after passing ownership
+ * of the connection to a child process.)  It is expected that someone else
+ * still has the socket open.  So, we only want to close the descriptor,
+ * we do NOT want to send anything to the far end.
+ */</comment>
+<function><type><name>void</name></type>
+<name>StreamClose</name><parameter_list>(<parameter><decl><type><name>int</name></type> <name>sock</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <expr_stmt><expr><call><name>close</name><argument_list>(<argument><expr><name>sock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * TouchSocketFile -- mark socket file as recently accessed
+ *
+ * This routine should be called every so often to ensure that the socket
+ * file has a recent mod date (ordinary operations on sockets usually won't
+ * change the mod date).  That saves it from being removed by
+ * overenthusiastic /tmp-directory-cleaner daemons.  (Another reason we should
+ * never have put the socket file in /tmp...)
+ */</comment>
+<function><type><name>void</name></type>
+<name>TouchSocketFile</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <comment type="block">/* Do nothing if we did not create a socket... */</comment>
+    <if_stmt><if>if <condition>(<expr><name><name>sock_path</name><index>[<expr><literal type="number">0</literal></expr>]</index></name> <operator>!=</operator> <literal type="char">'\0'</literal></expr>)</condition>
+    <block>{<block_content>
+        <comment type="block">/*
+         * utime() is POSIX standard, utimes() is a common alternative. If we
+         * have neither, there's no way to affect the mod or access time of
+         * the socket :-(
+         *
+         * In either path, we ignore errors; there's no point in complaining.
+         */</comment>
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>HAVE_UTIME</name></cpp:ifdef>
+        <expr_stmt><expr><call><name>utime</name><argument_list>(<argument><expr><name>sock_path</name></expr></argument>, <argument><expr><name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+<cpp:else>#<cpp:directive>else</cpp:directive></cpp:else>                            <comment type="block">/* !HAVE_UTIME */</comment>
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>HAVE_UTIMES</name></cpp:ifdef>
+        <expr_stmt><expr><call><name>utimes</name><argument_list>(<argument><expr><name>sock_path</name></expr></argument>, <argument><expr><name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>   <comment type="block">/* HAVE_UTIMES */</comment>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>   <comment type="block">/* HAVE_UTIME */</comment>
+    </block_content>}</block></if></if_stmt>
+</block_content>}</block></function>
+
+
+<comment type="block">/* --------------------------------
+ * Low-level I/O routines begin here.
+ *
+ * These routines communicate with a frontend client across a connection
+ * already established by the preceding routines.
+ * --------------------------------
+ */</comment>
+
+
+<comment type="block">/* --------------------------------
+ *        pq_recvbuf - load some bytes into the input buffer
+ *
+ *        returns 0 if OK, EOF if trouble
+ * --------------------------------
+ */</comment>
+<function><type><specifier>static</specifier> <name>int</name></type>
+<name>pq_recvbuf</name><parameter_list>(<parameter><decl><type><name>Port</name> <modifier>*</modifier></type><name>myport</name></decl></parameter>)</parameter_list>
+<block>{<block_content><comment type="line">// #lizard forgives</comment>
+    <if_stmt><if>if <condition>(<expr><name><name>myport</name><operator>-&gt;</operator><name>PqRecvPointer</name></name> <operator>&gt;</operator> <literal type="number">0</literal></expr>)</condition>
+    <block>{<block_content>
+        <if_stmt><if>if <condition>(<expr><name><name>myport</name><operator>-&gt;</operator><name>PqRecvLength</name></name> <operator>&gt;</operator> <name><name>myport</name><operator>-&gt;</operator><name>PqRecvPointer</name></name></expr>)</condition>
+        <block>{<block_content>
+            <comment type="block">/* still some unread data, left-justify it in the buffer */</comment>
+            <expr_stmt><expr><call><name>memmove</name><argument_list>(<argument><expr><name><name>myport</name><operator>-&gt;</operator><name>PqRecvBuffer</name></name></expr></argument>, <argument><expr><name><name>myport</name><operator>-&gt;</operator><name>PqRecvBuffer</name></name> <operator>+</operator> <name><name>myport</name><operator>-&gt;</operator><name>PqRecvPointer</name></name></expr></argument>,
+                    <argument><expr><name><name>myport</name><operator>-&gt;</operator><name>PqRecvLength</name></name> <operator>-</operator> <name><name>myport</name><operator>-&gt;</operator><name>PqRecvPointer</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+            <expr_stmt><expr><name><name>myport</name><operator>-&gt;</operator><name>PqRecvLength</name></name> <operator>-=</operator> <name><name>myport</name><operator>-&gt;</operator><name>PqRecvPointer</name></name></expr>;</expr_stmt>
+            <expr_stmt><expr><name><name>myport</name><operator>-&gt;</operator><name>PqRecvPointer</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+        </block_content>}</block></if>
+        <else>else<block type="pseudo"><block_content>
+            <expr_stmt><expr><name><name>myport</name><operator>-&gt;</operator><name>PqRecvLength</name></name> <operator>=</operator> <name><name>myport</name><operator>-&gt;</operator><name>PqRecvPointer</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt></block_content></block></else></if_stmt>
+    </block_content>}</block></if></if_stmt>
+
+    <comment type="block">/* Can fill buffer from myport-&gt;PqRecvLength and upwards */</comment>
+    <for>for <control>(<init>;</init><condition>;</condition><incr/>)</control>
+    <block>{<block_content>
+        <decl_stmt><decl><type><name>int</name></type>            <name>r</name></decl>;</decl_stmt>
+
+        <expr_stmt><expr><name>r</name> <operator>=</operator> <call><name>recv</name><argument_list>(<argument><expr><name><name>myport</name><operator>-&gt;</operator><name>sock</name></name></expr></argument>, <argument><expr><name><name>myport</name><operator>-&gt;</operator><name>PqRecvBuffer</name></name> <operator>+</operator> <name><name>myport</name><operator>-&gt;</operator><name>PqRecvLength</name></name></expr></argument>,
+                        <argument><expr><name>PQ_BUFFER_SIZE</name> <operator>-</operator> <name><name>myport</name><operator>-&gt;</operator><name>PqRecvLength</name></name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <expr_stmt><expr><name><name>myport</name><operator>-&gt;</operator><name>last_call</name></name> <operator>=</operator> <name>GTM_LastCall_RECV</name></expr>;</expr_stmt>
+
+        <if_stmt><if>if <condition>(<expr><name>r</name> <operator>&lt;</operator> <literal type="number">0</literal></expr>)</condition>
+        <block>{<block_content>
+            <expr_stmt><expr><name><name>myport</name><operator>-&gt;</operator><name>last_errno</name></name> <operator>=</operator> <name>errno</name></expr>;</expr_stmt>
+            <if_stmt><if>if <condition>(<expr><name>errno</name> <operator>==</operator> <name>EINTR</name></expr>)</condition><block type="pseudo"><block_content>
+                <continue>continue;</continue></block_content></block></if></if_stmt>        <comment type="block">/* Ok if interrupted */</comment>
+
+            <if_stmt><if>if<condition>(<expr><name><name>myport</name><operator>-&gt;</operator><name>is_nonblocking</name></name></expr>)</condition>
+            <block>{<block_content>
+                <if_stmt><if>if<condition>(<expr><name>errno</name> <operator>==</operator> <name>EAGAIN</name></expr>)</condition>
+                <block>{<block_content>
+                    <continue>continue;</continue>
+                </block_content>}</block></if></if_stmt>
+            </block_content>}</block></if></if_stmt>
+            <comment type="block">/*
+             * Careful: an ereport() that tries to write to the client would
+             * cause recursion to here, leading to stack overflow and core
+             * dump!  This message must go *only* to the postmaster log.
+             */</comment>
+            <expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>COMMERROR</name></expr></argument>,
+                    <argument><expr><operator>(</operator><name>EACCES</name><operator>,</operator>
+                     <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"could not receive data from client: %m"</literal></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+            <return>return <expr><name>EOF</name></expr>;</return>
+        </block_content>}</block></if>
+        <else>else<block type="pseudo"><block_content>
+            <expr_stmt><expr><name><name>myport</name><operator>-&gt;</operator><name>last_errno</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt></block_content></block></else></if_stmt>
+        <if_stmt><if>if <condition>(<expr><name>r</name> <operator>==</operator> <literal type="number">0</literal></expr>)</condition>
+        <block>{<block_content>
+            <comment type="block">/*
+             * EOF detected.  We used to write a log message here, but it's
+             * better to expect the ultimate caller to do that.
+             */</comment>
+            <return>return <expr><name>EOF</name></expr>;</return>
+        </block_content>}</block></if></if_stmt>
+        <comment type="block">/* r contains number of bytes read, so just incr length */</comment>
+        <expr_stmt><expr><name><name>myport</name><operator>-&gt;</operator><name>PqRecvLength</name></name> <operator>+=</operator> <name>r</name></expr>;</expr_stmt>
+        <return>return <expr><literal type="number">0</literal></expr>;</return>
+    </block_content>}</block></for>
+</block_content>}</block></function>
+
+<comment type="block">/* --------------------------------
+ *        pq_getbyte    - get a single byte from connection, or return EOF
+ * --------------------------------
+ */</comment>
+<function><type><name>int</name></type>
+<name>pq_getbyte</name><parameter_list>(<parameter><decl><type><name>Port</name> <modifier>*</modifier></type><name>myport</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <while>while <condition>(<expr><name><name>myport</name><operator>-&gt;</operator><name>PqRecvPointer</name></name> <operator>&gt;=</operator> <name><name>myport</name><operator>-&gt;</operator><name>PqRecvLength</name></name></expr>)</condition>
+    <block>{<block_content>
+        <if_stmt><if>if <condition>(<expr><call><name>pq_recvbuf</name><argument_list>(<argument><expr><name>myport</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>        <comment type="block">/* If nothing in buffer, then recv some */</comment>
+            <return>return <expr><name>EOF</name></expr>;</return></block_content></block></if></if_stmt>            <comment type="block">/* Failed to recv data */</comment>
+    </block_content>}</block></while>
+    <return>return <expr><operator>(</operator><name>unsigned</name> <name>char</name><operator>)</operator> <name><name>myport</name><operator>-&gt;</operator><name>PqRecvBuffer</name><index>[<expr><name><name>myport</name><operator>-&gt;</operator><name>PqRecvPointer</name></name><operator>++</operator></expr>]</index></name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/* --------------------------------
+ *        pq_peekbyte        - peek at next byte from connection
+ *
+ *     Same as pq_getbyte() except we don't advance the pointer.
+ * --------------------------------
+ */</comment>
+<function><type><name>int</name></type>
+<name>pq_peekbyte</name><parameter_list>(<parameter><decl><type><name>Port</name> <modifier>*</modifier></type><name>myport</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <while>while <condition>(<expr><name><name>myport</name><operator>-&gt;</operator><name>PqRecvPointer</name></name> <operator>&gt;=</operator> <name><name>myport</name><operator>-&gt;</operator><name>PqRecvLength</name></name></expr>)</condition>
+    <block>{<block_content>
+        <if_stmt><if>if <condition>(<expr><call><name>pq_recvbuf</name><argument_list>(<argument><expr><name>myport</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>        <comment type="block">/* If nothing in buffer, then recv some */</comment>
+            <return>return <expr><name>EOF</name></expr>;</return></block_content></block></if></if_stmt>            <comment type="block">/* Failed to recv data */</comment>
+    </block_content>}</block></while>
+    <return>return <expr><operator>(</operator><name>unsigned</name> <name>char</name><operator>)</operator> <name><name>myport</name><operator>-&gt;</operator><name>PqRecvBuffer</name><index>[<expr><name><name>myport</name><operator>-&gt;</operator><name>PqRecvPointer</name></name></expr>]</index></name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/* --------------------------------
+ *        pq_getbytes        - get a known number of bytes from connection
+ *
+ *        returns 0 if OK, EOF if trouble
+ * --------------------------------
+ */</comment>
+<function><type><name>int</name></type>
+<name>pq_getbytes</name><parameter_list>(<parameter><decl><type><name>Port</name> <modifier>*</modifier></type><name>myport</name></decl></parameter>, <parameter><decl><type><name>char</name> <modifier>*</modifier></type><name>s</name></decl></parameter>, <parameter><decl><type><name>size_t</name></type> <name>len</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <decl_stmt><decl><type><name>size_t</name></type>        <name>amount</name></decl>;</decl_stmt>
+
+    <while>while <condition>(<expr><name>len</name> <operator>&gt;</operator> <literal type="number">0</literal></expr>)</condition>
+    <block>{<block_content>
+        <while>while <condition>(<expr><name><name>myport</name><operator>-&gt;</operator><name>PqRecvPointer</name></name> <operator>&gt;=</operator> <name><name>myport</name><operator>-&gt;</operator><name>PqRecvLength</name></name></expr>)</condition>
+        <block>{<block_content>
+            <if_stmt><if>if <condition>(<expr><call><name>pq_recvbuf</name><argument_list>(<argument><expr><name>myport</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>    <comment type="block">/* If nothing in buffer, then recv some */</comment>
+                <return>return <expr><name>EOF</name></expr>;</return></block_content></block></if></if_stmt>        <comment type="block">/* Failed to recv data */</comment>
+        </block_content>}</block></while>
+        <expr_stmt><expr><name>amount</name> <operator>=</operator> <name><name>myport</name><operator>-&gt;</operator><name>PqRecvLength</name></name> <operator>-</operator> <name><name>myport</name><operator>-&gt;</operator><name>PqRecvPointer</name></name></expr>;</expr_stmt>
+        <if_stmt><if>if <condition>(<expr><name>amount</name> <operator>&gt;</operator> <name>len</name></expr>)</condition><block type="pseudo"><block_content>
+            <expr_stmt><expr><name>amount</name> <operator>=</operator> <name>len</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+        <expr_stmt><expr><call><name>memcpy</name><argument_list>(<argument><expr><name>s</name></expr></argument>, <argument><expr><name><name>myport</name><operator>-&gt;</operator><name>PqRecvBuffer</name></name> <operator>+</operator> <name><name>myport</name><operator>-&gt;</operator><name>PqRecvPointer</name></name></expr></argument>, <argument><expr><name>amount</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <expr_stmt><expr><name><name>myport</name><operator>-&gt;</operator><name>PqRecvPointer</name></name> <operator>+=</operator> <name>amount</name></expr>;</expr_stmt>
+        <expr_stmt><expr><name>s</name> <operator>+=</operator> <name>amount</name></expr>;</expr_stmt>
+        <expr_stmt><expr><name>len</name> <operator>-=</operator> <name>amount</name></expr>;</expr_stmt>
+    </block_content>}</block></while>
+    <return>return <expr><literal type="number">0</literal></expr>;</return>
+</block_content>}</block></function>
+
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>NOT_USED</name></cpp:ifdef>
+<comment type="block">/* --------------------------------
+ *        pq_discardbytes        - throw away a known number of bytes
+ *
+ *        same as pq_getbytes except we do not copy the data to anyplace.
+ *        this is used for resynchronizing after read errors.
+ *
+ *        returns 0 if OK, EOF if trouble
+ * --------------------------------
+ */</comment>
+<function><type><specifier>static</specifier> <name>int</name></type>
+<name>pq_discardbytes</name><parameter_list>(<parameter><decl><type><name>Port</name> <modifier>*</modifier></type><name>myport</name></decl></parameter>, <parameter><decl><type><name>size_t</name></type> <name>len</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <decl_stmt><decl><type><name>size_t</name></type>        <name>amount</name></decl>;</decl_stmt>
+
+    <while>while <condition>(<expr><name>len</name> <operator>&gt;</operator> <literal type="number">0</literal></expr>)</condition>
+    <block>{<block_content>
+        <while>while <condition>(<expr><name><name>myport</name><operator>-&gt;</operator><name>PqRecvPointer</name></name> <operator>&gt;=</operator> <name><name>myport</name><operator>-&gt;</operator><name>PqRecvLength</name></name></expr>)</condition>
+        <block>{<block_content>
+            <if_stmt><if>if <condition>(<expr><call><name>pq_recvbuf</name><argument_list>(<argument><expr><name>myport</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>    <comment type="block">/* If nothing in buffer, then recv some */</comment>
+                <return>return <expr><name>EOF</name></expr>;</return></block_content></block></if></if_stmt>        <comment type="block">/* Failed to recv data */</comment>
+        </block_content>}</block></while>
+        <expr_stmt><expr><name>amount</name> <operator>=</operator> <name><name>myport</name><operator>-&gt;</operator><name>PqRecvLength</name></name> <operator>-</operator> <name><name>myport</name><operator>-&gt;</operator><name>PqRecvPointer</name></name></expr>;</expr_stmt>
+        <if_stmt><if>if <condition>(<expr><name>amount</name> <operator>&gt;</operator> <name>len</name></expr>)</condition><block type="pseudo"><block_content>
+            <expr_stmt><expr><name>amount</name> <operator>=</operator> <name>len</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+        <expr_stmt><expr><name><name>myport</name><operator>-&gt;</operator><name>PqRecvPointer</name></name> <operator>+=</operator> <name>amount</name></expr>;</expr_stmt>
+        <expr_stmt><expr><name>len</name> <operator>-=</operator> <name>amount</name></expr>;</expr_stmt>
+    </block_content>}</block></while>
+    <return>return <expr><literal type="number">0</literal></expr>;</return>
+</block_content>}</block></function>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif> <comment type="block">/* NOT_USED */</comment>
+
+<comment type="block">/* --------------------------------
+ *        pq_getstring    - get a null terminated string from connection
+ *
+ *        The return value is placed in an expansible StringInfo, which has
+ *        already been initialized by the caller.
+ *
+ *        This is used only for dealing with old-protocol clients.  The idea
+ *        is to produce a StringInfo that looks the same as we would get from
+ *        pq_getmessage() with a newer client; we will then process it with
+ *        pq_getmsgstring.  Therefore, no character set conversion is done here,
+ *        even though this is presumably useful only for text.
+ *
+ *        returns 0 if OK, EOF if trouble
+ * --------------------------------
+ */</comment>
+<function><type><name>int</name></type>
+<name>pq_getstring</name><parameter_list>(<parameter><decl><type><name>Port</name> <modifier>*</modifier></type><name>myport</name></decl></parameter>, <parameter><decl><type><name>StringInfo</name></type> <name>s</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <decl_stmt><decl><type><name>int</name></type>            <name>i</name></decl>;</decl_stmt>
+
+    <expr_stmt><expr><call><name>resetStringInfo</name><argument_list>(<argument><expr><name>s</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+    <comment type="block">/* Read until we get the terminating '\0' */</comment>
+    <for>for <control>(<init>;</init><condition>;</condition><incr/>)</control>
+    <block>{<block_content>
+        <while>while <condition>(<expr><name><name>myport</name><operator>-&gt;</operator><name>PqRecvPointer</name></name> <operator>&gt;=</operator> <name><name>myport</name><operator>-&gt;</operator><name>PqRecvLength</name></name></expr>)</condition>
+        <block>{<block_content>
+            <if_stmt><if>if <condition>(<expr><call><name>pq_recvbuf</name><argument_list>(<argument><expr><name>myport</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>    <comment type="block">/* If nothing in buffer, then recv some */</comment>
+                <return>return <expr><name>EOF</name></expr>;</return></block_content></block></if></if_stmt>        <comment type="block">/* Failed to recv data */</comment>
+        </block_content>}</block></while>
+
+        <for>for <control>(<init><expr><name>i</name> <operator>=</operator> <name><name>myport</name><operator>-&gt;</operator><name>PqRecvPointer</name></name></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name><name>myport</name><operator>-&gt;</operator><name>PqRecvLength</name></name></expr>;</condition> <incr><expr><name>i</name><operator>++</operator></expr></incr>)</control>
+        <block>{<block_content>
+            <if_stmt><if>if <condition>(<expr><name><name>myport</name><operator>-&gt;</operator><name>PqRecvBuffer</name><index>[<expr><name>i</name></expr>]</index></name> <operator>==</operator> <literal type="char">'\0'</literal></expr>)</condition>
+            <block>{<block_content>
+                <comment type="block">/* include the '\0' in the copy */</comment>
+                <expr_stmt><expr><call><name>appendBinaryStringInfo</name><argument_list>(<argument><expr><name>s</name></expr></argument>, <argument><expr><name><name>myport</name><operator>-&gt;</operator><name>PqRecvBuffer</name></name> <operator>+</operator> <name><name>myport</name><operator>-&gt;</operator><name>PqRecvPointer</name></name></expr></argument>,
+                                       <argument><expr><name>i</name> <operator>-</operator> <name><name>myport</name><operator>-&gt;</operator><name>PqRecvPointer</name></name> <operator>+</operator> <literal type="number">1</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+                <expr_stmt><expr><name><name>myport</name><operator>-&gt;</operator><name>PqRecvPointer</name></name> <operator>=</operator> <name>i</name> <operator>+</operator> <literal type="number">1</literal></expr>;</expr_stmt>    <comment type="block">/* advance past \0 */</comment>
+                <return>return <expr><literal type="number">0</literal></expr>;</return>
+            </block_content>}</block></if></if_stmt>
+        </block_content>}</block></for>
+
+        <comment type="block">/* If we're here we haven't got the \0 in the buffer yet. */</comment>
+        <expr_stmt><expr><call><name>appendBinaryStringInfo</name><argument_list>(<argument><expr><name>s</name></expr></argument>, <argument><expr><name><name>myport</name><operator>-&gt;</operator><name>PqRecvBuffer</name></name> <operator>+</operator> <name><name>myport</name><operator>-&gt;</operator><name>PqRecvPointer</name></name></expr></argument>,
+                               <argument><expr><name><name>myport</name><operator>-&gt;</operator><name>PqRecvLength</name></name> <operator>-</operator> <name><name>myport</name><operator>-&gt;</operator><name>PqRecvPointer</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <expr_stmt><expr><name><name>myport</name><operator>-&gt;</operator><name>PqRecvPointer</name></name> <operator>=</operator> <name><name>myport</name><operator>-&gt;</operator><name>PqRecvLength</name></name></expr>;</expr_stmt>
+    </block_content>}</block></for>
+</block_content>}</block></function>
+
+
+<comment type="block">/* --------------------------------
+ *        pq_getmessage    - get a message with length word from connection
+ *
+ *        The return value is placed in an expansible StringInfo, which has
+ *        already been initialized by the caller.
+ *        Only the message body is placed in the StringInfo; the length word
+ *        is removed.  Also, s-&gt;cursor is initialized to zero for convenience
+ *        in scanning the message contents.
+ *
+ *        If maxlen is not zero, it is an upper limit on the length of the
+ *        message we are willing to accept.  We abort the connection (by
+ *        returning EOF) if client tries to send more than that.
+ *
+ *        returns 0 if OK, EOF if trouble
+ * --------------------------------
+ */</comment>
+<function><type><name>int</name></type>
+<name>pq_getmessage</name><parameter_list>(<parameter><decl><type><name>Port</name> <modifier>*</modifier></type><name>myport</name></decl></parameter>, <parameter><decl><type><name>StringInfo</name></type> <name>s</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>maxlen</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <decl_stmt><decl><type><name>int32</name></type>        <name>len</name></decl>;</decl_stmt>
+
+    <expr_stmt><expr><call><name>resetStringInfo</name><argument_list>(<argument><expr><name>s</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+    <comment type="block">/* Read message length word */</comment>
+    <if_stmt><if>if <condition>(<expr><call><name>pq_getbytes</name><argument_list>(<argument><expr><name>myport</name></expr></argument>, <argument><expr><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <operator>&amp;</operator><name>len</name></expr></argument>, <argument><expr><literal type="number">4</literal></expr></argument>)</argument_list></call> <operator>==</operator> <name>EOF</name></expr>)</condition>
+    <block>{<block_content>
+        <expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>COMMERROR</name></expr></argument>,
+                <argument><expr><operator>(</operator><name>EPROTO</name><operator>,</operator>
+                 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"unexpected EOF within message length word"</literal></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <return>return <expr><name>EOF</name></expr>;</return>
+    </block_content>}</block></if></if_stmt>
+
+    <expr_stmt><expr><name>len</name> <operator>=</operator> <call><name>ntohl</name><argument_list>(<argument><expr><name>len</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+    <if_stmt><if>if <condition>(<expr><name>len</name> <operator>&lt;</operator> <literal type="number">4</literal> <operator>||</operator>
+        <operator>(</operator><name>maxlen</name> <operator>&gt;</operator> <literal type="number">0</literal> <operator>&amp;&amp;</operator> <name>len</name> <operator>&gt;</operator> <name>maxlen</name><operator>)</operator></expr>)</condition>
+    <block>{<block_content>
+        <expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>COMMERROR</name></expr></argument>,
+                <argument><expr><operator>(</operator><name>EPROTO</name><operator>,</operator>
+                 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"invalid message length"</literal></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <return>return <expr><name>EOF</name></expr>;</return>
+    </block_content>}</block></if></if_stmt>
+
+    <expr_stmt><expr><name>len</name> <operator>-=</operator> <literal type="number">4</literal></expr>;</expr_stmt>                    <comment type="block">/* discount length itself */</comment>
+
+    <if_stmt><if>if <condition>(<expr><name>len</name> <operator>&gt;</operator> <literal type="number">0</literal></expr>)</condition>
+    <block>{<block_content>
+        <comment type="block">/*
+         * Allocate space for message.    If we run out of room (ridiculously
+         * large message), we will elog(ERROR), but we want to discard the
+         * message body so as not to lose communication sync.
+         */</comment>
+        <expr_stmt><expr><call><name>enlargeStringInfo</name><argument_list>(<argument><expr><name>s</name></expr></argument>, <argument><expr><name>len</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+        <comment type="block">/* And grab the message */</comment>
+        <if_stmt><if>if <condition>(<expr><call><name>pq_getbytes</name><argument_list>(<argument><expr><name>myport</name></expr></argument>, <argument><expr><name><name>s</name><operator>-&gt;</operator><name>data</name></name></expr></argument>, <argument><expr><name>len</name></expr></argument>)</argument_list></call> <operator>==</operator> <name>EOF</name></expr>)</condition>
+        <block>{<block_content>
+            <expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>COMMERROR</name></expr></argument>,
+                    <argument><expr><operator>(</operator><name>EPROTO</name><operator>,</operator>
+                     <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"incomplete message from client"</literal></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+            <return>return <expr><name>EOF</name></expr>;</return>
+        </block_content>}</block></if></if_stmt>
+        <expr_stmt><expr><name><name>s</name><operator>-&gt;</operator><name>len</name></name> <operator>=</operator> <name>len</name></expr>;</expr_stmt>
+        <comment type="block">/* Place a trailing null per StringInfo convention */</comment>
+        <expr_stmt><expr><name><name>s</name><operator>-&gt;</operator><name>data</name><index>[<expr><name>len</name></expr>]</index></name> <operator>=</operator> <literal type="char">'\0'</literal></expr>;</expr_stmt>
+    </block_content>}</block></if></if_stmt>
+
+    <return>return <expr><literal type="number">0</literal></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/* --------------------------------
+ *        pq_putbytes        - send bytes to connection (not flushed until pq_flush)
+ *
+ *        returns 0 if OK, EOF if trouble
+ * --------------------------------
+ */</comment>
+<function><type><name>int</name></type>
+<name>pq_putbytes</name><parameter_list>(<parameter><decl><type><name>Port</name> <modifier>*</modifier></type><name>myport</name></decl></parameter>, <parameter><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>s</name></decl></parameter>, <parameter><decl><type><name>size_t</name></type> <name>len</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <decl_stmt><decl><type><name>int</name></type>            <name>res</name></decl>;</decl_stmt>
+
+    <expr_stmt><expr><name>res</name> <operator>=</operator> <call><name>internal_putbytes</name><argument_list>(<argument><expr><name>myport</name></expr></argument>, <argument><expr><name>s</name></expr></argument>, <argument><expr><name>len</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <return>return <expr><name>res</name></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><specifier>static</specifier> <name>int</name></type>
+<name>internal_putbytes</name><parameter_list>(<parameter><decl><type><name>Port</name> <modifier>*</modifier></type><name>myport</name></decl></parameter>, <parameter><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>s</name></decl></parameter>, <parameter><decl><type><name>size_t</name></type> <name>len</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <decl_stmt><decl><type><name>size_t</name></type>        <name>amount</name></decl>;</decl_stmt>
+
+    <while>while <condition>(<expr><name>len</name> <operator>&gt;</operator> <literal type="number">0</literal></expr>)</condition>
+    <block>{<block_content>
+        <comment type="block">/* If buffer is full, then flush it out */</comment>
+        <if_stmt><if>if <condition>(<expr><name><name>myport</name><operator>-&gt;</operator><name>PqSendPointer</name></name> <operator>&gt;=</operator> <name>PQ_BUFFER_SIZE</name></expr>)</condition><block type="pseudo"><block_content>
+            <if_stmt><if>if <condition>(<expr><call><name>internal_flush</name><argument_list>(<argument><expr><name>myport</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+                <return>return <expr><name>EOF</name></expr>;</return></block_content></block></if></if_stmt></block_content></block></if></if_stmt>
+        <expr_stmt><expr><name>amount</name> <operator>=</operator> <name>PQ_BUFFER_SIZE</name> <operator>-</operator> <name><name>myport</name><operator>-&gt;</operator><name>PqSendPointer</name></name></expr>;</expr_stmt>
+        <if_stmt><if>if <condition>(<expr><name>amount</name> <operator>&gt;</operator> <name>len</name></expr>)</condition><block type="pseudo"><block_content>
+            <expr_stmt><expr><name>amount</name> <operator>=</operator> <name>len</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+        <expr_stmt><expr><call><name>memcpy</name><argument_list>(<argument><expr><name><name>myport</name><operator>-&gt;</operator><name>PqSendBuffer</name></name> <operator>+</operator> <name><name>myport</name><operator>-&gt;</operator><name>PqSendPointer</name></name></expr></argument>, <argument><expr><name>s</name></expr></argument>, <argument><expr><name>amount</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <expr_stmt><expr><name><name>myport</name><operator>-&gt;</operator><name>PqSendPointer</name></name> <operator>+=</operator> <name>amount</name></expr>;</expr_stmt>
+        <expr_stmt><expr><name>s</name> <operator>+=</operator> <name>amount</name></expr>;</expr_stmt>
+        <expr_stmt><expr><name>len</name> <operator>-=</operator> <name>amount</name></expr>;</expr_stmt>
+    </block_content>}</block></while>
+    <return>return <expr><literal type="number">0</literal></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/* --------------------------------
+ *        pq_flush        - flush pending output
+ *
+ *        returns 0 if OK, EOF if trouble
+ * --------------------------------
+ */</comment>
+<function><type><name>int</name></type>
+<name>pq_flush</name><parameter_list>(<parameter><decl><type><name>Port</name> <modifier>*</modifier></type><name>myport</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <decl_stmt><decl><type><name>int</name></type>            <name>res</name></decl>;</decl_stmt>
+
+    <comment type="block">/* No-op if reentrant call */</comment>
+    <expr_stmt><expr><name>res</name> <operator>=</operator> <call><name>internal_flush</name><argument_list>(<argument><expr><name>myport</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <return>return <expr><name>res</name></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><specifier>static</specifier> <name>int</name></type>
+<name>internal_flush</name><parameter_list>(<parameter><decl><type><name>Port</name> <modifier>*</modifier></type><name>myport</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <decl_stmt><decl><type><specifier>static</specifier> <name>int</name></type>    <name>last_reported_send_errno</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+
+    <decl_stmt><decl><type><name>char</name>       <modifier>*</modifier></type><name>bufptr</name> <init>= <expr><name><name>myport</name><operator>-&gt;</operator><name>PqSendBuffer</name></name></expr></init></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>char</name>       <modifier>*</modifier></type><name>bufend</name> <init>= <expr><name><name>myport</name><operator>-&gt;</operator><name>PqSendBuffer</name></name> <operator>+</operator> <name><name>myport</name><operator>-&gt;</operator><name>PqSendPointer</name></name></expr></init></decl>;</decl_stmt>
+
+    <while>while <condition>(<expr><name>bufptr</name> <operator>&lt;</operator> <name>bufend</name></expr>)</condition>
+    <block>{<block_content>
+        <decl_stmt><decl><type><name>int</name></type>            <name>r</name></decl>;</decl_stmt>
+
+        <expr_stmt><expr><name>r</name> <operator>=</operator> <call><name>send</name><argument_list>(<argument><expr><name><name>myport</name><operator>-&gt;</operator><name>sock</name></name></expr></argument>, <argument><expr><name>bufptr</name></expr></argument>, <argument><expr><name>bufend</name> <operator>-</operator> <name>bufptr</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <expr_stmt><expr><name><name>myport</name><operator>-&gt;</operator><name>last_call</name></name> <operator>=</operator> <name>GTM_LastCall_SEND</name></expr>;</expr_stmt>
+
+        <if_stmt><if>if <condition>(<expr><name>r</name> <operator>&lt;=</operator> <literal type="number">0</literal></expr>)</condition>
+        <block>{<block_content>
+            <expr_stmt><expr><name><name>myport</name><operator>-&gt;</operator><name>last_errno</name></name> <operator>=</operator> <name>errno</name></expr>;</expr_stmt>
+            <if_stmt><if>if <condition>(<expr><name>errno</name> <operator>==</operator> <name>EINTR</name></expr>)</condition><block type="pseudo"><block_content>
+                <continue>continue;</continue></block_content></block></if></if_stmt>        <comment type="block">/* Ok if we were interrupted */</comment>
+
+            <if_stmt><if>if<condition>(<expr><name><name>myport</name><operator>-&gt;</operator><name>is_nonblocking</name></name></expr>)</condition>
+            <block>{<block_content>
+                <if_stmt><if>if<condition>(<expr><name>errno</name> <operator>==</operator> <name>EAGAIN</name></expr>)</condition>
+                <block>{<block_content>
+                    <continue>continue;</continue>
+                </block_content>}</block></if></if_stmt>
+            </block_content>}</block></if></if_stmt>
+
+            <comment type="block">/*
+             * Careful: an ereport() that tries to write to the client would
+             * cause recursion to here, leading to stack overflow and core
+             * dump!  This message must go *only* to the postmaster log.
+             *
+             * If a client disconnects while we're in the midst of output, we
+             * might write quite a bit of data before we get to a safe query
+             * abort point.  So, suppress duplicate log messages.
+             */</comment>
+            <if_stmt><if>if <condition>(<expr><name>errno</name> <operator>!=</operator> <name>last_reported_send_errno</name></expr>)</condition>
+            <block>{<block_content>
+                <expr_stmt><expr><name>last_reported_send_errno</name> <operator>=</operator> <name>errno</name></expr>;</expr_stmt>
+                <expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>COMMERROR</name></expr></argument>,
+                        <argument><expr><operator>(</operator><name>EACCES</name><operator>,</operator>
+                         <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"could not send data to client: %m"</literal></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+            </block_content>}</block></if></if_stmt>
+
+            <comment type="block">/*
+             * We drop the buffered data anyway so that processing can
+             * continue, even though we'll probably quit soon.
+             */</comment>
+            <expr_stmt><expr><name><name>myport</name><operator>-&gt;</operator><name>PqSendPointer</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+            <return>return <expr><name>EOF</name></expr>;</return>
+        </block_content>}</block></if>
+        <else>else<block type="pseudo"><block_content>
+            <expr_stmt><expr><name><name>myport</name><operator>-&gt;</operator><name>last_errno</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt></block_content></block></else></if_stmt>
+
+        <expr_stmt><expr><name>last_reported_send_errno</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>    <comment type="block">/* reset after any successful send */</comment>
+        <expr_stmt><expr><name>bufptr</name> <operator>+=</operator> <name>r</name></expr>;</expr_stmt>
+    </block_content>}</block></while>
+
+    <expr_stmt><expr><name><name>myport</name><operator>-&gt;</operator><name>PqSendPointer</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+    <return>return <expr><literal type="number">0</literal></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/* --------------------------------
+ * Message-level I/O routines begin here.
+ *
+ * These routines understand about the old-style COPY OUT protocol.
+ * --------------------------------
+ */</comment>
+
+
+<comment type="block">/* --------------------------------
+ *        pq_putmessage    - send a normal message (suppressed in COPY OUT mode)
+ *
+ *        If msgtype is not '\0', it is a message type code to place before
+ *        the message body.  If msgtype is '\0', then the message has no type
+ *        code (this is only valid in pre-3.0 protocols).
+ *
+ *        len is the length of the message body data at *s.  In protocol 3.0
+ *        and later, a message length word (equal to len+4 because it counts
+ *        itself too) is inserted by this routine.
+ *
+ *        All normal messages are suppressed while old-style COPY OUT is in
+ *        progress.  (In practice only a few notice messages might get emitted
+ *        then; dropping them is annoying, but at least they will still appear
+ *        in the postmaster log.)
+ *
+ *        We also suppress messages generated while pqcomm.c is busy.  This
+ *        avoids any possibility of messages being inserted within other
+ *        messages.  The only known trouble case arises if SIGQUIT occurs
+ *        during a pqcomm.c routine --- quickdie() will try to send a warning
+ *        message, and the most reasonable approach seems to be to drop it.
+ *
+ *        returns 0 if OK, EOF if trouble
+ * --------------------------------
+ */</comment>
+<function><type><name>int</name></type>
+<name>pq_putmessage</name><parameter_list>(<parameter><decl><type><name>Port</name> <modifier>*</modifier></type><name>myport</name></decl></parameter>, <parameter><decl><type><name>char</name></type> <name>msgtype</name></decl></parameter>, <parameter><decl><type><specifier>const</specifier> <name>char</name> <modifier>*</modifier></type><name>s</name></decl></parameter>, <parameter><decl><type><name>size_t</name></type> <name>len</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <decl_stmt><decl><type><name>uint32</name></type>        <name>n32</name></decl>;</decl_stmt>
+    <if_stmt><if>if <condition>(<expr><name>msgtype</name></expr>)</condition><block type="pseudo"><block_content>
+        <if_stmt><if>if <condition>(<expr><call><name>internal_putbytes</name><argument_list>(<argument><expr><name>myport</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>msgtype</name></expr></argument>, <argument><expr><literal type="number">1</literal></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+            <goto>goto <name>fail</name>;</goto></block_content></block></if></if_stmt></block_content></block></if></if_stmt>
+
+    <expr_stmt><expr><name>n32</name> <operator>=</operator> <call><name>htonl</name><argument_list>(<argument><expr><operator>(</operator><name>uint32</name><operator>)</operator> <operator>(</operator><name>len</name> <operator>+</operator> <literal type="number">4</literal><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <if_stmt><if>if <condition>(<expr><call><name>internal_putbytes</name><argument_list>(<argument><expr><name>myport</name></expr></argument>, <argument><expr><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <operator>&amp;</operator><name>n32</name></expr></argument>, <argument><expr><literal type="number">4</literal></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+        <goto>goto <name>fail</name>;</goto></block_content></block></if></if_stmt>
+
+    <if_stmt><if>if <condition>(<expr><call><name>internal_putbytes</name><argument_list>(<argument><expr><name>myport</name></expr></argument>, <argument><expr><name>s</name></expr></argument>, <argument><expr><name>len</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+        <goto>goto <name>fail</name>;</goto></block_content></block></if></if_stmt>
+    <return>return <expr><literal type="number">0</literal></expr>;</return>
+
+<label><name>fail</name>:</label>
+    <return>return <expr><name>EOF</name></expr>;</return>
+</block_content>}</block></function>
+
+
+<comment type="block">/*
+ * Support for TCP Keepalive parameters
+ */</comment>
+
+<function><type><name>int</name></type>
+<name>pq_getkeepalivesidle</name><parameter_list>(<parameter><decl><type><name>Port</name> <modifier>*</modifier></type><name>port</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>TCP_KEEPIDLE</name></cpp:ifdef>
+    <if_stmt><if>if <condition>(<expr><name>port</name> <operator>==</operator> <name>NULL</name> <operator>||</operator> <call><name>IS_AF_UNIX</name><argument_list>(<argument><expr><name><name>port</name><operator>-&gt;</operator><name>laddr</name><operator>.</operator><name>addr</name><operator>.</operator><name>ss_family</name></name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+        <return>return <expr><literal type="number">0</literal></expr>;</return></block_content></block></if></if_stmt>
+
+    <if_stmt><if>if <condition>(<expr><name><name>port</name><operator>-&gt;</operator><name>keepalives_idle</name></name> <operator>!=</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+        <return>return <expr><name><name>port</name><operator>-&gt;</operator><name>keepalives_idle</name></name></expr>;</return></block_content></block></if></if_stmt>
+
+    <if_stmt><if>if <condition>(<expr><name><name>port</name><operator>-&gt;</operator><name>default_keepalives_idle</name></name> <operator>==</operator> <literal type="number">0</literal></expr>)</condition>
+    <block>{<block_content>
+        <decl_stmt><decl><type><name>ACCEPT_TYPE_ARG3</name></type> <name>size</name> <init>= <expr><sizeof>sizeof<argument_list>(<argument><expr><name><name>port</name><operator>-&gt;</operator><name>default_keepalives_idle</name></name></expr></argument>)</argument_list></sizeof></expr></init></decl>;</decl_stmt>
+
+        <if_stmt><if>if <condition>(<expr><call><name>getsockopt</name><argument_list>(<argument><expr><name><name>port</name><operator>-&gt;</operator><name>sock</name></name></expr></argument>, <argument><expr><name>IPPROTO_TCP</name></expr></argument>, <argument><expr><name>TCP_KEEPIDLE</name></expr></argument>,
+                       <argument><expr><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <operator>&amp;</operator><name><name>port</name><operator>-&gt;</operator><name>default_keepalives_idle</name></name></expr></argument>,
+                       <argument><expr><operator>&amp;</operator><name>size</name></expr></argument>)</argument_list></call> <operator>&lt;</operator> <literal type="number">0</literal></expr>)</condition>
+        <block>{<block_content>
+            <expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>LOG</name></expr></argument>, <argument><expr><literal type="string">"getsockopt(TCP_KEEPIDLE) failed: %m"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+            <expr_stmt><expr><name><name>port</name><operator>-&gt;</operator><name>default_keepalives_idle</name></name> <operator>=</operator> <operator>-</operator><literal type="number">1</literal></expr>;</expr_stmt> <comment type="block">/* don't know */</comment>
+        </block_content>}</block></if></if_stmt>
+    </block_content>}</block></if></if_stmt>
+
+    <return>return <expr><name><name>port</name><operator>-&gt;</operator><name>default_keepalives_idle</name></name></expr>;</return>
+<cpp:else>#<cpp:directive>else</cpp:directive></cpp:else>
+    <return>return <expr><literal type="number">0</literal></expr>;</return>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+</block_content>}</block></function>
+
+<function><type><name>int</name></type>
+<name>pq_setkeepalivesidle</name><parameter_list>(<parameter><decl><type><name>int</name></type> <name>idle</name></decl></parameter>, <parameter><decl><type><name>Port</name> <modifier>*</modifier></type><name>port</name></decl></parameter>)</parameter_list>
+<block>{<block_content><comment type="line">// #lizard forgives</comment>
+    <if_stmt><if>if <condition>(<expr><name>port</name> <operator>==</operator> <name>NULL</name> <operator>||</operator> <call><name>IS_AF_UNIX</name><argument_list>(<argument><expr><name><name>port</name><operator>-&gt;</operator><name>laddr</name><operator>.</operator><name>addr</name><operator>.</operator><name>ss_family</name></name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+        <return>return <expr><name>STATUS_OK</name></expr>;</return></block_content></block></if></if_stmt>
+
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>TCP_KEEPIDLE</name></cpp:ifdef>
+    <if_stmt><if>if <condition>(<expr><name>idle</name> <operator>==</operator> <name><name>port</name><operator>-&gt;</operator><name>keepalives_idle</name></name></expr>)</condition><block type="pseudo"><block_content>
+        <return>return <expr><name>STATUS_OK</name></expr>;</return></block_content></block></if></if_stmt>
+
+    <if_stmt><if>if <condition>(<expr><name><name>port</name><operator>-&gt;</operator><name>default_keepalives_idle</name></name> <operator>&lt;=</operator> <literal type="number">0</literal></expr>)</condition>
+    <block>{<block_content>
+        <if_stmt><if>if <condition>(<expr><call><name>pq_getkeepalivesidle</name><argument_list>(<argument><expr><name>port</name></expr></argument>)</argument_list></call> <operator>&lt;</operator> <literal type="number">0</literal></expr>)</condition>
+        <block>{<block_content>
+            <if_stmt><if>if <condition>(<expr><name>idle</name> <operator>==</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+                <return>return <expr><name>STATUS_OK</name></expr>;</return></block_content></block></if>        <comment type="block">/* default is set but unknown */</comment>
+            <else>else<block type="pseudo"><block_content>
+                <return>return <expr><name>STATUS_ERROR</name></expr>;</return></block_content></block></else></if_stmt>
+        </block_content>}</block></if></if_stmt>
+    </block_content>}</block></if></if_stmt>
+
+    <if_stmt><if>if <condition>(<expr><name>idle</name> <operator>==</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+        <expr_stmt><expr><name>idle</name> <operator>=</operator> <name><name>port</name><operator>-&gt;</operator><name>default_keepalives_idle</name></name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+    <if_stmt><if>if <condition>(<expr><call><name>setsockopt</name><argument_list>(<argument><expr><name><name>port</name><operator>-&gt;</operator><name>sock</name></name></expr></argument>, <argument><expr><name>IPPROTO_TCP</name></expr></argument>, <argument><expr><name>TCP_KEEPIDLE</name></expr></argument>,
+                   <argument><expr><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <operator>&amp;</operator><name>idle</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>idle</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call> <operator>&lt;</operator> <literal type="number">0</literal></expr>)</condition>
+    <block>{<block_content>
+        <expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>LOG</name></expr></argument>, <argument><expr><literal type="string">"setsockopt(TCP_KEEPIDLE) failed: %m"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <return>return <expr><name>STATUS_ERROR</name></expr>;</return>
+    </block_content>}</block></if></if_stmt>
+
+    <expr_stmt><expr><name><name>port</name><operator>-&gt;</operator><name>keepalives_idle</name></name> <operator>=</operator> <name>idle</name></expr>;</expr_stmt>
+<cpp:else>#<cpp:directive>else</cpp:directive></cpp:else>
+    <if_stmt><if>if <condition>(<expr><name>idle</name> <operator>!=</operator> <literal type="number">0</literal></expr>)</condition>
+    <block>{<block_content>
+        <expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>LOG</name></expr></argument>, <argument><expr><literal type="string">"setsockopt(TCP_KEEPIDLE) not supported"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <return>return <expr><name>STATUS_ERROR</name></expr>;</return>
+    </block_content>}</block></if></if_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+    <return>return <expr><name>STATUS_OK</name></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><name>int</name></type>
+<name>pq_getkeepalivesinterval</name><parameter_list>(<parameter><decl><type><name>Port</name> <modifier>*</modifier></type><name>port</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>TCP_KEEPINTVL</name></cpp:ifdef>
+    <if_stmt><if>if <condition>(<expr><name>port</name> <operator>==</operator> <name>NULL</name> <operator>||</operator> <call><name>IS_AF_UNIX</name><argument_list>(<argument><expr><name><name>port</name><operator>-&gt;</operator><name>laddr</name><operator>.</operator><name>addr</name><operator>.</operator><name>ss_family</name></name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+        <return>return <expr><literal type="number">0</literal></expr>;</return></block_content></block></if></if_stmt>
+
+    <if_stmt><if>if <condition>(<expr><name><name>port</name><operator>-&gt;</operator><name>keepalives_interval</name></name> <operator>!=</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+        <return>return <expr><name><name>port</name><operator>-&gt;</operator><name>keepalives_interval</name></name></expr>;</return></block_content></block></if></if_stmt>
+
+    <if_stmt><if>if <condition>(<expr><name><name>port</name><operator>-&gt;</operator><name>default_keepalives_interval</name></name> <operator>==</operator> <literal type="number">0</literal></expr>)</condition>
+    <block>{<block_content>
+        <decl_stmt><decl><type><name>ACCEPT_TYPE_ARG3</name></type> <name>size</name> <init>= <expr><sizeof>sizeof<argument_list>(<argument><expr><name><name>port</name><operator>-&gt;</operator><name>default_keepalives_interval</name></name></expr></argument>)</argument_list></sizeof></expr></init></decl>;</decl_stmt>
+
+        <if_stmt><if>if <condition>(<expr><call><name>getsockopt</name><argument_list>(<argument><expr><name><name>port</name><operator>-&gt;</operator><name>sock</name></name></expr></argument>, <argument><expr><name>IPPROTO_TCP</name></expr></argument>, <argument><expr><name>TCP_KEEPINTVL</name></expr></argument>,
+                       <argument><expr><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <operator>&amp;</operator><name><name>port</name><operator>-&gt;</operator><name>default_keepalives_interval</name></name></expr></argument>,
+                       <argument><expr><operator>&amp;</operator><name>size</name></expr></argument>)</argument_list></call> <operator>&lt;</operator> <literal type="number">0</literal></expr>)</condition>
+        <block>{<block_content>
+            <expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>LOG</name></expr></argument>, <argument><expr><literal type="string">"getsockopt(TCP_KEEPINTVL) failed: %m"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+            <expr_stmt><expr><name><name>port</name><operator>-&gt;</operator><name>default_keepalives_interval</name></name> <operator>=</operator> <operator>-</operator><literal type="number">1</literal></expr>;</expr_stmt>        <comment type="block">/* don't know */</comment>
+        </block_content>}</block></if></if_stmt>
+    </block_content>}</block></if></if_stmt>
+
+    <return>return <expr><name><name>port</name><operator>-&gt;</operator><name>default_keepalives_interval</name></name></expr>;</return>
+<cpp:else>#<cpp:directive>else</cpp:directive></cpp:else>
+    <return>return <expr><literal type="number">0</literal></expr>;</return>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+</block_content>}</block></function>
+
+<function><type><name>int</name></type>
+<name>pq_setkeepalivesinterval</name><parameter_list>(<parameter><decl><type><name>int</name></type> <name>interval</name></decl></parameter>, <parameter><decl><type><name>Port</name> <modifier>*</modifier></type><name>port</name></decl></parameter>)</parameter_list>
+<block>{<block_content><comment type="line">// #lizard forgives</comment>
+    <if_stmt><if>if <condition>(<expr><name>port</name> <operator>==</operator> <name>NULL</name> <operator>||</operator> <call><name>IS_AF_UNIX</name><argument_list>(<argument><expr><name><name>port</name><operator>-&gt;</operator><name>laddr</name><operator>.</operator><name>addr</name><operator>.</operator><name>ss_family</name></name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+        <return>return <expr><name>STATUS_OK</name></expr>;</return></block_content></block></if></if_stmt>
+
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>TCP_KEEPINTVL</name></cpp:ifdef>
+    <if_stmt><if>if <condition>(<expr><name>interval</name> <operator>==</operator> <name><name>port</name><operator>-&gt;</operator><name>keepalives_interval</name></name></expr>)</condition><block type="pseudo"><block_content>
+        <return>return <expr><name>STATUS_OK</name></expr>;</return></block_content></block></if></if_stmt>
+
+    <if_stmt><if>if <condition>(<expr><name><name>port</name><operator>-&gt;</operator><name>default_keepalives_interval</name></name> <operator>&lt;=</operator> <literal type="number">0</literal></expr>)</condition>
+    <block>{<block_content>
+        <if_stmt><if>if <condition>(<expr><call><name>pq_getkeepalivesinterval</name><argument_list>(<argument><expr><name>port</name></expr></argument>)</argument_list></call> <operator>&lt;</operator> <literal type="number">0</literal></expr>)</condition>
+        <block>{<block_content>
+            <if_stmt><if>if <condition>(<expr><name>interval</name> <operator>==</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+                <return>return <expr><name>STATUS_OK</name></expr>;</return></block_content></block></if>        <comment type="block">/* default is set but unknown */</comment>
+            <else>else<block type="pseudo"><block_content>
+                <return>return <expr><name>STATUS_ERROR</name></expr>;</return></block_content></block></else></if_stmt>
+        </block_content>}</block></if></if_stmt>
+    </block_content>}</block></if></if_stmt>
+
+    <if_stmt><if>if <condition>(<expr><name>interval</name> <operator>==</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+        <expr_stmt><expr><name>interval</name> <operator>=</operator> <name><name>port</name><operator>-&gt;</operator><name>default_keepalives_interval</name></name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+    <if_stmt><if>if <condition>(<expr><call><name>setsockopt</name><argument_list>(<argument><expr><name><name>port</name><operator>-&gt;</operator><name>sock</name></name></expr></argument>, <argument><expr><name>IPPROTO_TCP</name></expr></argument>, <argument><expr><name>TCP_KEEPINTVL</name></expr></argument>,
+                   <argument><expr><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <operator>&amp;</operator><name>interval</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>interval</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call> <operator>&lt;</operator> <literal type="number">0</literal></expr>)</condition>
+    <block>{<block_content>
+        <expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>LOG</name></expr></argument>, <argument><expr><literal type="string">"setsockopt(TCP_KEEPINTVL) failed: %m"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <return>return <expr><name>STATUS_ERROR</name></expr>;</return>
+    </block_content>}</block></if></if_stmt>
+
+    <expr_stmt><expr><name><name>port</name><operator>-&gt;</operator><name>keepalives_interval</name></name> <operator>=</operator> <name>interval</name></expr>;</expr_stmt>
+<cpp:else>#<cpp:directive>else</cpp:directive></cpp:else>
+    <if_stmt><if>if <condition>(<expr><name>interval</name> <operator>!=</operator> <literal type="number">0</literal></expr>)</condition>
+    <block>{<block_content>
+        <expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>LOG</name></expr></argument>, <argument><expr><literal type="string">"setsockopt(TCP_KEEPINTVL) not supported"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <return>return <expr><name>STATUS_ERROR</name></expr>;</return>
+    </block_content>}</block></if></if_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+    <return>return <expr><name>STATUS_OK</name></expr>;</return>
+</block_content>}</block></function>
+
+<function><type><name>int</name></type>
+<name>pq_getkeepalivescount</name><parameter_list>(<parameter><decl><type><name>Port</name> <modifier>*</modifier></type><name>port</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>TCP_KEEPCNT</name></cpp:ifdef>
+    <if_stmt><if>if <condition>(<expr><name>port</name> <operator>==</operator> <name>NULL</name> <operator>||</operator> <call><name>IS_AF_UNIX</name><argument_list>(<argument><expr><name><name>port</name><operator>-&gt;</operator><name>laddr</name><operator>.</operator><name>addr</name><operator>.</operator><name>ss_family</name></name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+        <return>return <expr><literal type="number">0</literal></expr>;</return></block_content></block></if></if_stmt>
+
+    <if_stmt><if>if <condition>(<expr><name><name>port</name><operator>-&gt;</operator><name>keepalives_count</name></name> <operator>!=</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+        <return>return <expr><name><name>port</name><operator>-&gt;</operator><name>keepalives_count</name></name></expr>;</return></block_content></block></if></if_stmt>
+
+    <if_stmt><if>if <condition>(<expr><name><name>port</name><operator>-&gt;</operator><name>default_keepalives_count</name></name> <operator>==</operator> <literal type="number">0</literal></expr>)</condition>
+    <block>{<block_content>
+        <decl_stmt><decl><type><name>ACCEPT_TYPE_ARG3</name></type> <name>size</name> <init>= <expr><sizeof>sizeof<argument_list>(<argument><expr><name><name>port</name><operator>-&gt;</operator><name>default_keepalives_count</name></name></expr></argument>)</argument_list></sizeof></expr></init></decl>;</decl_stmt>
+
+        <if_stmt><if>if <condition>(<expr><call><name>getsockopt</name><argument_list>(<argument><expr><name><name>port</name><operator>-&gt;</operator><name>sock</name></name></expr></argument>, <argument><expr><name>IPPROTO_TCP</name></expr></argument>, <argument><expr><name>TCP_KEEPCNT</name></expr></argument>,
+                       <argument><expr><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <operator>&amp;</operator><name><name>port</name><operator>-&gt;</operator><name>default_keepalives_count</name></name></expr></argument>,
+                       <argument><expr><operator>&amp;</operator><name>size</name></expr></argument>)</argument_list></call> <operator>&lt;</operator> <literal type="number">0</literal></expr>)</condition>
+        <block>{<block_content>
+            <expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>LOG</name></expr></argument>, <argument><expr><literal type="string">"getsockopt(TCP_KEEPCNT) failed: %m"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+            <expr_stmt><expr><name><name>port</name><operator>-&gt;</operator><name>default_keepalives_count</name></name> <operator>=</operator> <operator>-</operator><literal type="number">1</literal></expr>;</expr_stmt>        <comment type="block">/* don't know */</comment>
+        </block_content>}</block></if></if_stmt>
+    </block_content>}</block></if></if_stmt>
+
+    <return>return <expr><name><name>port</name><operator>-&gt;</operator><name>default_keepalives_count</name></name></expr>;</return>
+<cpp:else>#<cpp:directive>else</cpp:directive></cpp:else>
+    <return>return <expr><literal type="number">0</literal></expr>;</return>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+</block_content>}</block></function>
+
+<function><type><name>int</name></type>
+<name>pq_setkeepalivescount</name><parameter_list>(<parameter><decl><type><name>int</name></type> <name>count</name></decl></parameter>, <parameter><decl><type><name>Port</name> <modifier>*</modifier></type><name>port</name></decl></parameter>)</parameter_list>
+<block>{<block_content><comment type="line">// #lizard forgives</comment>
+    <if_stmt><if>if <condition>(<expr><name>port</name> <operator>==</operator> <name>NULL</name> <operator>||</operator> <call><name>IS_AF_UNIX</name><argument_list>(<argument><expr><name><name>port</name><operator>-&gt;</operator><name>laddr</name><operator>.</operator><name>addr</name><operator>.</operator><name>ss_family</name></name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+        <return>return <expr><name>STATUS_OK</name></expr>;</return></block_content></block></if></if_stmt>
+
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>TCP_KEEPCNT</name></cpp:ifdef>
+    <if_stmt><if>if <condition>(<expr><name>count</name> <operator>==</operator> <name><name>port</name><operator>-&gt;</operator><name>keepalives_count</name></name></expr>)</condition><block type="pseudo"><block_content>
+        <return>return <expr><name>STATUS_OK</name></expr>;</return></block_content></block></if></if_stmt>
+
+    <if_stmt><if>if <condition>(<expr><name><name>port</name><operator>-&gt;</operator><name>default_keepalives_count</name></name> <operator>&lt;=</operator> <literal type="number">0</literal></expr>)</condition>
+    <block>{<block_content>
+        <if_stmt><if>if <condition>(<expr><call><name>pq_getkeepalivescount</name><argument_list>(<argument><expr><name>port</name></expr></argument>)</argument_list></call> <operator>&lt;</operator> <literal type="number">0</literal></expr>)</condition>
+        <block>{<block_content>
+            <if_stmt><if>if <condition>(<expr><name>count</name> <operator>==</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+                <return>return <expr><name>STATUS_OK</name></expr>;</return></block_content></block></if>        <comment type="block">/* default is set but unknown */</comment>
+            <else>else<block type="pseudo"><block_content>
+                <return>return <expr><name>STATUS_ERROR</name></expr>;</return></block_content></block></else></if_stmt>
+        </block_content>}</block></if></if_stmt>
+    </block_content>}</block></if></if_stmt>
+
+    <if_stmt><if>if <condition>(<expr><name>count</name> <operator>==</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+        <expr_stmt><expr><name>count</name> <operator>=</operator> <name><name>port</name><operator>-&gt;</operator><name>default_keepalives_count</name></name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+    <if_stmt><if>if <condition>(<expr><call><name>setsockopt</name><argument_list>(<argument><expr><name><name>port</name><operator>-&gt;</operator><name>sock</name></name></expr></argument>, <argument><expr><name>IPPROTO_TCP</name></expr></argument>, <argument><expr><name>TCP_KEEPCNT</name></expr></argument>,
+                   <argument><expr><operator>(</operator><name>char</name> <operator>*</operator><operator>)</operator> <operator>&amp;</operator><name>count</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>count</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call> <operator>&lt;</operator> <literal type="number">0</literal></expr>)</condition>
+    <block>{<block_content>
+        <expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>LOG</name></expr></argument>, <argument><expr><literal type="string">"setsockopt(TCP_KEEPCNT) failed: %m"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <return>return <expr><name>STATUS_ERROR</name></expr>;</return>
+    </block_content>}</block></if></if_stmt>
+
+    <expr_stmt><expr><name><name>port</name><operator>-&gt;</operator><name>keepalives_count</name></name> <operator>=</operator> <name>count</name></expr>;</expr_stmt>
+<cpp:else>#<cpp:directive>else</cpp:directive></cpp:else>
+    <if_stmt><if>if <condition>(<expr><name>count</name> <operator>!=</operator> <literal type="number">0</literal></expr>)</condition>
+    <block>{<block_content>
+        <expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>LOG</name></expr></argument>, <argument><expr><literal type="string">"setsockopt(TCP_KEEPCNT) not supported"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <return>return <expr><name>STATUS_ERROR</name></expr>;</return>
+    </block_content>}</block></if></if_stmt>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+    <return>return <expr><name>STATUS_OK</name></expr>;</return>
+</block_content>}</block></function>
+
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>__XLOG__</name></cpp:ifdef>
+<function><type><name>bool</name></type>
+<name>pq_hasdataleft</name><parameter_list>(<parameter><decl><type><name>Port</name> <modifier>*</modifier></type><name>port</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <return>return <expr><ternary><condition><expr><name><name>port</name><operator>-&gt;</operator><name>PqRecvPointer</name></name> <operator>&gt;=</operator> <name><name>port</name><operator>-&gt;</operator><name>PqRecvLength</name></name></expr> ?</condition><then> <expr><name>false</name></expr> </then><else>: <expr><name>true</name></expr></else></ternary></expr>;</return>
+</block_content>}</block></function>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+</unit>

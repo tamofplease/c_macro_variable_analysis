@@ -1,0 +1,1169 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<unit xmlns="http://www.srcML.org/srcML/src" xmlns:cpp="http://www.srcML.org/srcML/cpp" revision="1.0.0" language="C" filename="/cloned_projects/TBase/src/backend/storage/ipc/dsm.c"><comment type="block">/*-------------------------------------------------------------------------
+ *
+ * dsm.c
+ *      manage dynamic shared memory segments
+ *
+ * This file provides a set of services to make programming with dynamic
+ * shared memory segments more convenient.  Unlike the low-level
+ * facilities provided by dsm_impl.h and dsm_impl.c, mappings and segments
+ * created using this module will be cleaned up automatically.  Mappings
+ * will be removed when the resource owner under which they were created
+ * is cleaned up, unless dsm_pin_mapping() is used, in which case they
+ * have session lifespan.  Segments will be removed when there are no
+ * remaining mappings, or at postmaster shutdown in any case.  After a
+ * hard postmaster crash, remaining segments will be removed, if they
+ * still exist, at the next postmaster startup.
+ *
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1994, Regents of the University of California
+ *
+ *
+ * IDENTIFICATION
+ *      src/backend/storage/ipc/dsm.c
+ *
+ *-------------------------------------------------------------------------
+ */</comment>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"postgres.h"</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;fcntl.h&gt;</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;unistd.h&gt;</cpp:file></cpp:include>
+<cpp:ifndef>#<cpp:directive>ifndef</cpp:directive> <name>WIN32</name></cpp:ifndef>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;sys/mman.h&gt;</cpp:file></cpp:include>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>&lt;sys/stat.h&gt;</cpp:file></cpp:include>
+
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"lib/ilist.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"miscadmin.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/dsm.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/ipc.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/lwlock.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"storage/pg_shmem.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/guc.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/memutils.h"</cpp:file></cpp:include>
+<cpp:include>#<cpp:directive>include</cpp:directive> <cpp:file>"utils/resowner_private.h"</cpp:file></cpp:include>
+
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>PG_DYNSHMEM_CONTROL_MAGIC</name></cpp:macro>        <cpp:value>0x9a503d32</cpp:value></cpp:define>
+
+<comment type="block">/*
+ * There's no point in getting too cheap here, because the minimum allocation
+ * is one OS page, which is probably at least 4KB and could easily be as high
+ * as 64KB.  Each currently sizeof(dsm_control_item), currently 8 bytes.
+ */</comment>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>PG_DYNSHMEM_FIXED_SLOTS</name></cpp:macro>            <cpp:value>64</cpp:value></cpp:define>
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>PG_DYNSHMEM_SLOTS_PER_BACKEND</name></cpp:macro>    <cpp:value>2</cpp:value></cpp:define>
+
+<cpp:define>#<cpp:directive>define</cpp:directive> <cpp:macro><name>INVALID_CONTROL_SLOT</name></cpp:macro>        <cpp:value>((uint32) -1)</cpp:value></cpp:define>
+
+<comment type="block">/* Backend-local tracking for on-detach callbacks. */</comment>
+<typedef>typedef <type><struct>struct <name>dsm_segment_detach_callback</name>
+<block>{
+    <decl_stmt><decl><type><name>on_dsm_detach_callback</name></type> <name>function</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>Datum</name></type>        <name>arg</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>slist_node</name></type>    <name>node</name></decl>;</decl_stmt>
+}</block></struct></type> <name>dsm_segment_detach_callback</name>;</typedef>
+
+<comment type="block">/* Backend-local state for a dynamic shared memory segment. */</comment>
+<struct>struct <name>dsm_segment</name>
+<block>{
+    <decl_stmt><decl><type><name>dlist_node</name></type>    <name>node</name></decl>;</decl_stmt>            <comment type="block">/* List link in dsm_segment_list. */</comment>
+    <decl_stmt><decl><type><name>ResourceOwner</name></type> <name>resowner</name></decl>;</decl_stmt>        <comment type="block">/* Resource owner. */</comment>
+    <decl_stmt><decl><type><name>dsm_handle</name></type>    <name>handle</name></decl>;</decl_stmt>            <comment type="block">/* Segment name. */</comment>
+    <decl_stmt><decl><type><name>uint32</name></type>        <name>control_slot</name></decl>;</decl_stmt>    <comment type="block">/* Slot in control segment. */</comment>
+    <decl_stmt><decl><type><name>void</name>       <modifier>*</modifier></type><name>impl_private</name></decl>;</decl_stmt>    <comment type="block">/* Implementation-specific private data. */</comment>
+    <decl_stmt><decl><type><name>void</name>       <modifier>*</modifier></type><name>mapped_address</name></decl>;</decl_stmt> <comment type="block">/* Mapping address, or NULL if unmapped. */</comment>
+    <decl_stmt><decl><type><name>Size</name></type>        <name>mapped_size</name></decl>;</decl_stmt>    <comment type="block">/* Size of our mapping. */</comment>
+    <decl_stmt><decl><type><name>slist_head</name></type>    <name>on_detach</name></decl>;</decl_stmt>        <comment type="block">/* On-detach callbacks. */</comment>
+}</block>;</struct>
+
+<comment type="block">/* Shared-memory state for a dynamic shared memory segment. */</comment>
+<typedef>typedef <type><struct>struct <name>dsm_control_item</name>
+<block>{
+    <decl_stmt><decl><type><name>dsm_handle</name></type>    <name>handle</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>uint32</name></type>        <name>refcnt</name></decl>;</decl_stmt>            <comment type="block">/* 2+ = active, 1 = moribund, 0 = gone */</comment>
+    <decl_stmt><decl><type><name>void</name>       <modifier>*</modifier></type><name>impl_private_pm_handle</name></decl>;</decl_stmt> <comment type="block">/* only needed on Windows */</comment>
+    <decl_stmt><decl><type><name>bool</name></type>        <name>pinned</name></decl>;</decl_stmt>
+}</block></struct></type> <name>dsm_control_item</name>;</typedef>
+
+<comment type="block">/* Layout of the dynamic shared memory control segment. */</comment>
+<typedef>typedef <type><struct>struct <name>dsm_control_header</name>
+<block>{
+    <decl_stmt><decl><type><name>uint32</name></type>        <name>magic</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>uint32</name></type>        <name>nitems</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>uint32</name></type>        <name>maxitems</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>dsm_control_item</name></type> <name><name>item</name><index>[<expr><name>FLEXIBLE_ARRAY_MEMBER</name></expr>]</index></name></decl>;</decl_stmt>
+}</block></struct></type> <name>dsm_control_header</name>;</typedef>
+
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>dsm_cleanup_for_mmap</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>void</name></type> <name>dsm_postmaster_shutdown</name><parameter_list>(<parameter><decl><type><name>int</name></type> <name>code</name></decl></parameter>, <parameter><decl><type><name>Datum</name></type> <name>arg</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>dsm_segment</name> <modifier>*</modifier></type><name>dsm_create_descriptor</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>bool</name></type> <name>dsm_control_segment_sane</name><parameter_list>(<parameter><decl><type><name>dsm_control_header</name> <modifier>*</modifier></type><name>control</name></decl></parameter>,
+                         <parameter><decl><type><name>Size</name></type> <name>mapped_size</name></decl></parameter>)</parameter_list>;</function_decl>
+<function_decl><type><specifier>static</specifier> <name>uint64</name></type> <name>dsm_control_bytes_needed</name><parameter_list>(<parameter><decl><type><name>uint32</name></type> <name>nitems</name></decl></parameter>)</parameter_list>;</function_decl>
+
+<comment type="block">/* Has this backend initialized the dynamic shared memory system yet? */</comment>
+<decl_stmt><decl><type><specifier>static</specifier> <name>bool</name></type> <name>dsm_init_done</name> <init>= <expr><name>false</name></expr></init></decl>;</decl_stmt>
+
+<comment type="block">/*
+ * List of dynamic shared memory segments used by this backend.
+ *
+ * At process exit time, we must decrement the reference count of each
+ * segment we have attached; this list makes it possible to find all such
+ * segments.
+ *
+ * This list should always be empty in the postmaster.  We could probably
+ * allow the postmaster to map dynamic shared memory segments before it
+ * begins to start child processes, provided that each process adjusted
+ * the reference counts for those segments in the control segment at
+ * startup time, but there's no obvious need for such a facility, which
+ * would also be complex to handle in the EXEC_BACKEND case.  Once the
+ * postmaster has begun spawning children, there's an additional problem:
+ * each new mapping would require an update to the control segment,
+ * which requires locking, in which the postmaster must not be involved.
+ */</comment>
+<decl_stmt><decl><type><specifier>static</specifier> <name>dlist_head</name></type> <name>dsm_segment_list</name> <init>= <expr><call><name>DLIST_STATIC_INIT</name><argument_list>(<argument><expr><name>dsm_segment_list</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+<comment type="block">/*
+ * Control segment information.
+ *
+ * Unlike ordinary shared memory segments, the control segment is not
+ * reference counted; instead, it lasts for the postmaster's entire
+ * life cycle.  For simplicity, it doesn't have a dsm_segment object either.
+ */</comment>
+<decl_stmt><decl><type><specifier>static</specifier> <name>dsm_handle</name></type> <name>dsm_control_handle</name></decl>;</decl_stmt>
+<decl_stmt><decl><type><specifier>static</specifier> <name>dsm_control_header</name> <modifier>*</modifier></type><name>dsm_control</name></decl>;</decl_stmt>
+<decl_stmt><decl><type><specifier>static</specifier> <name>Size</name></type> <name>dsm_control_mapped_size</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+<decl_stmt><decl><type><specifier>static</specifier> <name>void</name> <modifier>*</modifier></type><name>dsm_control_impl_private</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+
+<comment type="block">/*
+ * Start up the dynamic shared memory system.
+ *
+ * This is called just once during each cluster lifetime, at postmaster
+ * startup time.
+ */</comment>
+<function><type><name>void</name></type>
+<name>dsm_postmaster_startup</name><parameter_list>(<parameter><decl><type><name>PGShmemHeader</name> <modifier>*</modifier></type><name>shim</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <decl_stmt><decl><type><name>void</name>       <modifier>*</modifier></type><name>dsm_control_address</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>uint32</name></type>        <name>maxitems</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>Size</name></type>        <name>segsize</name></decl>;</decl_stmt>
+
+    <expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><operator>!</operator><name>IsUnderPostmaster</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+    <comment type="block">/* If dynamic shared memory is disabled, there's nothing to do. */</comment>
+    <if_stmt><if>if <condition>(<expr><name>dynamic_shared_memory_type</name> <operator>==</operator> <name>DSM_IMPL_NONE</name></expr>)</condition><block type="pseudo"><block_content>
+        <return>return;</return></block_content></block></if></if_stmt>
+
+    <comment type="block">/*
+     * If we're using the mmap implementations, clean up any leftovers.
+     * Cleanup isn't needed on Windows, and happens earlier in startup for
+     * POSIX and System V shared memory, via a direct call to
+     * dsm_cleanup_using_control_segment.
+     */</comment>
+    <if_stmt><if>if <condition>(<expr><name>dynamic_shared_memory_type</name> <operator>==</operator> <name>DSM_IMPL_MMAP</name></expr>)</condition><block type="pseudo"><block_content>
+        <expr_stmt><expr><call><name>dsm_cleanup_for_mmap</name><argument_list>()</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+    <comment type="block">/* Determine size for new control segment. */</comment>
+    <expr_stmt><expr><name>maxitems</name> <operator>=</operator> <name>PG_DYNSHMEM_FIXED_SLOTS</name>
+        <operator>+</operator> <name>PG_DYNSHMEM_SLOTS_PER_BACKEND</name> <operator>*</operator> <name>MaxBackends</name></expr>;</expr_stmt>
+    <expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>DEBUG2</name></expr></argument>, <argument><expr><literal type="string">"dynamic shared memory system will support %u segments"</literal></expr></argument>,
+         <argument><expr><name>maxitems</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><name>segsize</name> <operator>=</operator> <call><name>dsm_control_bytes_needed</name><argument_list>(<argument><expr><name>maxitems</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+    <comment type="block">/*
+     * Loop until we find an unused identifier for the new control segment. We
+     * sometimes use 0 as a sentinel value indicating that no control segment
+     * is known to exist, so avoid using that value for a real control
+     * segment.
+     */</comment>
+    <for>for <control>(<init>;</init><condition>;</condition><incr/>)</control>
+    <block>{<block_content>
+        <expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>dsm_control_address</name> <operator>==</operator> <name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>dsm_control_mapped_size</name> <operator>==</operator> <literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <expr_stmt><expr><name>dsm_control_handle</name> <operator>=</operator> <call><name>random</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+        <if_stmt><if>if <condition>(<expr><name>dsm_control_handle</name> <operator>==</operator> <name>DSM_HANDLE_INVALID</name></expr>)</condition><block type="pseudo"><block_content>
+            <continue>continue;</continue></block_content></block></if></if_stmt>
+        <if_stmt><if>if <condition>(<expr><call><name>dsm_impl_op</name><argument_list>(<argument><expr><name>DSM_OP_CREATE</name></expr></argument>, <argument><expr><name>dsm_control_handle</name></expr></argument>, <argument><expr><name>segsize</name></expr></argument>,
+                        <argument><expr><operator>&amp;</operator><name>dsm_control_impl_private</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>dsm_control_address</name></expr></argument>,
+                        <argument><expr><operator>&amp;</operator><name>dsm_control_mapped_size</name></expr></argument>, <argument><expr><name>ERROR</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+            <break>break;</break></block_content></block></if></if_stmt>
+    </block_content>}</block></for>
+    <expr_stmt><expr><name>dsm_control</name> <operator>=</operator> <name>dsm_control_address</name></expr>;</expr_stmt>
+    <expr_stmt><expr><call><name>on_shmem_exit</name><argument_list>(<argument><expr><name>dsm_postmaster_shutdown</name></expr></argument>, <argument><expr><call><name>PointerGetDatum</name><argument_list>(<argument><expr><name>shim</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>DEBUG2</name></expr></argument>,
+         <argument><expr><literal type="string">"created dynamic shared memory control segment %u (%zu bytes)"</literal></expr></argument>,
+         <argument><expr><name>dsm_control_handle</name></expr></argument>, <argument><expr><name>segsize</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>shim</name><operator>-&gt;</operator><name>dsm_control</name></name> <operator>=</operator> <name>dsm_control_handle</name></expr>;</expr_stmt>
+
+    <comment type="block">/* Initialize control segment. */</comment>
+    <expr_stmt><expr><name><name>dsm_control</name><operator>-&gt;</operator><name>magic</name></name> <operator>=</operator> <name>PG_DYNSHMEM_CONTROL_MAGIC</name></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>dsm_control</name><operator>-&gt;</operator><name>nitems</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>dsm_control</name><operator>-&gt;</operator><name>maxitems</name></name> <operator>=</operator> <name>maxitems</name></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Determine whether the control segment from the previous postmaster
+ * invocation still exists.  If so, remove the dynamic shared memory
+ * segments to which it refers, and then the control segment itself.
+ */</comment>
+<function><type><name>void</name></type>
+<name>dsm_cleanup_using_control_segment</name><parameter_list>(<parameter><decl><type><name>dsm_handle</name></type> <name>old_control_handle</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <decl_stmt><decl><type><name>void</name>       <modifier>*</modifier></type><name>mapped_address</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>void</name>       <modifier>*</modifier></type><name>junk_mapped_address</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>void</name>       <modifier>*</modifier></type><name>impl_private</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>void</name>       <modifier>*</modifier></type><name>junk_impl_private</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>Size</name></type>        <name>mapped_size</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>Size</name></type>        <name>junk_mapped_size</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>uint32</name></type>        <name>nitems</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>uint32</name></type>        <name>i</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>dsm_control_header</name> <modifier>*</modifier></type><name>old_control</name></decl>;</decl_stmt>
+
+    <comment type="block">/* If dynamic shared memory is disabled, there's nothing to do. */</comment>
+    <if_stmt><if>if <condition>(<expr><name>dynamic_shared_memory_type</name> <operator>==</operator> <name>DSM_IMPL_NONE</name></expr>)</condition><block type="pseudo"><block_content>
+        <return>return;</return></block_content></block></if></if_stmt>
+
+    <comment type="block">/*
+     * Try to attach the segment.  If this fails, it probably just means that
+     * the operating system has been rebooted and the segment no longer
+     * exists, or an unrelated process has used the same shm ID.  So just fall
+     * out quietly.
+     */</comment>
+    <if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>dsm_impl_op</name><argument_list>(<argument><expr><name>DSM_OP_ATTACH</name></expr></argument>, <argument><expr><name>old_control_handle</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><operator>&amp;</operator><name>impl_private</name></expr></argument>,
+                     <argument><expr><operator>&amp;</operator><name>mapped_address</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>mapped_size</name></expr></argument>, <argument><expr><name>DEBUG1</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+        <return>return;</return></block_content></block></if></if_stmt>
+
+    <comment type="block">/*
+     * We've managed to reattach it, but the contents might not be sane. If
+     * they aren't, we disregard the segment after all.
+     */</comment>
+    <expr_stmt><expr><name>old_control</name> <operator>=</operator> <operator>(</operator><name>dsm_control_header</name> <operator>*</operator><operator>)</operator> <name>mapped_address</name></expr>;</expr_stmt>
+    <if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>dsm_control_segment_sane</name><argument_list>(<argument><expr><name>old_control</name></expr></argument>, <argument><expr><name>mapped_size</name></expr></argument>)</argument_list></call></expr>)</condition>
+    <block>{<block_content>
+        <expr_stmt><expr><call><name>dsm_impl_op</name><argument_list>(<argument><expr><name>DSM_OP_DETACH</name></expr></argument>, <argument><expr><name>old_control_handle</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><operator>&amp;</operator><name>impl_private</name></expr></argument>,
+                    <argument><expr><operator>&amp;</operator><name>mapped_address</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>mapped_size</name></expr></argument>, <argument><expr><name>LOG</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <return>return;</return>
+    </block_content>}</block></if></if_stmt>
+
+    <comment type="block">/*
+     * OK, the control segment looks basically valid, so we can use it to get
+     * a list of segments that need to be removed.
+     */</comment>
+    <expr_stmt><expr><name>nitems</name> <operator>=</operator> <name><name>old_control</name><operator>-&gt;</operator><name>nitems</name></name></expr>;</expr_stmt>
+    <for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name>nitems</name></expr>;</condition> <incr><expr><operator>++</operator><name>i</name></expr></incr>)</control>
+    <block>{<block_content>
+        <decl_stmt><decl><type><name>dsm_handle</name></type>    <name>handle</name></decl>;</decl_stmt>
+        <decl_stmt><decl><type><name>uint32</name></type>        <name>refcnt</name></decl>;</decl_stmt>
+
+        <comment type="block">/* If the reference count is 0, the slot is actually unused. */</comment>
+        <expr_stmt><expr><name>refcnt</name> <operator>=</operator> <name><name>old_control</name><operator>-&gt;</operator><name>item</name><index>[<expr><name>i</name></expr>]</index></name><operator>.</operator><name>refcnt</name></expr>;</expr_stmt>
+        <if_stmt><if>if <condition>(<expr><name>refcnt</name> <operator>==</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+            <continue>continue;</continue></block_content></block></if></if_stmt>
+
+        <comment type="block">/* Log debugging information. */</comment>
+        <expr_stmt><expr><name>handle</name> <operator>=</operator> <name><name>old_control</name><operator>-&gt;</operator><name>item</name><index>[<expr><name>i</name></expr>]</index></name><operator>.</operator><name>handle</name></expr>;</expr_stmt>
+        <expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>DEBUG2</name></expr></argument>, <argument><expr><literal type="string">"cleaning up orphaned dynamic shared memory with ID %u (reference count %u)"</literal></expr></argument>,
+             <argument><expr><name>handle</name></expr></argument>, <argument><expr><name>refcnt</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+        <comment type="block">/* Destroy the referenced segment. */</comment>
+        <expr_stmt><expr><call><name>dsm_impl_op</name><argument_list>(<argument><expr><name>DSM_OP_DESTROY</name></expr></argument>, <argument><expr><name>handle</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><operator>&amp;</operator><name>junk_impl_private</name></expr></argument>,
+                    <argument><expr><operator>&amp;</operator><name>junk_mapped_address</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>junk_mapped_size</name></expr></argument>, <argument><expr><name>LOG</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    </block_content>}</block></for>
+
+    <comment type="block">/* Destroy the old control segment, too. */</comment>
+    <expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>DEBUG2</name></expr></argument>,
+         <argument><expr><literal type="string">"cleaning up dynamic shared memory control segment with ID %u"</literal></expr></argument>,
+         <argument><expr><name>old_control_handle</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><call><name>dsm_impl_op</name><argument_list>(<argument><expr><name>DSM_OP_DESTROY</name></expr></argument>, <argument><expr><name>old_control_handle</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><operator>&amp;</operator><name>impl_private</name></expr></argument>,
+                <argument><expr><operator>&amp;</operator><name>mapped_address</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>mapped_size</name></expr></argument>, <argument><expr><name>LOG</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * When we're using the mmap shared memory implementation, "shared memory"
+ * segments might even manage to survive an operating system reboot.
+ * But there's no guarantee as to exactly what will survive: some segments
+ * may survive, and others may not, and the contents of some may be out
+ * of date.  In particular, the control segment may be out of date, so we
+ * can't rely on it to figure out what to remove.  However, since we know
+ * what directory contains the files we used as shared memory, we can simply
+ * scan the directory and blow everything away that shouldn't be there.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>dsm_cleanup_for_mmap</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <decl_stmt><decl><type><name>DIR</name>           <modifier>*</modifier></type><name>dir</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name><name>struct</name> <name>dirent</name></name> <modifier>*</modifier></type><name>dent</name></decl>;</decl_stmt>
+
+    <comment type="block">/* Open the directory; can't use AllocateDir in postmaster. */</comment>
+    <if_stmt><if>if <condition>(<expr><operator>(</operator><name>dir</name> <operator>=</operator> <call><name>AllocateDir</name><argument_list>(<argument><expr><name>PG_DYNSHMEM_DIR</name></expr></argument>)</argument_list></call><operator>)</operator> <operator>==</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+        <expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+                <argument><expr><operator>(</operator><call><name>errcode_for_file_access</name><argument_list>()</argument_list></call><operator>,</operator>
+                 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"could not open directory \"%s\": %m"</literal></expr></argument>,
+                        <argument><expr><name>PG_DYNSHMEM_DIR</name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+    <comment type="block">/* Scan for something with a name of the correct format. */</comment>
+    <while>while <condition>(<expr><operator>(</operator><name>dent</name> <operator>=</operator> <call><name>ReadDir</name><argument_list>(<argument><expr><name>dir</name></expr></argument>, <argument><expr><name>PG_DYNSHMEM_DIR</name></expr></argument>)</argument_list></call><operator>)</operator> <operator>!=</operator> <name>NULL</name></expr>)</condition>
+    <block>{<block_content>
+        <if_stmt><if>if <condition>(<expr><call><name>strncmp</name><argument_list>(<argument><expr><name><name>dent</name><operator>-&gt;</operator><name>d_name</name></name></expr></argument>, <argument><expr><name>PG_DYNSHMEM_MMAP_FILE_PREFIX</name></expr></argument>,
+                    <argument><expr><call><name>strlen</name><argument_list>(<argument><expr><name>PG_DYNSHMEM_MMAP_FILE_PREFIX</name></expr></argument>)</argument_list></call></expr></argument>)</argument_list></call> <operator>==</operator> <literal type="number">0</literal></expr>)</condition>
+        <block>{<block_content>
+            <decl_stmt><decl><type><name>char</name></type>        <name><name>buf</name><index>[<expr><name>MAXPGPATH</name> <operator>+</operator> <sizeof>sizeof<argument_list>(<argument><expr><name>PG_DYNSHMEM_DIR</name></expr></argument>)</argument_list></sizeof></expr>]</index></name></decl>;</decl_stmt>
+
+            <expr_stmt><expr><call><name>snprintf</name><argument_list>(<argument><expr><name>buf</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>buf</name></expr></argument>)</argument_list></sizeof></expr></argument>, <argument><expr><name>PG_DYNSHMEM_DIR</name> <literal type="string">"/%s"</literal></expr></argument>, <argument><expr><name><name>dent</name><operator>-&gt;</operator><name>d_name</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+            <expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>DEBUG2</name></expr></argument>, <argument><expr><literal type="string">"removing file \"%s\""</literal></expr></argument>, <argument><expr><name>buf</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+            <comment type="block">/* We found a matching file; so remove it. */</comment>
+            <if_stmt><if>if <condition>(<expr><call><name>unlink</name><argument_list>(<argument><expr><name>buf</name></expr></argument>)</argument_list></call> <operator>!=</operator> <literal type="number">0</literal></expr>)</condition>
+            <block>{<block_content>
+                <decl_stmt><decl><type><name>int</name></type>            <name>save_errno</name></decl>;</decl_stmt>
+
+                <expr_stmt><expr><name>save_errno</name> <operator>=</operator> <name>errno</name></expr>;</expr_stmt>
+                <expr_stmt><expr><call><name>closedir</name><argument_list>(<argument><expr><name>dir</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+                <expr_stmt><expr><name>errno</name> <operator>=</operator> <name>save_errno</name></expr>;</expr_stmt>
+
+                <expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+                        <argument><expr><operator>(</operator><call><name>errcode_for_file_access</name><argument_list>()</argument_list></call><operator>,</operator>
+                         <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"could not remove file \"%s\": %m"</literal></expr></argument>, <argument><expr><name>buf</name></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+            </block_content>}</block></if></if_stmt>
+        </block_content>}</block></if></if_stmt>
+    </block_content>}</block></while>
+
+    <comment type="block">/* Cleanup complete. */</comment>
+    <expr_stmt><expr><call><name>FreeDir</name><argument_list>(<argument><expr><name>dir</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * At shutdown time, we iterate over the control segment and remove all
+ * remaining dynamic shared memory segments.  We avoid throwing errors here;
+ * the postmaster is shutting down either way, and this is just non-critical
+ * resource cleanup.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>dsm_postmaster_shutdown</name><parameter_list>(<parameter><decl><type><name>int</name></type> <name>code</name></decl></parameter>, <parameter><decl><type><name>Datum</name></type> <name>arg</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <decl_stmt><decl><type><name>uint32</name></type>        <name>nitems</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>uint32</name></type>        <name>i</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>void</name>       <modifier>*</modifier></type><name>dsm_control_address</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>void</name>       <modifier>*</modifier></type><name>junk_mapped_address</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>void</name>       <modifier>*</modifier></type><name>junk_impl_private</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>Size</name></type>        <name>junk_mapped_size</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>PGShmemHeader</name> <modifier>*</modifier></type><name>shim</name> <init>= <expr><operator>(</operator><name>PGShmemHeader</name> <operator>*</operator><operator>)</operator> <call><name>DatumGetPointer</name><argument_list>(<argument><expr><name>arg</name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+    <comment type="block">/*
+     * If some other backend exited uncleanly, it might have corrupted the
+     * control segment while it was dying.  In that case, we warn and ignore
+     * the contents of the control segment.  This may end up leaving behind
+     * stray shared memory segments, but there's not much we can do about that
+     * if the metadata is gone.
+     */</comment>
+    <expr_stmt><expr><name>nitems</name> <operator>=</operator> <name><name>dsm_control</name><operator>-&gt;</operator><name>nitems</name></name></expr>;</expr_stmt>
+    <if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>dsm_control_segment_sane</name><argument_list>(<argument><expr><name>dsm_control</name></expr></argument>, <argument><expr><name>dsm_control_mapped_size</name></expr></argument>)</argument_list></call></expr>)</condition>
+    <block>{<block_content>
+        <expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>LOG</name></expr></argument>,
+                <argument><expr><operator>(</operator><call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"dynamic shared memory control segment is corrupt"</literal></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <return>return;</return>
+    </block_content>}</block></if></if_stmt>
+
+    <comment type="block">/* Remove any remaining segments. */</comment>
+    <for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name>nitems</name></expr>;</condition> <incr><expr><operator>++</operator><name>i</name></expr></incr>)</control>
+    <block>{<block_content>
+        <decl_stmt><decl><type><name>dsm_handle</name></type>    <name>handle</name></decl>;</decl_stmt>
+
+        <comment type="block">/* If the reference count is 0, the slot is actually unused. */</comment>
+        <if_stmt><if>if <condition>(<expr><name><name>dsm_control</name><operator>-&gt;</operator><name>item</name><index>[<expr><name>i</name></expr>]</index></name><operator>.</operator><name>refcnt</name> <operator>==</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+            <continue>continue;</continue></block_content></block></if></if_stmt>
+
+        <comment type="block">/* Log debugging information. */</comment>
+        <expr_stmt><expr><name>handle</name> <operator>=</operator> <name><name>dsm_control</name><operator>-&gt;</operator><name>item</name><index>[<expr><name>i</name></expr>]</index></name><operator>.</operator><name>handle</name></expr>;</expr_stmt>
+        <expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>DEBUG2</name></expr></argument>, <argument><expr><literal type="string">"cleaning up orphaned dynamic shared memory with ID %u"</literal></expr></argument>,
+             <argument><expr><name>handle</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+        <comment type="block">/* Destroy the segment. */</comment>
+        <expr_stmt><expr><call><name>dsm_impl_op</name><argument_list>(<argument><expr><name>DSM_OP_DESTROY</name></expr></argument>, <argument><expr><name>handle</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><operator>&amp;</operator><name>junk_impl_private</name></expr></argument>,
+                    <argument><expr><operator>&amp;</operator><name>junk_mapped_address</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>junk_mapped_size</name></expr></argument>, <argument><expr><name>LOG</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    </block_content>}</block></for>
+
+    <comment type="block">/* Remove the control segment itself. */</comment>
+    <expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>DEBUG2</name></expr></argument>,
+         <argument><expr><literal type="string">"cleaning up dynamic shared memory control segment with ID %u"</literal></expr></argument>,
+         <argument><expr><name>dsm_control_handle</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><name>dsm_control_address</name> <operator>=</operator> <name>dsm_control</name></expr>;</expr_stmt>
+    <expr_stmt><expr><call><name>dsm_impl_op</name><argument_list>(<argument><expr><name>DSM_OP_DESTROY</name></expr></argument>, <argument><expr><name>dsm_control_handle</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>,
+                <argument><expr><operator>&amp;</operator><name>dsm_control_impl_private</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>dsm_control_address</name></expr></argument>,
+                <argument><expr><operator>&amp;</operator><name>dsm_control_mapped_size</name></expr></argument>, <argument><expr><name>LOG</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><name>dsm_control</name> <operator>=</operator> <name>dsm_control_address</name></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>shim</name><operator>-&gt;</operator><name>dsm_control</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Prepare this backend for dynamic shared memory usage.  Under EXEC_BACKEND,
+ * we must reread the state file and map the control segment; in other cases,
+ * we'll have inherited the postmaster's mapping and global variables.
+ */</comment>
+<function><type><specifier>static</specifier> <name>void</name></type>
+<name>dsm_backend_startup</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <comment type="block">/* If dynamic shared memory is disabled, reject this. */</comment>
+    <if_stmt><if>if <condition>(<expr><name>dynamic_shared_memory_type</name> <operator>==</operator> <name>DSM_IMPL_NONE</name></expr>)</condition><block type="pseudo"><block_content>
+        <expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+                <argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE</name></expr></argument>)</argument_list></call><operator>,</operator>
+                 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"dynamic shared memory is disabled"</literal></expr></argument>)</argument_list></call><operator>,</operator>
+                 <call><name>errhint</name><argument_list>(<argument><expr><literal type="string">"Set dynamic_shared_memory_type to a value other than \"none\"."</literal></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>EXEC_BACKEND</name></cpp:ifdef>
+    <block>{<block_content>
+        <decl_stmt><decl><type><name>void</name>       <modifier>*</modifier></type><name>control_address</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+
+        <comment type="block">/* Attach control segment. */</comment>
+        <expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>dsm_control_handle</name> <operator>!=</operator> <literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <expr_stmt><expr><call><name>dsm_impl_op</name><argument_list>(<argument><expr><name>DSM_OP_ATTACH</name></expr></argument>, <argument><expr><name>dsm_control_handle</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>,
+                    <argument><expr><operator>&amp;</operator><name>dsm_control_impl_private</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>control_address</name></expr></argument>,
+                    <argument><expr><operator>&amp;</operator><name>dsm_control_mapped_size</name></expr></argument>, <argument><expr><name>ERROR</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <expr_stmt><expr><name>dsm_control</name> <operator>=</operator> <name>control_address</name></expr>;</expr_stmt>
+        <comment type="block">/* If control segment doesn't look sane, something is badly wrong. */</comment>
+        <if_stmt><if>if <condition>(<expr><operator>!</operator><call><name>dsm_control_segment_sane</name><argument_list>(<argument><expr><name>dsm_control</name></expr></argument>, <argument><expr><name>dsm_control_mapped_size</name></expr></argument>)</argument_list></call></expr>)</condition>
+        <block>{<block_content>
+            <expr_stmt><expr><call><name>dsm_impl_op</name><argument_list>(<argument><expr><name>DSM_OP_DETACH</name></expr></argument>, <argument><expr><name>dsm_control_handle</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>,
+                        <argument><expr><operator>&amp;</operator><name>dsm_control_impl_private</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>control_address</name></expr></argument>,
+                        <argument><expr><operator>&amp;</operator><name>dsm_control_mapped_size</name></expr></argument>, <argument><expr><name>WARNING</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+            <expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>FATAL</name></expr></argument>,
+                    <argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_INTERNAL_ERROR</name></expr></argument>)</argument_list></call><operator>,</operator>
+                     <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"dynamic shared memory control segment is not valid"</literal></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        </block_content>}</block></if></if_stmt>
+    </block_content>}</block>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+    <expr_stmt><expr><name>dsm_init_done</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<cpp:ifdef>#<cpp:directive>ifdef</cpp:directive> <name>EXEC_BACKEND</name></cpp:ifdef>
+<comment type="block">/*
+ * When running under EXEC_BACKEND, we get a callback here when the main
+ * shared memory segment is re-attached, so that we can record the control
+ * handle retrieved from it.
+ */</comment>
+<function><type><name>void</name></type>
+<name>dsm_set_control_handle</name><parameter_list>(<parameter><decl><type><name>dsm_handle</name></type> <name>h</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>dsm_control_handle</name> <operator>==</operator> <literal type="number">0</literal> <operator>&amp;&amp;</operator> <name>h</name> <operator>!=</operator> <literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><name>dsm_control_handle</name> <operator>=</operator> <name>h</name></expr>;</expr_stmt>
+</block_content>}</block></function>
+<cpp:endif>#<cpp:directive>endif</cpp:directive></cpp:endif>
+
+<comment type="block">/*
+ * Create a new dynamic shared memory segment.
+ *
+ * If there is a non-NULL CurrentResourceOwner, the new segment is associated
+ * with it and must be detached before the resource owner releases, or a
+ * warning will be logged.  If CurrentResourceOwner is NULL, the segment
+ * remains attached until explicitely detached or the session ends.
+ * Creating with a NULL CurrentResourceOwner is equivalent to creating
+ * with a non-NULL CurrentResourceOwner and then calling dsm_pin_mapping.
+ */</comment>
+<function><type><name>dsm_segment</name> <modifier>*</modifier></type>
+<name>dsm_create</name><parameter_list>(<parameter><decl><type><name>Size</name></type> <name>size</name></decl></parameter>, <parameter><decl><type><name>int</name></type> <name>flags</name></decl></parameter>)</parameter_list>
+<block>{<block_content><comment type="line">// #lizard forgives</comment>
+    <decl_stmt><decl><type><name>dsm_segment</name> <modifier>*</modifier></type><name>seg</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>uint32</name></type>        <name>i</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>uint32</name></type>        <name>nitems</name></decl>;</decl_stmt>
+
+    <comment type="block">/* Unsafe in postmaster (and pointless in a stand-alone backend). */</comment>
+    <expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>IsUnderPostmaster</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+    <if_stmt><if>if <condition>(<expr><operator>!</operator><name>dsm_init_done</name></expr>)</condition><block type="pseudo"><block_content>
+        <expr_stmt><expr><call><name>dsm_backend_startup</name><argument_list>()</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+    <comment type="block">/* Create a new segment descriptor. */</comment>
+    <expr_stmt><expr><name>seg</name> <operator>=</operator> <call><name>dsm_create_descriptor</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+    <comment type="block">/* Loop until we find an unused segment identifier. */</comment>
+    <for>for <control>(<init>;</init><condition>;</condition><incr/>)</control>
+    <block>{<block_content>
+        <expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>seg</name><operator>-&gt;</operator><name>mapped_address</name></name> <operator>==</operator> <name>NULL</name> <operator>&amp;&amp;</operator> <name><name>seg</name><operator>-&gt;</operator><name>mapped_size</name></name> <operator>==</operator> <literal type="number">0</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <expr_stmt><expr><name><name>seg</name><operator>-&gt;</operator><name>handle</name></name> <operator>=</operator> <call><name>random</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+        <if_stmt><if>if <condition>(<expr><name><name>seg</name><operator>-&gt;</operator><name>handle</name></name> <operator>==</operator> <name>DSM_HANDLE_INVALID</name></expr>)</condition><block type="pseudo"><block_content>    <comment type="block">/* Reserve sentinel */</comment>
+            <continue>continue;</continue></block_content></block></if></if_stmt>
+        <if_stmt><if>if <condition>(<expr><call><name>dsm_impl_op</name><argument_list>(<argument><expr><name>DSM_OP_CREATE</name></expr></argument>, <argument><expr><name><name>seg</name><operator>-&gt;</operator><name>handle</name></name></expr></argument>, <argument><expr><name>size</name></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>seg</name><operator>-&gt;</operator><name>impl_private</name></name></expr></argument>,
+                        <argument><expr><operator>&amp;</operator><name><name>seg</name><operator>-&gt;</operator><name>mapped_address</name></name></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>seg</name><operator>-&gt;</operator><name>mapped_size</name></name></expr></argument>, <argument><expr><name>ERROR</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+            <break>break;</break></block_content></block></if></if_stmt>
+    </block_content>}</block></for>
+
+    <comment type="block">/* Lock the control segment so we can register the new segment. */</comment>
+    <expr_stmt><expr><call><name>LWLockAcquire</name><argument_list>(<argument><expr><name>DynamicSharedMemoryControlLock</name></expr></argument>, <argument><expr><name>LW_EXCLUSIVE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+    <comment type="block">/* Search the control segment for an unused slot. */</comment>
+    <expr_stmt><expr><name>nitems</name> <operator>=</operator> <name><name>dsm_control</name><operator>-&gt;</operator><name>nitems</name></name></expr>;</expr_stmt>
+    <for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name>nitems</name></expr>;</condition> <incr><expr><operator>++</operator><name>i</name></expr></incr>)</control>
+    <block>{<block_content>
+        <if_stmt><if>if <condition>(<expr><name><name>dsm_control</name><operator>-&gt;</operator><name>item</name><index>[<expr><name>i</name></expr>]</index></name><operator>.</operator><name>refcnt</name> <operator>==</operator> <literal type="number">0</literal></expr>)</condition>
+        <block>{<block_content>
+            <expr_stmt><expr><name><name>dsm_control</name><operator>-&gt;</operator><name>item</name><index>[<expr><name>i</name></expr>]</index></name><operator>.</operator><name>handle</name> <operator>=</operator> <name><name>seg</name><operator>-&gt;</operator><name>handle</name></name></expr>;</expr_stmt>
+            <comment type="block">/* refcnt of 1 triggers destruction, so start at 2 */</comment>
+            <expr_stmt><expr><name><name>dsm_control</name><operator>-&gt;</operator><name>item</name><index>[<expr><name>i</name></expr>]</index></name><operator>.</operator><name>refcnt</name> <operator>=</operator> <literal type="number">2</literal></expr>;</expr_stmt>
+            <expr_stmt><expr><name><name>dsm_control</name><operator>-&gt;</operator><name>item</name><index>[<expr><name>i</name></expr>]</index></name><operator>.</operator><name>impl_private_pm_handle</name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+            <expr_stmt><expr><name><name>dsm_control</name><operator>-&gt;</operator><name>item</name><index>[<expr><name>i</name></expr>]</index></name><operator>.</operator><name>pinned</name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+            <expr_stmt><expr><name><name>seg</name><operator>-&gt;</operator><name>control_slot</name></name> <operator>=</operator> <name>i</name></expr>;</expr_stmt>
+            <expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><name>DynamicSharedMemoryControlLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+            <return>return <expr><name>seg</name></expr>;</return>
+        </block_content>}</block></if></if_stmt>
+    </block_content>}</block></for>
+
+    <comment type="block">/* Verify that we can support an additional mapping. */</comment>
+    <if_stmt><if>if <condition>(<expr><name>nitems</name> <operator>&gt;=</operator> <name><name>dsm_control</name><operator>-&gt;</operator><name>maxitems</name></name></expr>)</condition>
+    <block>{<block_content>
+            <expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><name>DynamicSharedMemoryControlLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+            <expr_stmt><expr><call><name>dsm_impl_op</name><argument_list>(<argument><expr><name>DSM_OP_DESTROY</name></expr></argument>, <argument><expr><name><name>seg</name><operator>-&gt;</operator><name>handle</name></name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>seg</name><operator>-&gt;</operator><name>impl_private</name></name></expr></argument>,
+                        <argument><expr><operator>&amp;</operator><name><name>seg</name><operator>-&gt;</operator><name>mapped_address</name></name></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>seg</name><operator>-&gt;</operator><name>mapped_size</name></name></expr></argument>, <argument><expr><name>WARNING</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+            <if_stmt><if>if <condition>(<expr><name><name>seg</name><operator>-&gt;</operator><name>resowner</name></name> <operator>!=</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+                <expr_stmt><expr><call><name>ResourceOwnerForgetDSM</name><argument_list>(<argument><expr><name><name>seg</name><operator>-&gt;</operator><name>resowner</name></name></expr></argument>, <argument><expr><name>seg</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+            <expr_stmt><expr><call><name>dlist_delete</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>seg</name><operator>-&gt;</operator><name>node</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+            <expr_stmt><expr><call><name>pfree</name><argument_list>(<argument><expr><name>seg</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+		<if_stmt><if>if <condition>(<expr><operator>(</operator><name>flags</name> <operator>&amp;</operator> <name>DSM_CREATE_NULL_IF_MAXSEGMENTS</name><operator>)</operator> <operator>!=</operator> <literal type="number">0</literal></expr>)</condition><block type="pseudo"><block_content>
+            <return>return <expr><name>NULL</name></expr>;</return></block_content></block></if></if_stmt>
+
+        <expr_stmt><expr><call><name>ereport</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>,
+                <argument><expr><operator>(</operator><call><name>errcode</name><argument_list>(<argument><expr><name>ERRCODE_INSUFFICIENT_RESOURCES</name></expr></argument>)</argument_list></call><operator>,</operator>
+                 <call><name>errmsg</name><argument_list>(<argument><expr><literal type="string">"too many dynamic shared memory segments"</literal></expr></argument>)</argument_list></call><operator>)</operator></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    </block_content>}</block></if></if_stmt>
+
+    <comment type="block">/* Enter the handle into a new array slot. */</comment>
+    <expr_stmt><expr><name><name>dsm_control</name><operator>-&gt;</operator><name>item</name><index>[<expr><name>nitems</name></expr>]</index></name><operator>.</operator><name>handle</name> <operator>=</operator> <name><name>seg</name><operator>-&gt;</operator><name>handle</name></name></expr>;</expr_stmt>
+    <comment type="block">/* refcnt of 1 triggers destruction, so start at 2 */</comment>
+    <expr_stmt><expr><name><name>dsm_control</name><operator>-&gt;</operator><name>item</name><index>[<expr><name>nitems</name></expr>]</index></name><operator>.</operator><name>refcnt</name> <operator>=</operator> <literal type="number">2</literal></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>dsm_control</name><operator>-&gt;</operator><name>item</name><index>[<expr><name>nitems</name></expr>]</index></name><operator>.</operator><name>impl_private_pm_handle</name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>dsm_control</name><operator>-&gt;</operator><name>item</name><index>[<expr><name>nitems</name></expr>]</index></name><operator>.</operator><name>pinned</name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>seg</name><operator>-&gt;</operator><name>control_slot</name></name> <operator>=</operator> <name>nitems</name></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>dsm_control</name><operator>-&gt;</operator><name>nitems</name></name><operator>++</operator></expr>;</expr_stmt>
+    <expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><name>DynamicSharedMemoryControlLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+    <return>return <expr><name>seg</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Attach a dynamic shared memory segment.
+ *
+ * See comments for dsm_segment_handle() for an explanation of how this
+ * is intended to be used.
+ *
+ * This function will return NULL if the segment isn't known to the system.
+ * This can happen if we're asked to attach the segment, but then everyone
+ * else detaches it (causing it to be destroyed) before we get around to
+ * attaching it.
+ *
+ * If there is a non-NULL CurrentResourceOwner, the attached segment is
+ * associated with it and must be detached before the resource owner releases,
+ * or a warning will be logged.  Otherwise the segment remains attached until
+ * explicitely detached or the session ends.  See the note atop dsm_create().
+ */</comment>
+<function><type><name>dsm_segment</name> <modifier>*</modifier></type>
+<name>dsm_attach</name><parameter_list>(<parameter><decl><type><name>dsm_handle</name></type> <name>h</name></decl></parameter>)</parameter_list>
+<block>{<block_content><comment type="line">// #lizard forgives</comment>
+    <decl_stmt><decl><type><name>dsm_segment</name> <modifier>*</modifier></type><name>seg</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>dlist_iter</name></type>    <name>iter</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>uint32</name></type>        <name>i</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>uint32</name></type>        <name>nitems</name></decl>;</decl_stmt>
+
+    <comment type="block">/* Unsafe in postmaster (and pointless in a stand-alone backend). */</comment>
+    <expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name>IsUnderPostmaster</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+    <if_stmt><if>if <condition>(<expr><operator>!</operator><name>dsm_init_done</name></expr>)</condition><block type="pseudo"><block_content>
+        <expr_stmt><expr><call><name>dsm_backend_startup</name><argument_list>()</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+    <comment type="block">/*
+     * Since this is just a debugging cross-check, we could leave it out
+     * altogether, or include it only in assert-enabled builds.  But since the
+     * list of attached segments should normally be very short, let's include
+     * it always for right now.
+     *
+     * If you're hitting this error, you probably want to attempt to find an
+     * existing mapping via dsm_find_mapping() before calling dsm_attach() to
+     * create a new one.
+     */</comment>
+    <macro><name>dlist_foreach</name><argument_list>(<argument>iter</argument>, <argument>&amp;dsm_segment_list</argument>)</argument_list></macro>
+    <block>{<block_content>
+        <expr_stmt><expr><name>seg</name> <operator>=</operator> <call><name>dlist_container</name><argument_list>(<argument><expr><name>dsm_segment</name></expr></argument>, <argument><expr><name>node</name></expr></argument>, <argument><expr><name><name>iter</name><operator>.</operator><name>cur</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <if_stmt><if>if <condition>(<expr><name><name>seg</name><operator>-&gt;</operator><name>handle</name></name> <operator>==</operator> <name>h</name></expr>)</condition><block type="pseudo"><block_content>
+            <expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"can't attach the same segment more than once"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+    </block_content>}</block>
+
+    <comment type="block">/* Create a new segment descriptor. */</comment>
+    <expr_stmt><expr><name>seg</name> <operator>=</operator> <call><name>dsm_create_descriptor</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>seg</name><operator>-&gt;</operator><name>handle</name></name> <operator>=</operator> <name>h</name></expr>;</expr_stmt>
+
+    <comment type="block">/* Bump reference count for this segment in shared memory. */</comment>
+    <expr_stmt><expr><call><name>LWLockAcquire</name><argument_list>(<argument><expr><name>DynamicSharedMemoryControlLock</name></expr></argument>, <argument><expr><name>LW_EXCLUSIVE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><name>nitems</name> <operator>=</operator> <name><name>dsm_control</name><operator>-&gt;</operator><name>nitems</name></name></expr>;</expr_stmt>
+    <for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name>nitems</name></expr>;</condition> <incr><expr><operator>++</operator><name>i</name></expr></incr>)</control>
+    <block>{<block_content>
+		<comment type="block">/*
+		 * If the reference count is 0, the slot is actually unused.  If the
+		 * reference count is 1, the slot is still in use, but the segment is
+		 * in the process of going away; even if the handle matches, another
+		 * slot may already have started using the same handle value by
+		 * coincidence so we have to keep searching.
+		 */</comment>
+		<if_stmt><if>if <condition>(<expr><name><name>dsm_control</name><operator>-&gt;</operator><name>item</name><index>[<expr><name>i</name></expr>]</index></name><operator>.</operator><name>refcnt</name> <operator>&lt;=</operator> <literal type="number">1</literal></expr>)</condition><block type="pseudo"><block_content>
+            <continue>continue;</continue></block_content></block></if></if_stmt>
+
+        <comment type="block">/* If the handle doesn't match, it's not the slot we want. */</comment>
+        <if_stmt><if>if <condition>(<expr><name><name>dsm_control</name><operator>-&gt;</operator><name>item</name><index>[<expr><name>i</name></expr>]</index></name><operator>.</operator><name>handle</name> <operator>!=</operator> <name><name>seg</name><operator>-&gt;</operator><name>handle</name></name></expr>)</condition><block type="pseudo"><block_content>
+            <continue>continue;</continue></block_content></block></if></if_stmt>
+
+        <comment type="block">/* Otherwise we've found a match. */</comment>
+        <expr_stmt><expr><name><name>dsm_control</name><operator>-&gt;</operator><name>item</name><index>[<expr><name>i</name></expr>]</index></name><operator>.</operator><name>refcnt</name><operator>++</operator></expr>;</expr_stmt>
+        <expr_stmt><expr><name><name>seg</name><operator>-&gt;</operator><name>control_slot</name></name> <operator>=</operator> <name>i</name></expr>;</expr_stmt>
+        <break>break;</break>
+    </block_content>}</block></for>
+    <expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><name>DynamicSharedMemoryControlLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+    <comment type="block">/*
+     * If we didn't find the handle we're looking for in the control segment,
+     * it probably means that everyone else who had it mapped, including the
+     * original creator, died before we got to this point. It's up to the
+     * caller to decide what to do about that.
+     */</comment>
+    <if_stmt><if>if <condition>(<expr><name><name>seg</name><operator>-&gt;</operator><name>control_slot</name></name> <operator>==</operator> <name>INVALID_CONTROL_SLOT</name></expr>)</condition>
+    <block>{<block_content>
+        <expr_stmt><expr><call><name>dsm_detach</name><argument_list>(<argument><expr><name>seg</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <return>return <expr><name>NULL</name></expr>;</return>
+    </block_content>}</block></if></if_stmt>
+
+    <comment type="block">/* Here's where we actually try to map the segment. */</comment>
+    <expr_stmt><expr><call><name>dsm_impl_op</name><argument_list>(<argument><expr><name>DSM_OP_ATTACH</name></expr></argument>, <argument><expr><name><name>seg</name><operator>-&gt;</operator><name>handle</name></name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>seg</name><operator>-&gt;</operator><name>impl_private</name></name></expr></argument>,
+                <argument><expr><operator>&amp;</operator><name><name>seg</name><operator>-&gt;</operator><name>mapped_address</name></name></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>seg</name><operator>-&gt;</operator><name>mapped_size</name></name></expr></argument>, <argument><expr><name>ERROR</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+    <return>return <expr><name>seg</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * At backend shutdown time, detach any segments that are still attached.
+ * (This is similar to dsm_detach_all, except that there's no reason to
+ * unmap the control segment before exiting, so we don't bother.)
+ */</comment>
+<function><type><name>void</name></type>
+<name>dsm_backend_shutdown</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <while>while <condition>(<expr><operator>!</operator><call><name>dlist_is_empty</name><argument_list>(<argument><expr><operator>&amp;</operator><name>dsm_segment_list</name></expr></argument>)</argument_list></call></expr>)</condition>
+    <block>{<block_content>
+        <decl_stmt><decl><type><name>dsm_segment</name> <modifier>*</modifier></type><name>seg</name></decl>;</decl_stmt>
+
+        <expr_stmt><expr><name>seg</name> <operator>=</operator> <call><name>dlist_head_element</name><argument_list>(<argument><expr><name>dsm_segment</name></expr></argument>, <argument><expr><name>node</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>dsm_segment_list</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <expr_stmt><expr><call><name>dsm_detach</name><argument_list>(<argument><expr><name>seg</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    </block_content>}</block></while>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Detach all shared memory segments, including the control segments.  This
+ * should be called, along with PGSharedMemoryDetach, in processes that
+ * might inherit mappings but are not intended to be connected to dynamic
+ * shared memory.
+ */</comment>
+<function><type><name>void</name></type>
+<name>dsm_detach_all</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <decl_stmt><decl><type><name>void</name>       <modifier>*</modifier></type><name>control_address</name> <init>= <expr><name>dsm_control</name></expr></init></decl>;</decl_stmt>
+
+    <while>while <condition>(<expr><operator>!</operator><call><name>dlist_is_empty</name><argument_list>(<argument><expr><operator>&amp;</operator><name>dsm_segment_list</name></expr></argument>)</argument_list></call></expr>)</condition>
+    <block>{<block_content>
+        <decl_stmt><decl><type><name>dsm_segment</name> <modifier>*</modifier></type><name>seg</name></decl>;</decl_stmt>
+
+        <expr_stmt><expr><name>seg</name> <operator>=</operator> <call><name>dlist_head_element</name><argument_list>(<argument><expr><name>dsm_segment</name></expr></argument>, <argument><expr><name>node</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>dsm_segment_list</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <expr_stmt><expr><call><name>dsm_detach</name><argument_list>(<argument><expr><name>seg</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    </block_content>}</block></while>
+
+    <if_stmt><if>if <condition>(<expr><name>control_address</name> <operator>!=</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+        <expr_stmt><expr><call><name>dsm_impl_op</name><argument_list>(<argument><expr><name>DSM_OP_DETACH</name></expr></argument>, <argument><expr><name>dsm_control_handle</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>,
+                    <argument><expr><operator>&amp;</operator><name>dsm_control_impl_private</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>control_address</name></expr></argument>,
+                    <argument><expr><operator>&amp;</operator><name>dsm_control_mapped_size</name></expr></argument>, <argument><expr><name>ERROR</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Resize an existing shared memory segment.
+ *
+ * This may cause the shared memory segment to be remapped at a different
+ * address.  For the caller's convenience, we return the mapped address.
+ */</comment>
+<function><type><name>void</name> <modifier>*</modifier></type>
+<name>dsm_resize</name><parameter_list>(<parameter><decl><type><name>dsm_segment</name> <modifier>*</modifier></type><name>seg</name></decl></parameter>, <parameter><decl><type><name>Size</name></type> <name>size</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>seg</name><operator>-&gt;</operator><name>control_slot</name></name> <operator>!=</operator> <name>INVALID_CONTROL_SLOT</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><call><name>dsm_impl_op</name><argument_list>(<argument><expr><name>DSM_OP_RESIZE</name></expr></argument>, <argument><expr><name><name>seg</name><operator>-&gt;</operator><name>handle</name></name></expr></argument>, <argument><expr><name>size</name></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>seg</name><operator>-&gt;</operator><name>impl_private</name></name></expr></argument>,
+                <argument><expr><operator>&amp;</operator><name><name>seg</name><operator>-&gt;</operator><name>mapped_address</name></name></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>seg</name><operator>-&gt;</operator><name>mapped_size</name></name></expr></argument>, <argument><expr><name>ERROR</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <return>return <expr><name><name>seg</name><operator>-&gt;</operator><name>mapped_address</name></name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Remap an existing shared memory segment.
+ *
+ * This is intended to be used when some other process has extended the
+ * mapping using dsm_resize(), but we've still only got the initial
+ * portion mapped.  Since this might change the address at which the
+ * segment is mapped, we return the new mapped address.
+ */</comment>
+<function><type><name>void</name> <modifier>*</modifier></type>
+<name>dsm_remap</name><parameter_list>(<parameter><decl><type><name>dsm_segment</name> <modifier>*</modifier></type><name>seg</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <expr_stmt><expr><call><name>dsm_impl_op</name><argument_list>(<argument><expr><name>DSM_OP_ATTACH</name></expr></argument>, <argument><expr><name><name>seg</name><operator>-&gt;</operator><name>handle</name></name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>seg</name><operator>-&gt;</operator><name>impl_private</name></name></expr></argument>,
+                <argument><expr><operator>&amp;</operator><name><name>seg</name><operator>-&gt;</operator><name>mapped_address</name></name></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>seg</name><operator>-&gt;</operator><name>mapped_size</name></name></expr></argument>, <argument><expr><name>ERROR</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+    <return>return <expr><name><name>seg</name><operator>-&gt;</operator><name>mapped_address</name></name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Detach from a shared memory segment, destroying the segment if we
+ * remove the last reference.
+ *
+ * This function should never fail.  It will often be invoked when aborting
+ * a transaction, and a further error won't serve any purpose.  It's not a
+ * complete disaster if we fail to unmap or destroy the segment; it means a
+ * resource leak, but that doesn't necessarily preclude further operations.
+ */</comment>
+<function><type><name>void</name></type>
+<name>dsm_detach</name><parameter_list>(<parameter><decl><type><name>dsm_segment</name> <modifier>*</modifier></type><name>seg</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <comment type="block">/*
+     * Invoke registered callbacks.  Just in case one of those callbacks
+     * throws a further error that brings us back here, pop the callback
+	 * before invoking it, to avoid infinite error recursion. Don't allow
+	 * interrupts while running the individual callbacks in non-error code
+	 * paths, to avoid leaving cleanup work unfinished if we're interrupted by
+	 * a statement timeout or similar.
+     */</comment>
+	<expr_stmt><expr><call><name>HOLD_INTERRUPTS</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+    <while>while <condition>(<expr><operator>!</operator><call><name>slist_is_empty</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>seg</name><operator>-&gt;</operator><name>on_detach</name></name></expr></argument>)</argument_list></call></expr>)</condition>
+    <block>{<block_content>
+        <decl_stmt><decl><type><name>slist_node</name> <modifier>*</modifier></type><name>node</name></decl>;</decl_stmt>
+        <decl_stmt><decl><type><name>dsm_segment_detach_callback</name> <modifier>*</modifier></type><name>cb</name></decl>;</decl_stmt>
+        <decl_stmt><decl><type><name>on_dsm_detach_callback</name></type> <name>function</name></decl>;</decl_stmt>
+        <decl_stmt><decl><type><name>Datum</name></type>        <name>arg</name></decl>;</decl_stmt>
+
+        <expr_stmt><expr><name>node</name> <operator>=</operator> <call><name>slist_pop_head_node</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>seg</name><operator>-&gt;</operator><name>on_detach</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <expr_stmt><expr><name>cb</name> <operator>=</operator> <call><name>slist_container</name><argument_list>(<argument><expr><name>dsm_segment_detach_callback</name></expr></argument>, <argument><expr><name>node</name></expr></argument>, <argument><expr><name>node</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <expr_stmt><expr><name>function</name> <operator>=</operator> <name><name>cb</name><operator>-&gt;</operator><name>function</name></name></expr>;</expr_stmt>
+        <expr_stmt><expr><name>arg</name> <operator>=</operator> <name><name>cb</name><operator>-&gt;</operator><name>arg</name></name></expr>;</expr_stmt>
+        <expr_stmt><expr><call><name>pfree</name><argument_list>(<argument><expr><name>cb</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+        <expr_stmt><expr><call><name>function</name><argument_list>(<argument><expr><name>seg</name></expr></argument>, <argument><expr><name>arg</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    </block_content>}</block></while>
+	<expr_stmt><expr><call><name>RESUME_INTERRUPTS</name><argument_list>()</argument_list></call></expr>;</expr_stmt>
+
+    <comment type="block">/*
+     * Try to remove the mapping, if one exists.  Normally, there will be, but
+     * maybe not, if we failed partway through a create or attach operation.
+     * We remove the mapping before decrementing the reference count so that
+     * the process that sees a zero reference count can be certain that no
+     * remaining mappings exist.  Even if this fails, we pretend that it
+     * works, because retrying is likely to fail in the same way.
+     */</comment>
+    <if_stmt><if>if <condition>(<expr><name><name>seg</name><operator>-&gt;</operator><name>mapped_address</name></name> <operator>!=</operator> <name>NULL</name></expr>)</condition>
+    <block>{<block_content>
+        <expr_stmt><expr><call><name>dsm_impl_op</name><argument_list>(<argument><expr><name>DSM_OP_DETACH</name></expr></argument>, <argument><expr><name><name>seg</name><operator>-&gt;</operator><name>handle</name></name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>seg</name><operator>-&gt;</operator><name>impl_private</name></name></expr></argument>,
+                    <argument><expr><operator>&amp;</operator><name><name>seg</name><operator>-&gt;</operator><name>mapped_address</name></name></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>seg</name><operator>-&gt;</operator><name>mapped_size</name></name></expr></argument>, <argument><expr><name>WARNING</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <expr_stmt><expr><name><name>seg</name><operator>-&gt;</operator><name>impl_private</name></name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+        <expr_stmt><expr><name><name>seg</name><operator>-&gt;</operator><name>mapped_address</name></name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+        <expr_stmt><expr><name><name>seg</name><operator>-&gt;</operator><name>mapped_size</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+    </block_content>}</block></if></if_stmt>
+
+    <comment type="block">/* Reduce reference count, if we previously increased it. */</comment>
+    <if_stmt><if>if <condition>(<expr><name><name>seg</name><operator>-&gt;</operator><name>control_slot</name></name> <operator>!=</operator> <name>INVALID_CONTROL_SLOT</name></expr>)</condition>
+    <block>{<block_content>
+        <decl_stmt><decl><type><name>uint32</name></type>        <name>refcnt</name></decl>;</decl_stmt>
+        <decl_stmt><decl><type><name>uint32</name></type>        <name>control_slot</name> <init>= <expr><name><name>seg</name><operator>-&gt;</operator><name>control_slot</name></name></expr></init></decl>;</decl_stmt>
+
+        <expr_stmt><expr><call><name>LWLockAcquire</name><argument_list>(<argument><expr><name>DynamicSharedMemoryControlLock</name></expr></argument>, <argument><expr><name>LW_EXCLUSIVE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>dsm_control</name><operator>-&gt;</operator><name>item</name><index>[<expr><name>control_slot</name></expr>]</index></name><operator>.</operator><name>handle</name> <operator>==</operator> <name><name>seg</name><operator>-&gt;</operator><name>handle</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>dsm_control</name><operator>-&gt;</operator><name>item</name><index>[<expr><name>control_slot</name></expr>]</index></name><operator>.</operator><name>refcnt</name> <operator>&gt;</operator> <literal type="number">1</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <expr_stmt><expr><name>refcnt</name> <operator>=</operator> <operator>--</operator><name><name>dsm_control</name><operator>-&gt;</operator><name>item</name><index>[<expr><name>control_slot</name></expr>]</index></name><operator>.</operator><name>refcnt</name></expr>;</expr_stmt>
+        <expr_stmt><expr><name><name>seg</name><operator>-&gt;</operator><name>control_slot</name></name> <operator>=</operator> <name>INVALID_CONTROL_SLOT</name></expr>;</expr_stmt>
+        <expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><name>DynamicSharedMemoryControlLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+        <comment type="block">/* If new reference count is 1, try to destroy the segment. */</comment>
+        <if_stmt><if>if <condition>(<expr><name>refcnt</name> <operator>==</operator> <literal type="number">1</literal></expr>)</condition>
+        <block>{<block_content>
+            <comment type="block">/* A pinned segment should never reach 1. */</comment>
+            <expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><operator>!</operator><name><name>dsm_control</name><operator>-&gt;</operator><name>item</name><index>[<expr><name>control_slot</name></expr>]</index></name><operator>.</operator><name>pinned</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+            <comment type="block">/*
+             * If we fail to destroy the segment here, or are killed before we
+             * finish doing so, the reference count will remain at 1, which
+             * will mean that nobody else can attach to the segment.  At
+             * postmaster shutdown time, or when a new postmaster is started
+             * after a hard kill, another attempt will be made to remove the
+             * segment.
+             *
+             * The main case we're worried about here is being killed by a
+             * signal before we can finish removing the segment.  In that
+             * case, it's important to be sure that the segment still gets
+             * removed. If we actually fail to remove the segment for some
+             * other reason, the postmaster may not have any better luck than
+             * we did.  There's not much we can do about that, though.
+             */</comment>
+            <if_stmt><if>if <condition>(<expr><call><name>dsm_impl_op</name><argument_list>(<argument><expr><name>DSM_OP_DESTROY</name></expr></argument>, <argument><expr><name><name>seg</name><operator>-&gt;</operator><name>handle</name></name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>seg</name><operator>-&gt;</operator><name>impl_private</name></name></expr></argument>,
+                            <argument><expr><operator>&amp;</operator><name><name>seg</name><operator>-&gt;</operator><name>mapped_address</name></name></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>seg</name><operator>-&gt;</operator><name>mapped_size</name></name></expr></argument>, <argument><expr><name>WARNING</name></expr></argument>)</argument_list></call></expr>)</condition>
+            <block>{<block_content>
+                <expr_stmt><expr><call><name>LWLockAcquire</name><argument_list>(<argument><expr><name>DynamicSharedMemoryControlLock</name></expr></argument>, <argument><expr><name>LW_EXCLUSIVE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+                <expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>dsm_control</name><operator>-&gt;</operator><name>item</name><index>[<expr><name>control_slot</name></expr>]</index></name><operator>.</operator><name>handle</name> <operator>==</operator> <name><name>seg</name><operator>-&gt;</operator><name>handle</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+                <expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>dsm_control</name><operator>-&gt;</operator><name>item</name><index>[<expr><name>control_slot</name></expr>]</index></name><operator>.</operator><name>refcnt</name> <operator>==</operator> <literal type="number">1</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+                <expr_stmt><expr><name><name>dsm_control</name><operator>-&gt;</operator><name>item</name><index>[<expr><name>control_slot</name></expr>]</index></name><operator>.</operator><name>refcnt</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+                <expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><name>DynamicSharedMemoryControlLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+            </block_content>}</block></if></if_stmt>
+        </block_content>}</block></if></if_stmt>
+    </block_content>}</block></if></if_stmt>
+
+    <comment type="block">/* Clean up our remaining backend-private data structures. */</comment>
+    <if_stmt><if>if <condition>(<expr><name><name>seg</name><operator>-&gt;</operator><name>resowner</name></name> <operator>!=</operator> <name>NULL</name></expr>)</condition><block type="pseudo"><block_content>
+        <expr_stmt><expr><call><name>ResourceOwnerForgetDSM</name><argument_list>(<argument><expr><name><name>seg</name><operator>-&gt;</operator><name>resowner</name></name></expr></argument>, <argument><expr><name>seg</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+    <expr_stmt><expr><call><name>dlist_delete</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>seg</name><operator>-&gt;</operator><name>node</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><call><name>pfree</name><argument_list>(<argument><expr><name>seg</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Keep a dynamic shared memory mapping until end of session.
+ *
+ * By default, mappings are owned by the current resource owner, which
+ * typically means they stick around for the duration of the current query
+ * only.
+ */</comment>
+<function><type><name>void</name></type>
+<name>dsm_pin_mapping</name><parameter_list>(<parameter><decl><type><name>dsm_segment</name> <modifier>*</modifier></type><name>seg</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <if_stmt><if>if <condition>(<expr><name><name>seg</name><operator>-&gt;</operator><name>resowner</name></name> <operator>!=</operator> <name>NULL</name></expr>)</condition>
+    <block>{<block_content>
+        <expr_stmt><expr><call><name>ResourceOwnerForgetDSM</name><argument_list>(<argument><expr><name><name>seg</name><operator>-&gt;</operator><name>resowner</name></name></expr></argument>, <argument><expr><name>seg</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <expr_stmt><expr><name><name>seg</name><operator>-&gt;</operator><name>resowner</name></name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+    </block_content>}</block></if></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Arrange to remove a dynamic shared memory mapping at cleanup time.
+ *
+ * dsm_pin_mapping() can be used to preserve a mapping for the entire
+ * lifetime of a process; this function reverses that decision, making
+ * the segment owned by the current resource owner.  This may be useful
+ * just before performing some operation that will invalidate the segment
+ * for future use by this backend.
+ */</comment>
+<function><type><name>void</name></type>
+<name>dsm_unpin_mapping</name><parameter_list>(<parameter><decl><type><name>dsm_segment</name> <modifier>*</modifier></type><name>seg</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>seg</name><operator>-&gt;</operator><name>resowner</name></name> <operator>==</operator> <name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><call><name>ResourceOwnerEnlargeDSMs</name><argument_list>(<argument><expr><name>CurrentResourceOwner</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>seg</name><operator>-&gt;</operator><name>resowner</name></name> <operator>=</operator> <name>CurrentResourceOwner</name></expr>;</expr_stmt>
+    <expr_stmt><expr><call><name>ResourceOwnerRememberDSM</name><argument_list>(<argument><expr><name><name>seg</name><operator>-&gt;</operator><name>resowner</name></name></expr></argument>, <argument><expr><name>seg</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Keep a dynamic shared memory segment until postmaster shutdown, or until
+ * dsm_unpin_segment is called.
+ *
+ * This function should not be called more than once per segment, unless the
+ * segment is explicitly unpinned with dsm_unpin_segment in between calls.
+ *
+ * Note that this function does not arrange for the current process to
+ * keep the segment mapped indefinitely; if that behavior is desired,
+ * dsm_pin_mapping() should be used from each process that needs to
+ * retain the mapping.
+ */</comment>
+<function><type><name>void</name></type>
+<name>dsm_pin_segment</name><parameter_list>(<parameter><decl><type><name>dsm_segment</name> <modifier>*</modifier></type><name>seg</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <decl_stmt><decl><type><name>void</name>       <modifier>*</modifier></type><name>handle</name></decl>;</decl_stmt>
+
+    <comment type="block">/*
+     * Bump reference count for this segment in shared memory. This will
+     * ensure that even if there is no session which is attached to this
+     * segment, it will remain until postmaster shutdown or an explicit call
+     * to unpin.
+     */</comment>
+    <expr_stmt><expr><call><name>LWLockAcquire</name><argument_list>(<argument><expr><name>DynamicSharedMemoryControlLock</name></expr></argument>, <argument><expr><name>LW_EXCLUSIVE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <if_stmt><if>if <condition>(<expr><name><name>dsm_control</name><operator>-&gt;</operator><name>item</name><index>[<expr><name><name>seg</name><operator>-&gt;</operator><name>control_slot</name></name></expr>]</index></name><operator>.</operator><name>pinned</name></expr>)</condition><block type="pseudo"><block_content>
+        <expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"cannot pin a segment that is already pinned"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+    <expr_stmt><expr><call><name>dsm_impl_pin_segment</name><argument_list>(<argument><expr><name><name>seg</name><operator>-&gt;</operator><name>handle</name></name></expr></argument>, <argument><expr><name><name>seg</name><operator>-&gt;</operator><name>impl_private</name></name></expr></argument>, <argument><expr><operator>&amp;</operator><name>handle</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>dsm_control</name><operator>-&gt;</operator><name>item</name><index>[<expr><name><name>seg</name><operator>-&gt;</operator><name>control_slot</name></name></expr>]</index></name><operator>.</operator><name>pinned</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>dsm_control</name><operator>-&gt;</operator><name>item</name><index>[<expr><name><name>seg</name><operator>-&gt;</operator><name>control_slot</name></name></expr>]</index></name><operator>.</operator><name>refcnt</name><operator>++</operator></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>dsm_control</name><operator>-&gt;</operator><name>item</name><index>[<expr><name><name>seg</name><operator>-&gt;</operator><name>control_slot</name></name></expr>]</index></name><operator>.</operator><name>impl_private_pm_handle</name> <operator>=</operator> <name>handle</name></expr>;</expr_stmt>
+    <expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><name>DynamicSharedMemoryControlLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Unpin a dynamic shared memory segment that was previously pinned with
+ * dsm_pin_segment.  This function should not be called unless dsm_pin_segment
+ * was previously called for this segment.
+ *
+ * The argument is a dsm_handle rather than a dsm_segment in case you want
+ * to unpin a segment to which you haven't attached.  This turns out to be
+ * useful if, for example, a reference to one shared memory segment is stored
+ * within another shared memory segment.  You might want to unpin the
+ * referenced segment before destroying the referencing segment.
+ */</comment>
+<function><type><name>void</name></type>
+<name>dsm_unpin_segment</name><parameter_list>(<parameter><decl><type><name>dsm_handle</name></type> <name>handle</name></decl></parameter>)</parameter_list>
+<block>{<block_content><comment type="line">// #lizard forgives</comment>
+    <decl_stmt><decl><type><name>uint32</name></type>        <name>control_slot</name> <init>= <expr><name>INVALID_CONTROL_SLOT</name></expr></init></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>bool</name></type>        <name>destroy</name> <init>= <expr><name>false</name></expr></init></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>uint32</name></type>        <name>i</name></decl>;</decl_stmt>
+
+    <comment type="block">/* Find the control slot for the given handle. */</comment>
+    <expr_stmt><expr><call><name>LWLockAcquire</name><argument_list>(<argument><expr><name>DynamicSharedMemoryControlLock</name></expr></argument>, <argument><expr><name>LW_EXCLUSIVE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <for>for <control>(<init><expr><name>i</name> <operator>=</operator> <literal type="number">0</literal></expr>;</init> <condition><expr><name>i</name> <operator>&lt;</operator> <name><name>dsm_control</name><operator>-&gt;</operator><name>nitems</name></name></expr>;</condition> <incr><expr><operator>++</operator><name>i</name></expr></incr>)</control>
+    <block>{<block_content>
+		<comment type="block">/* Skip unused slots and segments that are concurrently going away. */</comment>
+		<if_stmt><if>if <condition>(<expr><name><name>dsm_control</name><operator>-&gt;</operator><name>item</name><index>[<expr><name>i</name></expr>]</index></name><operator>.</operator><name>refcnt</name> <operator>&lt;=</operator> <literal type="number">1</literal></expr>)</condition><block type="pseudo"><block_content>
+            <continue>continue;</continue></block_content></block></if></if_stmt>
+
+        <comment type="block">/* If we've found our handle, we can stop searching. */</comment>
+        <if_stmt><if>if <condition>(<expr><name><name>dsm_control</name><operator>-&gt;</operator><name>item</name><index>[<expr><name>i</name></expr>]</index></name><operator>.</operator><name>handle</name> <operator>==</operator> <name>handle</name></expr>)</condition>
+        <block>{<block_content>
+            <expr_stmt><expr><name>control_slot</name> <operator>=</operator> <name>i</name></expr>;</expr_stmt>
+            <break>break;</break>
+        </block_content>}</block></if></if_stmt>
+    </block_content>}</block></for>
+
+    <comment type="block">/*
+     * We should definitely have found the slot, and it should not already be
+     * in the process of going away, because this function should only be
+     * called on a segment which is pinned.
+     */</comment>
+    <if_stmt><if>if <condition>(<expr><name>control_slot</name> <operator>==</operator> <name>INVALID_CONTROL_SLOT</name></expr>)</condition><block type="pseudo"><block_content>
+        <expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"cannot unpin unknown segment handle"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+    <if_stmt><if>if <condition>(<expr><operator>!</operator><name><name>dsm_control</name><operator>-&gt;</operator><name>item</name><index>[<expr><name>control_slot</name></expr>]</index></name><operator>.</operator><name>pinned</name></expr>)</condition><block type="pseudo"><block_content>
+        <expr_stmt><expr><call><name>elog</name><argument_list>(<argument><expr><name>ERROR</name></expr></argument>, <argument><expr><literal type="string">"cannot unpin a segment that is not pinned"</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+    <expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>dsm_control</name><operator>-&gt;</operator><name>item</name><index>[<expr><name>control_slot</name></expr>]</index></name><operator>.</operator><name>refcnt</name> <operator>&gt;</operator> <literal type="number">1</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+    <comment type="block">/*
+     * Allow implementation-specific code to run.  We have to do this before
+     * releasing the lock, because impl_private_pm_handle may get modified by
+     * dsm_impl_unpin_segment.
+     */</comment>
+    <expr_stmt><expr><call><name>dsm_impl_unpin_segment</name><argument_list>(<argument><expr><name>handle</name></expr></argument>,
+                           <argument><expr><operator>&amp;</operator><name><name>dsm_control</name><operator>-&gt;</operator><name>item</name><index>[<expr><name>control_slot</name></expr>]</index></name><operator>.</operator><name>impl_private_pm_handle</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+    <comment type="block">/* Note that 1 means no references (0 means unused slot). */</comment>
+    <if_stmt><if>if <condition>(<expr><operator>--</operator><name><name>dsm_control</name><operator>-&gt;</operator><name>item</name><index>[<expr><name>control_slot</name></expr>]</index></name><operator>.</operator><name>refcnt</name> <operator>==</operator> <literal type="number">1</literal></expr>)</condition><block type="pseudo"><block_content>
+        <expr_stmt><expr><name>destroy</name> <operator>=</operator> <name>true</name></expr>;</expr_stmt></block_content></block></if></if_stmt>
+    <expr_stmt><expr><name><name>dsm_control</name><operator>-&gt;</operator><name>item</name><index>[<expr><name>control_slot</name></expr>]</index></name><operator>.</operator><name>pinned</name> <operator>=</operator> <name>false</name></expr>;</expr_stmt>
+
+    <comment type="block">/* Now we can release the lock. */</comment>
+    <expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><name>DynamicSharedMemoryControlLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+    <comment type="block">/* Clean up resources if that was the last reference. */</comment>
+    <if_stmt><if>if <condition>(<expr><name>destroy</name></expr>)</condition>
+    <block>{<block_content>
+        <decl_stmt><decl><type><name>void</name>       <modifier>*</modifier></type><name>junk_impl_private</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+        <decl_stmt><decl><type><name>void</name>       <modifier>*</modifier></type><name>junk_mapped_address</name> <init>= <expr><name>NULL</name></expr></init></decl>;</decl_stmt>
+        <decl_stmt><decl><type><name>Size</name></type>        <name>junk_mapped_size</name> <init>= <expr><literal type="number">0</literal></expr></init></decl>;</decl_stmt>
+
+        <comment type="block">/*
+         * For an explanation of how error handling works in this case, see
+         * comments in dsm_detach.  Note that if we reach this point, the
+         * current process certainly does not have the segment mapped, because
+         * if it did, the reference count would have still been greater than 1
+         * even after releasing the reference count held by the pin.  The fact
+         * that there can't be a dsm_segment for this handle makes it OK to
+         * pass the mapped size, mapped address, and private data as NULL
+         * here.
+         */</comment>
+        <if_stmt><if>if <condition>(<expr><call><name>dsm_impl_op</name><argument_list>(<argument><expr><name>DSM_OP_DESTROY</name></expr></argument>, <argument><expr><name>handle</name></expr></argument>, <argument><expr><literal type="number">0</literal></expr></argument>, <argument><expr><operator>&amp;</operator><name>junk_impl_private</name></expr></argument>,
+                        <argument><expr><operator>&amp;</operator><name>junk_mapped_address</name></expr></argument>, <argument><expr><operator>&amp;</operator><name>junk_mapped_size</name></expr></argument>, <argument><expr><name>WARNING</name></expr></argument>)</argument_list></call></expr>)</condition>
+        <block>{<block_content>
+            <expr_stmt><expr><call><name>LWLockAcquire</name><argument_list>(<argument><expr><name>DynamicSharedMemoryControlLock</name></expr></argument>, <argument><expr><name>LW_EXCLUSIVE</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+            <expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>dsm_control</name><operator>-&gt;</operator><name>item</name><index>[<expr><name>control_slot</name></expr>]</index></name><operator>.</operator><name>handle</name> <operator>==</operator> <name>handle</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+            <expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>dsm_control</name><operator>-&gt;</operator><name>item</name><index>[<expr><name>control_slot</name></expr>]</index></name><operator>.</operator><name>refcnt</name> <operator>==</operator> <literal type="number">1</literal></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+            <expr_stmt><expr><name><name>dsm_control</name><operator>-&gt;</operator><name>item</name><index>[<expr><name>control_slot</name></expr>]</index></name><operator>.</operator><name>refcnt</name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+            <expr_stmt><expr><call><name>LWLockRelease</name><argument_list>(<argument><expr><name>DynamicSharedMemoryControlLock</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        </block_content>}</block></if></if_stmt>
+    </block_content>}</block></if></if_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Find an existing mapping for a shared memory segment, if there is one.
+ */</comment>
+<function><type><name>dsm_segment</name> <modifier>*</modifier></type>
+<name>dsm_find_mapping</name><parameter_list>(<parameter><decl><type><name>dsm_handle</name></type> <name>h</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <decl_stmt><decl><type><name>dlist_iter</name></type>    <name>iter</name></decl>;</decl_stmt>
+    <decl_stmt><decl><type><name>dsm_segment</name> <modifier>*</modifier></type><name>seg</name></decl>;</decl_stmt>
+
+    <macro><name>dlist_foreach</name><argument_list>(<argument>iter</argument>, <argument>&amp;dsm_segment_list</argument>)</argument_list></macro>
+    <block>{<block_content>
+        <expr_stmt><expr><name>seg</name> <operator>=</operator> <call><name>dlist_container</name><argument_list>(<argument><expr><name>dsm_segment</name></expr></argument>, <argument><expr><name>node</name></expr></argument>, <argument><expr><name><name>iter</name><operator>.</operator><name>cur</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <if_stmt><if>if <condition>(<expr><name><name>seg</name><operator>-&gt;</operator><name>handle</name></name> <operator>==</operator> <name>h</name></expr>)</condition><block type="pseudo"><block_content>
+            <return>return <expr><name>seg</name></expr>;</return></block_content></block></if></if_stmt>
+    </block_content>}</block>
+
+    <return>return <expr><name>NULL</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Get the address at which a dynamic shared memory segment is mapped.
+ */</comment>
+<function><type><name>void</name> <modifier>*</modifier></type>
+<name>dsm_segment_address</name><parameter_list>(<parameter><decl><type><name>dsm_segment</name> <modifier>*</modifier></type><name>seg</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>seg</name><operator>-&gt;</operator><name>mapped_address</name></name> <operator>!=</operator> <name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <return>return <expr><name><name>seg</name><operator>-&gt;</operator><name>mapped_address</name></name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Get the size of a mapping.
+ */</comment>
+<function><type><name>Size</name></type>
+<name>dsm_segment_map_length</name><parameter_list>(<parameter><decl><type><name>dsm_segment</name> <modifier>*</modifier></type><name>seg</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <expr_stmt><expr><call><name>Assert</name><argument_list>(<argument><expr><name><name>seg</name><operator>-&gt;</operator><name>mapped_address</name></name> <operator>!=</operator> <name>NULL</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <return>return <expr><name><name>seg</name><operator>-&gt;</operator><name>mapped_size</name></name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Get a handle for a mapping.
+ *
+ * To establish communication via dynamic shared memory between two backends,
+ * one of them should first call dsm_create() to establish a new shared
+ * memory mapping.  That process should then call dsm_segment_handle() to
+ * obtain a handle for the mapping, and pass that handle to the
+ * coordinating backend via some means (e.g. bgw_main_arg, or via the
+ * main shared memory segment).  The recipient, once in possession of the
+ * handle, should call dsm_attach().
+ */</comment>
+<function><type><name>dsm_handle</name></type>
+<name>dsm_segment_handle</name><parameter_list>(<parameter><decl><type><name>dsm_segment</name> <modifier>*</modifier></type><name>seg</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <return>return <expr><name><name>seg</name><operator>-&gt;</operator><name>handle</name></name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Register an on-detach callback for a dynamic shared memory segment.
+ */</comment>
+<function><type><name>void</name></type>
+<name>on_dsm_detach</name><parameter_list>(<parameter><decl><type><name>dsm_segment</name> <modifier>*</modifier></type><name>seg</name></decl></parameter>, <parameter><decl><type><name>on_dsm_detach_callback</name></type> <name>function</name></decl></parameter>, <parameter><decl><type><name>Datum</name></type> <name>arg</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <decl_stmt><decl><type><name>dsm_segment_detach_callback</name> <modifier>*</modifier></type><name>cb</name></decl>;</decl_stmt>
+
+    <expr_stmt><expr><name>cb</name> <operator>=</operator> <call><name>MemoryContextAlloc</name><argument_list>(<argument><expr><name>TopMemoryContext</name></expr></argument>,
+                            <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>dsm_segment_detach_callback</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>cb</name><operator>-&gt;</operator><name>function</name></name> <operator>=</operator> <name>function</name></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>cb</name><operator>-&gt;</operator><name>arg</name></name> <operator>=</operator> <name>arg</name></expr>;</expr_stmt>
+    <expr_stmt><expr><call><name>slist_push_head</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>seg</name><operator>-&gt;</operator><name>on_detach</name></name></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>cb</name><operator>-&gt;</operator><name>node</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Unregister an on-detach callback for a dynamic shared memory segment.
+ */</comment>
+<function><type><name>void</name></type>
+<name>cancel_on_dsm_detach</name><parameter_list>(<parameter><decl><type><name>dsm_segment</name> <modifier>*</modifier></type><name>seg</name></decl></parameter>, <parameter><decl><type><name>on_dsm_detach_callback</name></type> <name>function</name></decl></parameter>,
+                     <parameter><decl><type><name>Datum</name></type> <name>arg</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <decl_stmt><decl><type><name>slist_mutable_iter</name></type> <name>iter</name></decl>;</decl_stmt>
+
+    <macro><name>slist_foreach_modify</name><argument_list>(<argument>iter</argument>, <argument>&amp;seg-&gt;on_detach</argument>)</argument_list></macro>
+    <block>{<block_content>
+        <decl_stmt><decl><type><name>dsm_segment_detach_callback</name> <modifier>*</modifier></type><name>cb</name></decl>;</decl_stmt>
+
+        <expr_stmt><expr><name>cb</name> <operator>=</operator> <call><name>slist_container</name><argument_list>(<argument><expr><name>dsm_segment_detach_callback</name></expr></argument>, <argument><expr><name>node</name></expr></argument>, <argument><expr><name><name>iter</name><operator>.</operator><name>cur</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        <if_stmt><if>if <condition>(<expr><name><name>cb</name><operator>-&gt;</operator><name>function</name></name> <operator>==</operator> <name>function</name> <operator>&amp;&amp;</operator> <name><name>cb</name><operator>-&gt;</operator><name>arg</name></name> <operator>==</operator> <name>arg</name></expr>)</condition>
+        <block>{<block_content>
+            <expr_stmt><expr><call><name>slist_delete_current</name><argument_list>(<argument><expr><operator>&amp;</operator><name>iter</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+            <expr_stmt><expr><call><name>pfree</name><argument_list>(<argument><expr><name>cb</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+            <break>break;</break>
+        </block_content>}</block></if></if_stmt>
+    </block_content>}</block>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Discard all registered on-detach callbacks without executing them.
+ */</comment>
+<function><type><name>void</name></type>
+<name>reset_on_dsm_detach</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <decl_stmt><decl><type><name>dlist_iter</name></type>    <name>iter</name></decl>;</decl_stmt>
+
+    <macro><name>dlist_foreach</name><argument_list>(<argument>iter</argument>, <argument>&amp;dsm_segment_list</argument>)</argument_list></macro>
+    <block>{<block_content>
+        <decl_stmt><decl><type><name>dsm_segment</name> <modifier>*</modifier></type><name>seg</name> <init>= <expr><call><name>dlist_container</name><argument_list>(<argument><expr><name>dsm_segment</name></expr></argument>, <argument><expr><name>node</name></expr></argument>, <argument><expr><name><name>iter</name><operator>.</operator><name>cur</name></name></expr></argument>)</argument_list></call></expr></init></decl>;</decl_stmt>
+
+        <comment type="block">/* Throw away explicit on-detach actions one by one. */</comment>
+        <while>while <condition>(<expr><operator>!</operator><call><name>slist_is_empty</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>seg</name><operator>-&gt;</operator><name>on_detach</name></name></expr></argument>)</argument_list></call></expr>)</condition>
+        <block>{<block_content>
+            <decl_stmt><decl><type><name>slist_node</name> <modifier>*</modifier></type><name>node</name></decl>;</decl_stmt>
+            <decl_stmt><decl><type><name>dsm_segment_detach_callback</name> <modifier>*</modifier></type><name>cb</name></decl>;</decl_stmt>
+
+            <expr_stmt><expr><name>node</name> <operator>=</operator> <call><name>slist_pop_head_node</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>seg</name><operator>-&gt;</operator><name>on_detach</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+            <expr_stmt><expr><name>cb</name> <operator>=</operator> <call><name>slist_container</name><argument_list>(<argument><expr><name>dsm_segment_detach_callback</name></expr></argument>, <argument><expr><name>node</name></expr></argument>, <argument><expr><name>node</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+            <expr_stmt><expr><call><name>pfree</name><argument_list>(<argument><expr><name>cb</name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+        </block_content>}</block></while>
+
+        <comment type="block">/*
+         * Decrementing the reference count is a sort of implicit on-detach
+         * action; make sure we don't do that, either.
+         */</comment>
+        <expr_stmt><expr><name><name>seg</name><operator>-&gt;</operator><name>control_slot</name></name> <operator>=</operator> <name>INVALID_CONTROL_SLOT</name></expr>;</expr_stmt>
+    </block_content>}</block>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Create a segment descriptor.
+ */</comment>
+<function><type><specifier>static</specifier> <name>dsm_segment</name> <modifier>*</modifier></type>
+<name>dsm_create_descriptor</name><parameter_list>(<parameter><decl><type><name>void</name></type></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <decl_stmt><decl><type><name>dsm_segment</name> <modifier>*</modifier></type><name>seg</name></decl>;</decl_stmt>
+
+    <if_stmt><if>if <condition>(<expr><name>CurrentResourceOwner</name></expr>)</condition><block type="pseudo"><block_content>
+        <expr_stmt><expr><call><name>ResourceOwnerEnlargeDSMs</name><argument_list>(<argument><expr><name>CurrentResourceOwner</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+    <expr_stmt><expr><name>seg</name> <operator>=</operator> <call><name>MemoryContextAlloc</name><argument_list>(<argument><expr><name>TopMemoryContext</name></expr></argument>, <argument><expr><sizeof>sizeof<argument_list>(<argument><expr><name>dsm_segment</name></expr></argument>)</argument_list></sizeof></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+    <expr_stmt><expr><call><name>dlist_push_head</name><argument_list>(<argument><expr><operator>&amp;</operator><name>dsm_segment_list</name></expr></argument>, <argument><expr><operator>&amp;</operator><name><name>seg</name><operator>-&gt;</operator><name>node</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+    <comment type="block">/* seg-&gt;handle must be initialized by the caller */</comment>
+    <expr_stmt><expr><name><name>seg</name><operator>-&gt;</operator><name>control_slot</name></name> <operator>=</operator> <name>INVALID_CONTROL_SLOT</name></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>seg</name><operator>-&gt;</operator><name>impl_private</name></name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>seg</name><operator>-&gt;</operator><name>mapped_address</name></name> <operator>=</operator> <name>NULL</name></expr>;</expr_stmt>
+    <expr_stmt><expr><name><name>seg</name><operator>-&gt;</operator><name>mapped_size</name></name> <operator>=</operator> <literal type="number">0</literal></expr>;</expr_stmt>
+
+    <expr_stmt><expr><name><name>seg</name><operator>-&gt;</operator><name>resowner</name></name> <operator>=</operator> <name>CurrentResourceOwner</name></expr>;</expr_stmt>
+    <if_stmt><if>if <condition>(<expr><name>CurrentResourceOwner</name></expr>)</condition><block type="pseudo"><block_content>
+        <expr_stmt><expr><call><name>ResourceOwnerRememberDSM</name><argument_list>(<argument><expr><name>CurrentResourceOwner</name></expr></argument>, <argument><expr><name>seg</name></expr></argument>)</argument_list></call></expr>;</expr_stmt></block_content></block></if></if_stmt>
+
+    <expr_stmt><expr><call><name>slist_init</name><argument_list>(<argument><expr><operator>&amp;</operator><name><name>seg</name><operator>-&gt;</operator><name>on_detach</name></name></expr></argument>)</argument_list></call></expr>;</expr_stmt>
+
+    <return>return <expr><name>seg</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Sanity check a control segment.
+ *
+ * The goal here isn't to detect everything that could possibly be wrong with
+ * the control segment; there's not enough information for that.  Rather, the
+ * goal is to make sure that someone can iterate over the items in the segment
+ * without overrunning the end of the mapping and crashing.  We also check
+ * the magic number since, if that's messed up, this may not even be one of
+ * our segments at all.
+ */</comment>
+<function><type><specifier>static</specifier> <name>bool</name></type>
+<name>dsm_control_segment_sane</name><parameter_list>(<parameter><decl><type><name>dsm_control_header</name> <modifier>*</modifier></type><name>control</name></decl></parameter>, <parameter><decl><type><name>Size</name></type> <name>mapped_size</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <if_stmt><if>if <condition>(<expr><name>mapped_size</name> <operator>&lt;</operator> <call><name>offsetof</name><argument_list>(<argument><expr><name>dsm_control_header</name></expr></argument>, <argument><expr><name>item</name></expr></argument>)</argument_list></call></expr>)</condition><block type="pseudo"><block_content>
+        <return>return <expr><name>false</name></expr>;</return></block_content></block></if></if_stmt>            <comment type="block">/* Mapped size too short to read header. */</comment>
+    <if_stmt><if>if <condition>(<expr><name><name>control</name><operator>-&gt;</operator><name>magic</name></name> <operator>!=</operator> <name>PG_DYNSHMEM_CONTROL_MAGIC</name></expr>)</condition><block type="pseudo"><block_content>
+        <return>return <expr><name>false</name></expr>;</return></block_content></block></if></if_stmt>            <comment type="block">/* Magic number doesn't match. */</comment>
+    <if_stmt><if>if <condition>(<expr><call><name>dsm_control_bytes_needed</name><argument_list>(<argument><expr><name><name>control</name><operator>-&gt;</operator><name>maxitems</name></name></expr></argument>)</argument_list></call> <operator>&gt;</operator> <name>mapped_size</name></expr>)</condition><block type="pseudo"><block_content>
+        <return>return <expr><name>false</name></expr>;</return></block_content></block></if></if_stmt>            <comment type="block">/* Max item count won't fit in map. */</comment>
+    <if_stmt><if>if <condition>(<expr><name><name>control</name><operator>-&gt;</operator><name>nitems</name></name> <operator>&gt;</operator> <name><name>control</name><operator>-&gt;</operator><name>maxitems</name></name></expr>)</condition><block type="pseudo"><block_content>
+        <return>return <expr><name>false</name></expr>;</return></block_content></block></if></if_stmt>            <comment type="block">/* Overfull. */</comment>
+    <return>return <expr><name>true</name></expr>;</return>
+</block_content>}</block></function>
+
+<comment type="block">/*
+ * Compute the number of control-segment bytes needed to store a given
+ * number of items.
+ */</comment>
+<function><type><specifier>static</specifier> <name>uint64</name></type>
+<name>dsm_control_bytes_needed</name><parameter_list>(<parameter><decl><type><name>uint32</name></type> <name>nitems</name></decl></parameter>)</parameter_list>
+<block>{<block_content>
+    <return>return <expr><call><name>offsetof</name><argument_list>(<argument><expr><name>dsm_control_header</name></expr></argument>, <argument><expr><name>item</name></expr></argument>)</argument_list></call>
+        <operator>+</operator> <sizeof>sizeof<argument_list>(<argument><expr><name>dsm_control_item</name></expr></argument>)</argument_list></sizeof> <operator>*</operator> <operator>(</operator><name>uint64</name><operator>)</operator> <name>nitems</name></expr>;</return>
+</block_content>}</block></function>
+</unit>
