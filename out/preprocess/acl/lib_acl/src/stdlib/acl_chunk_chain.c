@@ -1,16 +1,16 @@
-# 1 "/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c"
-# 1 "<built-in>"
-# 1 "<command-line>"
+# 0 "/acl/lib_acl/src/stdlib/acl_chunk_chain.c"
+# 0 "<built-in>"
+# 0 "<command-line>"
 # 1 "/usr/include/stdc-predef.h" 1 3 4
-# 1 "<command-line>" 2
-# 1 "/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c"
-# 1 "/workspace/acl/lib_acl/StdAfx.h" 1
+# 0 "<command-line>" 2
+# 1 "/acl/lib_acl/src/stdlib/acl_chunk_chain.c"
+# 1 "/acl/lib_acl/StdAfx.h" 1
 
 
 
 
 
-# 1 "/workspace/acl/lib_acl/include/stdlib/acl_define.h" 1
+# 1 "/acl/lib_acl/include/stdlib/acl_define.h" 1
 
 
 
@@ -18,60 +18,75 @@
 
 
 
-# 1 "/workspace/acl/lib_acl/include/stdlib/acl_define_win32.h" 1
-# 9 "/workspace/acl/lib_acl/include/stdlib/acl_define.h" 2
+# 1 "/acl/lib_acl/include/stdlib/acl_define_win32.h" 1
+# 9 "/acl/lib_acl/include/stdlib/acl_define.h" 2
 
-# 1 "/workspace/acl/lib_acl/include/stdlib/acl_define_unix.h" 1
+# 1 "/acl/lib_acl/include/stdlib/acl_define_unix.h" 1
 
 
 
-# 1 "/workspace/acl/lib_acl/include/stdlib/acl_define_linux.h" 1
-# 18 "/workspace/acl/lib_acl/include/stdlib/acl_define_linux.h"
-# 1 "/usr/lib/gcc/x86_64-linux-gnu/7/include/stddef.h" 1 3 4
-# 149 "/usr/lib/gcc/x86_64-linux-gnu/7/include/stddef.h" 3 4
+# 1 "/acl/lib_acl/include/stdlib/acl_define_linux.h" 1
+# 18 "/acl/lib_acl/include/stdlib/acl_define_linux.h"
+# 1 "/usr/lib/gcc/aarch64-linux-gnu/11/include/stddef.h" 1 3 4
+# 143 "/usr/lib/gcc/aarch64-linux-gnu/11/include/stddef.h" 3 4
 
-# 149 "/usr/lib/gcc/x86_64-linux-gnu/7/include/stddef.h" 3 4
+# 143 "/usr/lib/gcc/aarch64-linux-gnu/11/include/stddef.h" 3 4
 typedef long int ptrdiff_t;
-# 216 "/usr/lib/gcc/x86_64-linux-gnu/7/include/stddef.h" 3 4
+# 209 "/usr/lib/gcc/aarch64-linux-gnu/11/include/stddef.h" 3 4
 typedef long unsigned int size_t;
-# 328 "/usr/lib/gcc/x86_64-linux-gnu/7/include/stddef.h" 3 4
-typedef int wchar_t;
-# 426 "/usr/lib/gcc/x86_64-linux-gnu/7/include/stddef.h" 3 4
+# 321 "/usr/lib/gcc/aarch64-linux-gnu/11/include/stddef.h" 3 4
+typedef unsigned int wchar_t;
+# 415 "/usr/lib/gcc/aarch64-linux-gnu/11/include/stddef.h" 3 4
 typedef struct {
   long long __max_align_ll __attribute__((__aligned__(__alignof__(long long))));
   long double __max_align_ld __attribute__((__aligned__(__alignof__(long double))));
-# 437 "/usr/lib/gcc/x86_64-linux-gnu/7/include/stddef.h" 3 4
+# 426 "/usr/lib/gcc/aarch64-linux-gnu/11/include/stddef.h" 3 4
 } max_align_t;
-# 19 "/workspace/acl/lib_acl/include/stdlib/acl_define_linux.h" 2
-# 66 "/workspace/acl/lib_acl/include/stdlib/acl_define_linux.h"
+# 19 "/acl/lib_acl/include/stdlib/acl_define_linux.h" 2
+# 66 "/acl/lib_acl/include/stdlib/acl_define_linux.h"
  
-# 66 "/workspace/acl/lib_acl/include/stdlib/acl_define_linux.h"
+# 66 "/acl/lib_acl/include/stdlib/acl_define_linux.h"
 typedef int ACL_WAIT_STATUS_T;
-# 5 "/workspace/acl/lib_acl/include/stdlib/acl_define_unix.h" 2
-# 1 "/workspace/acl/lib_acl/include/stdlib/acl_define_sunx86.h" 1
-# 6 "/workspace/acl/lib_acl/include/stdlib/acl_define_unix.h" 2
-# 1 "/workspace/acl/lib_acl/include/stdlib/acl_define_bsd.h" 1
-# 7 "/workspace/acl/lib_acl/include/stdlib/acl_define_unix.h" 2
-# 1 "/workspace/acl/lib_acl/include/stdlib/acl_define_macosx.h" 1
-# 8 "/workspace/acl/lib_acl/include/stdlib/acl_define_unix.h" 2
-# 41 "/workspace/acl/lib_acl/include/stdlib/acl_define_unix.h"
+# 5 "/acl/lib_acl/include/stdlib/acl_define_unix.h" 2
+# 1 "/acl/lib_acl/include/stdlib/acl_define_sunx86.h" 1
+# 6 "/acl/lib_acl/include/stdlib/acl_define_unix.h" 2
+# 1 "/acl/lib_acl/include/stdlib/acl_define_bsd.h" 1
+# 7 "/acl/lib_acl/include/stdlib/acl_define_unix.h" 2
+# 1 "/acl/lib_acl/include/stdlib/acl_define_macosx.h" 1
+# 8 "/acl/lib_acl/include/stdlib/acl_define_unix.h" 2
+# 41 "/acl/lib_acl/include/stdlib/acl_define_unix.h"
 # 1 "/usr/include/assert.h" 1 3 4
 # 35 "/usr/include/assert.h" 3 4
 # 1 "/usr/include/features.h" 1 3 4
-# 424 "/usr/include/features.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/sys/cdefs.h" 1 3 4
-# 427 "/usr/include/x86_64-linux-gnu/sys/cdefs.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/wordsize.h" 1 3 4
-# 428 "/usr/include/x86_64-linux-gnu/sys/cdefs.h" 2 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/long-double.h" 1 3 4
-# 429 "/usr/include/x86_64-linux-gnu/sys/cdefs.h" 2 3 4
-# 425 "/usr/include/features.h" 2 3 4
-# 448 "/usr/include/features.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/gnu/stubs.h" 1 3 4
-# 10 "/usr/include/x86_64-linux-gnu/gnu/stubs.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/gnu/stubs-64.h" 1 3 4
-# 11 "/usr/include/x86_64-linux-gnu/gnu/stubs.h" 2 3 4
-# 449 "/usr/include/features.h" 2 3 4
+# 392 "/usr/include/features.h" 3 4
+# 1 "/usr/include/features-time64.h" 1 3 4
+# 20 "/usr/include/features-time64.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/wordsize.h" 1 3 4
+# 21 "/usr/include/features-time64.h" 2 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/timesize.h" 1 3 4
+# 22 "/usr/include/features-time64.h" 2 3 4
+# 393 "/usr/include/features.h" 2 3 4
+# 486 "/usr/include/features.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/sys/cdefs.h" 1 3 4
+# 559 "/usr/include/aarch64-linux-gnu/sys/cdefs.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/wordsize.h" 1 3 4
+# 560 "/usr/include/aarch64-linux-gnu/sys/cdefs.h" 2 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/long-double.h" 1 3 4
+# 561 "/usr/include/aarch64-linux-gnu/sys/cdefs.h" 2 3 4
+# 487 "/usr/include/features.h" 2 3 4
+# 510 "/usr/include/features.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/gnu/stubs.h" 1 3 4
+
+
+
+
+# 1 "/usr/include/aarch64-linux-gnu/bits/wordsize.h" 1 3 4
+# 6 "/usr/include/aarch64-linux-gnu/gnu/stubs.h" 2 3 4
+
+
+# 1 "/usr/include/aarch64-linux-gnu/gnu/stubs-lp64.h" 1 3 4
+# 9 "/usr/include/aarch64-linux-gnu/gnu/stubs.h" 2 3 4
+# 511 "/usr/include/features.h" 2 3 4
 # 36 "/usr/include/assert.h" 2 3 4
 # 66 "/usr/include/assert.h" 3 4
 
@@ -96,15 +111,17 @@ extern void __assert (const char *__assertion, const char *__file, int __line)
 
 
 
-# 42 "/workspace/acl/lib_acl/include/stdlib/acl_define_unix.h" 2
-# 1 "/usr/include/x86_64-linux-gnu/sys/types.h" 1 3 4
-# 27 "/usr/include/x86_64-linux-gnu/sys/types.h" 3 4
+# 42 "/acl/lib_acl/include/stdlib/acl_define_unix.h" 2
+# 1 "/usr/include/aarch64-linux-gnu/sys/types.h" 1 3 4
+# 27 "/usr/include/aarch64-linux-gnu/sys/types.h" 3 4
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/types.h" 1 3 4
-# 27 "/usr/include/x86_64-linux-gnu/bits/types.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/wordsize.h" 1 3 4
-# 28 "/usr/include/x86_64-linux-gnu/bits/types.h" 2 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/types.h" 1 3 4
+# 27 "/usr/include/aarch64-linux-gnu/bits/types.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/wordsize.h" 1 3 4
+# 28 "/usr/include/aarch64-linux-gnu/bits/types.h" 2 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/timesize.h" 1 3 4
+# 29 "/usr/include/aarch64-linux-gnu/bits/types.h" 2 3 4
 
 
 typedef unsigned char __u_char;
@@ -128,6 +145,16 @@ typedef unsigned long int __uint64_t;
 
 
 
+typedef __int8_t __int_least8_t;
+typedef __uint8_t __uint_least8_t;
+typedef __int16_t __int_least16_t;
+typedef __uint16_t __uint_least16_t;
+typedef __int32_t __int_least32_t;
+typedef __uint32_t __uint_least32_t;
+typedef __int64_t __int_least64_t;
+typedef __uint64_t __uint_least64_t;
+
+
 
 typedef long int __quad_t;
 typedef unsigned long int __u_quad_t;
@@ -140,9 +167,11 @@ typedef unsigned long int __u_quad_t;
 
 typedef long int __intmax_t;
 typedef unsigned long int __uintmax_t;
-# 130 "/usr/include/x86_64-linux-gnu/bits/types.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/typesizes.h" 1 3 4
-# 131 "/usr/include/x86_64-linux-gnu/bits/types.h" 2 3 4
+# 141 "/usr/include/aarch64-linux-gnu/bits/types.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/typesizes.h" 1 3 4
+# 142 "/usr/include/aarch64-linux-gnu/bits/types.h" 2 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/time64.h" 1 3 4
+# 143 "/usr/include/aarch64-linux-gnu/bits/types.h" 2 3 4
 
 
 typedef unsigned long int __dev_t;
@@ -151,7 +180,7 @@ typedef unsigned int __gid_t;
 typedef unsigned long int __ino_t;
 typedef unsigned long int __ino64_t;
 typedef unsigned int __mode_t;
-typedef unsigned long int __nlink_t;
+typedef unsigned int __nlink_t;
 typedef long int __off_t;
 typedef long int __off64_t;
 typedef int __pid_t;
@@ -163,6 +192,7 @@ typedef unsigned int __id_t;
 typedef long int __time_t;
 typedef unsigned int __useconds_t;
 typedef long int __suseconds_t;
+typedef long int __suseconds64_t;
 
 typedef int __daddr_t;
 typedef int __key_t;
@@ -174,7 +204,7 @@ typedef int __clockid_t;
 typedef void * __timer_t;
 
 
-typedef long int __blksize_t;
+typedef int __blksize_t;
 
 
 
@@ -215,7 +245,7 @@ typedef unsigned int __socklen_t;
 
 
 typedef int __sig_atomic_t;
-# 30 "/usr/include/x86_64-linux-gnu/sys/types.h" 2 3 4
+# 30 "/usr/include/aarch64-linux-gnu/sys/types.h" 2 3 4
 
 
 
@@ -228,9 +258,8 @@ typedef __u_quad_t u_quad_t;
 typedef __fsid_t fsid_t;
 
 
-
-
 typedef __loff_t loff_t;
+
 
 
 
@@ -313,7 +342,7 @@ typedef __key_t key_t;
 
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/types/clock_t.h" 1 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/types/clock_t.h" 1 3 4
 
 
 
@@ -321,9 +350,9 @@ typedef __key_t key_t;
 
 
 typedef __clock_t clock_t;
-# 128 "/usr/include/x86_64-linux-gnu/sys/types.h" 2 3 4
+# 127 "/usr/include/aarch64-linux-gnu/sys/types.h" 2 3 4
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/types/clockid_t.h" 1 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/types/clockid_t.h" 1 3 4
 
 
 
@@ -331,17 +360,12 @@ typedef __clock_t clock_t;
 
 
 typedef __clockid_t clockid_t;
-# 130 "/usr/include/x86_64-linux-gnu/sys/types.h" 2 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/types/time_t.h" 1 3 4
-
-
-
-
-
-
+# 129 "/usr/include/aarch64-linux-gnu/sys/types.h" 2 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/types/time_t.h" 1 3 4
+# 10 "/usr/include/aarch64-linux-gnu/bits/types/time_t.h" 3 4
 typedef __time_t time_t;
-# 131 "/usr/include/x86_64-linux-gnu/sys/types.h" 2 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/types/timer_t.h" 1 3 4
+# 130 "/usr/include/aarch64-linux-gnu/sys/types.h" 2 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/types/timer_t.h" 1 3 4
 
 
 
@@ -349,10 +373,10 @@ typedef __time_t time_t;
 
 
 typedef __timer_t timer_t;
-# 132 "/usr/include/x86_64-linux-gnu/sys/types.h" 2 3 4
-# 145 "/usr/include/x86_64-linux-gnu/sys/types.h" 3 4
-# 1 "/usr/lib/gcc/x86_64-linux-gnu/7/include/stddef.h" 1 3 4
-# 146 "/usr/include/x86_64-linux-gnu/sys/types.h" 2 3 4
+# 131 "/usr/include/aarch64-linux-gnu/sys/types.h" 2 3 4
+# 144 "/usr/include/aarch64-linux-gnu/sys/types.h" 3 4
+# 1 "/usr/lib/gcc/aarch64-linux-gnu/11/include/stddef.h" 1 3 4
+# 145 "/usr/include/aarch64-linux-gnu/sys/types.h" 2 3 4
 
 
 
@@ -363,53 +387,70 @@ typedef unsigned int uint;
 
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/stdint-intn.h" 1 3 4
-# 24 "/usr/include/x86_64-linux-gnu/bits/stdint-intn.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/stdint-intn.h" 1 3 4
+# 24 "/usr/include/aarch64-linux-gnu/bits/stdint-intn.h" 3 4
 typedef __int8_t int8_t;
 typedef __int16_t int16_t;
 typedef __int32_t int32_t;
 typedef __int64_t int64_t;
-# 157 "/usr/include/x86_64-linux-gnu/sys/types.h" 2 3 4
-# 178 "/usr/include/x86_64-linux-gnu/sys/types.h" 3 4
-typedef unsigned int u_int8_t __attribute__ ((__mode__ (__QI__)));
-typedef unsigned int u_int16_t __attribute__ ((__mode__ (__HI__)));
-typedef unsigned int u_int32_t __attribute__ ((__mode__ (__SI__)));
-typedef unsigned int u_int64_t __attribute__ ((__mode__ (__DI__)));
+# 156 "/usr/include/aarch64-linux-gnu/sys/types.h" 2 3 4
+
+
+typedef __uint8_t u_int8_t;
+typedef __uint16_t u_int16_t;
+typedef __uint32_t u_int32_t;
+typedef __uint64_t u_int64_t;
+
 
 typedef int register_t __attribute__ ((__mode__ (__word__)));
-# 194 "/usr/include/x86_64-linux-gnu/sys/types.h" 3 4
+# 176 "/usr/include/aarch64-linux-gnu/sys/types.h" 3 4
 # 1 "/usr/include/endian.h" 1 3 4
-# 36 "/usr/include/endian.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/endian.h" 1 3 4
-# 37 "/usr/include/endian.h" 2 3 4
-# 60 "/usr/include/endian.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/byteswap.h" 1 3 4
-# 28 "/usr/include/x86_64-linux-gnu/bits/byteswap.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/wordsize.h" 1 3 4
-# 29 "/usr/include/x86_64-linux-gnu/bits/byteswap.h" 2 3 4
-
-
-
-
-
-
-# 1 "/usr/include/x86_64-linux-gnu/bits/byteswap-16.h" 1 3 4
-# 36 "/usr/include/x86_64-linux-gnu/bits/byteswap.h" 2 3 4
-# 44 "/usr/include/x86_64-linux-gnu/bits/byteswap.h" 3 4
-static __inline unsigned int
-__bswap_32 (unsigned int __bsx)
+# 24 "/usr/include/endian.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/endian.h" 1 3 4
+# 35 "/usr/include/aarch64-linux-gnu/bits/endian.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/endianness.h" 1 3 4
+# 36 "/usr/include/aarch64-linux-gnu/bits/endian.h" 2 3 4
+# 25 "/usr/include/endian.h" 2 3 4
+# 35 "/usr/include/endian.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/byteswap.h" 1 3 4
+# 33 "/usr/include/aarch64-linux-gnu/bits/byteswap.h" 3 4
+static __inline __uint16_t
+__bswap_16 (__uint16_t __bsx)
 {
-  return __builtin_bswap32 (__bsx);
+
+  return __builtin_bswap16 (__bsx);
+
+
+
 }
-# 108 "/usr/include/x86_64-linux-gnu/bits/byteswap.h" 3 4
-static __inline __uint64_t
+
+
+
+
+
+
+static __inline __uint32_t
+__bswap_32 (__uint32_t __bsx)
+{
+
+  return __builtin_bswap32 (__bsx);
+
+
+
+}
+# 69 "/usr/include/aarch64-linux-gnu/bits/byteswap.h" 3 4
+__extension__ static __inline __uint64_t
 __bswap_64 (__uint64_t __bsx)
 {
+
   return __builtin_bswap64 (__bsx);
+
+
+
 }
-# 61 "/usr/include/endian.h" 2 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/uintn-identity.h" 1 3 4
-# 32 "/usr/include/x86_64-linux-gnu/bits/uintn-identity.h" 3 4
+# 36 "/usr/include/endian.h" 2 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/uintn-identity.h" 1 3 4
+# 32 "/usr/include/aarch64-linux-gnu/bits/uintn-identity.h" 3 4
 static __inline __uint16_t
 __uint16_identity (__uint16_t __x)
 {
@@ -427,24 +468,21 @@ __uint64_identity (__uint64_t __x)
 {
   return __x;
 }
-# 62 "/usr/include/endian.h" 2 3 4
-# 195 "/usr/include/x86_64-linux-gnu/sys/types.h" 2 3 4
+# 37 "/usr/include/endian.h" 2 3 4
+# 177 "/usr/include/aarch64-linux-gnu/sys/types.h" 2 3 4
 
 
-# 1 "/usr/include/x86_64-linux-gnu/sys/select.h" 1 3 4
-# 30 "/usr/include/x86_64-linux-gnu/sys/select.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/select.h" 1 3 4
-# 22 "/usr/include/x86_64-linux-gnu/bits/select.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/wordsize.h" 1 3 4
-# 23 "/usr/include/x86_64-linux-gnu/bits/select.h" 2 3 4
-# 31 "/usr/include/x86_64-linux-gnu/sys/select.h" 2 3 4
+# 1 "/usr/include/aarch64-linux-gnu/sys/select.h" 1 3 4
+# 30 "/usr/include/aarch64-linux-gnu/sys/select.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/select.h" 1 3 4
+# 31 "/usr/include/aarch64-linux-gnu/sys/select.h" 2 3 4
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/types/sigset_t.h" 1 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/types/sigset_t.h" 1 3 4
 
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/types/__sigset_t.h" 1 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/types/__sigset_t.h" 1 3 4
 
 
 
@@ -453,15 +491,15 @@ typedef struct
 {
   unsigned long int __val[(1024 / (8 * sizeof (unsigned long int)))];
 } __sigset_t;
-# 5 "/usr/include/x86_64-linux-gnu/bits/types/sigset_t.h" 2 3 4
+# 5 "/usr/include/aarch64-linux-gnu/bits/types/sigset_t.h" 2 3 4
 
 
 typedef __sigset_t sigset_t;
-# 34 "/usr/include/x86_64-linux-gnu/sys/select.h" 2 3 4
+# 34 "/usr/include/aarch64-linux-gnu/sys/select.h" 2 3 4
 
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/types/struct_timeval.h" 1 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/types/struct_timeval.h" 1 3 4
 
 
 
@@ -471,19 +509,32 @@ typedef __sigset_t sigset_t;
 
 struct timeval
 {
+
+
+
+
   __time_t tv_sec;
   __suseconds_t tv_usec;
-};
-# 38 "/usr/include/x86_64-linux-gnu/sys/select.h" 2 3 4
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/types/struct_timespec.h" 1 3 4
-# 9 "/usr/include/x86_64-linux-gnu/bits/types/struct_timespec.h" 3 4
+};
+# 38 "/usr/include/aarch64-linux-gnu/sys/select.h" 2 3 4
+
+# 1 "/usr/include/aarch64-linux-gnu/bits/types/struct_timespec.h" 1 3 4
+# 11 "/usr/include/aarch64-linux-gnu/bits/types/struct_timespec.h" 3 4
 struct timespec
 {
+
+
+
   __time_t tv_sec;
+
+
+
+
   __syscall_slong_t tv_nsec;
+# 31 "/usr/include/aarch64-linux-gnu/bits/types/struct_timespec.h" 3 4
 };
-# 40 "/usr/include/x86_64-linux-gnu/sys/select.h" 2 3 4
+# 40 "/usr/include/aarch64-linux-gnu/sys/select.h" 2 3 4
 
 
 
@@ -494,7 +545,7 @@ typedef __suseconds_t suseconds_t;
 
 
 typedef long int __fd_mask;
-# 59 "/usr/include/x86_64-linux-gnu/sys/select.h" 3 4
+# 59 "/usr/include/aarch64-linux-gnu/sys/select.h" 3 4
 typedef struct
   {
 
@@ -514,70 +565,37 @@ typedef struct
 
 
 typedef __fd_mask fd_mask;
-# 91 "/usr/include/x86_64-linux-gnu/sys/select.h" 3 4
+# 91 "/usr/include/aarch64-linux-gnu/sys/select.h" 3 4
 
-# 101 "/usr/include/x86_64-linux-gnu/sys/select.h" 3 4
+# 102 "/usr/include/aarch64-linux-gnu/sys/select.h" 3 4
 extern int select (int __nfds, fd_set *__restrict __readfds,
      fd_set *__restrict __writefds,
      fd_set *__restrict __exceptfds,
      struct timeval *__restrict __timeout);
-# 113 "/usr/include/x86_64-linux-gnu/sys/select.h" 3 4
+# 127 "/usr/include/aarch64-linux-gnu/sys/select.h" 3 4
 extern int pselect (int __nfds, fd_set *__restrict __readfds,
       fd_set *__restrict __writefds,
       fd_set *__restrict __exceptfds,
       const struct timespec *__restrict __timeout,
       const __sigset_t *__restrict __sigmask);
-
-
-
-
-
-# 1 "/usr/include/x86_64-linux-gnu/bits/select2.h" 1 3 4
-# 24 "/usr/include/x86_64-linux-gnu/bits/select2.h" 3 4
+# 150 "/usr/include/aarch64-linux-gnu/sys/select.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/select2.h" 1 3 4
+# 24 "/usr/include/aarch64-linux-gnu/bits/select2.h" 3 4
 extern long int __fdelt_chk (long int __d);
 extern long int __fdelt_warn (long int __d)
   __attribute__((__warning__ ("bit outside of fd_set selected")));
-# 124 "/usr/include/x86_64-linux-gnu/sys/select.h" 2 3 4
+# 151 "/usr/include/aarch64-linux-gnu/sys/select.h" 2 3 4
 
 
 
-# 198 "/usr/include/x86_64-linux-gnu/sys/types.h" 2 3 4
-
-
-
-
-
-
-
-# 1 "/usr/include/x86_64-linux-gnu/sys/sysmacros.h" 1 3 4
-# 41 "/usr/include/x86_64-linux-gnu/sys/sysmacros.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/sysmacros.h" 1 3 4
-# 42 "/usr/include/x86_64-linux-gnu/sys/sysmacros.h" 2 3 4
-# 71 "/usr/include/x86_64-linux-gnu/sys/sysmacros.h" 3 4
-
-
-extern unsigned int gnu_dev_major (__dev_t __dev) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__const__));
-extern unsigned int gnu_dev_minor (__dev_t __dev) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__const__));
-extern __dev_t gnu_dev_makedev (unsigned int __major, unsigned int __minor) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__const__));
-
-
-
-__extension__ extern __inline __attribute__ ((__gnu_inline__)) __attribute__ ((__const__)) unsigned int __attribute__ ((__nothrow__ , __leaf__)) gnu_dev_major (__dev_t __dev) { unsigned int __major; __major = ((__dev & (__dev_t) 0x00000000000fff00u) >> 8); __major |= ((__dev & (__dev_t) 0xfffff00000000000u) >> 32); return __major; }
-__extension__ extern __inline __attribute__ ((__gnu_inline__)) __attribute__ ((__const__)) unsigned int __attribute__ ((__nothrow__ , __leaf__)) gnu_dev_minor (__dev_t __dev) { unsigned int __minor; __minor = ((__dev & (__dev_t) 0x00000000000000ffu) >> 0); __minor |= ((__dev & (__dev_t) 0x00000ffffff00000u) >> 12); return __minor; }
-__extension__ extern __inline __attribute__ ((__gnu_inline__)) __attribute__ ((__const__)) __dev_t __attribute__ ((__nothrow__ , __leaf__)) gnu_dev_makedev (unsigned int __major, unsigned int __minor) { __dev_t __dev; __dev = (((__dev_t) (__major & 0x00000fffu)) << 8); __dev |= (((__dev_t) (__major & 0xfffff000u)) << 32); __dev |= (((__dev_t) (__minor & 0x000000ffu)) << 0); __dev |= (((__dev_t) (__minor & 0xffffff00u)) << 12); return __dev; }
-
-
-
-
-# 206 "/usr/include/x86_64-linux-gnu/sys/types.h" 2 3 4
-
+# 180 "/usr/include/aarch64-linux-gnu/sys/types.h" 2 3 4
 
 
 
 
 
 typedef __blksize_t blksize_t;
-# 232 "/usr/include/x86_64-linux-gnu/sys/types.h" 3 4
+# 205 "/usr/include/aarch64-linux-gnu/sys/types.h" 3 4
 typedef __blkcnt64_t blkcnt_t;
 
 
@@ -600,41 +618,25 @@ typedef __fsfilcnt64_t fsfilcnt64_t;
 
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/pthreadtypes.h" 1 3 4
-# 23 "/usr/include/x86_64-linux-gnu/bits/pthreadtypes.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/thread-shared-types.h" 1 3 4
-# 77 "/usr/include/x86_64-linux-gnu/bits/thread-shared-types.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/pthreadtypes-arch.h" 1 3 4
-# 21 "/usr/include/x86_64-linux-gnu/bits/pthreadtypes-arch.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/wordsize.h" 1 3 4
-# 22 "/usr/include/x86_64-linux-gnu/bits/pthreadtypes-arch.h" 2 3 4
-# 65 "/usr/include/x86_64-linux-gnu/bits/pthreadtypes-arch.h" 3 4
-struct __pthread_rwlock_arch_t
+# 1 "/usr/include/aarch64-linux-gnu/bits/pthreadtypes.h" 1 3 4
+# 23 "/usr/include/aarch64-linux-gnu/bits/pthreadtypes.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/thread-shared-types.h" 1 3 4
+# 44 "/usr/include/aarch64-linux-gnu/bits/thread-shared-types.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/pthreadtypes-arch.h" 1 3 4
+# 45 "/usr/include/aarch64-linux-gnu/bits/thread-shared-types.h" 2 3 4
+
+# 1 "/usr/include/aarch64-linux-gnu/bits/atomic_wide_counter.h" 1 3 4
+# 25 "/usr/include/aarch64-linux-gnu/bits/atomic_wide_counter.h" 3 4
+typedef union
 {
-  unsigned int __readers;
-  unsigned int __writers;
-  unsigned int __wrphase_futex;
-  unsigned int __writers_futex;
-  unsigned int __pad3;
-  unsigned int __pad4;
-
-  int __cur_writer;
-  int __shared;
-  signed char __rwelision;
-
-
-
-
-  unsigned char __pad1[7];
-
-
-  unsigned long int __pad2;
-
-
-  unsigned int __flags;
-# 99 "/usr/include/x86_64-linux-gnu/bits/pthreadtypes-arch.h" 3 4
-};
-# 78 "/usr/include/x86_64-linux-gnu/bits/thread-shared-types.h" 2 3 4
+  __extension__ unsigned long long int __value64;
+  struct
+  {
+    unsigned int __low;
+    unsigned int __high;
+  } __value32;
+} __atomic_wide_counter;
+# 47 "/usr/include/aarch64-linux-gnu/bits/thread-shared-types.h" 2 3 4
 
 
 
@@ -644,7 +646,14 @@ typedef struct __pthread_internal_list
   struct __pthread_internal_list *__prev;
   struct __pthread_internal_list *__next;
 } __pthread_list_t;
-# 118 "/usr/include/x86_64-linux-gnu/bits/thread-shared-types.h" 3 4
+
+typedef struct __pthread_internal_slist
+{
+  struct __pthread_internal_slist *__next;
+} __pthread_slist_t;
+# 76 "/usr/include/aarch64-linux-gnu/bits/thread-shared-types.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/struct_mutex.h" 1 3 4
+# 27 "/usr/include/aarch64-linux-gnu/bits/struct_mutex.h" 3 4
 struct __pthread_mutex_s
 {
   int __lock ;
@@ -652,49 +661,58 @@ struct __pthread_mutex_s
   int __owner;
 
   unsigned int __nusers;
-# 148 "/usr/include/x86_64-linux-gnu/bits/thread-shared-types.h" 3 4
+# 58 "/usr/include/aarch64-linux-gnu/bits/struct_mutex.h" 3 4
   int __kind;
- 
 
 
 
 
-  short __spins; short __elision;
+  int __spins;
   __pthread_list_t __list;
-# 165 "/usr/include/x86_64-linux-gnu/bits/thread-shared-types.h" 3 4
- 
+# 74 "/usr/include/aarch64-linux-gnu/bits/struct_mutex.h" 3 4
 };
+# 77 "/usr/include/aarch64-linux-gnu/bits/thread-shared-types.h" 2 3 4
+# 89 "/usr/include/aarch64-linux-gnu/bits/thread-shared-types.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/struct_rwlock.h" 1 3 4
+# 23 "/usr/include/aarch64-linux-gnu/bits/struct_rwlock.h" 3 4
+struct __pthread_rwlock_arch_t
+{
+  unsigned int __readers;
+  unsigned int __writers;
+  unsigned int __wrphase_futex;
+  unsigned int __writers_futex;
+  unsigned int __pad3;
+  unsigned int __pad4;
+  int __cur_writer;
+  int __shared;
+  unsigned long int __pad1;
+  unsigned long int __pad2;
+  unsigned int __flags;
+};
+# 90 "/usr/include/aarch64-linux-gnu/bits/thread-shared-types.h" 2 3 4
 
 
 
 
 struct __pthread_cond_s
 {
-  __extension__ union
-  {
-    __extension__ unsigned long long int __wseq;
-    struct
-    {
-      unsigned int __low;
-      unsigned int __high;
-    } __wseq32;
-  };
-  __extension__ union
-  {
-    __extension__ unsigned long long int __g1_start;
-    struct
-    {
-      unsigned int __low;
-      unsigned int __high;
-    } __g1_start32;
-  };
+  __atomic_wide_counter __wseq;
+  __atomic_wide_counter __g1_start;
   unsigned int __g_refs[2] ;
   unsigned int __g_size[2];
   unsigned int __g1_orig_size;
   unsigned int __wrefs;
   unsigned int __g_signals[2];
 };
-# 24 "/usr/include/x86_64-linux-gnu/bits/pthreadtypes.h" 2 3 4
+
+typedef unsigned int __tss_t;
+typedef unsigned long int __thrd_t;
+
+typedef struct
+{
+  int __data ;
+} __once_flag;
+# 24 "/usr/include/aarch64-linux-gnu/bits/pthreadtypes.h" 2 3 4
 
 
 
@@ -705,7 +723,7 @@ typedef unsigned long int pthread_t;
 
 typedef union
 {
-  char __size[4];
+  char __size[8];
   int __align;
 } pthread_mutexattr_t;
 
@@ -714,7 +732,7 @@ typedef union
 
 typedef union
 {
-  char __size[4];
+  char __size[8];
   int __align;
 } pthread_condattr_t;
 
@@ -729,7 +747,7 @@ typedef int pthread_once_t;
 
 union pthread_attr_t
 {
-  char __size[56];
+  char __size[64];
   long int __align;
 };
 
@@ -741,7 +759,7 @@ typedef union pthread_attr_t pthread_attr_t;
 typedef union
 {
   struct __pthread_mutex_s __data;
-  char __size[40];
+  char __size[48];
   long int __align;
 } pthread_mutex_t;
 
@@ -787,24 +805,24 @@ typedef union
 
 typedef union
 {
-  char __size[4];
+  char __size[8];
   int __align;
 } pthread_barrierattr_t;
-# 255 "/usr/include/x86_64-linux-gnu/sys/types.h" 2 3 4
+# 228 "/usr/include/aarch64-linux-gnu/sys/types.h" 2 3 4
 
 
 
-# 43 "/workspace/acl/lib_acl/include/stdlib/acl_define_unix.h" 2
+# 43 "/acl/lib_acl/include/stdlib/acl_define_unix.h" 2
 # 1 "/usr/include/net/if.h" 1 3 4
 # 26 "/usr/include/net/if.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/sys/socket.h" 1 3 4
-# 24 "/usr/include/x86_64-linux-gnu/sys/socket.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/sys/socket.h" 1 3 4
+# 24 "/usr/include/aarch64-linux-gnu/sys/socket.h" 3 4
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/types/struct_iovec.h" 1 3 4
-# 23 "/usr/include/x86_64-linux-gnu/bits/types/struct_iovec.h" 3 4
-# 1 "/usr/lib/gcc/x86_64-linux-gnu/7/include/stddef.h" 1 3 4
-# 24 "/usr/include/x86_64-linux-gnu/bits/types/struct_iovec.h" 2 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/types/struct_iovec.h" 1 3 4
+# 23 "/usr/include/aarch64-linux-gnu/bits/types/struct_iovec.h" 3 4
+# 1 "/usr/lib/gcc/aarch64-linux-gnu/11/include/stddef.h" 1 3 4
+# 24 "/usr/include/aarch64-linux-gnu/bits/types/struct_iovec.h" 2 3 4
 
 
 struct iovec
@@ -812,18 +830,18 @@ struct iovec
     void *iov_base;
     size_t iov_len;
   };
-# 27 "/usr/include/x86_64-linux-gnu/sys/socket.h" 2 3 4
+# 27 "/usr/include/aarch64-linux-gnu/sys/socket.h" 2 3 4
 
-# 1 "/usr/lib/gcc/x86_64-linux-gnu/7/include/stddef.h" 1 3 4
-# 29 "/usr/include/x86_64-linux-gnu/sys/socket.h" 2 3 4
-
-
+# 1 "/usr/lib/gcc/aarch64-linux-gnu/11/include/stddef.h" 1 3 4
+# 29 "/usr/include/aarch64-linux-gnu/sys/socket.h" 2 3 4
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/socket.h" 1 3 4
-# 27 "/usr/include/x86_64-linux-gnu/bits/socket.h" 3 4
-# 1 "/usr/lib/gcc/x86_64-linux-gnu/7/include/stddef.h" 1 3 4
-# 28 "/usr/include/x86_64-linux-gnu/bits/socket.h" 2 3 4
+
+
+# 1 "/usr/include/aarch64-linux-gnu/bits/socket.h" 1 3 4
+# 27 "/usr/include/aarch64-linux-gnu/bits/socket.h" 3 4
+# 1 "/usr/lib/gcc/aarch64-linux-gnu/11/include/stddef.h" 1 3 4
+# 28 "/usr/include/aarch64-linux-gnu/bits/socket.h" 2 3 4
 
 
 
@@ -834,8 +852,8 @@ typedef __socklen_t socklen_t;
 
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/socket_type.h" 1 3 4
-# 24 "/usr/include/x86_64-linux-gnu/bits/socket_type.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/socket_type.h" 1 3 4
+# 24 "/usr/include/aarch64-linux-gnu/bits/socket_type.h" 3 4
 enum __socket_type
 {
   SOCK_STREAM = 1,
@@ -868,12 +886,12 @@ enum __socket_type
 
 
 };
-# 39 "/usr/include/x86_64-linux-gnu/bits/socket.h" 2 3 4
-# 172 "/usr/include/x86_64-linux-gnu/bits/socket.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/sockaddr.h" 1 3 4
-# 28 "/usr/include/x86_64-linux-gnu/bits/sockaddr.h" 3 4
+# 39 "/usr/include/aarch64-linux-gnu/bits/socket.h" 2 3 4
+# 177 "/usr/include/aarch64-linux-gnu/bits/socket.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/sockaddr.h" 1 3 4
+# 28 "/usr/include/aarch64-linux-gnu/bits/sockaddr.h" 3 4
 typedef unsigned short int sa_family_t;
-# 173 "/usr/include/x86_64-linux-gnu/bits/socket.h" 2 3 4
+# 178 "/usr/include/aarch64-linux-gnu/bits/socket.h" 2 3 4
 
 
 struct sockaddr
@@ -881,7 +899,7 @@ struct sockaddr
     sa_family_t sa_family;
     char sa_data[14];
   };
-# 188 "/usr/include/x86_64-linux-gnu/bits/socket.h" 3 4
+# 193 "/usr/include/aarch64-linux-gnu/bits/socket.h" 3 4
 struct sockaddr_storage
   {
     sa_family_t ss_family;
@@ -979,7 +997,7 @@ struct cmsghdr
     __extension__ unsigned char __cmsg_data [];
 
   };
-# 302 "/usr/include/x86_64-linux-gnu/bits/socket.h" 3 4
+# 307 "/usr/include/aarch64-linux-gnu/bits/socket.h" 3 4
 extern struct cmsghdr *__cmsg_nxthdr (struct msghdr *__mhdr,
           struct cmsghdr *__cmsg) __attribute__ ((__nothrow__ , __leaf__));
 
@@ -1016,29 +1034,141 @@ enum
 
 
   };
-# 390 "/usr/include/x86_64-linux-gnu/bits/socket.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/asm/socket.h" 1 3 4
+# 356 "/usr/include/aarch64-linux-gnu/bits/socket.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/asm/socket.h" 1 3 4
 # 1 "/usr/include/asm-generic/socket.h" 1 3 4
 
 
 
 
-# 1 "/usr/include/x86_64-linux-gnu/asm/sockios.h" 1 3 4
-# 1 "/usr/include/asm-generic/sockios.h" 1 3 4
-# 1 "/usr/include/x86_64-linux-gnu/asm/sockios.h" 2 3 4
+# 1 "/usr/include/linux/posix_types.h" 1 3 4
+
+
+
+
+# 1 "/usr/include/linux/stddef.h" 1 3 4
+# 6 "/usr/include/linux/posix_types.h" 2 3 4
+# 25 "/usr/include/linux/posix_types.h" 3 4
+typedef struct {
+ unsigned long fds_bits[1024 / (8 * sizeof(long))];
+} __kernel_fd_set;
+
+
+typedef void (*__kernel_sighandler_t)(int);
+
+
+typedef int __kernel_key_t;
+typedef int __kernel_mqd_t;
+
+# 1 "/usr/include/aarch64-linux-gnu/asm/posix_types.h" 1 3 4
+
+
+
+
+typedef unsigned short __kernel_old_uid_t;
+typedef unsigned short __kernel_old_gid_t;
+
+
+# 1 "/usr/include/asm-generic/posix_types.h" 1 3 4
+
+
+
+
+# 1 "/usr/include/aarch64-linux-gnu/asm/bitsperlong.h" 1 3 4
+# 22 "/usr/include/aarch64-linux-gnu/asm/bitsperlong.h" 3 4
+# 1 "/usr/include/asm-generic/bitsperlong.h" 1 3 4
+# 23 "/usr/include/aarch64-linux-gnu/asm/bitsperlong.h" 2 3 4
+# 6 "/usr/include/asm-generic/posix_types.h" 2 3 4
+# 15 "/usr/include/asm-generic/posix_types.h" 3 4
+typedef long __kernel_long_t;
+typedef unsigned long __kernel_ulong_t;
+
+
+
+typedef __kernel_ulong_t __kernel_ino_t;
+
+
+
+typedef unsigned int __kernel_mode_t;
+
+
+
+typedef int __kernel_pid_t;
+
+
+
+typedef int __kernel_ipc_pid_t;
+
+
+
+typedef unsigned int __kernel_uid_t;
+typedef unsigned int __kernel_gid_t;
+
+
+
+typedef __kernel_long_t __kernel_suseconds_t;
+
+
+
+typedef int __kernel_daddr_t;
+
+
+
+typedef unsigned int __kernel_uid32_t;
+typedef unsigned int __kernel_gid32_t;
+# 59 "/usr/include/asm-generic/posix_types.h" 3 4
+typedef unsigned int __kernel_old_dev_t;
+# 72 "/usr/include/asm-generic/posix_types.h" 3 4
+typedef __kernel_ulong_t __kernel_size_t;
+typedef __kernel_long_t __kernel_ssize_t;
+typedef __kernel_long_t __kernel_ptrdiff_t;
+
+
+
+
+typedef struct {
+ int val[2];
+} __kernel_fsid_t;
+
+
+
+
+
+typedef __kernel_long_t __kernel_off_t;
+typedef long long __kernel_loff_t;
+typedef __kernel_long_t __kernel_old_time_t;
+typedef __kernel_long_t __kernel_time_t;
+typedef long long __kernel_time64_t;
+typedef __kernel_long_t __kernel_clock_t;
+typedef int __kernel_timer_t;
+typedef int __kernel_clockid_t;
+typedef char * __kernel_caddr_t;
+typedef unsigned short __kernel_uid16_t;
+typedef unsigned short __kernel_gid16_t;
+# 10 "/usr/include/aarch64-linux-gnu/asm/posix_types.h" 2 3 4
+# 37 "/usr/include/linux/posix_types.h" 2 3 4
 # 6 "/usr/include/asm-generic/socket.h" 2 3 4
-# 1 "/usr/include/x86_64-linux-gnu/asm/socket.h" 2 3 4
-# 391 "/usr/include/x86_64-linux-gnu/bits/socket.h" 2 3 4
-# 444 "/usr/include/x86_64-linux-gnu/bits/socket.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/asm/sockios.h" 1 3 4
+# 1 "/usr/include/asm-generic/sockios.h" 1 3 4
+# 2 "/usr/include/aarch64-linux-gnu/asm/sockios.h" 2 3 4
+# 7 "/usr/include/asm-generic/socket.h" 2 3 4
+# 2 "/usr/include/aarch64-linux-gnu/asm/socket.h" 2 3 4
+# 357 "/usr/include/aarch64-linux-gnu/bits/socket.h" 2 3 4
+
+
+
+
+
+
 struct linger
   {
     int l_onoff;
     int l_linger;
   };
-# 34 "/usr/include/x86_64-linux-gnu/sys/socket.h" 2 3 4
+# 34 "/usr/include/aarch64-linux-gnu/sys/socket.h" 2 3 4
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/types/struct_osockaddr.h" 1 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/types/struct_osockaddr.h" 1 3 4
 
 
 
@@ -1049,7 +1179,7 @@ struct osockaddr
   unsigned short int sa_family;
   unsigned char sa_data[14];
 };
-# 37 "/usr/include/x86_64-linux-gnu/sys/socket.h" 2 3 4
+# 37 "/usr/include/aarch64-linux-gnu/sys/socket.h" 2 3 4
 
 
 
@@ -1063,7 +1193,7 @@ enum
   SHUT_RDWR
 
 };
-# 102 "/usr/include/x86_64-linux-gnu/sys/socket.h" 3 4
+# 102 "/usr/include/aarch64-linux-gnu/sys/socket.h" 3 4
 extern int socket (int __domain, int __type, int __protocol) __attribute__ ((__nothrow__ , __leaf__));
 
 
@@ -1080,7 +1210,7 @@ extern int bind (int __fd, const struct sockaddr * __addr, socklen_t __len)
 
 extern int getsockname (int __fd, struct sockaddr *__restrict __addr,
    socklen_t *__restrict __len) __attribute__ ((__nothrow__ , __leaf__));
-# 126 "/usr/include/x86_64-linux-gnu/sys/socket.h" 3 4
+# 126 "/usr/include/aarch64-linux-gnu/sys/socket.h" 3 4
 extern int connect (int __fd, const struct sockaddr * __addr, socklen_t __len);
 
 
@@ -1110,41 +1240,28 @@ extern ssize_t recv (int __fd, void *__buf, size_t __n, int __flags);
 extern ssize_t sendto (int __fd, const void *__buf, size_t __n,
          int __flags, const struct sockaddr * __addr,
          socklen_t __addr_len);
-# 163 "/usr/include/x86_64-linux-gnu/sys/socket.h" 3 4
+# 163 "/usr/include/aarch64-linux-gnu/sys/socket.h" 3 4
 extern ssize_t recvfrom (int __fd, void *__restrict __buf, size_t __n,
     int __flags, struct sockaddr *__restrict __addr,
     socklen_t *__restrict __addr_len);
-
-
-
-
-
-
-
+# 174 "/usr/include/aarch64-linux-gnu/sys/socket.h" 3 4
 extern ssize_t sendmsg (int __fd, const struct msghdr *__message,
    int __flags);
-# 191 "/usr/include/x86_64-linux-gnu/sys/socket.h" 3 4
+# 216 "/usr/include/aarch64-linux-gnu/sys/socket.h" 3 4
 extern ssize_t recvmsg (int __fd, struct msghdr *__message, int __flags);
-# 208 "/usr/include/x86_64-linux-gnu/sys/socket.h" 3 4
+# 255 "/usr/include/aarch64-linux-gnu/sys/socket.h" 3 4
 extern int getsockopt (int __fd, int __level, int __optname,
          void *__restrict __optval,
          socklen_t *__restrict __optlen) __attribute__ ((__nothrow__ , __leaf__));
-
-
-
-
+# 277 "/usr/include/aarch64-linux-gnu/sys/socket.h" 3 4
 extern int setsockopt (int __fd, int __level, int __optname,
          const void *__optval, socklen_t __optlen) __attribute__ ((__nothrow__ , __leaf__));
-
-
-
-
-
+# 296 "/usr/include/aarch64-linux-gnu/sys/socket.h" 3 4
 extern int listen (int __fd, int __n) __attribute__ ((__nothrow__ , __leaf__));
-# 232 "/usr/include/x86_64-linux-gnu/sys/socket.h" 3 4
+# 306 "/usr/include/aarch64-linux-gnu/sys/socket.h" 3 4
 extern int accept (int __fd, struct sockaddr *__restrict __addr,
      socklen_t *__restrict __addr_len);
-# 250 "/usr/include/x86_64-linux-gnu/sys/socket.h" 3 4
+# 324 "/usr/include/aarch64-linux-gnu/sys/socket.h" 3 4
 extern int shutdown (int __fd, int __how) __attribute__ ((__nothrow__ , __leaf__));
 
 
@@ -1164,8 +1281,8 @@ extern int isfdtype (int __fd, int __fdtype) __attribute__ ((__nothrow__ , __lea
 
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/socket2.h" 1 3 4
-# 23 "/usr/include/x86_64-linux-gnu/bits/socket2.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/socket2.h" 1 3 4
+# 23 "/usr/include/aarch64-linux-gnu/bits/socket2.h" 3 4
 extern ssize_t __recv_chk (int __fd, void *__buf, size_t __n, size_t __buflen,
       int __flags);
 extern ssize_t __recv_alias (int __fd, void *__buf, size_t __n, int __flags) __asm__ ("" "recv")
@@ -1179,15 +1296,12 @@ extern ssize_t __recv_chk_warn (int __fd, void *__buf, size_t __n, size_t __bufl
 extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline__)) __attribute__ ((__artificial__)) ssize_t
 recv (int __fd, void *__buf, size_t __n, int __flags)
 {
-  if (__builtin_object_size (__buf, 0) != (size_t) -1)
-    {
-      if (!__builtin_constant_p (__n))
- return __recv_chk (__fd, __buf, __n, __builtin_object_size (__buf, 0), __flags);
-
-      if (__n > __builtin_object_size (__buf, 0))
- return __recv_chk_warn (__fd, __buf, __n, __builtin_object_size (__buf, 0), __flags);
-    }
-  return __recv_alias (__fd, __buf, __n, __flags);
+  size_t sz = __builtin_object_size (__buf, 0);
+  if ((((__typeof (__n)) 0 < (__typeof (__n)) -1 || (__builtin_constant_p (__n) && (__n) > 0)) && __builtin_constant_p ((((long unsigned int) (__n)) <= (sz) / (sizeof (char)))) && (((long unsigned int) (__n)) <= (sz) / (sizeof (char)))))
+    return __recv_alias (__fd, __buf, __n, __flags);
+  if ((((__typeof (__n)) 0 < (__typeof (__n)) -1 || (__builtin_constant_p (__n) && (__n) > 0)) && __builtin_constant_p ((((long unsigned int) (__n)) <= (sz) / (sizeof (char)))) && !(((long unsigned int) (__n)) <= (sz) / (sizeof (char)))))
+    return __recv_chk_warn (__fd, __buf, __n, sz, __flags);
+  return __recv_chk (__fd, __buf, __n, sz, __flags);
 }
 
 extern ssize_t __recvfrom_chk (int __fd, void *__restrict __buf, size_t __n,
@@ -1210,18 +1324,15 @@ extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline
 recvfrom (int __fd, void *__restrict __buf, size_t __n, int __flags,
    struct sockaddr *__restrict __addr, socklen_t *__restrict __addr_len)
 {
-  if (__builtin_object_size (__buf, 0) != (size_t) -1)
-    {
-      if (!__builtin_constant_p (__n))
- return __recvfrom_chk (__fd, __buf, __n, __builtin_object_size (__buf, 0), __flags,
-          __addr, __addr_len);
-      if (__n > __builtin_object_size (__buf, 0))
- return __recvfrom_chk_warn (__fd, __buf, __n, __builtin_object_size (__buf, 0), __flags,
-        __addr, __addr_len);
-    }
-  return __recvfrom_alias (__fd, __buf, __n, __flags, __addr, __addr_len);
+  size_t sz = __builtin_object_size (__buf, 0);
+  if ((((__typeof (__n)) 0 < (__typeof (__n)) -1 || (__builtin_constant_p (__n) && (__n) > 0)) && __builtin_constant_p ((((long unsigned int) (__n)) <= (sz) / (sizeof (char)))) && (((long unsigned int) (__n)) <= (sz) / (sizeof (char)))))
+    return __recvfrom_alias (__fd, __buf, __n, __flags, __addr, __addr_len);
+  if ((((__typeof (__n)) 0 < (__typeof (__n)) -1 || (__builtin_constant_p (__n) && (__n) > 0)) && __builtin_constant_p ((((long unsigned int) (__n)) <= (sz) / (sizeof (char)))) && !(((long unsigned int) (__n)) <= (sz) / (sizeof (char)))))
+    return __recvfrom_chk_warn (__fd, __buf, __n, sz, __flags, __addr,
+    __addr_len);
+  return __recvfrom_chk (__fd, __buf, __n, sz, __flags, __addr, __addr_len);
 }
-# 270 "/usr/include/x86_64-linux-gnu/sys/socket.h" 2 3 4
+# 344 "/usr/include/aarch64-linux-gnu/sys/socket.h" 2 3 4
 
 
 
@@ -1358,7 +1469,9 @@ struct ifconf
 
 
 extern unsigned int if_nametoindex (const char *__ifname) __attribute__ ((__nothrow__ , __leaf__));
-extern char *if_indextoname (unsigned int __ifindex, char *__ifname) __attribute__ ((__nothrow__ , __leaf__));
+extern char *if_indextoname (unsigned int __ifindex,
+        char __ifname[16]) __attribute__ ((__nothrow__ , __leaf__))
+    __attribute__ ((__access__ (__write_only__, 2)));
 
 
 extern struct if_nameindex *if_nameindex (void) __attribute__ ((__nothrow__ , __leaf__));
@@ -1367,7 +1480,7 @@ extern struct if_nameindex *if_nameindex (void) __attribute__ ((__nothrow__ , __
 extern void if_freenameindex (struct if_nameindex *__ptr) __attribute__ ((__nothrow__ , __leaf__));
 
 
-# 44 "/workspace/acl/lib_acl/include/stdlib/acl_define_unix.h" 2
+# 44 "/acl/lib_acl/include/stdlib/acl_define_unix.h" 2
 
 
 
@@ -1375,8 +1488,8 @@ extern void if_freenameindex (struct if_nameindex *__ptr) __attribute__ ((__noth
 # 27 "/usr/include/netdb.h" 3 4
 # 1 "/usr/include/netinet/in.h" 1 3 4
 # 22 "/usr/include/netinet/in.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/stdint-uintn.h" 1 3 4
-# 24 "/usr/include/x86_64-linux-gnu/bits/stdint-uintn.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/stdint-uintn.h" 1 3 4
+# 24 "/usr/include/aarch64-linux-gnu/bits/stdint-uintn.h" 3 4
 typedef __uint8_t uint8_t;
 typedef __uint16_t uint16_t;
 typedef __uint32_t uint32_t;
@@ -1396,8 +1509,8 @@ struct in_addr
   };
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/in.h" 1 3 4
-# 142 "/usr/include/x86_64-linux-gnu/bits/in.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/in.h" 1 3 4
+# 143 "/usr/include/aarch64-linux-gnu/bits/in.h" 3 4
 struct ip_opts
   {
     struct in_addr ip_dst;
@@ -1472,7 +1585,11 @@ enum
 
     IPPROTO_MPLS = 137,
 
+    IPPROTO_ETHERNET = 143,
+
     IPPROTO_RAW = 255,
+
+    IPPROTO_MPTCP = 262,
 
     IPPROTO_MAX
   };
@@ -1542,7 +1659,7 @@ enum
 
     IPPORT_USERRESERVED = 5000
   };
-# 211 "/usr/include/netinet/in.h" 3 4
+# 219 "/usr/include/netinet/in.h" 3 4
 struct in6_addr
   {
     union
@@ -1561,7 +1678,7 @@ struct in6_addr
 
 extern const struct in6_addr in6addr_any;
 extern const struct in6_addr in6addr_loopback;
-# 237 "/usr/include/netinet/in.h" 3 4
+# 245 "/usr/include/netinet/in.h" 3 4
 struct sockaddr_in
   {
     sa_family_t sin_family;
@@ -1569,10 +1686,10 @@ struct sockaddr_in
     struct in_addr sin_addr;
 
 
-    unsigned char sin_zero[sizeof (struct sockaddr) -
-      (sizeof (unsigned short int)) -
-      sizeof (in_port_t) -
-      sizeof (struct in_addr)];
+    unsigned char sin_zero[sizeof (struct sockaddr)
+      - (sizeof (unsigned short int))
+      - sizeof (in_port_t)
+      - sizeof (struct in_addr)];
   };
 
 
@@ -1685,7 +1802,7 @@ struct group_filter
 
     struct sockaddr_storage gf_slist[1];
 };
-# 374 "/usr/include/netinet/in.h" 3 4
+# 382 "/usr/include/netinet/in.h" 3 4
 extern uint32_t ntohl (uint32_t __netlong) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__const__));
 extern uint16_t ntohs (uint16_t __netshort)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__const__));
@@ -1697,17 +1814,17 @@ extern uint16_t htons (uint16_t __hostshort)
 
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/byteswap.h" 1 3 4
-# 386 "/usr/include/netinet/in.h" 2 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/uintn-identity.h" 1 3 4
-# 387 "/usr/include/netinet/in.h" 2 3 4
-# 502 "/usr/include/netinet/in.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/byteswap.h" 1 3 4
+# 394 "/usr/include/netinet/in.h" 2 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/uintn-identity.h" 1 3 4
+# 395 "/usr/include/netinet/in.h" 2 3 4
+# 510 "/usr/include/netinet/in.h" 3 4
 extern int bindresvport (int __sockfd, struct sockaddr_in *__sock_in) __attribute__ ((__nothrow__ , __leaf__));
 
 
 extern int bindresvport6 (int __sockfd, struct sockaddr_in6 *__sock_in)
      __attribute__ ((__nothrow__ , __leaf__));
-# 630 "/usr/include/netinet/in.h" 3 4
+# 638 "/usr/include/netinet/in.h" 3 4
 
 # 28 "/usr/include/netdb.h" 2 3 4
 
@@ -1716,7 +1833,7 @@ extern int bindresvport6 (int __sockfd, struct sockaddr_in6 *__sock_in)
 
 # 1 "/usr/include/rpc/netdb.h" 1 3 4
 # 42 "/usr/include/rpc/netdb.h" 3 4
-# 1 "/usr/lib/gcc/x86_64-linux-gnu/7/include/stddef.h" 1 3 4
+# 1 "/usr/lib/gcc/aarch64-linux-gnu/11/include/stddef.h" 1 3 4
 # 43 "/usr/include/rpc/netdb.h" 2 3 4
 
 
@@ -1756,8 +1873,8 @@ extern int getrpcent_r (struct rpcent *__result_buf, char *__buffer,
 
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/netdb.h" 1 3 4
-# 26 "/usr/include/x86_64-linux-gnu/bits/netdb.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/netdb.h" 1 3 4
+# 26 "/usr/include/aarch64-linux-gnu/bits/netdb.h" 3 4
 struct netent
 {
   char *n_name;
@@ -2122,13 +2239,13 @@ extern int getnameinfo (const struct sockaddr *__restrict __sa,
    socklen_t __salen, char *__restrict __host,
    socklen_t __hostlen, char *__restrict __serv,
    socklen_t __servlen, int __flags);
-# 711 "/usr/include/netdb.h" 3 4
+# 722 "/usr/include/netdb.h" 3 4
 
-# 48 "/workspace/acl/lib_acl/include/stdlib/acl_define_unix.h" 2
-# 11 "/workspace/acl/lib_acl/include/stdlib/acl_define.h" 2
+# 48 "/acl/lib_acl/include/stdlib/acl_define_unix.h" 2
+# 11 "/acl/lib_acl/include/stdlib/acl_define.h" 2
 
 
-# 12 "/workspace/acl/lib_acl/include/stdlib/acl_define.h"
+# 12 "/acl/lib_acl/include/stdlib/acl_define.h"
 typedef long long int acl_off_t;
 typedef struct stat64 acl_stat_t;
 
@@ -2213,10 +2330,10 @@ __attribute__ ((__nothrow__ , __leaf__)) toupper (int __c)
   return __c >= -128 && __c < 256 ? (*__ctype_toupper_loc ())[__c] : __c;
 }
 # 237 "/usr/include/ctype.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/types/locale_t.h" 1 3 4
-# 22 "/usr/include/x86_64-linux-gnu/bits/types/locale_t.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/types/__locale_t.h" 1 3 4
-# 28 "/usr/include/x86_64-linux-gnu/bits/types/__locale_t.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/types/locale_t.h" 1 3 4
+# 22 "/usr/include/aarch64-linux-gnu/bits/types/locale_t.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/types/__locale_t.h" 1 3 4
+# 27 "/usr/include/aarch64-linux-gnu/bits/types/__locale_t.h" 3 4
 struct __locale_struct
 {
 
@@ -2232,7 +2349,7 @@ struct __locale_struct
 };
 
 typedef struct __locale_struct *__locale_t;
-# 23 "/usr/include/x86_64-linux-gnu/bits/types/locale_t.h" 2 3 4
+# 23 "/usr/include/aarch64-linux-gnu/bits/types/locale_t.h" 2 3 4
 
 typedef __locale_t locale_t;
 # 238 "/usr/include/ctype.h" 2 3 4
@@ -2261,48 +2378,33 @@ extern int __toupper_l (int __c, locale_t __l) __attribute__ ((__nothrow__ , __l
 extern int toupper_l (int __c, locale_t __l) __attribute__ ((__nothrow__ , __leaf__));
 # 327 "/usr/include/ctype.h" 3 4
 
-# 21 "/workspace/acl/lib_acl/include/stdlib/acl_define.h" 2
+# 21 "/acl/lib_acl/include/stdlib/acl_define.h" 2
 # 1 "/usr/include/stdio.h" 1 3 4
 # 27 "/usr/include/stdio.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/libc-header-start.h" 1 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/libc-header-start.h" 1 3 4
 # 28 "/usr/include/stdio.h" 2 3 4
 
 
 
 
 
-# 1 "/usr/lib/gcc/x86_64-linux-gnu/7/include/stddef.h" 1 3 4
+# 1 "/usr/lib/gcc/aarch64-linux-gnu/11/include/stddef.h" 1 3 4
 # 34 "/usr/include/stdio.h" 2 3 4
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/types/__FILE.h" 1 3 4
-
-
-
-struct _IO_FILE;
-typedef struct _IO_FILE __FILE;
+# 1 "/usr/lib/gcc/aarch64-linux-gnu/11/include/stdarg.h" 1 3 4
+# 40 "/usr/lib/gcc/aarch64-linux-gnu/11/include/stdarg.h" 3 4
+typedef __builtin_va_list __gnuc_va_list;
 # 37 "/usr/include/stdio.h" 2 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/types/FILE.h" 1 3 4
+
+
+# 1 "/usr/include/aarch64-linux-gnu/bits/types/__fpos_t.h" 1 3 4
 
 
 
-struct _IO_FILE;
 
-
-typedef struct _IO_FILE FILE;
-# 38 "/usr/include/stdio.h" 2 3 4
-
-
-
-# 1 "/usr/include/x86_64-linux-gnu/bits/libio.h" 1 3 4
-# 35 "/usr/include/x86_64-linux-gnu/bits/libio.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/_G_config.h" 1 3 4
-# 19 "/usr/include/x86_64-linux-gnu/bits/_G_config.h" 3 4
-# 1 "/usr/lib/gcc/x86_64-linux-gnu/7/include/stddef.h" 1 3 4
-# 20 "/usr/include/x86_64-linux-gnu/bits/_G_config.h" 2 3 4
-
-# 1 "/usr/include/x86_64-linux-gnu/bits/types/__mbstate_t.h" 1 3 4
-# 13 "/usr/include/x86_64-linux-gnu/bits/types/__mbstate_t.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/types/__mbstate_t.h" 1 3 4
+# 13 "/usr/include/aarch64-linux-gnu/bits/types/__mbstate_t.h" 3 4
 typedef struct
 {
   int __count;
@@ -2312,29 +2414,47 @@ typedef struct
     char __wchb[4];
   } __value;
 } __mbstate_t;
-# 22 "/usr/include/x86_64-linux-gnu/bits/_G_config.h" 2 3 4
+# 6 "/usr/include/aarch64-linux-gnu/bits/types/__fpos_t.h" 2 3 4
 
 
 
 
-typedef struct
+typedef struct _G_fpos_t
 {
   __off_t __pos;
   __mbstate_t __state;
-} _G_fpos_t;
-typedef struct
+} __fpos_t;
+# 40 "/usr/include/stdio.h" 2 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/types/__fpos64_t.h" 1 3 4
+# 10 "/usr/include/aarch64-linux-gnu/bits/types/__fpos64_t.h" 3 4
+typedef struct _G_fpos64_t
 {
   __off64_t __pos;
   __mbstate_t __state;
-} _G_fpos64_t;
-# 36 "/usr/include/x86_64-linux-gnu/bits/libio.h" 2 3 4
-# 53 "/usr/include/x86_64-linux-gnu/bits/libio.h" 3 4
-# 1 "/usr/lib/gcc/x86_64-linux-gnu/7/include/stdarg.h" 1 3 4
-# 40 "/usr/lib/gcc/x86_64-linux-gnu/7/include/stdarg.h" 3 4
-typedef __builtin_va_list __gnuc_va_list;
-# 54 "/usr/include/x86_64-linux-gnu/bits/libio.h" 2 3 4
-# 149 "/usr/include/x86_64-linux-gnu/bits/libio.h" 3 4
-struct _IO_jump_t; struct _IO_FILE;
+} __fpos64_t;
+# 41 "/usr/include/stdio.h" 2 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/types/__FILE.h" 1 3 4
+
+
+
+struct _IO_FILE;
+typedef struct _IO_FILE __FILE;
+# 42 "/usr/include/stdio.h" 2 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/types/FILE.h" 1 3 4
+
+
+
+struct _IO_FILE;
+
+
+typedef struct _IO_FILE FILE;
+# 43 "/usr/include/stdio.h" 2 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/types/struct_FILE.h" 1 3 4
+# 35 "/usr/include/aarch64-linux-gnu/bits/types/struct_FILE.h" 3 4
+struct _IO_FILE;
+struct _IO_marker;
+struct _IO_codecvt;
+struct _IO_wide_data;
 
 
 
@@ -2345,39 +2465,20 @@ typedef void _IO_lock_t;
 
 
 
-struct _IO_marker {
-  struct _IO_marker *_next;
-  struct _IO_FILE *_sbuf;
-
-
-
-  int _pos;
-# 177 "/usr/include/x86_64-linux-gnu/bits/libio.h" 3 4
-};
-
-
-enum __codecvt_result
+struct _IO_FILE
 {
-  __codecvt_ok,
-  __codecvt_partial,
-  __codecvt_error,
-  __codecvt_noconv
-};
-# 245 "/usr/include/x86_64-linux-gnu/bits/libio.h" 3 4
-struct _IO_FILE {
   int _flags;
 
 
+  char *_IO_read_ptr;
+  char *_IO_read_end;
+  char *_IO_read_base;
+  char *_IO_write_base;
+  char *_IO_write_ptr;
+  char *_IO_write_end;
+  char *_IO_buf_base;
+  char *_IO_buf_end;
 
-
-  char* _IO_read_ptr;
-  char* _IO_read_end;
-  char* _IO_read_base;
-  char* _IO_write_base;
-  char* _IO_write_ptr;
-  char* _IO_write_end;
-  char* _IO_buf_base;
-  char* _IO_buf_end;
 
   char *_IO_save_base;
   char *_IO_backup_base;
@@ -2388,125 +2489,48 @@ struct _IO_FILE {
   struct _IO_FILE *_chain;
 
   int _fileno;
-
-
-
   int _flags2;
-
   __off_t _old_offset;
-
 
 
   unsigned short _cur_column;
   signed char _vtable_offset;
   char _shortbuf[1];
 
-
-
   _IO_lock_t *_lock;
-# 293 "/usr/include/x86_64-linux-gnu/bits/libio.h" 3 4
+
+
+
+
+
+
+
   __off64_t _offset;
 
-
-
-
-
-
-
-  void *__pad1;
-  void *__pad2;
-  void *__pad3;
-  void *__pad4;
-
+  struct _IO_codecvt *_codecvt;
+  struct _IO_wide_data *_wide_data;
+  struct _IO_FILE *_freeres_list;
+  void *_freeres_buf;
   size_t __pad5;
   int _mode;
 
   char _unused2[15 * sizeof (int) - 4 * sizeof (void *) - sizeof (size_t)];
-
 };
-
-
-typedef struct _IO_FILE _IO_FILE;
-
-
-struct _IO_FILE_plus;
-
-extern struct _IO_FILE_plus _IO_2_1_stdin_;
-extern struct _IO_FILE_plus _IO_2_1_stdout_;
-extern struct _IO_FILE_plus _IO_2_1_stderr_;
-# 337 "/usr/include/x86_64-linux-gnu/bits/libio.h" 3 4
-typedef __ssize_t __io_read_fn (void *__cookie, char *__buf, size_t __nbytes);
-
-
-
-
-
-
-
-typedef __ssize_t __io_write_fn (void *__cookie, const char *__buf,
-     size_t __n);
-
-
-
-
-
-
-
-typedef int __io_seek_fn (void *__cookie, __off64_t *__pos, int __w);
-
-
-typedef int __io_close_fn (void *__cookie);
-# 389 "/usr/include/x86_64-linux-gnu/bits/libio.h" 3 4
-extern int __underflow (_IO_FILE *);
-extern int __uflow (_IO_FILE *);
-extern int __overflow (_IO_FILE *, int);
-# 433 "/usr/include/x86_64-linux-gnu/bits/libio.h" 3 4
-extern int _IO_getc (_IO_FILE *__fp);
-extern int _IO_putc (int __c, _IO_FILE *__fp);
-extern int _IO_feof (_IO_FILE *__fp) __attribute__ ((__nothrow__ , __leaf__));
-extern int _IO_ferror (_IO_FILE *__fp) __attribute__ ((__nothrow__ , __leaf__));
-
-extern int _IO_peekc_locked (_IO_FILE *__fp);
-
-
-
-
-
-extern void _IO_flockfile (_IO_FILE *) __attribute__ ((__nothrow__ , __leaf__));
-extern void _IO_funlockfile (_IO_FILE *) __attribute__ ((__nothrow__ , __leaf__));
-extern int _IO_ftrylockfile (_IO_FILE *) __attribute__ ((__nothrow__ , __leaf__));
-# 462 "/usr/include/x86_64-linux-gnu/bits/libio.h" 3 4
-extern int _IO_vfscanf (_IO_FILE * __restrict, const char * __restrict,
-   __gnuc_va_list, int *__restrict);
-extern int _IO_vfprintf (_IO_FILE *__restrict, const char *__restrict,
-    __gnuc_va_list);
-extern __ssize_t _IO_padn (_IO_FILE *, int, __ssize_t);
-extern size_t _IO_sgetn (_IO_FILE *, void *, size_t);
-
-extern __off64_t _IO_seekoff (_IO_FILE *, __off64_t, int, int);
-extern __off64_t _IO_seekpos (_IO_FILE *, __off64_t, int);
-
-extern void _IO_free_backup_area (_IO_FILE *) __attribute__ ((__nothrow__ , __leaf__));
-# 42 "/usr/include/stdio.h" 2 3 4
-
-
-
-
+# 44 "/usr/include/stdio.h" 2 3 4
+# 52 "/usr/include/stdio.h" 3 4
 typedef __gnuc_va_list va_list;
-# 80 "/usr/include/stdio.h" 3 4
-typedef _G_fpos64_t fpos_t;
+# 86 "/usr/include/stdio.h" 3 4
+typedef __fpos64_t fpos_t;
 
 
-typedef _G_fpos64_t fpos64_t;
-# 131 "/usr/include/stdio.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/stdio_lim.h" 1 3 4
-# 132 "/usr/include/stdio.h" 2 3 4
-
-
-
-extern struct _IO_FILE *stdin;
-extern struct _IO_FILE *stdout;
-extern struct _IO_FILE *stderr;
+typedef __fpos64_t fpos64_t;
+# 133 "/usr/include/stdio.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/stdio_lim.h" 1 3 4
+# 134 "/usr/include/stdio.h" 2 3 4
+# 143 "/usr/include/stdio.h" 3 4
+extern FILE *stdin;
+extern FILE *stdout;
+extern FILE *stderr;
 
 
 
@@ -2521,46 +2545,44 @@ extern int rename (const char *__old, const char *__new) __attribute__ ((__nothr
 
 extern int renameat (int __oldfd, const char *__old, int __newfd,
        const char *__new) __attribute__ ((__nothrow__ , __leaf__));
-# 162 "/usr/include/stdio.h" 3 4
-extern FILE *tmpfile (void) __asm__ ("" "tmpfile64") __attribute__ ((__warn_unused_result__));
-
-
-
-
-
-
-extern FILE *tmpfile64 (void) __attribute__ ((__warn_unused_result__));
-
-
-
-extern char *tmpnam (char *__s) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__warn_unused_result__));
-
-
-
-
-extern char *tmpnam_r (char *__s) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__warn_unused_result__));
-# 190 "/usr/include/stdio.h" 3 4
-extern char *tempnam (const char *__dir, const char *__pfx)
-     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__malloc__)) __attribute__ ((__warn_unused_result__));
-
-
-
-
-
-
-
+# 178 "/usr/include/stdio.h" 3 4
 extern int fclose (FILE *__stream);
+# 192 "/usr/include/stdio.h" 3 4
+extern FILE *tmpfile (void) __asm__ ("" "tmpfile64")
+  __attribute__ ((__malloc__)) __attribute__ ((__malloc__ (fclose, 1))) __attribute__ ((__warn_unused_result__));
+
+
+
+
+
+
+extern FILE *tmpfile64 (void)
+   __attribute__ ((__malloc__)) __attribute__ ((__malloc__ (fclose, 1))) __attribute__ ((__warn_unused_result__));
+
+
+
+extern char *tmpnam (char[20]) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__warn_unused_result__));
+
+
+
+
+extern char *tmpnam_r (char __s[20]) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__warn_unused_result__));
+# 222 "/usr/include/stdio.h" 3 4
+extern char *tempnam (const char *__dir, const char *__pfx)
+   __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__malloc__)) __attribute__ ((__warn_unused_result__)) __attribute__ ((__malloc__ (__builtin_free, 1)));
+
+
 
 
 
 
 extern int fflush (FILE *__stream);
-# 213 "/usr/include/stdio.h" 3 4
+# 239 "/usr/include/stdio.h" 3 4
 extern int fflush_unlocked (FILE *__stream);
-# 243 "/usr/include/stdio.h" 3 4
+# 270 "/usr/include/stdio.h" 3 4
 extern FILE *fopen (const char *__restrict __filename, const char *__restrict __modes) __asm__ ("" "fopen64")
 
-  __attribute__ ((__warn_unused_result__));
+  __attribute__ ((__malloc__)) __attribute__ ((__malloc__ (fclose, 1))) __attribute__ ((__warn_unused_result__));
 extern FILE *freopen (const char *__restrict __filename, const char *__restrict __modes, FILE *__restrict __stream) __asm__ ("" "freopen64")
 
 
@@ -2572,7 +2594,8 @@ extern FILE *freopen (const char *__restrict __filename, const char *__restrict 
 
 
 extern FILE *fopen64 (const char *__restrict __filename,
-        const char *__restrict __modes) __attribute__ ((__warn_unused_result__));
+        const char *__restrict __modes)
+  __attribute__ ((__malloc__)) __attribute__ ((__malloc__ (fclose, 1))) __attribute__ ((__warn_unused_result__));
 extern FILE *freopen64 (const char *__restrict __filename,
    const char *__restrict __modes,
    FILE *__restrict __stream) __attribute__ ((__warn_unused_result__));
@@ -2580,20 +2603,18 @@ extern FILE *freopen64 (const char *__restrict __filename,
 
 
 
-extern FILE *fdopen (int __fd, const char *__modes) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__warn_unused_result__));
-# 278 "/usr/include/stdio.h" 3 4
+extern FILE *fdopen (int __fd, const char *__modes) __attribute__ ((__nothrow__ , __leaf__))
+  __attribute__ ((__malloc__)) __attribute__ ((__malloc__ (fclose, 1))) __attribute__ ((__warn_unused_result__));
+# 308 "/usr/include/stdio.h" 3 4
 extern FILE *fmemopen (void *__s, size_t __len, const char *__modes)
-  __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__warn_unused_result__));
+  __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__malloc__)) __attribute__ ((__malloc__ (fclose, 1))) __attribute__ ((__warn_unused_result__));
 
 
 
 
-extern FILE *open_memstream (char **__bufloc, size_t *__sizeloc) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__warn_unused_result__));
-
-
-
-
-
+extern FILE *open_memstream (char **__bufloc, size_t *__sizeloc) __attribute__ ((__nothrow__ , __leaf__))
+  __attribute__ ((__malloc__)) __attribute__ ((__malloc__ (fclose, 1))) __attribute__ ((__warn_unused_result__));
+# 328 "/usr/include/stdio.h" 3 4
 extern void setbuf (FILE *__restrict __stream, char *__restrict __buf) __attribute__ ((__nothrow__ , __leaf__));
 
 
@@ -2651,7 +2672,7 @@ extern int snprintf (char *__restrict __s, size_t __maxlen,
 extern int vsnprintf (char *__restrict __s, size_t __maxlen,
         const char *__restrict __format, __gnuc_va_list __arg)
      __attribute__ ((__nothrow__)) __attribute__ ((__format__ (__printf__, 3, 0)));
-# 365 "/usr/include/stdio.h" 3 4
+# 403 "/usr/include/stdio.h" 3 4
 extern int vdprintf (int __fd, const char *__restrict __fmt,
        __gnuc_va_list __arg)
      __attribute__ ((__format__ (__printf__, 2, 0)));
@@ -2674,7 +2695,25 @@ extern int scanf (const char *__restrict __format, ...) __attribute__ ((__warn_u
 
 extern int sscanf (const char *__restrict __s,
      const char *__restrict __format, ...) __attribute__ ((__nothrow__ , __leaf__));
-# 395 "/usr/include/stdio.h" 3 4
+
+
+
+
+
+# 1 "/usr/include/aarch64-linux-gnu/bits/floatn.h" 1 3 4
+# 23 "/usr/include/aarch64-linux-gnu/bits/floatn.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/long-double.h" 1 3 4
+# 24 "/usr/include/aarch64-linux-gnu/bits/floatn.h" 2 3 4
+# 95 "/usr/include/aarch64-linux-gnu/bits/floatn.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/floatn-common.h" 1 3 4
+# 24 "/usr/include/aarch64-linux-gnu/bits/floatn-common.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/long-double.h" 1 3 4
+# 25 "/usr/include/aarch64-linux-gnu/bits/floatn-common.h" 2 3 4
+# 96 "/usr/include/aarch64-linux-gnu/bits/floatn.h" 2 3 4
+# 431 "/usr/include/stdio.h" 2 3 4
+
+
+
 extern int fscanf (FILE *__restrict __stream, const char *__restrict __format, ...) __asm__ ("" "__isoc99_fscanf")
 
                           __attribute__ ((__warn_unused_result__));
@@ -2683,7 +2722,7 @@ extern int scanf (const char *__restrict __format, ...) __asm__ ("" "__isoc99_sc
 extern int sscanf (const char *__restrict __s, const char *__restrict __format, ...) __asm__ ("" "__isoc99_sscanf") __attribute__ ((__nothrow__ , __leaf__))
 
                       ;
-# 420 "/usr/include/stdio.h" 3 4
+# 459 "/usr/include/stdio.h" 3 4
 extern int vfscanf (FILE *__restrict __s, const char *__restrict __format,
       __gnuc_va_list __arg)
      __attribute__ ((__format__ (__scanf__, 2, 0))) __attribute__ ((__warn_unused_result__));
@@ -2699,7 +2738,11 @@ extern int vscanf (const char *__restrict __format, __gnuc_va_list __arg)
 extern int vsscanf (const char *__restrict __s,
       const char *__restrict __format, __gnuc_va_list __arg)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__format__ (__scanf__, 2, 0)));
-# 443 "/usr/include/stdio.h" 3 4
+
+
+
+
+
 extern int vfscanf (FILE *__restrict __s, const char *__restrict __format, __gnuc_va_list __arg) __asm__ ("" "__isoc99_vfscanf")
 
 
@@ -2713,7 +2756,7 @@ extern int vsscanf (const char *__restrict __s, const char *__restrict __format,
 
 
      __attribute__ ((__format__ (__scanf__, 2, 0)));
-# 477 "/usr/include/stdio.h" 3 4
+# 513 "/usr/include/stdio.h" 3 4
 extern int fgetc (FILE *__stream);
 extern int getc (FILE *__stream);
 
@@ -2722,12 +2765,17 @@ extern int getc (FILE *__stream);
 
 
 extern int getchar (void);
-# 495 "/usr/include/stdio.h" 3 4
+
+
+
+
+
+
 extern int getc_unlocked (FILE *__stream);
 extern int getchar_unlocked (void);
-# 506 "/usr/include/stdio.h" 3 4
+# 538 "/usr/include/stdio.h" 3 4
 extern int fgetc_unlocked (FILE *__stream);
-# 517 "/usr/include/stdio.h" 3 4
+# 549 "/usr/include/stdio.h" 3 4
 extern int fputc (int __c, FILE *__stream);
 extern int putc (int __c, FILE *__stream);
 
@@ -2736,7 +2784,7 @@ extern int putc (int __c, FILE *__stream);
 
 
 extern int putchar (int __c);
-# 537 "/usr/include/stdio.h" 3 4
+# 565 "/usr/include/stdio.h" 3 4
 extern int fputc_unlocked (int __c, FILE *__stream);
 
 
@@ -2765,14 +2813,14 @@ extern int putw (int __w, FILE *__stream);
 
 
 extern char *fgets (char *__restrict __s, int __n, FILE *__restrict __stream)
-     __attribute__ ((__warn_unused_result__));
-# 603 "/usr/include/stdio.h" 3 4
+     __attribute__ ((__warn_unused_result__)) __attribute__ ((__access__ (__write_only__, 1, 2)));
+# 632 "/usr/include/stdio.h" 3 4
 extern __ssize_t __getdelim (char **__restrict __lineptr,
-          size_t *__restrict __n, int __delimiter,
-          FILE *__restrict __stream) __attribute__ ((__warn_unused_result__));
+                             size_t *__restrict __n, int __delimiter,
+                             FILE *__restrict __stream) __attribute__ ((__warn_unused_result__));
 extern __ssize_t getdelim (char **__restrict __lineptr,
-        size_t *__restrict __n, int __delimiter,
-        FILE *__restrict __stream) __attribute__ ((__warn_unused_result__));
+                           size_t *__restrict __n, int __delimiter,
+                           FILE *__restrict __stream) __attribute__ ((__warn_unused_result__));
 
 
 
@@ -2781,8 +2829,8 @@ extern __ssize_t getdelim (char **__restrict __lineptr,
 
 
 extern __ssize_t getline (char **__restrict __lineptr,
-       size_t *__restrict __n,
-       FILE *__restrict __stream) __attribute__ ((__warn_unused_result__));
+                          size_t *__restrict __n,
+                          FILE *__restrict __stream) __attribute__ ((__warn_unused_result__));
 
 
 
@@ -2818,7 +2866,7 @@ extern size_t fread (void *__restrict __ptr, size_t __size,
 
 extern size_t fwrite (const void *__restrict __ptr, size_t __size,
         size_t __n, FILE *__restrict __s);
-# 673 "/usr/include/stdio.h" 3 4
+# 702 "/usr/include/stdio.h" 3 4
 extern size_t fread_unlocked (void *__restrict __ptr, size_t __size,
          size_t __n, FILE *__restrict __stream) __attribute__ ((__warn_unused_result__));
 extern size_t fwrite_unlocked (const void *__restrict __ptr, size_t __size,
@@ -2841,12 +2889,12 @@ extern long int ftell (FILE *__stream) __attribute__ ((__warn_unused_result__));
 
 
 extern void rewind (FILE *__stream);
-# 715 "/usr/include/stdio.h" 3 4
+# 744 "/usr/include/stdio.h" 3 4
 extern int fseeko (FILE *__stream, __off64_t __off, int __whence) __asm__ ("" "fseeko64")
 
                   ;
 extern __off64_t ftello (FILE *__stream) __asm__ ("" "ftello64");
-# 739 "/usr/include/stdio.h" 3 4
+# 768 "/usr/include/stdio.h" 3 4
 extern int fgetpos (FILE *__restrict __stream, fpos_t *__restrict __pos) __asm__ ("" "fgetpos64")
                                           ;
 extern int fsetpos (FILE *__stream, const fpos_t *__pos) __asm__ ("" "fsetpos64")
@@ -2888,37 +2936,30 @@ extern void perror (const char *__s);
 
 
 
-
-# 1 "/usr/include/x86_64-linux-gnu/bits/sys_errlist.h" 1 3 4
-# 26 "/usr/include/x86_64-linux-gnu/bits/sys_errlist.h" 3 4
-extern int sys_nerr;
-extern const char *const sys_errlist[];
-# 782 "/usr/include/stdio.h" 2 3 4
-
-
-
-
 extern int fileno (FILE *__stream) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__warn_unused_result__));
 
 
 
 
 extern int fileno_unlocked (FILE *__stream) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__warn_unused_result__));
-# 800 "/usr/include/stdio.h" 3 4
-extern FILE *popen (const char *__command, const char *__modes) __attribute__ ((__warn_unused_result__));
-
-
-
-
-
+# 823 "/usr/include/stdio.h" 3 4
 extern int pclose (FILE *__stream);
 
 
 
 
 
-extern char *ctermid (char *__s) __attribute__ ((__nothrow__ , __leaf__));
-# 840 "/usr/include/stdio.h" 3 4
+extern FILE *popen (const char *__command, const char *__modes)
+  __attribute__ ((__malloc__)) __attribute__ ((__malloc__ (pclose, 1))) __attribute__ ((__warn_unused_result__));
+
+
+
+
+
+
+extern char *ctermid (char *__s) __attribute__ ((__nothrow__ , __leaf__))
+  __attribute__ ((__access__ (__write_only__, 1)));
+# 867 "/usr/include/stdio.h" 3 4
 extern void flockfile (FILE *__stream) __attribute__ ((__nothrow__ , __leaf__));
 
 
@@ -2927,13 +2968,19 @@ extern int ftrylockfile (FILE *__stream) __attribute__ ((__nothrow__ , __leaf__)
 
 
 extern void funlockfile (FILE *__stream) __attribute__ ((__nothrow__ , __leaf__));
-# 859 "/usr/include/stdio.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/stdio.h" 1 3 4
-# 43 "/usr/include/x86_64-linux-gnu/bits/stdio.h" 3 4
+# 885 "/usr/include/stdio.h" 3 4
+extern int __uflow (FILE *);
+extern int __overflow (FILE *, int);
+
+
+
+
+# 1 "/usr/include/aarch64-linux-gnu/bits/stdio.h" 1 3 4
+# 46 "/usr/include/aarch64-linux-gnu/bits/stdio.h" 3 4
 extern __inline __attribute__ ((__gnu_inline__)) int
 getchar (void)
 {
-  return _IO_getc (stdin);
+  return getc (stdin);
 }
 
 
@@ -2968,7 +3015,7 @@ getchar_unlocked (void)
 extern __inline __attribute__ ((__gnu_inline__)) int
 putchar (int __c)
 {
-  return _IO_putc (__c, stdout);
+  return putc (__c, stdout);
 }
 
 
@@ -2996,36 +3043,39 @@ putchar_unlocked (int __c)
 {
   return (__builtin_expect (((stdout)->_IO_write_ptr >= (stdout)->_IO_write_end), 0) ? __overflow (stdout, (unsigned char) (__c)) : (unsigned char) (*(stdout)->_IO_write_ptr++ = (__c)));
 }
-# 124 "/usr/include/x86_64-linux-gnu/bits/stdio.h" 3 4
+# 127 "/usr/include/aarch64-linux-gnu/bits/stdio.h" 3 4
 extern __inline __attribute__ ((__gnu_inline__)) int
 __attribute__ ((__nothrow__ , __leaf__)) feof_unlocked (FILE *__stream)
 {
-  return (((__stream)->_flags & 0x10) != 0);
+  return (((__stream)->_flags & 0x0010) != 0);
 }
 
 
 extern __inline __attribute__ ((__gnu_inline__)) int
 __attribute__ ((__nothrow__ , __leaf__)) ferror_unlocked (FILE *__stream)
 {
-  return (((__stream)->_flags & 0x20) != 0);
+  return (((__stream)->_flags & 0x0020) != 0);
 }
-# 860 "/usr/include/stdio.h" 2 3 4
+# 892 "/usr/include/stdio.h" 2 3 4
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/stdio2.h" 1 3 4
-# 23 "/usr/include/x86_64-linux-gnu/bits/stdio2.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/stdio2.h" 1 3 4
+# 26 "/usr/include/aarch64-linux-gnu/bits/stdio2.h" 3 4
 extern int __sprintf_chk (char *__restrict __s, int __flag, size_t __slen,
-     const char *__restrict __format, ...) __attribute__ ((__nothrow__ , __leaf__));
+     const char *__restrict __format, ...) __attribute__ ((__nothrow__ , __leaf__))
+    __attribute__ ((__access__ (__write_only__, 1, 3)));
 extern int __vsprintf_chk (char *__restrict __s, int __flag, size_t __slen,
       const char *__restrict __format,
-      __gnuc_va_list __ap) __attribute__ ((__nothrow__ , __leaf__));
+      __gnuc_va_list __ap) __attribute__ ((__nothrow__ , __leaf__))
+    __attribute__ ((__access__ (__write_only__, 1, 3)));
 
 
 extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline__)) __attribute__ ((__artificial__)) int
 __attribute__ ((__nothrow__ , __leaf__)) sprintf (char *__restrict __s, const char *__restrict __fmt, ...)
 {
   return __builtin___sprintf_chk (__s, 2 - 1,
-      __builtin_object_size (__s, 2 > 1), __fmt, __builtin_va_arg_pack ());
+      __builtin_object_size (__s, 2 > 1), __fmt,
+      __builtin_va_arg_pack ());
 }
 
 
@@ -3045,7 +3095,8 @@ __attribute__ ((__nothrow__ , __leaf__)) vsprintf (char *__restrict __s, const c
 
 extern int __snprintf_chk (char *__restrict __s, size_t __n, int __flag,
       size_t __slen, const char *__restrict __format,
-      ...) __attribute__ ((__nothrow__ , __leaf__));
+      ...) __attribute__ ((__nothrow__ , __leaf__))
+    __attribute__ ((__access__ (__write_only__, 1, 2)));
 extern int __vsnprintf_chk (char *__restrict __s, size_t __n, int __flag,
        size_t __slen, const char *__restrict __format,
        __gnuc_va_list __ap) __attribute__ ((__nothrow__ , __leaf__));
@@ -3056,7 +3107,8 @@ __attribute__ ((__nothrow__ , __leaf__)) snprintf (char *__restrict __s, size_t 
 
 {
   return __builtin___snprintf_chk (__s, __n, 2 - 1,
-       __builtin_object_size (__s, 2 > 1), __fmt, __builtin_va_arg_pack ());
+       __builtin_object_size (__s, 2 > 1), __fmt,
+       __builtin_va_arg_pack ());
 }
 
 
@@ -3145,30 +3197,29 @@ vdprintf (int __fd, const char *__restrict __fmt, __gnuc_va_list __ap)
 {
   return __vdprintf_chk (__fd, 2 - 1, __fmt, __ap);
 }
-# 240 "/usr/include/x86_64-linux-gnu/bits/stdio2.h" 3 4
+# 248 "/usr/include/aarch64-linux-gnu/bits/stdio2.h" 3 4
 extern char *__fgets_chk (char *__restrict __s, size_t __size, int __n,
-     FILE *__restrict __stream) __attribute__ ((__warn_unused_result__));
+     FILE *__restrict __stream)
+    __attribute__ ((__warn_unused_result__)) __attribute__ ((__access__ (__write_only__, 1, 3)));
 extern char *__fgets_alias (char *__restrict __s, int __n, FILE *__restrict __stream) __asm__ ("" "fgets")
 
-                                        __attribute__ ((__warn_unused_result__));
+
+    __attribute__ ((__warn_unused_result__)) __attribute__ ((__access__ (__write_only__, 1, 2)));
 extern char *__fgets_chk_warn (char *__restrict __s, size_t __size, int __n, FILE *__restrict __stream) __asm__ ("" "__fgets_chk")
 
 
      __attribute__ ((__warn_unused_result__)) __attribute__((__warning__ ("fgets called with bigger size than length " "of destination buffer")))
                                  ;
 
-extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline__)) __attribute__ ((__artificial__)) __attribute__ ((__warn_unused_result__)) char *
+extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline__)) __attribute__ ((__artificial__)) __attribute__ ((__warn_unused_result__)) __attribute__ ((__access__ (__write_only__, 1, 2))) char *
 fgets (char *__restrict __s, int __n, FILE *__restrict __stream)
 {
-  if (__builtin_object_size (__s, 2 > 1) != (size_t) -1)
-    {
-      if (!__builtin_constant_p (__n) || __n <= 0)
- return __fgets_chk (__s, __builtin_object_size (__s, 2 > 1), __n, __stream);
-
-      if ((size_t) __n > __builtin_object_size (__s, 2 > 1))
- return __fgets_chk_warn (__s, __builtin_object_size (__s, 2 > 1), __n, __stream);
-    }
-  return __fgets_alias (__s, __n, __stream);
+  size_t sz = __builtin_object_size (__s, 2 > 1);
+  if ((((__typeof (__n)) 0 < (__typeof (__n)) -1 || (__builtin_constant_p (__n) && (__n) > 0)) && __builtin_constant_p ((((long unsigned int) (__n)) <= (sz) / (sizeof (char)))) && (((long unsigned int) (__n)) <= (sz) / (sizeof (char)))))
+    return __fgets_alias (__s, __n, __stream);
+  if ((((__typeof (__n)) 0 < (__typeof (__n)) -1 || (__builtin_constant_p (__n) && (__n) > 0)) && __builtin_constant_p ((((long unsigned int) (__n)) <= (sz) / (sizeof (char)))) && !(((long unsigned int) (__n)) <= (sz) / (sizeof (char)))))
+    return __fgets_chk_warn (__s, sz, __n, __stream);
+  return __fgets_chk (__s, sz, __n, __stream);
 }
 
 extern size_t __fread_chk (void *__restrict __ptr, size_t __ptrlen,
@@ -3190,19 +3241,14 @@ extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline
 fread (void *__restrict __ptr, size_t __size, size_t __n,
        FILE *__restrict __stream)
 {
-  if (__builtin_object_size (__ptr, 0) != (size_t) -1)
-    {
-      if (!__builtin_constant_p (__size)
-   || !__builtin_constant_p (__n)
-   || (__size | __n) >= (((size_t) 1) << (8 * sizeof (size_t) / 2)))
- return __fread_chk (__ptr, __builtin_object_size (__ptr, 0), __size, __n, __stream);
-
-      if (__size * __n > __builtin_object_size (__ptr, 0))
- return __fread_chk_warn (__ptr, __builtin_object_size (__ptr, 0), __size, __n, __stream);
-    }
-  return __fread_alias (__ptr, __size, __n, __stream);
+  size_t sz = __builtin_object_size (__ptr, 0);
+  if ((((__typeof (__n)) 0 < (__typeof (__n)) -1 || (__builtin_constant_p (__n) && (__n) > 0)) && __builtin_constant_p ((((long unsigned int) (__n)) <= (sz) / (__size))) && (((long unsigned int) (__n)) <= (sz) / (__size))))
+    return __fread_alias (__ptr, __size, __n, __stream);
+  if ((((__typeof (__n)) 0 < (__typeof (__n)) -1 || (__builtin_constant_p (__n) && (__n) > 0)) && __builtin_constant_p ((((long unsigned int) (__n)) <= (sz) / (__size))) && !(((long unsigned int) (__n)) <= (sz) / (__size))))
+    return __fread_chk_warn (__ptr, sz, __size, __n, __stream);
+  return __fread_chk (__ptr, sz, __size, __n, __stream);
 }
-# 326 "/usr/include/x86_64-linux-gnu/bits/stdio2.h" 3 4
+# 327 "/usr/include/aarch64-linux-gnu/bits/stdio2.h" 3 4
 extern size_t __fread_unlocked_chk (void *__restrict __ptr, size_t __ptrlen,
         size_t __size, size_t __n,
         FILE *__restrict __stream) __attribute__ ((__warn_unused_result__));
@@ -3222,61 +3268,58 @@ extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline
 fread_unlocked (void *__restrict __ptr, size_t __size, size_t __n,
   FILE *__restrict __stream)
 {
-  if (__builtin_object_size (__ptr, 0) != (size_t) -1)
+  size_t sz = __builtin_object_size (__ptr, 0);
+  if ((((__typeof (__n)) 0 < (__typeof (__n)) -1 || (__builtin_constant_p (__n) && (__n) > 0)) && __builtin_constant_p ((((long unsigned int) (__n)) <= (sz) / (__size))) && (((long unsigned int) (__n)) <= (sz) / (__size))))
     {
-      if (!__builtin_constant_p (__size)
-   || !__builtin_constant_p (__n)
-   || (__size | __n) >= (((size_t) 1) << (8 * sizeof (size_t) / 2)))
- return __fread_unlocked_chk (__ptr, __builtin_object_size (__ptr, 0), __size, __n,
-         __stream);
 
-      if (__size * __n > __builtin_object_size (__ptr, 0))
- return __fread_unlocked_chk_warn (__ptr, __builtin_object_size (__ptr, 0), __size, __n,
-       __stream);
-    }
-
-
-  if (__builtin_constant_p (__size)
-      && __builtin_constant_p (__n)
-      && (__size | __n) < (((size_t) 1) << (8 * sizeof (size_t) / 2))
-      && __size * __n <= 8)
-    {
-      size_t __cnt = __size * __n;
-      char *__cptr = (char *) __ptr;
-      if (__cnt == 0)
- return 0;
-
-      for (; __cnt > 0; --__cnt)
+      if (__builtin_constant_p (__size)
+   && __builtin_constant_p (__n)
+   && (__size | __n) < (((size_t) 1) << (8 * sizeof (size_t) / 2))
+   && __size * __n <= 8)
  {
-   int __c = (__builtin_expect (((__stream)->_IO_read_ptr >= (__stream)->_IO_read_end), 0) ? __uflow (__stream) : *(unsigned char *) (__stream)->_IO_read_ptr++);
-   if (__c == (-1))
-     break;
-   *__cptr++ = __c;
+   size_t __cnt = __size * __n;
+   char *__cptr = (char *) __ptr;
+   if (__cnt == 0)
+     return 0;
+
+   for (; __cnt > 0; --__cnt)
+     {
+       int __c = getc_unlocked (__stream);
+       if (__c == (-1))
+  break;
+       *__cptr++ = __c;
+     }
+   return (__cptr - (char *) __ptr) / __size;
  }
-      return (__cptr - (char *) __ptr) / __size;
+
+      return __fread_unlocked_alias (__ptr, __size, __n, __stream);
     }
+  if ((((__typeof (__n)) 0 < (__typeof (__n)) -1 || (__builtin_constant_p (__n) && (__n) > 0)) && __builtin_constant_p ((((long unsigned int) (__n)) <= (sz) / (__size))) && !(((long unsigned int) (__n)) <= (sz) / (__size))))
+    return __fread_unlocked_chk_warn (__ptr, sz, __size, __n, __stream);
+  return __fread_unlocked_chk (__ptr, sz, __size, __n, __stream);
 
-  return __fread_unlocked_alias (__ptr, __size, __n, __stream);
 }
-# 863 "/usr/include/stdio.h" 2 3 4
+# 895 "/usr/include/stdio.h" 2 3 4
 
 
 
 
 
 
-# 22 "/workspace/acl/lib_acl/include/stdlib/acl_define.h" 2
+
+
+# 22 "/acl/lib_acl/include/stdlib/acl_define.h" 2
 # 1 "/usr/include/stdlib.h" 1 3 4
-# 25 "/usr/include/stdlib.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/libc-header-start.h" 1 3 4
-# 26 "/usr/include/stdlib.h" 2 3 4
+# 26 "/usr/include/stdlib.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/libc-header-start.h" 1 3 4
+# 27 "/usr/include/stdlib.h" 2 3 4
 
 
 
 
 
-# 1 "/usr/lib/gcc/x86_64-linux-gnu/7/include/stddef.h" 1 3 4
-# 32 "/usr/include/stdlib.h" 2 3 4
+# 1 "/usr/lib/gcc/aarch64-linux-gnu/11/include/stddef.h" 1 3 4
+# 33 "/usr/include/stdlib.h" 2 3 4
 
 
 
@@ -3284,28 +3327,11 @@ fread_unlocked (void *__restrict __ptr, size_t __size, size_t __n,
 
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/waitflags.h" 1 3 4
-# 52 "/usr/include/x86_64-linux-gnu/bits/waitflags.h" 3 4
-typedef enum
-{
-  P_ALL,
-  P_PID,
-  P_PGID
-} idtype_t;
-# 40 "/usr/include/stdlib.h" 2 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/waitstatus.h" 1 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/waitflags.h" 1 3 4
 # 41 "/usr/include/stdlib.h" 2 3 4
-# 55 "/usr/include/stdlib.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/floatn.h" 1 3 4
-# 120 "/usr/include/x86_64-linux-gnu/bits/floatn.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/floatn-common.h" 1 3 4
-# 24 "/usr/include/x86_64-linux-gnu/bits/floatn-common.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/long-double.h" 1 3 4
-# 25 "/usr/include/x86_64-linux-gnu/bits/floatn-common.h" 2 3 4
-# 121 "/usr/include/x86_64-linux-gnu/bits/floatn.h" 2 3 4
-# 56 "/usr/include/stdlib.h" 2 3 4
-
-
+# 1 "/usr/include/aarch64-linux-gnu/bits/waitstatus.h" 1 3 4
+# 42 "/usr/include/stdlib.h" 2 3 4
+# 59 "/usr/include/stdlib.h" 3 4
 typedef struct
   {
     int quot;
@@ -3329,7 +3355,7 @@ __extension__ typedef struct
     long long int quot;
     long long int rem;
   } lldiv_t;
-# 97 "/usr/include/stdlib.h" 3 4
+# 98 "/usr/include/stdlib.h" 3 4
 extern size_t __ctype_get_mb_cur_max (void) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__warn_unused_result__));
 
 
@@ -3362,7 +3388,7 @@ extern float strtof (const char *__restrict __nptr,
 extern long double strtold (const char *__restrict __nptr,
        char **__restrict __endptr)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)));
-# 176 "/usr/include/stdlib.h" 3 4
+# 177 "/usr/include/stdlib.h" 3 4
 extern long int strtol (const char *__restrict __nptr,
    char **__restrict __endptr, int __base)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)));
@@ -3395,7 +3421,7 @@ __extension__
 extern unsigned long long int strtoull (const char *__restrict __nptr,
      char **__restrict __endptr, int __base)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)));
-# 360 "/usr/include/stdlib.h" 3 4
+# 361 "/usr/include/stdlib.h" 3 4
 extern __inline __attribute__ ((__gnu_inline__)) int
 __attribute__ ((__nothrow__ , __leaf__)) atoi (const char *__nptr)
 {
@@ -3413,13 +3439,13 @@ __attribute__ ((__nothrow__ , __leaf__)) atoll (const char *__nptr)
 {
   return strtoll (__nptr, (char **) ((void *)0), 10);
 }
-# 385 "/usr/include/stdlib.h" 3 4
+# 386 "/usr/include/stdlib.h" 3 4
 extern char *l64a (long int __n) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__warn_unused_result__));
 
 
 extern long int a64l (const char *__s)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__pure__)) __attribute__ ((__nonnull__ (1))) __attribute__ ((__warn_unused_result__));
-# 401 "/usr/include/stdlib.h" 3 4
+# 402 "/usr/include/stdlib.h" 3 4
 extern long int random (void) __attribute__ ((__nothrow__ , __leaf__));
 
 
@@ -3558,10 +3584,11 @@ extern int lcong48_r (unsigned short int __param[7],
 
 
 
-extern void *malloc (size_t __size) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__malloc__)) __attribute__ ((__warn_unused_result__));
+extern void *malloc (size_t __size) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__malloc__))
+     __attribute__ ((__alloc_size__ (1))) __attribute__ ((__warn_unused_result__));
 
 extern void *calloc (size_t __nmemb, size_t __size)
-     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__malloc__)) __attribute__ ((__warn_unused_result__));
+     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__malloc__)) __attribute__ ((__alloc_size__ (1, 2))) __attribute__ ((__warn_unused_result__));
 
 
 
@@ -3569,14 +3596,31 @@ extern void *calloc (size_t __nmemb, size_t __size)
 
 
 extern void *realloc (void *__ptr, size_t __size)
-     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__warn_unused_result__));
-# 563 "/usr/include/stdlib.h" 3 4
+     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__warn_unused_result__)) __attribute__ ((__alloc_size__ (2)));
+
+
 extern void free (void *__ptr) __attribute__ ((__nothrow__ , __leaf__));
+
+
+
+
+
+
+
+extern void *reallocarray (void *__ptr, size_t __nmemb, size_t __size)
+     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__warn_unused_result__))
+     __attribute__ ((__alloc_size__ (2, 3)))
+    __attribute__ ((__malloc__ (__builtin_free, 1)));
+
+
+extern void *reallocarray (void *__ptr, size_t __nmemb, size_t __size)
+     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__malloc__ (reallocarray, 1)));
+
 
 
 # 1 "/usr/include/alloca.h" 1 3 4
 # 24 "/usr/include/alloca.h" 3 4
-# 1 "/usr/lib/gcc/x86_64-linux-gnu/7/include/stddef.h" 1 3 4
+# 1 "/usr/lib/gcc/aarch64-linux-gnu/11/include/stddef.h" 1 3 4
 # 25 "/usr/include/alloca.h" 2 3 4
 
 
@@ -3592,13 +3636,14 @@ extern void *alloca (size_t __size) __attribute__ ((__nothrow__ , __leaf__));
 
 
 
-# 567 "/usr/include/stdlib.h" 2 3 4
+# 575 "/usr/include/stdlib.h" 2 3 4
 
 
 
 
 
-extern void *valloc (size_t __size) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__malloc__)) __attribute__ ((__warn_unused_result__));
+extern void *valloc (size_t __size) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__malloc__))
+     __attribute__ ((__alloc_size__ (1))) __attribute__ ((__warn_unused_result__));
 
 
 
@@ -3610,7 +3655,8 @@ extern int posix_memalign (void **__memptr, size_t __alignment, size_t __size)
 
 
 extern void *aligned_alloc (size_t __alignment, size_t __size)
-     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__malloc__)) __attribute__ ((__alloc_size__ (2))) __attribute__ ((__warn_unused_result__));
+     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__malloc__)) __attribute__ ((__alloc_align__ (1)))
+     __attribute__ ((__alloc_size__ (2))) __attribute__ ((__warn_unused_result__));
 
 
 
@@ -3658,7 +3704,7 @@ extern void _Exit (int __status) __attribute__ ((__nothrow__ , __leaf__)) __attr
 
 
 extern char *getenv (const char *__name) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1))) __attribute__ ((__warn_unused_result__));
-# 644 "/usr/include/stdlib.h" 3 4
+# 654 "/usr/include/stdlib.h" 3 4
 extern int putenv (char *__string) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)));
 
 
@@ -3677,9 +3723,9 @@ extern int unsetenv (const char *__name) __attribute__ ((__nothrow__ , __leaf__)
 
 
 extern int clearenv (void) __attribute__ ((__nothrow__ , __leaf__));
-# 672 "/usr/include/stdlib.h" 3 4
+# 682 "/usr/include/stdlib.h" 3 4
 extern char *mktemp (char *__template) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)));
-# 688 "/usr/include/stdlib.h" 3 4
+# 698 "/usr/include/stdlib.h" 3 4
 extern int mkstemp (char *__template) __asm__ ("" "mkstemp64")
      __attribute__ ((__nonnull__ (1))) __attribute__ ((__warn_unused_result__));
 
@@ -3688,7 +3734,7 @@ extern int mkstemp (char *__template) __asm__ ("" "mkstemp64")
 
 
 extern int mkstemp64 (char *__template) __attribute__ ((__nonnull__ (1))) __attribute__ ((__warn_unused_result__));
-# 710 "/usr/include/stdlib.h" 3 4
+# 720 "/usr/include/stdlib.h" 3 4
 extern int mkstemps (char *__template, int __suffixlen) __asm__ ("" "mkstemps64")
                      __attribute__ ((__nonnull__ (1))) __attribute__ ((__warn_unused_result__));
 
@@ -3698,11 +3744,11 @@ extern int mkstemps (char *__template, int __suffixlen) __asm__ ("" "mkstemps64"
 
 extern int mkstemps64 (char *__template, int __suffixlen)
      __attribute__ ((__nonnull__ (1))) __attribute__ ((__warn_unused_result__));
-# 728 "/usr/include/stdlib.h" 3 4
+# 738 "/usr/include/stdlib.h" 3 4
 extern char *mkdtemp (char *__template) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1))) __attribute__ ((__warn_unused_result__));
-# 781 "/usr/include/stdlib.h" 3 4
+# 791 "/usr/include/stdlib.h" 3 4
 extern int system (const char *__command) __attribute__ ((__warn_unused_result__));
-# 797 "/usr/include/stdlib.h" 3 4
+# 808 "/usr/include/stdlib.h" 3 4
 extern char *realpath (const char *__restrict __name,
          char *__restrict __resolved) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__warn_unused_result__));
 
@@ -3712,14 +3758,14 @@ extern char *realpath (const char *__restrict __name,
 
 
 typedef int (*__compar_fn_t) (const void *, const void *);
-# 817 "/usr/include/stdlib.h" 3 4
+# 828 "/usr/include/stdlib.h" 3 4
 extern void *bsearch (const void *__key, const void *__base,
         size_t __nmemb, size_t __size, __compar_fn_t __compar)
      __attribute__ ((__nonnull__ (1, 2, 5))) __attribute__ ((__warn_unused_result__));
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/stdlib-bsearch.h" 1 3 4
-# 19 "/usr/include/x86_64-linux-gnu/bits/stdlib-bsearch.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/stdlib-bsearch.h" 1 3 4
+# 19 "/usr/include/aarch64-linux-gnu/bits/stdlib-bsearch.h" 3 4
 extern __inline __attribute__ ((__gnu_inline__)) void *
 bsearch (const void *__key, const void *__base, size_t __nmemb, size_t __size,
   __compar_fn_t __compar)
@@ -3733,26 +3779,35 @@ bsearch (const void *__key, const void *__base, size_t __nmemb, size_t __size,
   while (__l < __u)
     {
       __idx = (__l + __u) / 2;
-      __p = (void *) (((const char *) __base) + (__idx * __size));
+      __p = (const void *) (((const char *) __base) + (__idx * __size));
       __comparison = (*__compar) (__key, __p);
       if (__comparison < 0)
  __u = __idx;
       else if (__comparison > 0)
  __l = __idx + 1;
       else
- return (void *) __p;
+ {
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wcast-qual"
+
+   return (void *) __p;
+
+#pragma GCC diagnostic pop
+
+ }
     }
 
   return ((void *)0);
 }
-# 823 "/usr/include/stdlib.h" 2 3 4
+# 834 "/usr/include/stdlib.h" 2 3 4
 
 
 
 
 extern void qsort (void *__base, size_t __nmemb, size_t __size,
      __compar_fn_t __compar) __attribute__ ((__nonnull__ (1, 4)));
-# 837 "/usr/include/stdlib.h" 3 4
+# 848 "/usr/include/stdlib.h" 3 4
 extern int abs (int __x) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__const__)) __attribute__ ((__warn_unused_result__));
 extern long int labs (long int __x) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__const__)) __attribute__ ((__warn_unused_result__));
 
@@ -3774,7 +3829,7 @@ extern ldiv_t ldiv (long int __numer, long int __denom)
 __extension__ extern lldiv_t lldiv (long long int __numer,
         long long int __denom)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__const__)) __attribute__ ((__warn_unused_result__));
-# 869 "/usr/include/stdlib.h" 3 4
+# 880 "/usr/include/stdlib.h" 3 4
 extern char *ecvt (double __value, int __ndigit, int *__restrict __decpt,
      int *__restrict __sign) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (3, 4))) __attribute__ ((__warn_unused_result__));
 
@@ -3837,12 +3892,14 @@ extern int wctomb (char *__s, wchar_t __wchar) __attribute__ ((__nothrow__ , __l
 
 
 extern size_t mbstowcs (wchar_t *__restrict __pwcs,
-   const char *__restrict __s, size_t __n) __attribute__ ((__nothrow__ , __leaf__));
+   const char *__restrict __s, size_t __n) __attribute__ ((__nothrow__ , __leaf__))
+    __attribute__ ((__access__ (__read_only__, 2)));
 
 extern size_t wcstombs (char *__restrict __s,
    const wchar_t *__restrict __pwcs, size_t __n)
-     __attribute__ ((__nothrow__ , __leaf__));
-
+     __attribute__ ((__nothrow__ , __leaf__))
+  __attribute__ ((__access__ (__write_only__, 1, 3)))
+  __attribute__ ((__access__ (__read_only__, 2)));
 
 
 
@@ -3850,28 +3907,28 @@ extern size_t wcstombs (char *__restrict __s,
 
 
 extern int rpmatch (const char *__response) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1))) __attribute__ ((__warn_unused_result__));
-# 954 "/usr/include/stdlib.h" 3 4
+# 967 "/usr/include/stdlib.h" 3 4
 extern int getsubopt (char **__restrict __optionp,
         char *const *__restrict __tokens,
         char **__restrict __valuep)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1, 2, 3))) __attribute__ ((__warn_unused_result__));
-# 1006 "/usr/include/stdlib.h" 3 4
+# 1013 "/usr/include/stdlib.h" 3 4
 extern int getloadavg (double __loadavg[], int __nelem)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)));
-# 1016 "/usr/include/stdlib.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/stdlib-float.h" 1 3 4
-# 24 "/usr/include/x86_64-linux-gnu/bits/stdlib-float.h" 3 4
+# 1023 "/usr/include/stdlib.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/stdlib-float.h" 1 3 4
+# 24 "/usr/include/aarch64-linux-gnu/bits/stdlib-float.h" 3 4
 extern __inline __attribute__ ((__gnu_inline__)) double
 __attribute__ ((__nothrow__ , __leaf__)) atof (const char *__nptr)
 {
   return strtod (__nptr, (char **) ((void *)0));
 }
-# 1017 "/usr/include/stdlib.h" 2 3 4
+# 1024 "/usr/include/stdlib.h" 2 3 4
 
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/stdlib.h" 1 3 4
-# 23 "/usr/include/x86_64-linux-gnu/bits/stdlib.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/stdlib.h" 1 3 4
+# 23 "/usr/include/aarch64-linux-gnu/bits/stdlib.h" 3 4
 extern char *__realpath_chk (const char *__restrict __name,
         char *__restrict __resolved,
         size_t __resolvedlen) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__warn_unused_result__));
@@ -3888,24 +3945,25 @@ extern char *__realpath_chk_warn (const char *__restrict __name, char *__restric
 extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline__)) __attribute__ ((__artificial__)) __attribute__ ((__warn_unused_result__)) char *
 __attribute__ ((__nothrow__ , __leaf__)) realpath (const char *__restrict __name, char *__restrict __resolved)
 {
-  if (__builtin_object_size (__resolved, 2 > 1) != (size_t) -1)
-    {
+  size_t sz = __builtin_object_size (__resolved, 2 > 1);
+
+  if (sz == (size_t) -1)
+    return __realpath_alias (__name, __resolved);
 
 
 
 
-      return __realpath_chk (__name, __resolved, __builtin_object_size (__resolved, 2 > 1));
-    }
 
-  return __realpath_alias (__name, __resolved);
+  return __realpath_chk (__name, __resolved, sz);
 }
 
 
 extern int __ptsname_r_chk (int __fd, char *__buf, size_t __buflen,
-       size_t __nreal) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (2)));
+       size_t __nreal) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (2)))
+    __attribute__ ((__access__ (__write_only__, 2, 3)));
 extern int __ptsname_r_alias (int __fd, char *__buf, size_t __buflen) __asm__ ("" "ptsname_r") __attribute__ ((__nothrow__ , __leaf__))
 
-     __attribute__ ((__nonnull__ (2)));
+     __attribute__ ((__nonnull__ (2))) __attribute__ ((__access__ (__write_only__, 2, 3)));
 extern int __ptsname_r_chk_warn (int __fd, char *__buf, size_t __buflen, size_t __nreal) __asm__ ("" "__ptsname_r_chk") __attribute__ ((__nothrow__ , __leaf__))
 
 
@@ -3915,14 +3973,9 @@ extern int __ptsname_r_chk_warn (int __fd, char *__buf, size_t __buflen, size_t 
 extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline__)) __attribute__ ((__artificial__)) int
 __attribute__ ((__nothrow__ , __leaf__)) ptsname_r (int __fd, char *__buf, size_t __buflen)
 {
-  if (__builtin_object_size (__buf, 2 > 1) != (size_t) -1)
-    {
-      if (!__builtin_constant_p (__buflen))
- return __ptsname_r_chk (__fd, __buf, __buflen, __builtin_object_size (__buf, 2 > 1));
-      if (__buflen > __builtin_object_size (__buf, 2 > 1))
- return __ptsname_r_chk_warn (__fd, __buf, __buflen, __builtin_object_size (__buf, 2 > 1));
-    }
-  return __ptsname_r_alias (__fd, __buf, __buflen);
+  return ((((__typeof (__buflen)) 0 < (__typeof (__buflen)) -1 || (__builtin_constant_p (__buflen) && (__buflen) > 0)) && __builtin_constant_p ((((long unsigned int) (__buflen)) <= (__builtin_object_size (__buf, 2 > 1)) / (sizeof (char)))) && (((long unsigned int) (__buflen)) <= (__builtin_object_size (__buf, 2 > 1)) / (sizeof (char)))) ? __ptsname_r_alias (__fd, __buf, __buflen) : ((((__typeof (__buflen)) 0 < (__typeof (__buflen)) -1 || (__builtin_constant_p (__buflen) && (__buflen) > 0)) && __builtin_constant_p ((((long unsigned int) (__buflen)) <= (__builtin_object_size (__buf, 2 > 1)) / (sizeof (char)))) && !(((long unsigned int) (__buflen)) <= (__builtin_object_size (__buf, 2 > 1)) / (sizeof (char)))) ? __ptsname_r_chk_warn (__fd, __buf, __buflen, __builtin_object_size (__buf, 2 > 1)) : __ptsname_r_chk (__fd, __buf, __buflen, __builtin_object_size (__buf, 2 > 1))))
+
+                           ;
 }
 
 
@@ -3941,7 +3994,8 @@ __attribute__ ((__nothrow__ , __leaf__)) wctomb (char *__s, wchar_t __wchar)
 
 
 
-  if (__builtin_object_size (__s, 2 > 1) != (size_t) -1 && 16 > __builtin_object_size (__s, 2 > 1))
+  if (__builtin_object_size (__s, 2 > 1) != (size_t) -1
+      && 16 > __builtin_object_size (__s, 2 > 1))
     return __wctomb_chk (__s, __wchar, __builtin_object_size (__s, 2 > 1));
   return __wctomb_alias (__s, __wchar);
 }
@@ -3949,11 +4003,13 @@ __attribute__ ((__nothrow__ , __leaf__)) wctomb (char *__s, wchar_t __wchar)
 
 extern size_t __mbstowcs_chk (wchar_t *__restrict __dst,
          const char *__restrict __src,
-         size_t __len, size_t __dstlen) __attribute__ ((__nothrow__ , __leaf__));
+         size_t __len, size_t __dstlen) __attribute__ ((__nothrow__ , __leaf__))
+    __attribute__ ((__access__ (__write_only__, 1, 3))) __attribute__ ((__access__ (__read_only__, 2)));
 extern size_t __mbstowcs_alias (wchar_t *__restrict __dst, const char *__restrict __src, size_t __len) __asm__ ("" "mbstowcs") __attribute__ ((__nothrow__ , __leaf__))
 
 
-                                  ;
+
+    __attribute__ ((__access__ (__write_only__, 1, 3))) __attribute__ ((__access__ (__read_only__, 2)));
 extern size_t __mbstowcs_chk_warn (wchar_t *__restrict __dst, const char *__restrict __src, size_t __len, size_t __dstlen) __asm__ ("" "__mbstowcs_chk") __attribute__ ((__nothrow__ , __leaf__))
 
 
@@ -3965,27 +4021,21 @@ extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline
 __attribute__ ((__nothrow__ , __leaf__)) mbstowcs (wchar_t *__restrict __dst, const char *__restrict __src, size_t __len)
 
 {
-  if (__builtin_object_size (__dst, 2 > 1) != (size_t) -1)
-    {
-      if (!__builtin_constant_p (__len))
- return __mbstowcs_chk (__dst, __src, __len,
-          __builtin_object_size (__dst, 2 > 1) / sizeof (wchar_t));
+  return ((((__typeof (__len)) 0 < (__typeof (__len)) -1 || (__builtin_constant_p (__len) && (__len) > 0)) && __builtin_constant_p ((((long unsigned int) (__len)) <= (__builtin_object_size (__dst, 2 > 1)) / (sizeof (wchar_t)))) && (((long unsigned int) (__len)) <= (__builtin_object_size (__dst, 2 > 1)) / (sizeof (wchar_t)))) ? __mbstowcs_alias (__dst, __src, __len) : ((((__typeof (__len)) 0 < (__typeof (__len)) -1 || (__builtin_constant_p (__len) && (__len) > 0)) && __builtin_constant_p ((((long unsigned int) (__len)) <= (__builtin_object_size (__dst, 2 > 1)) / (sizeof (wchar_t)))) && !(((long unsigned int) (__len)) <= (__builtin_object_size (__dst, 2 > 1)) / (sizeof (wchar_t)))) ? __mbstowcs_chk_warn (__dst, __src, __len, (__builtin_object_size (__dst, 2 > 1)) / (sizeof (wchar_t))) : __mbstowcs_chk (__dst, __src, __len, (__builtin_object_size (__dst, 2 > 1)) / (sizeof (wchar_t)))))
 
-      if (__len > __builtin_object_size (__dst, 2 > 1) / sizeof (wchar_t))
- return __mbstowcs_chk_warn (__dst, __src, __len,
-         __builtin_object_size (__dst, 2 > 1) / sizeof (wchar_t));
-    }
-  return __mbstowcs_alias (__dst, __src, __len);
+                           ;
 }
 
 
 extern size_t __wcstombs_chk (char *__restrict __dst,
          const wchar_t *__restrict __src,
-         size_t __len, size_t __dstlen) __attribute__ ((__nothrow__ , __leaf__));
+         size_t __len, size_t __dstlen) __attribute__ ((__nothrow__ , __leaf__))
+  __attribute__ ((__access__ (__write_only__, 1, 3))) __attribute__ ((__access__ (__read_only__, 2)));
 extern size_t __wcstombs_alias (char *__restrict __dst, const wchar_t *__restrict __src, size_t __len) __asm__ ("" "wcstombs") __attribute__ ((__nothrow__ , __leaf__))
 
 
-                                  ;
+
+  __attribute__ ((__access__ (__write_only__, 1, 3))) __attribute__ ((__access__ (__read_only__, 2)));
 extern size_t __wcstombs_chk_warn (char *__restrict __dst, const wchar_t *__restrict __src, size_t __len, size_t __dstlen) __asm__ ("" "__wcstombs_chk") __attribute__ ((__nothrow__ , __leaf__))
 
 
@@ -3996,29 +4046,26 @@ extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline
 __attribute__ ((__nothrow__ , __leaf__)) wcstombs (char *__restrict __dst, const wchar_t *__restrict __src, size_t __len)
 
 {
-  if (__builtin_object_size (__dst, 2 > 1) != (size_t) -1)
-    {
-      if (!__builtin_constant_p (__len))
- return __wcstombs_chk (__dst, __src, __len, __builtin_object_size (__dst, 2 > 1));
-      if (__len > __builtin_object_size (__dst, 2 > 1))
- return __wcstombs_chk_warn (__dst, __src, __len, __builtin_object_size (__dst, 2 > 1));
-    }
-  return __wcstombs_alias (__dst, __src, __len);
+  return ((((__typeof (__len)) 0 < (__typeof (__len)) -1 || (__builtin_constant_p (__len) && (__len) > 0)) && __builtin_constant_p ((((long unsigned int) (__len)) <= (__builtin_object_size (__dst, 2 > 1)) / (sizeof (char)))) && (((long unsigned int) (__len)) <= (__builtin_object_size (__dst, 2 > 1)) / (sizeof (char)))) ? __wcstombs_alias (__dst, __src, __len) : ((((__typeof (__len)) 0 < (__typeof (__len)) -1 || (__builtin_constant_p (__len) && (__len) > 0)) && __builtin_constant_p ((((long unsigned int) (__len)) <= (__builtin_object_size (__dst, 2 > 1)) / (sizeof (char)))) && !(((long unsigned int) (__len)) <= (__builtin_object_size (__dst, 2 > 1)) / (sizeof (char)))) ? __wcstombs_chk_warn (__dst, __src, __len, __builtin_object_size (__dst, 2 > 1)) : __wcstombs_chk (__dst, __src, __len, __builtin_object_size (__dst, 2 > 1))))
+
+                         ;
 }
-# 1021 "/usr/include/stdlib.h" 2 3 4
+# 1028 "/usr/include/stdlib.h" 2 3 4
 
 
 
 
 
 
-# 23 "/workspace/acl/lib_acl/include/stdlib/acl_define.h" 2
+
+
+# 23 "/acl/lib_acl/include/stdlib/acl_define.h" 2
 # 1 "/usr/include/errno.h" 1 3 4
 # 28 "/usr/include/errno.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/errno.h" 1 3 4
-# 26 "/usr/include/x86_64-linux-gnu/bits/errno.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/errno.h" 1 3 4
+# 26 "/usr/include/aarch64-linux-gnu/bits/errno.h" 3 4
 # 1 "/usr/include/linux/errno.h" 1 3 4
-# 1 "/usr/include/x86_64-linux-gnu/asm/errno.h" 1 3 4
+# 1 "/usr/include/aarch64-linux-gnu/asm/errno.h" 1 3 4
 # 1 "/usr/include/asm-generic/errno.h" 1 3 4
 
 
@@ -4026,9 +4073,9 @@ __attribute__ ((__nothrow__ , __leaf__)) wcstombs (char *__restrict __dst, const
 
 # 1 "/usr/include/asm-generic/errno-base.h" 1 3 4
 # 6 "/usr/include/asm-generic/errno.h" 2 3 4
-# 1 "/usr/include/x86_64-linux-gnu/asm/errno.h" 2 3 4
-# 1 "/usr/include/linux/errno.h" 2 3 4
-# 27 "/usr/include/x86_64-linux-gnu/bits/errno.h" 2 3 4
+# 2 "/usr/include/aarch64-linux-gnu/asm/errno.h" 2 3 4
+# 2 "/usr/include/linux/errno.h" 2 3 4
+# 27 "/usr/include/aarch64-linux-gnu/bits/errno.h" 2 3 4
 # 29 "/usr/include/errno.h" 2 3 4
 
 
@@ -4039,12 +4086,12 @@ __attribute__ ((__nothrow__ , __leaf__)) wcstombs (char *__restrict __dst, const
 
 
 extern int *__errno_location (void) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__const__));
-# 57 "/usr/include/errno.h" 3 4
+# 52 "/usr/include/errno.h" 3 4
 
-# 24 "/workspace/acl/lib_acl/include/stdlib/acl_define.h" 2
+# 24 "/acl/lib_acl/include/stdlib/acl_define.h" 2
 # 1 "/usr/include/string.h" 1 3 4
 # 26 "/usr/include/string.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/libc-header-start.h" 1 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/libc-header-start.h" 1 3 4
 # 27 "/usr/include/string.h" 2 3 4
 
 
@@ -4052,9 +4099,9 @@ extern int *__errno_location (void) __attribute__ ((__nothrow__ , __leaf__)) __a
 
 
 
-# 1 "/usr/lib/gcc/x86_64-linux-gnu/7/include/stddef.h" 1 3 4
+# 1 "/usr/lib/gcc/aarch64-linux-gnu/11/include/stddef.h" 1 3 4
 # 34 "/usr/include/string.h" 2 3 4
-# 42 "/usr/include/string.h" 3 4
+# 43 "/usr/include/string.h" 3 4
 extern void *memcpy (void *__restrict __dest, const void *__restrict __src,
        size_t __n) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1, 2)));
 
@@ -4068,7 +4115,7 @@ extern void *memmove (void *__dest, const void *__src, size_t __n)
 
 extern void *memccpy (void *__restrict __dest, const void *__restrict __src,
         int __c, size_t __n)
-     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1, 2)));
+    __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1, 2))) __attribute__ ((__access__ (__write_only__, 1, 4)));
 
 
 
@@ -4078,10 +4125,13 @@ extern void *memset (void *__s, int __c, size_t __n) __attribute__ ((__nothrow__
 
 extern int memcmp (const void *__s1, const void *__s2, size_t __n)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__pure__)) __attribute__ ((__nonnull__ (1, 2)));
-# 90 "/usr/include/string.h" 3 4
+# 80 "/usr/include/string.h" 3 4
+extern int __memcmpeq (const void *__s1, const void *__s2, size_t __n)
+     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__pure__)) __attribute__ ((__nonnull__ (1, 2)));
+# 107 "/usr/include/string.h" 3 4
 extern void *memchr (const void *__s, int __c, size_t __n)
       __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__pure__)) __attribute__ ((__nonnull__ (1)));
-# 121 "/usr/include/string.h" 3 4
+# 141 "/usr/include/string.h" 3 4
 extern char *strcpy (char *__restrict __dest, const char *__restrict __src)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1, 2)));
 
@@ -4109,7 +4159,7 @@ extern int strcoll (const char *__s1, const char *__s2)
 
 extern size_t strxfrm (char *__restrict __dest,
          const char *__restrict __src, size_t __n)
-     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (2)));
+    __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (2))) __attribute__ ((__access__ (__write_only__, 1, 3)));
 
 
 
@@ -4121,7 +4171,8 @@ extern int strcoll_l (const char *__s1, const char *__s2, locale_t __l)
 
 
 extern size_t strxfrm_l (char *__dest, const char *__src, size_t __n,
-    locale_t __l) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (2, 4)));
+    locale_t __l) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (2, 4)))
+     __attribute__ ((__access__ (__write_only__, 1, 3)));
 
 
 
@@ -4137,23 +4188,23 @@ extern char *strdup (const char *__s)
 
 extern char *strndup (const char *__string, size_t __n)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__malloc__)) __attribute__ ((__nonnull__ (1)));
-# 225 "/usr/include/string.h" 3 4
+# 246 "/usr/include/string.h" 3 4
 extern char *strchr (const char *__s, int __c)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__pure__)) __attribute__ ((__nonnull__ (1)));
-# 252 "/usr/include/string.h" 3 4
+# 273 "/usr/include/string.h" 3 4
 extern char *strrchr (const char *__s, int __c)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__pure__)) __attribute__ ((__nonnull__ (1)));
-# 272 "/usr/include/string.h" 3 4
+# 293 "/usr/include/string.h" 3 4
 extern size_t strcspn (const char *__s, const char *__reject)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__pure__)) __attribute__ ((__nonnull__ (1, 2)));
 
 
 extern size_t strspn (const char *__s, const char *__accept)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__pure__)) __attribute__ ((__nonnull__ (1, 2)));
-# 302 "/usr/include/string.h" 3 4
+# 323 "/usr/include/string.h" 3 4
 extern char *strpbrk (const char *__s, const char *__accept)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__pure__)) __attribute__ ((__nonnull__ (1, 2)));
-# 329 "/usr/include/string.h" 3 4
+# 350 "/usr/include/string.h" 3 4
 extern char *strstr (const char *__haystack, const char *__needle)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__pure__)) __attribute__ ((__nonnull__ (1, 2)));
 
@@ -4173,7 +4224,7 @@ extern char *__strtok_r (char *__restrict __s,
 extern char *strtok_r (char *__restrict __s, const char *__restrict __delim,
          char **__restrict __save_ptr)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (2, 3)));
-# 384 "/usr/include/string.h" 3 4
+# 407 "/usr/include/string.h" 3 4
 extern size_t strlen (const char *__s)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__pure__)) __attribute__ ((__nonnull__ (1)));
 
@@ -4187,18 +4238,19 @@ extern size_t strnlen (const char *__string, size_t __maxlen)
 
 
 extern char *strerror (int __errnum) __attribute__ ((__nothrow__ , __leaf__));
-# 409 "/usr/include/string.h" 3 4
+# 432 "/usr/include/string.h" 3 4
 extern int strerror_r (int __errnum, char *__buf, size_t __buflen) __asm__ ("" "__xpg_strerror_r") __attribute__ ((__nothrow__ , __leaf__))
 
-                        __attribute__ ((__nonnull__ (2)));
-# 427 "/usr/include/string.h" 3 4
+                        __attribute__ ((__nonnull__ (2)))
+    __attribute__ ((__access__ (__write_only__, 2, 3)));
+# 458 "/usr/include/string.h" 3 4
 extern char *strerror_l (int __errnum, locale_t __l) __attribute__ ((__nothrow__ , __leaf__));
 
 
 
 # 1 "/usr/include/strings.h" 1 3 4
 # 23 "/usr/include/strings.h" 3 4
-# 1 "/usr/lib/gcc/x86_64-linux-gnu/7/include/stddef.h" 1 3 4
+# 1 "/usr/lib/gcc/aarch64-linux-gnu/11/include/stddef.h" 1 3 4
 # 24 "/usr/include/strings.h" 2 3 4
 
 
@@ -4271,25 +4323,28 @@ extern int strncasecmp_l (const char *__s1, const char *__s2,
 
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/strings_fortified.h" 1 3 4
-# 22 "/usr/include/x86_64-linux-gnu/bits/strings_fortified.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/strings_fortified.h" 1 3 4
+# 22 "/usr/include/aarch64-linux-gnu/bits/strings_fortified.h" 3 4
 extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline__)) __attribute__ ((__artificial__)) void
 __attribute__ ((__nothrow__ , __leaf__)) bcopy (const void *__src, void *__dest, size_t __len)
 {
-  (void) __builtin___memmove_chk (__dest, __src, __len, __builtin_object_size (__dest, 0));
+  (void) __builtin___memmove_chk (__dest, __src, __len,
+      __builtin_object_size (__dest, 0));
 }
 
 extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline__)) __attribute__ ((__artificial__)) void
 __attribute__ ((__nothrow__ , __leaf__)) bzero (void *__dest, size_t __len)
 {
-  (void) __builtin___memset_chk (__dest, '\0', __len, __builtin_object_size (__dest, 0));
+  (void) __builtin___memset_chk (__dest, '\0', __len,
+     __builtin_object_size (__dest, 0));
 }
 # 145 "/usr/include/strings.h" 2 3 4
-# 432 "/usr/include/string.h" 2 3 4
+# 463 "/usr/include/string.h" 2 3 4
 
 
 
-extern void explicit_bzero (void *__s, size_t __n) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)));
+extern void explicit_bzero (void *__s, size_t __n) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)))
+    __attribute__ ((__access__ (__write_only__, 1, 2)));
 
 
 
@@ -4301,8 +4356,7 @@ extern char *strsep (char **__restrict __stringp,
 
 
 extern char *strsignal (int __sig) __attribute__ ((__nothrow__ , __leaf__));
-
-
+# 489 "/usr/include/string.h" 3 4
 extern char *__stpcpy (char *__restrict __dest, const char *__restrict __src)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1, 2)));
 extern char *stpcpy (char *__restrict __dest, const char *__restrict __src)
@@ -4316,34 +4370,36 @@ extern char *__stpncpy (char *__restrict __dest,
 extern char *stpncpy (char *__restrict __dest,
         const char *__restrict __src, size_t __n)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1, 2)));
-# 494 "/usr/include/string.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/string_fortified.h" 1 3 4
-# 30 "/usr/include/x86_64-linux-gnu/bits/string_fortified.h" 3 4
+# 535 "/usr/include/string.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/string_fortified.h" 1 3 4
+# 25 "/usr/include/aarch64-linux-gnu/bits/string_fortified.h" 3 4
 extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline__)) __attribute__ ((__artificial__)) void *
 __attribute__ ((__nothrow__ , __leaf__)) memcpy (void *__restrict __dest, const void *__restrict __src, size_t __len)
 
 {
-  return __builtin___memcpy_chk (__dest, __src, __len, __builtin_object_size (__dest, 0));
+  return __builtin___memcpy_chk (__dest, __src, __len,
+     __builtin_object_size (__dest, 0));
 }
 
 extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline__)) __attribute__ ((__artificial__)) void *
 __attribute__ ((__nothrow__ , __leaf__)) memmove (void *__dest, const void *__src, size_t __len)
 {
-  return __builtin___memmove_chk (__dest, __src, __len, __builtin_object_size (__dest, 0));
+  return __builtin___memmove_chk (__dest, __src, __len,
+      __builtin_object_size (__dest, 0));
 }
-# 58 "/usr/include/x86_64-linux-gnu/bits/string_fortified.h" 3 4
+# 56 "/usr/include/aarch64-linux-gnu/bits/string_fortified.h" 3 4
 extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline__)) __attribute__ ((__artificial__)) void *
 __attribute__ ((__nothrow__ , __leaf__)) memset (void *__dest, int __ch, size_t __len)
 {
-# 71 "/usr/include/x86_64-linux-gnu/bits/string_fortified.h" 3 4
-  return __builtin___memset_chk (__dest, __ch, __len, __builtin_object_size (__dest, 0));
+  return __builtin___memset_chk (__dest, __ch, __len,
+     __builtin_object_size (__dest, 0));
 }
 
 
 
 
 void __explicit_bzero_chk (void *__dest, size_t __len, size_t __destlen)
-  __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)));
+  __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1))) __attribute__ ((__access__ (__write_only__, 1, 2)));
 
 extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline__)) __attribute__ ((__artificial__)) void
 __attribute__ ((__nothrow__ , __leaf__)) explicit_bzero (void *__dest, size_t __len)
@@ -4357,30 +4413,33 @@ __attribute__ ((__nothrow__ , __leaf__)) strcpy (char *__restrict __dest, const 
 {
   return __builtin___strcpy_chk (__dest, __src, __builtin_object_size (__dest, 2 > 1));
 }
-# 102 "/usr/include/x86_64-linux-gnu/bits/string_fortified.h" 3 4
+
+
+extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline__)) __attribute__ ((__artificial__)) char *
+__attribute__ ((__nothrow__ , __leaf__)) stpcpy (char *__restrict __dest, const char *__restrict __src)
+{
+  return __builtin___stpcpy_chk (__dest, __src, __builtin_object_size (__dest, 2 > 1));
+}
+
+
+
 extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline__)) __attribute__ ((__artificial__)) char *
 __attribute__ ((__nothrow__ , __leaf__)) strncpy (char *__restrict __dest, const char *__restrict __src, size_t __len)
 
 {
-  return __builtin___strncpy_chk (__dest, __src, __len, __builtin_object_size (__dest, 2 > 1));
+  return __builtin___strncpy_chk (__dest, __src, __len,
+      __builtin_object_size (__dest, 2 > 1));
 }
 
 
-extern char *__stpncpy_chk (char *__dest, const char *__src, size_t __n,
-       size_t __destlen) __attribute__ ((__nothrow__ , __leaf__));
-extern char *__stpncpy_alias (char *__dest, const char *__src, size_t __n) __asm__ ("" "stpncpy") __attribute__ ((__nothrow__ , __leaf__))
-                                 ;
 
 extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline__)) __attribute__ ((__artificial__)) char *
 __attribute__ ((__nothrow__ , __leaf__)) stpncpy (char *__dest, const char *__src, size_t __n)
 {
-  if (__builtin_object_size (__dest, 2 > 1) != (size_t) -1
-      && (!__builtin_constant_p (__n) || __n > __builtin_object_size (__dest, 2 > 1)))
-    return __stpncpy_chk (__dest, __src, __n, __builtin_object_size (__dest, 2 > 1));
-  return __stpncpy_alias (__dest, __src, __n);
+  return __builtin___stpncpy_chk (__dest, __src, __n,
+      __builtin_object_size (__dest, 2 > 1));
 }
-
-
+# 127 "/usr/include/aarch64-linux-gnu/bits/string_fortified.h" 3 4
 extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline__)) __attribute__ ((__artificial__)) char *
 __attribute__ ((__nothrow__ , __leaf__)) strcat (char *__restrict __dest, const char *__restrict __src)
 {
@@ -4392,84 +4451,94 @@ extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline
 __attribute__ ((__nothrow__ , __leaf__)) strncat (char *__restrict __dest, const char *__restrict __src, size_t __len)
 
 {
-  return __builtin___strncat_chk (__dest, __src, __len, __builtin_object_size (__dest, 2 > 1));
+  return __builtin___strncat_chk (__dest, __src, __len,
+      __builtin_object_size (__dest, 2 > 1));
 }
-# 495 "/usr/include/string.h" 2 3 4
+# 536 "/usr/include/string.h" 2 3 4
 
 
 
 
-# 25 "/workspace/acl/lib_acl/include/stdlib/acl_define.h" 2
-# 7 "/workspace/acl/lib_acl/StdAfx.h" 2
+# 25 "/acl/lib_acl/include/stdlib/acl_define.h" 2
+# 7 "/acl/lib_acl/StdAfx.h" 2
 
 
 
-# 1 "/usr/lib/gcc/x86_64-linux-gnu/7/include/float.h" 1 3 4
-# 11 "/workspace/acl/lib_acl/StdAfx.h" 2
+# 1 "/usr/lib/gcc/aarch64-linux-gnu/11/include/float.h" 1 3 4
+# 11 "/acl/lib_acl/StdAfx.h" 2
 
-# 1 "/usr/lib/gcc/x86_64-linux-gnu/7/include-fixed/limits.h" 1 3 4
-# 34 "/usr/lib/gcc/x86_64-linux-gnu/7/include-fixed/limits.h" 3 4
-# 1 "/usr/lib/gcc/x86_64-linux-gnu/7/include-fixed/syslimits.h" 1 3 4
-
-
+# 1 "/usr/lib/gcc/aarch64-linux-gnu/11/include/limits.h" 1 3 4
+# 34 "/usr/lib/gcc/aarch64-linux-gnu/11/include/limits.h" 3 4
+# 1 "/usr/lib/gcc/aarch64-linux-gnu/11/include/syslimits.h" 1 3 4
 
 
 
 
-# 1 "/usr/lib/gcc/x86_64-linux-gnu/7/include-fixed/limits.h" 1 3 4
-# 194 "/usr/lib/gcc/x86_64-linux-gnu/7/include-fixed/limits.h" 3 4
+
+
+# 1 "/usr/lib/gcc/aarch64-linux-gnu/11/include/limits.h" 1 3 4
+# 203 "/usr/lib/gcc/aarch64-linux-gnu/11/include/limits.h" 3 4
 # 1 "/usr/include/limits.h" 1 3 4
 # 26 "/usr/include/limits.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/libc-header-start.h" 1 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/libc-header-start.h" 1 3 4
 # 27 "/usr/include/limits.h" 2 3 4
-# 183 "/usr/include/limits.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/posix1_lim.h" 1 3 4
-# 160 "/usr/include/x86_64-linux-gnu/bits/posix1_lim.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/local_lim.h" 1 3 4
-# 38 "/usr/include/x86_64-linux-gnu/bits/local_lim.h" 3 4
+# 195 "/usr/include/limits.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/posix1_lim.h" 1 3 4
+# 27 "/usr/include/aarch64-linux-gnu/bits/posix1_lim.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/wordsize.h" 1 3 4
+# 28 "/usr/include/aarch64-linux-gnu/bits/posix1_lim.h" 2 3 4
+# 161 "/usr/include/aarch64-linux-gnu/bits/posix1_lim.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/local_lim.h" 1 3 4
+# 38 "/usr/include/aarch64-linux-gnu/bits/local_lim.h" 3 4
 # 1 "/usr/include/linux/limits.h" 1 3 4
-# 39 "/usr/include/x86_64-linux-gnu/bits/local_lim.h" 2 3 4
-# 161 "/usr/include/x86_64-linux-gnu/bits/posix1_lim.h" 2 3 4
-# 184 "/usr/include/limits.h" 2 3 4
+# 39 "/usr/include/aarch64-linux-gnu/bits/local_lim.h" 2 3 4
+# 81 "/usr/include/aarch64-linux-gnu/bits/local_lim.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/pthread_stack_min-dynamic.h" 1 3 4
+# 29 "/usr/include/aarch64-linux-gnu/bits/pthread_stack_min-dynamic.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/pthread_stack_min.h" 1 3 4
+# 30 "/usr/include/aarch64-linux-gnu/bits/pthread_stack_min-dynamic.h" 2 3 4
+# 82 "/usr/include/aarch64-linux-gnu/bits/local_lim.h" 2 3 4
+# 162 "/usr/include/aarch64-linux-gnu/bits/posix1_lim.h" 2 3 4
+# 196 "/usr/include/limits.h" 2 3 4
 
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/posix2_lim.h" 1 3 4
-# 188 "/usr/include/limits.h" 2 3 4
-# 195 "/usr/lib/gcc/x86_64-linux-gnu/7/include-fixed/limits.h" 2 3 4
-# 8 "/usr/lib/gcc/x86_64-linux-gnu/7/include-fixed/syslimits.h" 2 3 4
-# 35 "/usr/lib/gcc/x86_64-linux-gnu/7/include-fixed/limits.h" 2 3 4
-# 13 "/workspace/acl/lib_acl/StdAfx.h" 2
+# 1 "/usr/include/aarch64-linux-gnu/bits/posix2_lim.h" 1 3 4
+# 200 "/usr/include/limits.h" 2 3 4
+# 204 "/usr/lib/gcc/aarch64-linux-gnu/11/include/limits.h" 2 3 4
+# 8 "/usr/lib/gcc/aarch64-linux-gnu/11/include/syslimits.h" 2 3 4
+# 35 "/usr/lib/gcc/aarch64-linux-gnu/11/include/limits.h" 2 3 4
+# 13 "/acl/lib_acl/StdAfx.h" 2
 # 1 "/usr/include/assert.h" 1 3 4
-# 14 "/workspace/acl/lib_acl/StdAfx.h" 2
-# 51 "/workspace/acl/lib_acl/StdAfx.h"
+# 14 "/acl/lib_acl/StdAfx.h" 2
+# 51 "/acl/lib_acl/StdAfx.h"
 # 1 "/usr/include/unistd.h" 1 3 4
 # 27 "/usr/include/unistd.h" 3 4
 
-# 205 "/usr/include/unistd.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/posix_opt.h" 1 3 4
-# 206 "/usr/include/unistd.h" 2 3 4
+# 202 "/usr/include/unistd.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/posix_opt.h" 1 3 4
+# 203 "/usr/include/unistd.h" 2 3 4
 
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/environments.h" 1 3 4
-# 22 "/usr/include/x86_64-linux-gnu/bits/environments.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/wordsize.h" 1 3 4
-# 23 "/usr/include/x86_64-linux-gnu/bits/environments.h" 2 3 4
-# 210 "/usr/include/unistd.h" 2 3 4
-# 229 "/usr/include/unistd.h" 3 4
-# 1 "/usr/lib/gcc/x86_64-linux-gnu/7/include/stddef.h" 1 3 4
-# 230 "/usr/include/unistd.h" 2 3 4
-# 258 "/usr/include/unistd.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/environments.h" 1 3 4
+# 22 "/usr/include/aarch64-linux-gnu/bits/environments.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/wordsize.h" 1 3 4
+# 23 "/usr/include/aarch64-linux-gnu/bits/environments.h" 2 3 4
+# 207 "/usr/include/unistd.h" 2 3 4
+# 226 "/usr/include/unistd.h" 3 4
+# 1 "/usr/lib/gcc/aarch64-linux-gnu/11/include/stddef.h" 1 3 4
+# 227 "/usr/include/unistd.h" 2 3 4
+# 255 "/usr/include/unistd.h" 3 4
 typedef __useconds_t useconds_t;
-# 270 "/usr/include/unistd.h" 3 4
+# 267 "/usr/include/unistd.h" 3 4
 typedef __intptr_t intptr_t;
-# 290 "/usr/include/unistd.h" 3 4
+# 287 "/usr/include/unistd.h" 3 4
 extern int access (const char *__name, int __type) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)));
-# 307 "/usr/include/unistd.h" 3 4
+# 309 "/usr/include/unistd.h" 3 4
 extern int faccessat (int __fd, const char *__file, int __type, int __flag)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (2))) __attribute__ ((__warn_unused_result__));
-# 340 "/usr/include/unistd.h" 3 4
+# 342 "/usr/include/unistd.h" 3 4
 extern __off64_t lseek (int __fd, __off64_t __offset, int __whence) __asm__ ("" "lseek64") __attribute__ ((__nothrow__ , __leaf__))
 
              ;
@@ -4491,29 +4560,41 @@ extern int close (int __fd);
 
 
 
-
-
-extern ssize_t read (int __fd, void *__buf, size_t __nbytes) __attribute__ ((__warn_unused_result__));
-
+extern void closefrom (int __lowfd) __attribute__ ((__nothrow__ , __leaf__));
 
 
 
 
-extern ssize_t write (int __fd, const void *__buf, size_t __n) __attribute__ ((__warn_unused_result__));
-# 391 "/usr/include/unistd.h" 3 4
+
+
+
+extern ssize_t read (int __fd, void *__buf, size_t __nbytes) __attribute__ ((__warn_unused_result__))
+    __attribute__ ((__access__ (__write_only__, 2, 3)));
+
+
+
+
+
+extern ssize_t write (int __fd, const void *__buf, size_t __n) __attribute__ ((__warn_unused_result__))
+    __attribute__ ((__access__ (__read_only__, 2, 3)));
+# 404 "/usr/include/unistd.h" 3 4
 extern ssize_t pread (int __fd, void *__buf, size_t __nbytes, __off64_t __offset) __asm__ ("" "pread64")
 
-               __attribute__ ((__warn_unused_result__));
+               __attribute__ ((__warn_unused_result__))
+    __attribute__ ((__access__ (__write_only__, 2, 3)));
 extern ssize_t pwrite (int __fd, const void *__buf, size_t __nbytes, __off64_t __offset) __asm__ ("" "pwrite64")
 
-                __attribute__ ((__warn_unused_result__));
-# 407 "/usr/include/unistd.h" 3 4
+                __attribute__ ((__warn_unused_result__))
+    __attribute__ ((__access__ (__read_only__, 2, 3)));
+# 422 "/usr/include/unistd.h" 3 4
 extern ssize_t pread64 (int __fd, void *__buf, size_t __nbytes,
-   __off64_t __offset) __attribute__ ((__warn_unused_result__));
+   __off64_t __offset) __attribute__ ((__warn_unused_result__))
+    __attribute__ ((__access__ (__write_only__, 2, 3)));
 
 
 extern ssize_t pwrite64 (int __fd, const void *__buf, size_t __n,
-    __off64_t __offset) __attribute__ ((__warn_unused_result__));
+    __off64_t __offset) __attribute__ ((__warn_unused_result__))
+    __attribute__ ((__access__ (__read_only__, 2, 3)));
 
 
 
@@ -4522,9 +4603,9 @@ extern ssize_t pwrite64 (int __fd, const void *__buf, size_t __n,
 
 
 extern int pipe (int __pipedes[2]) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__warn_unused_result__));
-# 435 "/usr/include/unistd.h" 3 4
+# 452 "/usr/include/unistd.h" 3 4
 extern unsigned int alarm (unsigned int __seconds) __attribute__ ((__nothrow__ , __leaf__));
-# 447 "/usr/include/unistd.h" 3 4
+# 464 "/usr/include/unistd.h" 3 4
 extern unsigned int sleep (unsigned int __seconds);
 
 
@@ -4542,7 +4623,7 @@ extern __useconds_t ualarm (__useconds_t __value, __useconds_t __interval)
 
 
 extern int usleep (__useconds_t __useconds);
-# 472 "/usr/include/unistd.h" 3 4
+# 489 "/usr/include/unistd.h" 3 4
 extern int pause (void);
 
 
@@ -4576,11 +4657,12 @@ extern int chdir (const char *__path) __attribute__ ((__nothrow__ , __leaf__)) _
 
 
 extern int fchdir (int __fd) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__warn_unused_result__));
-# 514 "/usr/include/unistd.h" 3 4
+# 531 "/usr/include/unistd.h" 3 4
 extern char *getcwd (char *__buf, size_t __size) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__warn_unused_result__));
-# 528 "/usr/include/unistd.h" 3 4
+# 545 "/usr/include/unistd.h" 3 4
 extern char *getwd (char *__buf)
-     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1))) __attribute__ ((__deprecated__)) __attribute__ ((__warn_unused_result__));
+     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1))) __attribute__ ((__deprecated__)) __attribute__ ((__warn_unused_result__))
+    __attribute__ ((__access__ (__write_only__, 1)));
 
 
 
@@ -4589,7 +4671,7 @@ extern int dup (int __fd) __attribute__ ((__nothrow__ , __leaf__)) __attribute__
 
 
 extern int dup2 (int __fd, int __fd2) __attribute__ ((__nothrow__ , __leaf__));
-# 546 "/usr/include/unistd.h" 3 4
+# 564 "/usr/include/unistd.h" 3 4
 extern char **__environ;
 
 
@@ -4633,7 +4715,7 @@ extern int execvp (const char *__file, char *const __argv[])
 
 extern int execlp (const char *__file, const char *__arg, ...)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1, 2)));
-# 601 "/usr/include/unistd.h" 3 4
+# 619 "/usr/include/unistd.h" 3 4
 extern int nice (int __inc) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__warn_unused_result__));
 
 
@@ -4645,8 +4727,8 @@ extern void _exit (int __status) __attribute__ ((__noreturn__));
 
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/confname.h" 1 3 4
-# 24 "/usr/include/x86_64-linux-gnu/bits/confname.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/confname.h" 1 3 4
+# 24 "/usr/include/aarch64-linux-gnu/bits/confname.h" 3 4
 enum
   {
     _PC_LINK_MAX,
@@ -5151,7 +5233,13 @@ enum
 
     _SC_THREAD_ROBUST_PRIO_INHERIT,
 
-    _SC_THREAD_ROBUST_PRIO_PROTECT
+    _SC_THREAD_ROBUST_PRIO_PROTECT,
+
+
+    _SC_MINSIGSTKSZ,
+
+
+    _SC_SIGSTKSZ
 
   };
 
@@ -5299,7 +5387,7 @@ enum
     _CS_V7_ENV
 
   };
-# 613 "/usr/include/unistd.h" 2 3 4
+# 631 "/usr/include/unistd.h" 2 3 4
 
 
 extern long int pathconf (const char *__path, int __name)
@@ -5313,7 +5401,8 @@ extern long int sysconf (int __name) __attribute__ ((__nothrow__ , __leaf__));
 
 
 
-extern size_t confstr (int __name, char *__buf, size_t __len) __attribute__ ((__nothrow__ , __leaf__));
+extern size_t confstr (int __name, char *__buf, size_t __len) __attribute__ ((__nothrow__ , __leaf__))
+    __attribute__ ((__access__ (__write_only__, 2, 3)));
 
 
 
@@ -5337,7 +5426,7 @@ extern __pid_t getpgid (__pid_t __pid) __attribute__ ((__nothrow__ , __leaf__));
 
 
 extern int setpgid (__pid_t __pid, __pid_t __pgid) __attribute__ ((__nothrow__ , __leaf__));
-# 663 "/usr/include/unistd.h" 3 4
+# 682 "/usr/include/unistd.h" 3 4
 extern int setpgrp (void) __attribute__ ((__nothrow__ , __leaf__));
 
 
@@ -5367,8 +5456,9 @@ extern __gid_t getegid (void) __attribute__ ((__nothrow__ , __leaf__));
 
 
 
-extern int getgroups (int __size, __gid_t __list[]) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__warn_unused_result__));
-# 703 "/usr/include/unistd.h" 3 4
+extern int getgroups (int __size, __gid_t __list[]) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__warn_unused_result__))
+    __attribute__ ((__access__ (__write_only__, 2, 1)));
+# 722 "/usr/include/unistd.h" 3 4
 extern int setuid (__uid_t __uid) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__warn_unused_result__));
 
 
@@ -5397,7 +5487,7 @@ extern int setregid (__gid_t __rgid, __gid_t __egid) __attribute__ ((__nothrow__
 
 
 extern int setegid (__gid_t __gid) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__warn_unused_result__));
-# 759 "/usr/include/unistd.h" 3 4
+# 778 "/usr/include/unistd.h" 3 4
 extern __pid_t fork (void) __attribute__ ((__nothrow__));
 
 
@@ -5407,17 +5497,14 @@ extern __pid_t fork (void) __attribute__ ((__nothrow__));
 
 
 extern __pid_t vfork (void) __attribute__ ((__nothrow__ , __leaf__));
-
-
-
-
-
+# 799 "/usr/include/unistd.h" 3 4
 extern char *ttyname (int __fd) __attribute__ ((__nothrow__ , __leaf__));
 
 
 
 extern int ttyname_r (int __fd, char *__buf, size_t __buflen)
-     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (2))) __attribute__ ((__warn_unused_result__));
+     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (2))) __attribute__ ((__warn_unused_result__))
+     __attribute__ ((__access__ (__write_only__, 2, 3)));
 
 
 
@@ -5452,7 +5539,9 @@ extern int symlink (const char *__from, const char *__to)
 
 extern ssize_t readlink (const char *__restrict __path,
     char *__restrict __buf, size_t __len)
-     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1, 2))) __attribute__ ((__warn_unused_result__));
+     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1, 2))) __attribute__ ((__warn_unused_result__))
+     __attribute__ ((__access__ (__write_only__, 2, 3)));
+
 
 
 
@@ -5463,7 +5552,8 @@ extern int symlinkat (const char *__from, int __tofd,
 
 extern ssize_t readlinkat (int __fd, const char *__restrict __path,
       char *__restrict __buf, size_t __len)
-     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (2, 3))) __attribute__ ((__warn_unused_result__));
+     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (2, 3))) __attribute__ ((__warn_unused_result__))
+     __attribute__ ((__access__ (__write_only__, 3, 4)));
 
 
 
@@ -5498,7 +5588,8 @@ extern char *getlogin (void);
 
 
 
-extern int getlogin_r (char *__name, size_t __name_len) __attribute__ ((__nonnull__ (1)));
+extern int getlogin_r (char *__name, size_t __name_len) __attribute__ ((__nonnull__ (1)))
+    __attribute__ ((__access__ (__write_only__, 1, 2)));
 
 
 
@@ -5511,10 +5602,10 @@ extern int setlogin (const char *__name) __attribute__ ((__nothrow__ , __leaf__)
 
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/getopt_posix.h" 1 3 4
-# 27 "/usr/include/x86_64-linux-gnu/bits/getopt_posix.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/getopt_core.h" 1 3 4
-# 28 "/usr/include/x86_64-linux-gnu/bits/getopt_core.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/getopt_posix.h" 1 3 4
+# 27 "/usr/include/aarch64-linux-gnu/bits/getopt_posix.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/getopt_core.h" 1 3 4
+# 28 "/usr/include/aarch64-linux-gnu/bits/getopt_core.h" 3 4
 
 
 
@@ -5524,7 +5615,7 @@ extern int setlogin (const char *__name) __attribute__ ((__nothrow__ , __leaf__)
 
 
 extern char *optarg;
-# 50 "/usr/include/x86_64-linux-gnu/bits/getopt_core.h" 3 4
+# 50 "/usr/include/aarch64-linux-gnu/bits/getopt_core.h" 3 4
 extern int optind;
 
 
@@ -5535,25 +5626,26 @@ extern int opterr;
 
 
 extern int optopt;
-# 91 "/usr/include/x86_64-linux-gnu/bits/getopt_core.h" 3 4
+# 91 "/usr/include/aarch64-linux-gnu/bits/getopt_core.h" 3 4
 extern int getopt (int ___argc, char *const *___argv, const char *__shortopts)
        __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (2, 3)));
 
 
-# 28 "/usr/include/x86_64-linux-gnu/bits/getopt_posix.h" 2 3 4
+# 28 "/usr/include/aarch64-linux-gnu/bits/getopt_posix.h" 2 3 4
 
 
-# 49 "/usr/include/x86_64-linux-gnu/bits/getopt_posix.h" 3 4
+# 49 "/usr/include/aarch64-linux-gnu/bits/getopt_posix.h" 3 4
 
-# 873 "/usr/include/unistd.h" 2 3 4
-
-
-
+# 904 "/usr/include/unistd.h" 2 3 4
 
 
 
 
-extern int gethostname (char *__name, size_t __len) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)));
+
+
+
+extern int gethostname (char *__name, size_t __len) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)))
+    __attribute__ ((__access__ (__write_only__, 1, 2)));
 
 
 
@@ -5561,7 +5653,7 @@ extern int gethostname (char *__name, size_t __len) __attribute__ ((__nothrow__ 
 
 
 extern int sethostname (const char *__name, size_t __len)
-     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1))) __attribute__ ((__warn_unused_result__));
+     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1))) __attribute__ ((__warn_unused_result__)) __attribute__ ((__access__ (__read_only__, 1, 2)));
 
 
 
@@ -5572,10 +5664,10 @@ extern int sethostid (long int __id) __attribute__ ((__nothrow__ , __leaf__)) __
 
 
 extern int getdomainname (char *__name, size_t __len)
-     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1))) __attribute__ ((__warn_unused_result__));
+     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1))) __attribute__ ((__warn_unused_result__))
+     __attribute__ ((__access__ (__write_only__, 1, 2)));
 extern int setdomainname (const char *__name, size_t __len)
-     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1))) __attribute__ ((__warn_unused_result__));
-
+     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1))) __attribute__ ((__warn_unused_result__)) __attribute__ ((__access__ (__read_only__, 1, 2)));
 
 
 
@@ -5631,7 +5723,7 @@ extern char *getpass (const char *__prompt) __attribute__ ((__nonnull__ (1)));
 
 
 extern int fsync (int __fd);
-# 970 "/usr/include/unistd.h" 3 4
+# 1002 "/usr/include/unistd.h" 3 4
 extern long int gethostid (void);
 
 
@@ -5647,7 +5739,7 @@ extern int getpagesize (void) __attribute__ ((__nothrow__ , __leaf__)) __attribu
 
 
 extern int getdtablesize (void) __attribute__ ((__nothrow__ , __leaf__));
-# 998 "/usr/include/unistd.h" 3 4
+# 1030 "/usr/include/unistd.h" 3 4
 extern int truncate (const char *__file, __off64_t __length) __asm__ ("" "truncate64") __attribute__ ((__nothrow__ , __leaf__))
 
                   __attribute__ ((__nonnull__ (1))) __attribute__ ((__warn_unused_result__));
@@ -5658,7 +5750,7 @@ extern int truncate (const char *__file, __off64_t __length) __asm__ ("" "trunca
 
 extern int truncate64 (const char *__file, __off64_t __length)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1))) __attribute__ ((__warn_unused_result__));
-# 1020 "/usr/include/unistd.h" 3 4
+# 1052 "/usr/include/unistd.h" 3 4
 extern int ftruncate (int __fd, __off64_t __length) __asm__ ("" "ftruncate64") __attribute__ ((__nothrow__ , __leaf__))
                    __attribute__ ((__warn_unused_result__));
 
@@ -5667,7 +5759,7 @@ extern int ftruncate (int __fd, __off64_t __length) __asm__ ("" "ftruncate64") _
 
 
 extern int ftruncate64 (int __fd, __off64_t __length) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__warn_unused_result__));
-# 1038 "/usr/include/unistd.h" 3 4
+# 1070 "/usr/include/unistd.h" 3 4
 extern int brk (void *__addr) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__warn_unused_result__));
 
 
@@ -5675,9 +5767,9 @@ extern int brk (void *__addr) __attribute__ ((__nothrow__ , __leaf__)) __attribu
 
 
 extern void *sbrk (intptr_t __delta) __attribute__ ((__nothrow__ , __leaf__));
-# 1059 "/usr/include/unistd.h" 3 4
+# 1091 "/usr/include/unistd.h" 3 4
 extern long int syscall (long int __sysno, ...) __attribute__ ((__nothrow__ , __leaf__));
-# 1085 "/usr/include/unistd.h" 3 4
+# 1117 "/usr/include/unistd.h" 3 4
 extern int lockf (int __fd, int __cmd, __off64_t __len) __asm__ ("" "lockf64")
                   __attribute__ ((__warn_unused_result__));
 
@@ -5686,20 +5778,23 @@ extern int lockf (int __fd, int __cmd, __off64_t __len) __asm__ ("" "lockf64")
 
 
 extern int lockf64 (int __fd, int __cmd, __off64_t __len) __attribute__ ((__warn_unused_result__));
-# 1118 "/usr/include/unistd.h" 3 4
+# 1150 "/usr/include/unistd.h" 3 4
 extern int fdatasync (int __fildes);
-# 1167 "/usr/include/unistd.h" 3 4
-int getentropy (void *__buffer, size_t __length) __attribute__ ((__warn_unused_result__));
-
-
-
-
-# 1 "/usr/include/x86_64-linux-gnu/bits/unistd.h" 1 3 4
-# 23 "/usr/include/x86_64-linux-gnu/bits/unistd.h" 3 4
+# 1159 "/usr/include/unistd.h" 3 4
+extern char *crypt (const char *__key, const char *__salt)
+     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1, 2)));
+# 1198 "/usr/include/unistd.h" 3 4
+int getentropy (void *__buffer, size_t __length) __attribute__ ((__warn_unused_result__))
+    __attribute__ ((__access__ (__write_only__, 1, 2)));
+# 1214 "/usr/include/unistd.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/unistd.h" 1 3 4
+# 23 "/usr/include/aarch64-linux-gnu/bits/unistd.h" 3 4
 extern ssize_t __read_chk (int __fd, void *__buf, size_t __nbytes,
-      size_t __buflen) __attribute__ ((__warn_unused_result__));
+      size_t __buflen)
+  __attribute__ ((__warn_unused_result__)) __attribute__ ((__access__ (__write_only__, 2, 3)));
 extern ssize_t __read_alias (int __fd, void *__buf, size_t __nbytes) __asm__ ("" "read")
-                               __attribute__ ((__warn_unused_result__));
+
+  __attribute__ ((__warn_unused_result__)) __attribute__ ((__access__ (__write_only__, 2, 3)));
 extern ssize_t __read_chk_warn (int __fd, void *__buf, size_t __nbytes, size_t __buflen) __asm__ ("" "__read_chk")
 
 
@@ -5709,28 +5804,26 @@ extern ssize_t __read_chk_warn (int __fd, void *__buf, size_t __nbytes, size_t _
 extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline__)) __attribute__ ((__artificial__)) __attribute__ ((__warn_unused_result__)) ssize_t
 read (int __fd, void *__buf, size_t __nbytes)
 {
-  if (__builtin_object_size (__buf, 0) != (size_t) -1)
-    {
-      if (!__builtin_constant_p (__nbytes))
- return __read_chk (__fd, __buf, __nbytes, __builtin_object_size (__buf, 0));
+  return ((((__typeof (__nbytes)) 0 < (__typeof (__nbytes)) -1 || (__builtin_constant_p (__nbytes) && (__nbytes) > 0)) && __builtin_constant_p ((((long unsigned int) (__nbytes)) <= (__builtin_object_size (__buf, 0)) / (sizeof (char)))) && (((long unsigned int) (__nbytes)) <= (__builtin_object_size (__buf, 0)) / (sizeof (char)))) ? __read_alias (__fd, __buf, __nbytes) : ((((__typeof (__nbytes)) 0 < (__typeof (__nbytes)) -1 || (__builtin_constant_p (__nbytes) && (__nbytes) > 0)) && __builtin_constant_p ((((long unsigned int) (__nbytes)) <= (__builtin_object_size (__buf, 0)) / (sizeof (char)))) && !(((long unsigned int) (__nbytes)) <= (__builtin_object_size (__buf, 0)) / (sizeof (char)))) ? __read_chk_warn (__fd, __buf, __nbytes, __builtin_object_size (__buf, 0)) : __read_chk (__fd, __buf, __nbytes, __builtin_object_size (__buf, 0))))
 
-      if (__nbytes > __builtin_object_size (__buf, 0))
- return __read_chk_warn (__fd, __buf, __nbytes, __builtin_object_size (__buf, 0));
-    }
-  return __read_alias (__fd, __buf, __nbytes);
+                           ;
 }
 
 
 extern ssize_t __pread_chk (int __fd, void *__buf, size_t __nbytes,
-       __off_t __offset, size_t __bufsize) __attribute__ ((__warn_unused_result__));
+       __off_t __offset, size_t __bufsize)
+  __attribute__ ((__warn_unused_result__)) __attribute__ ((__access__ (__write_only__, 2, 3)));
 extern ssize_t __pread64_chk (int __fd, void *__buf, size_t __nbytes,
-         __off64_t __offset, size_t __bufsize) __attribute__ ((__warn_unused_result__));
+         __off64_t __offset, size_t __bufsize)
+  __attribute__ ((__warn_unused_result__)) __attribute__ ((__access__ (__write_only__, 2, 3)));
 extern ssize_t __pread_alias (int __fd, void *__buf, size_t __nbytes, __off_t __offset) __asm__ ("" "pread")
 
-                                 __attribute__ ((__warn_unused_result__));
+
+  __attribute__ ((__warn_unused_result__)) __attribute__ ((__access__ (__write_only__, 2, 3)));
 extern ssize_t __pread64_alias (int __fd, void *__buf, size_t __nbytes, __off64_t __offset) __asm__ ("" "pread64")
 
-                                     __attribute__ ((__warn_unused_result__));
+
+  __attribute__ ((__warn_unused_result__)) __attribute__ ((__access__ (__write_only__, 2, 3)));
 extern ssize_t __pread_chk_warn (int __fd, void *__buf, size_t __nbytes, __off_t __offset, size_t __bufsize) __asm__ ("" "__pread_chk")
 
 
@@ -5742,21 +5835,13 @@ extern ssize_t __pread64_chk_warn (int __fd, void *__buf, size_t __nbytes, __off
 
      __attribute__ ((__warn_unused_result__)) __attribute__((__warning__ ("pread64 called with bigger length than size of " "the destination buffer")))
                                   ;
-# 86 "/usr/include/x86_64-linux-gnu/bits/unistd.h" 3 4
+# 79 "/usr/include/aarch64-linux-gnu/bits/unistd.h" 3 4
 extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline__)) __attribute__ ((__artificial__)) __attribute__ ((__warn_unused_result__)) ssize_t
 pread (int __fd, void *__buf, size_t __nbytes, __off64_t __offset)
 {
-  if (__builtin_object_size (__buf, 0) != (size_t) -1)
-    {
-      if (!__builtin_constant_p (__nbytes))
- return __pread64_chk (__fd, __buf, __nbytes, __offset, __builtin_object_size (__buf, 0));
+  return ((((__typeof (__nbytes)) 0 < (__typeof (__nbytes)) -1 || (__builtin_constant_p (__nbytes) && (__nbytes) > 0)) && __builtin_constant_p ((((long unsigned int) (__nbytes)) <= (__builtin_object_size (__buf, 0)) / (sizeof (char)))) && (((long unsigned int) (__nbytes)) <= (__builtin_object_size (__buf, 0)) / (sizeof (char)))) ? __pread64_alias (__fd, __buf, __nbytes, __offset) : ((((__typeof (__nbytes)) 0 < (__typeof (__nbytes)) -1 || (__builtin_constant_p (__nbytes) && (__nbytes) > 0)) && __builtin_constant_p ((((long unsigned int) (__nbytes)) <= (__builtin_object_size (__buf, 0)) / (sizeof (char)))) && !(((long unsigned int) (__nbytes)) <= (__builtin_object_size (__buf, 0)) / (sizeof (char)))) ? __pread64_chk_warn (__fd, __buf, __nbytes, __offset, __builtin_object_size (__buf, 0)) : __pread64_chk (__fd, __buf, __nbytes, __offset, __builtin_object_size (__buf, 0))))
 
-      if ( __nbytes > __builtin_object_size (__buf, 0))
- return __pread64_chk_warn (__fd, __buf, __nbytes, __offset,
-       __builtin_object_size (__buf, 0));
-    }
-
-  return __pread64_alias (__fd, __buf, __nbytes, __offset);
+                                     ;
 }
 
 
@@ -5764,17 +5849,9 @@ pread (int __fd, void *__buf, size_t __nbytes, __off64_t __offset)
 extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline__)) __attribute__ ((__artificial__)) __attribute__ ((__warn_unused_result__)) ssize_t
 pread64 (int __fd, void *__buf, size_t __nbytes, __off64_t __offset)
 {
-  if (__builtin_object_size (__buf, 0) != (size_t) -1)
-    {
-      if (!__builtin_constant_p (__nbytes))
- return __pread64_chk (__fd, __buf, __nbytes, __offset, __builtin_object_size (__buf, 0));
+  return ((((__typeof (__nbytes)) 0 < (__typeof (__nbytes)) -1 || (__builtin_constant_p (__nbytes) && (__nbytes) > 0)) && __builtin_constant_p ((((long unsigned int) (__nbytes)) <= (__builtin_object_size (__buf, 0)) / (sizeof (char)))) && (((long unsigned int) (__nbytes)) <= (__builtin_object_size (__buf, 0)) / (sizeof (char)))) ? __pread64_alias (__fd, __buf, __nbytes, __offset) : ((((__typeof (__nbytes)) 0 < (__typeof (__nbytes)) -1 || (__builtin_constant_p (__nbytes) && (__nbytes) > 0)) && __builtin_constant_p ((((long unsigned int) (__nbytes)) <= (__builtin_object_size (__buf, 0)) / (sizeof (char)))) && !(((long unsigned int) (__nbytes)) <= (__builtin_object_size (__buf, 0)) / (sizeof (char)))) ? __pread64_chk_warn (__fd, __buf, __nbytes, __offset, __builtin_object_size (__buf, 0)) : __pread64_chk (__fd, __buf, __nbytes, __offset, __builtin_object_size (__buf, 0))))
 
-      if ( __nbytes > __builtin_object_size (__buf, 0))
- return __pread64_chk_warn (__fd, __buf, __nbytes, __offset,
-       __builtin_object_size (__buf, 0));
-    }
-
-  return __pread64_alias (__fd, __buf, __nbytes, __offset);
+                                     ;
 }
 
 
@@ -5783,11 +5860,11 @@ pread64 (int __fd, void *__buf, size_t __nbytes, __off64_t __offset)
 extern ssize_t __readlink_chk (const char *__restrict __path,
           char *__restrict __buf, size_t __len,
           size_t __buflen)
-     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1, 2))) __attribute__ ((__warn_unused_result__));
+     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1, 2))) __attribute__ ((__warn_unused_result__)) __attribute__ ((__access__ (__write_only__, 2, 3)));
 extern ssize_t __readlink_alias (const char *__restrict __path, char *__restrict __buf, size_t __len) __asm__ ("" "readlink") __attribute__ ((__nothrow__ , __leaf__))
 
 
-     __attribute__ ((__nonnull__ (1, 2))) __attribute__ ((__warn_unused_result__));
+     __attribute__ ((__nonnull__ (1, 2))) __attribute__ ((__warn_unused_result__)) __attribute__ ((__access__ (__write_only__, 2, 3)));
 extern ssize_t __readlink_chk_warn (const char *__restrict __path, char *__restrict __buf, size_t __len, size_t __buflen) __asm__ ("" "__readlink_chk") __attribute__ ((__nothrow__ , __leaf__))
 
 
@@ -5799,15 +5876,9 @@ extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline
 __attribute__ ((__nothrow__ , __leaf__)) readlink (const char *__restrict __path, char *__restrict __buf, size_t __len)
 
 {
-  if (__builtin_object_size (__buf, 2 > 1) != (size_t) -1)
-    {
-      if (!__builtin_constant_p (__len))
- return __readlink_chk (__path, __buf, __len, __builtin_object_size (__buf, 2 > 1));
+  return ((((__typeof (__len)) 0 < (__typeof (__len)) -1 || (__builtin_constant_p (__len) && (__len) > 0)) && __builtin_constant_p ((((long unsigned int) (__len)) <= (__builtin_object_size (__buf, 2 > 1)) / (sizeof (char)))) && (((long unsigned int) (__len)) <= (__builtin_object_size (__buf, 2 > 1)) / (sizeof (char)))) ? __readlink_alias (__path, __buf, __len) : ((((__typeof (__len)) 0 < (__typeof (__len)) -1 || (__builtin_constant_p (__len) && (__len) > 0)) && __builtin_constant_p ((((long unsigned int) (__len)) <= (__builtin_object_size (__buf, 2 > 1)) / (sizeof (char)))) && !(((long unsigned int) (__len)) <= (__builtin_object_size (__buf, 2 > 1)) / (sizeof (char)))) ? __readlink_chk_warn (__path, __buf, __len, __builtin_object_size (__buf, 2 > 1)) : __readlink_chk (__path, __buf, __len, __builtin_object_size (__buf, 2 > 1))))
 
-      if ( __len > __builtin_object_size (__buf, 2 > 1))
- return __readlink_chk_warn (__path, __buf, __len, __builtin_object_size (__buf, 2 > 1));
-    }
-  return __readlink_alias (__path, __buf, __len);
+                          ;
 }
 
 
@@ -5815,12 +5886,12 @@ __attribute__ ((__nothrow__ , __leaf__)) readlink (const char *__restrict __path
 extern ssize_t __readlinkat_chk (int __fd, const char *__restrict __path,
      char *__restrict __buf, size_t __len,
      size_t __buflen)
-     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (2, 3))) __attribute__ ((__warn_unused_result__));
+     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (2, 3))) __attribute__ ((__warn_unused_result__)) __attribute__ ((__access__ (__write_only__, 3, 4)));
 extern ssize_t __readlinkat_alias (int __fd, const char *__restrict __path, char *__restrict __buf, size_t __len) __asm__ ("" "readlinkat") __attribute__ ((__nothrow__ , __leaf__))
 
 
 
-     __attribute__ ((__nonnull__ (2, 3))) __attribute__ ((__warn_unused_result__));
+     __attribute__ ((__nonnull__ (2, 3))) __attribute__ ((__warn_unused_result__)) __attribute__ ((__access__ (__write_only__, 3, 4)));
 extern ssize_t __readlinkat_chk_warn (int __fd, const char *__restrict __path, char *__restrict __buf, size_t __len, size_t __buflen) __asm__ ("" "__readlinkat_chk") __attribute__ ((__nothrow__ , __leaf__))
 
 
@@ -5833,16 +5904,9 @@ extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline
 __attribute__ ((__nothrow__ , __leaf__)) readlinkat (int __fd, const char *__restrict __path, char *__restrict __buf, size_t __len)
 
 {
-  if (__builtin_object_size (__buf, 2 > 1) != (size_t) -1)
-    {
-      if (!__builtin_constant_p (__len))
- return __readlinkat_chk (__fd, __path, __buf, __len, __builtin_object_size (__buf, 2 > 1));
+  return ((((__typeof (__len)) 0 < (__typeof (__len)) -1 || (__builtin_constant_p (__len) && (__len) > 0)) && __builtin_constant_p ((((long unsigned int) (__len)) <= (__builtin_object_size (__buf, 2 > 1)) / (sizeof (char)))) && (((long unsigned int) (__len)) <= (__builtin_object_size (__buf, 2 > 1)) / (sizeof (char)))) ? __readlinkat_alias (__fd, __path, __buf, __len) : ((((__typeof (__len)) 0 < (__typeof (__len)) -1 || (__builtin_constant_p (__len) && (__len) > 0)) && __builtin_constant_p ((((long unsigned int) (__len)) <= (__builtin_object_size (__buf, 2 > 1)) / (sizeof (char)))) && !(((long unsigned int) (__len)) <= (__builtin_object_size (__buf, 2 > 1)) / (sizeof (char)))) ? __readlinkat_chk_warn (__fd, __path, __buf, __len, __builtin_object_size (__buf, 2 > 1)) : __readlinkat_chk (__fd, __path, __buf, __len, __builtin_object_size (__buf, 2 > 1))))
 
-      if (__len > __builtin_object_size (__buf, 2 > 1))
- return __readlinkat_chk_warn (__fd, __path, __buf, __len,
-          __builtin_object_size (__buf, 2 > 1));
-    }
-  return __readlinkat_alias (__fd, __path, __buf, __len);
+                                ;
 }
 
 
@@ -5859,20 +5923,14 @@ extern char *__getcwd_chk_warn (char *__buf, size_t __size, size_t __buflen) __a
 extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline__)) __attribute__ ((__artificial__)) __attribute__ ((__warn_unused_result__)) char *
 __attribute__ ((__nothrow__ , __leaf__)) getcwd (char *__buf, size_t __size)
 {
-  if (__builtin_object_size (__buf, 2 > 1) != (size_t) -1)
-    {
-      if (!__builtin_constant_p (__size))
- return __getcwd_chk (__buf, __size, __builtin_object_size (__buf, 2 > 1));
+  return ((((__typeof (__size)) 0 < (__typeof (__size)) -1 || (__builtin_constant_p (__size) && (__size) > 0)) && __builtin_constant_p ((((long unsigned int) (__size)) <= (__builtin_object_size (__buf, 2 > 1)) / (sizeof (char)))) && (((long unsigned int) (__size)) <= (__builtin_object_size (__buf, 2 > 1)) / (sizeof (char)))) ? __getcwd_alias (__buf, __size) : ((((__typeof (__size)) 0 < (__typeof (__size)) -1 || (__builtin_constant_p (__size) && (__size) > 0)) && __builtin_constant_p ((((long unsigned int) (__size)) <= (__builtin_object_size (__buf, 2 > 1)) / (sizeof (char)))) && !(((long unsigned int) (__size)) <= (__builtin_object_size (__buf, 2 > 1)) / (sizeof (char)))) ? __getcwd_chk_warn (__buf, __size, __builtin_object_size (__buf, 2 > 1)) : __getcwd_chk (__buf, __size, __builtin_object_size (__buf, 2 > 1))))
 
-      if (__size > __builtin_object_size (__buf, 2 > 1))
- return __getcwd_chk_warn (__buf, __size, __builtin_object_size (__buf, 2 > 1));
-    }
-  return __getcwd_alias (__buf, __size);
+                   ;
 }
 
 
 extern char *__getwd_chk (char *__buf, size_t buflen)
-     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1))) __attribute__ ((__warn_unused_result__));
+     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1))) __attribute__ ((__warn_unused_result__)) __attribute__ ((__access__ (__write_only__, 1, 2)));
 extern char *__getwd_warn (char *__buf) __asm__ ("" "getwd") __attribute__ ((__nothrow__ , __leaf__))
      __attribute__ ((__nonnull__ (1))) __attribute__ ((__warn_unused_result__)) __attribute__((__warning__ ("please use getcwd instead, as getwd " "doesn't specify buffer size")))
                                          ;
@@ -5887,9 +5945,11 @@ __attribute__ ((__nothrow__ , __leaf__)) getwd (char *__buf)
 
 
 extern size_t __confstr_chk (int __name, char *__buf, size_t __len,
-        size_t __buflen) __attribute__ ((__nothrow__ , __leaf__));
+        size_t __buflen) __attribute__ ((__nothrow__ , __leaf__))
+  __attribute__ ((__access__ (__write_only__, 2, 3)));
 extern size_t __confstr_alias (int __name, char *__buf, size_t __len) __asm__ ("" "confstr") __attribute__ ((__nothrow__ , __leaf__))
-                             ;
+
+   __attribute__ ((__access__ (__write_only__, 2, 3)));
 extern size_t __confstr_chk_warn (int __name, char *__buf, size_t __len, size_t __buflen) __asm__ ("" "__confstr_chk") __attribute__ ((__nothrow__ , __leaf__))
 
 
@@ -5899,22 +5959,16 @@ extern size_t __confstr_chk_warn (int __name, char *__buf, size_t __len, size_t 
 extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline__)) __attribute__ ((__artificial__)) size_t
 __attribute__ ((__nothrow__ , __leaf__)) confstr (int __name, char *__buf, size_t __len)
 {
-  if (__builtin_object_size (__buf, 2 > 1) != (size_t) -1)
-    {
-      if (!__builtin_constant_p (__len))
- return __confstr_chk (__name, __buf, __len, __builtin_object_size (__buf, 2 > 1));
+  return ((((__typeof (__len)) 0 < (__typeof (__len)) -1 || (__builtin_constant_p (__len) && (__len) > 0)) && __builtin_constant_p ((((long unsigned int) (__len)) <= (__builtin_object_size (__buf, 2 > 1)) / (sizeof (char)))) && (((long unsigned int) (__len)) <= (__builtin_object_size (__buf, 2 > 1)) / (sizeof (char)))) ? __confstr_alias (__name, __buf, __len) : ((((__typeof (__len)) 0 < (__typeof (__len)) -1 || (__builtin_constant_p (__len) && (__len) > 0)) && __builtin_constant_p ((((long unsigned int) (__len)) <= (__builtin_object_size (__buf, 2 > 1)) / (sizeof (char)))) && !(((long unsigned int) (__len)) <= (__builtin_object_size (__buf, 2 > 1)) / (sizeof (char)))) ? __confstr_chk_warn (__name, __buf, __len, __builtin_object_size (__buf, 2 > 1)) : __confstr_chk (__name, __buf, __len, __builtin_object_size (__buf, 2 > 1))))
 
-      if (__builtin_object_size (__buf, 2 > 1) < __len)
- return __confstr_chk_warn (__name, __buf, __len, __builtin_object_size (__buf, 2 > 1));
-    }
-  return __confstr_alias (__name, __buf, __len);
+                          ;
 }
 
 
 extern int __getgroups_chk (int __size, __gid_t __list[], size_t __listlen)
-     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__warn_unused_result__));
+  __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__warn_unused_result__)) __attribute__ ((__access__ (__write_only__, 2, 1)));
 extern int __getgroups_alias (int __size, __gid_t __list[]) __asm__ ("" "getgroups") __attribute__ ((__nothrow__ , __leaf__))
-                 __attribute__ ((__warn_unused_result__));
+                 __attribute__ ((__warn_unused_result__)) __attribute__ ((__access__ (__write_only__, 2, 1)));
 extern int __getgroups_chk_warn (int __size, __gid_t __list[], size_t __listlen) __asm__ ("" "__getgroups_chk") __attribute__ ((__nothrow__ , __leaf__))
 
 
@@ -5924,20 +5978,15 @@ extern int __getgroups_chk_warn (int __size, __gid_t __list[], size_t __listlen)
 extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline__)) __attribute__ ((__artificial__)) int
 __attribute__ ((__nothrow__ , __leaf__)) getgroups (int __size, __gid_t __list[])
 {
-  if (__builtin_object_size (__list, 2 > 1) != (size_t) -1)
-    {
-      if (!__builtin_constant_p (__size) || __size < 0)
- return __getgroups_chk (__size, __list, __builtin_object_size (__list, 2 > 1));
+  return ((((__typeof (__size)) 0 < (__typeof (__size)) -1 || (__builtin_constant_p (__size) && (__size) > 0)) && __builtin_constant_p ((((long unsigned int) (__size)) <= (__builtin_object_size (__list, 2 > 1)) / (sizeof (__gid_t)))) && (((long unsigned int) (__size)) <= (__builtin_object_size (__list, 2 > 1)) / (sizeof (__gid_t)))) ? __getgroups_alias (__size, __list) : ((((__typeof (__size)) 0 < (__typeof (__size)) -1 || (__builtin_constant_p (__size) && (__size) > 0)) && __builtin_constant_p ((((long unsigned int) (__size)) <= (__builtin_object_size (__list, 2 > 1)) / (sizeof (__gid_t)))) && !(((long unsigned int) (__size)) <= (__builtin_object_size (__list, 2 > 1)) / (sizeof (__gid_t)))) ? __getgroups_chk_warn (__size, __list, __builtin_object_size (__list, 2 > 1)) : __getgroups_chk (__size, __list, __builtin_object_size (__list, 2 > 1))))
 
-      if (__size * sizeof (__gid_t) > __builtin_object_size (__list, 2 > 1))
- return __getgroups_chk_warn (__size, __list, __builtin_object_size (__list, 2 > 1));
-    }
-  return __getgroups_alias (__size, __list);
+                    ;
 }
 
 
 extern int __ttyname_r_chk (int __fd, char *__buf, size_t __buflen,
-       size_t __nreal) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (2)));
+       size_t __nreal) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (2)))
+   __attribute__ ((__access__ (__write_only__, 2, 3)));
 extern int __ttyname_r_alias (int __fd, char *__buf, size_t __buflen) __asm__ ("" "ttyname_r") __attribute__ ((__nothrow__ , __leaf__))
 
      __attribute__ ((__nonnull__ (2)));
@@ -5950,21 +5999,15 @@ extern int __ttyname_r_chk_warn (int __fd, char *__buf, size_t __buflen, size_t 
 extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline__)) __attribute__ ((__artificial__)) int
 __attribute__ ((__nothrow__ , __leaf__)) ttyname_r (int __fd, char *__buf, size_t __buflen)
 {
-  if (__builtin_object_size (__buf, 2 > 1) != (size_t) -1)
-    {
-      if (!__builtin_constant_p (__buflen))
- return __ttyname_r_chk (__fd, __buf, __buflen, __builtin_object_size (__buf, 2 > 1));
+  return ((((__typeof (__buflen)) 0 < (__typeof (__buflen)) -1 || (__builtin_constant_p (__buflen) && (__buflen) > 0)) && __builtin_constant_p ((((long unsigned int) (__buflen)) <= (__builtin_object_size (__buf, 2 > 1)) / (sizeof (char)))) && (((long unsigned int) (__buflen)) <= (__builtin_object_size (__buf, 2 > 1)) / (sizeof (char)))) ? __ttyname_r_alias (__fd, __buf, __buflen) : ((((__typeof (__buflen)) 0 < (__typeof (__buflen)) -1 || (__builtin_constant_p (__buflen) && (__buflen) > 0)) && __builtin_constant_p ((((long unsigned int) (__buflen)) <= (__builtin_object_size (__buf, 2 > 1)) / (sizeof (char)))) && !(((long unsigned int) (__buflen)) <= (__builtin_object_size (__buf, 2 > 1)) / (sizeof (char)))) ? __ttyname_r_chk_warn (__fd, __buf, __buflen, __builtin_object_size (__buf, 2 > 1)) : __ttyname_r_chk (__fd, __buf, __buflen, __builtin_object_size (__buf, 2 > 1))))
 
-      if (__buflen > __builtin_object_size (__buf, 2 > 1))
- return __ttyname_r_chk_warn (__fd, __buf, __buflen, __builtin_object_size (__buf, 2 > 1));
-    }
-  return __ttyname_r_alias (__fd, __buf, __buflen);
+                           ;
 }
 
 
 
 extern int __getlogin_r_chk (char *__buf, size_t __buflen, size_t __nreal)
-     __attribute__ ((__nonnull__ (1)));
+     __attribute__ ((__nonnull__ (1))) __attribute__ ((__access__ (__write_only__, 1, 2)));
 extern int __getlogin_r_alias (char *__buf, size_t __buflen) __asm__ ("" "getlogin_r")
                      __attribute__ ((__nonnull__ (1)));
 extern int __getlogin_r_chk_warn (char *__buf, size_t __buflen, size_t __nreal) __asm__ ("" "__getlogin_r_chk")
@@ -5976,24 +6019,19 @@ extern int __getlogin_r_chk_warn (char *__buf, size_t __buflen, size_t __nreal) 
 extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline__)) __attribute__ ((__artificial__)) int
 getlogin_r (char *__buf, size_t __buflen)
 {
-  if (__builtin_object_size (__buf, 2 > 1) != (size_t) -1)
-    {
-      if (!__builtin_constant_p (__buflen))
- return __getlogin_r_chk (__buf, __buflen, __builtin_object_size (__buf, 2 > 1));
+  return ((((__typeof (__buflen)) 0 < (__typeof (__buflen)) -1 || (__builtin_constant_p (__buflen) && (__buflen) > 0)) && __builtin_constant_p ((((long unsigned int) (__buflen)) <= (__builtin_object_size (__buf, 2 > 1)) / (sizeof (char)))) && (((long unsigned int) (__buflen)) <= (__builtin_object_size (__buf, 2 > 1)) / (sizeof (char)))) ? __getlogin_r_alias (__buf, __buflen) : ((((__typeof (__buflen)) 0 < (__typeof (__buflen)) -1 || (__builtin_constant_p (__buflen) && (__buflen) > 0)) && __builtin_constant_p ((((long unsigned int) (__buflen)) <= (__builtin_object_size (__buf, 2 > 1)) / (sizeof (char)))) && !(((long unsigned int) (__buflen)) <= (__builtin_object_size (__buf, 2 > 1)) / (sizeof (char)))) ? __getlogin_r_chk_warn (__buf, __buflen, __builtin_object_size (__buf, 2 > 1)) : __getlogin_r_chk (__buf, __buflen, __builtin_object_size (__buf, 2 > 1))))
 
-      if (__buflen > __builtin_object_size (__buf, 2 > 1))
- return __getlogin_r_chk_warn (__buf, __buflen, __builtin_object_size (__buf, 2 > 1));
-    }
-  return __getlogin_r_alias (__buf, __buflen);
+                     ;
 }
 
 
 
 
 extern int __gethostname_chk (char *__buf, size_t __buflen, size_t __nreal)
-     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)));
+     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1))) __attribute__ ((__access__ (__write_only__, 1, 2)));
 extern int __gethostname_alias (char *__buf, size_t __buflen) __asm__ ("" "gethostname") __attribute__ ((__nothrow__ , __leaf__))
-                   __attribute__ ((__nonnull__ (1)));
+
+  __attribute__ ((__nonnull__ (1))) __attribute__ ((__access__ (__write_only__, 1, 2)));
 extern int __gethostname_chk_warn (char *__buf, size_t __buflen, size_t __nreal) __asm__ ("" "__gethostname_chk") __attribute__ ((__nothrow__ , __leaf__))
 
 
@@ -6003,25 +6041,20 @@ extern int __gethostname_chk_warn (char *__buf, size_t __buflen, size_t __nreal)
 extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline__)) __attribute__ ((__artificial__)) int
 __attribute__ ((__nothrow__ , __leaf__)) gethostname (char *__buf, size_t __buflen)
 {
-  if (__builtin_object_size (__buf, 2 > 1) != (size_t) -1)
-    {
-      if (!__builtin_constant_p (__buflen))
- return __gethostname_chk (__buf, __buflen, __builtin_object_size (__buf, 2 > 1));
+  return ((((__typeof (__buflen)) 0 < (__typeof (__buflen)) -1 || (__builtin_constant_p (__buflen) && (__buflen) > 0)) && __builtin_constant_p ((((long unsigned int) (__buflen)) <= (__builtin_object_size (__buf, 2 > 1)) / (sizeof (char)))) && (((long unsigned int) (__buflen)) <= (__builtin_object_size (__buf, 2 > 1)) / (sizeof (char)))) ? __gethostname_alias (__buf, __buflen) : ((((__typeof (__buflen)) 0 < (__typeof (__buflen)) -1 || (__builtin_constant_p (__buflen) && (__buflen) > 0)) && __builtin_constant_p ((((long unsigned int) (__buflen)) <= (__builtin_object_size (__buf, 2 > 1)) / (sizeof (char)))) && !(((long unsigned int) (__buflen)) <= (__builtin_object_size (__buf, 2 > 1)) / (sizeof (char)))) ? __gethostname_chk_warn (__buf, __buflen, __builtin_object_size (__buf, 2 > 1)) : __gethostname_chk (__buf, __buflen, __builtin_object_size (__buf, 2 > 1))))
 
-      if (__buflen > __builtin_object_size (__buf, 2 > 1))
- return __gethostname_chk_warn (__buf, __buflen, __builtin_object_size (__buf, 2 > 1));
-    }
-  return __gethostname_alias (__buf, __buflen);
+                     ;
 }
 
 
 
 
 extern int __getdomainname_chk (char *__buf, size_t __buflen, size_t __nreal)
-     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1))) __attribute__ ((__warn_unused_result__));
+     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1))) __attribute__ ((__warn_unused_result__)) __attribute__ ((__access__ (__write_only__, 1, 2)));
 extern int __getdomainname_alias (char *__buf, size_t __buflen) __asm__ ("" "getdomainname") __attribute__ ((__nothrow__ , __leaf__))
 
-                     __attribute__ ((__nonnull__ (1))) __attribute__ ((__warn_unused_result__));
+                     __attribute__ ((__nonnull__ (1)))
+  __attribute__ ((__warn_unused_result__)) __attribute__ ((__access__ (__write_only__, 1, 2)));
 extern int __getdomainname_chk_warn (char *__buf, size_t __buflen, size_t __nreal) __asm__ ("" "__getdomainname_chk") __attribute__ ((__nothrow__ , __leaf__))
 
 
@@ -6032,33 +6065,31 @@ extern int __getdomainname_chk_warn (char *__buf, size_t __buflen, size_t __nrea
 extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline__)) __attribute__ ((__artificial__)) int
 __attribute__ ((__nothrow__ , __leaf__)) getdomainname (char *__buf, size_t __buflen)
 {
-  if (__builtin_object_size (__buf, 2 > 1) != (size_t) -1)
-    {
-      if (!__builtin_constant_p (__buflen))
- return __getdomainname_chk (__buf, __buflen, __builtin_object_size (__buf, 2 > 1));
+  return ((((__typeof (__buflen)) 0 < (__typeof (__buflen)) -1 || (__builtin_constant_p (__buflen) && (__buflen) > 0)) && __builtin_constant_p ((((long unsigned int) (__buflen)) <= (__builtin_object_size (__buf, 2 > 1)) / (sizeof (char)))) && (((long unsigned int) (__buflen)) <= (__builtin_object_size (__buf, 2 > 1)) / (sizeof (char)))) ? __getdomainname_alias (__buf, __buflen) : ((((__typeof (__buflen)) 0 < (__typeof (__buflen)) -1 || (__builtin_constant_p (__buflen) && (__buflen) > 0)) && __builtin_constant_p ((((long unsigned int) (__buflen)) <= (__builtin_object_size (__buf, 2 > 1)) / (sizeof (char)))) && !(((long unsigned int) (__buflen)) <= (__builtin_object_size (__buf, 2 > 1)) / (sizeof (char)))) ? __getdomainname_chk_warn (__buf, __buflen, __builtin_object_size (__buf, 2 > 1)) : __getdomainname_chk (__buf, __buflen, __builtin_object_size (__buf, 2 > 1))))
 
-      if (__buflen > __builtin_object_size (__buf, 2 > 1))
- return __getdomainname_chk_warn (__buf, __buflen, __builtin_object_size (__buf, 2 > 1));
-    }
-  return __getdomainname_alias (__buf, __buflen);
+                     ;
 }
-# 1173 "/usr/include/unistd.h" 2 3 4
+# 1215 "/usr/include/unistd.h" 2 3 4
 
 
 
-# 52 "/workspace/acl/lib_acl/StdAfx.h" 2
+# 1 "/usr/include/aarch64-linux-gnu/bits/unistd_ext.h" 1 3 4
+# 1219 "/usr/include/unistd.h" 2 3 4
+
+
+# 52 "/acl/lib_acl/StdAfx.h" 2
 # 1 "/usr/include/signal.h" 1 3 4
 # 27 "/usr/include/signal.h" 3 4
 
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/signum.h" 1 3 4
-# 26 "/usr/include/x86_64-linux-gnu/bits/signum.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/signum-generic.h" 1 3 4
-# 27 "/usr/include/x86_64-linux-gnu/bits/signum.h" 2 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/signum-generic.h" 1 3 4
+# 76 "/usr/include/aarch64-linux-gnu/bits/signum-generic.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/signum-arch.h" 1 3 4
+# 77 "/usr/include/aarch64-linux-gnu/bits/signum-generic.h" 2 3 4
 # 31 "/usr/include/signal.h" 2 3 4
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/types/sig_atomic_t.h" 1 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/types/sig_atomic_t.h" 1 3 4
 
 
 
@@ -6069,15 +6100,15 @@ __attribute__ ((__nothrow__ , __leaf__)) getdomainname (char *__buf, size_t __bu
 typedef __sig_atomic_t sig_atomic_t;
 # 33 "/usr/include/signal.h" 2 3 4
 # 57 "/usr/include/signal.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/types/siginfo_t.h" 1 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/types/siginfo_t.h" 1 3 4
 
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/wordsize.h" 1 3 4
-# 5 "/usr/include/x86_64-linux-gnu/bits/types/siginfo_t.h" 2 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/wordsize.h" 1 3 4
+# 5 "/usr/include/aarch64-linux-gnu/bits/types/siginfo_t.h" 2 3 4
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/types/__sigval_t.h" 1 3 4
-# 24 "/usr/include/x86_64-linux-gnu/bits/types/__sigval_t.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/types/__sigval_t.h" 1 3 4
+# 24 "/usr/include/aarch64-linux-gnu/bits/types/__sigval_t.h" 3 4
 union sigval
 {
   int sival_int;
@@ -6085,11 +6116,11 @@ union sigval
 };
 
 typedef union sigval __sigval_t;
-# 7 "/usr/include/x86_64-linux-gnu/bits/types/siginfo_t.h" 2 3 4
-# 16 "/usr/include/x86_64-linux-gnu/bits/types/siginfo_t.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/siginfo-arch.h" 1 3 4
-# 17 "/usr/include/x86_64-linux-gnu/bits/types/siginfo_t.h" 2 3 4
-# 36 "/usr/include/x86_64-linux-gnu/bits/types/siginfo_t.h" 3 4
+# 7 "/usr/include/aarch64-linux-gnu/bits/types/siginfo_t.h" 2 3 4
+# 16 "/usr/include/aarch64-linux-gnu/bits/types/siginfo_t.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/siginfo-arch.h" 1 3 4
+# 17 "/usr/include/aarch64-linux-gnu/bits/types/siginfo_t.h" 2 3 4
+# 36 "/usr/include/aarch64-linux-gnu/bits/types/siginfo_t.h" 3 4
 typedef struct
   {
     int si_signo;
@@ -6180,12 +6211,14 @@ typedef struct
       } _sifields;
   } siginfo_t ;
 # 58 "/usr/include/signal.h" 2 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/siginfo-consts.h" 1 3 4
-# 35 "/usr/include/x86_64-linux-gnu/bits/siginfo-consts.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/siginfo-consts.h" 1 3 4
+# 35 "/usr/include/aarch64-linux-gnu/bits/siginfo-consts.h" 3 4
 enum
 {
   SI_ASYNCNL = -60,
-  SI_TKILL = -6,
+  SI_DETHREAD = -7,
+
+  SI_TKILL,
   SI_SIGIO,
 
   SI_ASYNCIO,
@@ -6199,7 +6232,7 @@ enum
   SI_QUEUE,
   SI_USER,
   SI_KERNEL = 0x80
-# 63 "/usr/include/x86_64-linux-gnu/bits/siginfo-consts.h" 3 4
+# 66 "/usr/include/aarch64-linux-gnu/bits/siginfo-consts.h" 3 4
 };
 
 
@@ -6221,7 +6254,9 @@ enum
 
   ILL_COPROC,
 
-  ILL_BADSTK
+  ILL_BADSTK,
+
+  ILL_BADIADDR
 
 };
 
@@ -6242,7 +6277,11 @@ enum
 
   FPE_FLTINV,
 
-  FPE_FLTSUB
+  FPE_FLTSUB,
+
+  FPE_FLTUNK = 14,
+
+  FPE_CONDTRAP
 
 };
 
@@ -6255,7 +6294,17 @@ enum
 
   SEGV_BNDERR,
 
-  SEGV_PKUERR
+  SEGV_PKUERR,
+
+  SEGV_ACCADI,
+
+  SEGV_ADIDERR,
+
+  SEGV_ADIPERR,
+
+  SEGV_MTEAERR,
+
+  SEGV_MTESERR
 
 };
 
@@ -6273,7 +6322,7 @@ enum
   BUS_MCEERR_AO
 
 };
-# 151 "/usr/include/x86_64-linux-gnu/bits/siginfo-consts.h" 3 4
+# 176 "/usr/include/aarch64-linux-gnu/bits/siginfo-consts.h" 3 4
 enum
 {
   CLD_EXITED = 1,
@@ -6310,20 +6359,20 @@ enum
 
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/types/sigval_t.h" 1 3 4
-# 16 "/usr/include/x86_64-linux-gnu/bits/types/sigval_t.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/types/sigval_t.h" 1 3 4
+# 16 "/usr/include/aarch64-linux-gnu/bits/types/sigval_t.h" 3 4
 typedef __sigval_t sigval_t;
 # 63 "/usr/include/signal.h" 2 3 4
 
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/types/sigevent_t.h" 1 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/types/sigevent_t.h" 1 3 4
 
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/wordsize.h" 1 3 4
-# 5 "/usr/include/x86_64-linux-gnu/bits/types/sigevent_t.h" 2 3 4
-# 22 "/usr/include/x86_64-linux-gnu/bits/types/sigevent_t.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/wordsize.h" 1 3 4
+# 5 "/usr/include/aarch64-linux-gnu/bits/types/sigevent_t.h" 2 3 4
+# 22 "/usr/include/aarch64-linux-gnu/bits/types/sigevent_t.h" 3 4
 typedef struct sigevent
   {
     __sigval_t sigev_value;
@@ -6346,8 +6395,8 @@ typedef struct sigevent
       } _sigev_un;
   } sigevent_t;
 # 67 "/usr/include/signal.h" 2 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/sigevent-consts.h" 1 3 4
-# 27 "/usr/include/x86_64-linux-gnu/bits/sigevent-consts.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/sigevent-consts.h" 1 3 4
+# 27 "/usr/include/aarch64-linux-gnu/bits/sigevent-consts.h" 3 4
 enum
 {
   SIGEV_SIGNAL = 0,
@@ -6403,7 +6452,7 @@ extern void psignal (int __sig, const char *__s);
 
 
 extern void psiginfo (const siginfo_t *__pinfo, const char *__s);
-# 170 "/usr/include/signal.h" 3 4
+# 173 "/usr/include/signal.h" 3 4
 extern int sigblock (int __mask) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__deprecated__));
 
 
@@ -6411,7 +6460,7 @@ extern int sigsetmask (int __mask) __attribute__ ((__nothrow__ , __leaf__)) __at
 
 
 extern int siggetmask (void) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__deprecated__));
-# 190 "/usr/include/signal.h" 3 4
+# 193 "/usr/include/signal.h" 3 4
 typedef __sighandler_t sig_t;
 
 
@@ -6432,9 +6481,9 @@ extern int sigdelset (sigset_t *__set, int __signo) __attribute__ ((__nothrow__ 
 
 extern int sigismember (const sigset_t *__set, int __signo)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)));
-# 226 "/usr/include/signal.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/sigaction.h" 1 3 4
-# 24 "/usr/include/x86_64-linux-gnu/bits/sigaction.h" 3 4
+# 229 "/usr/include/signal.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/sigaction.h" 1 3 4
+# 27 "/usr/include/aarch64-linux-gnu/bits/sigaction.h" 3 4
 struct sigaction
   {
 
@@ -6462,7 +6511,7 @@ struct sigaction
 
     void (*sa_restorer) (void);
   };
-# 227 "/usr/include/signal.h" 2 3 4
+# 230 "/usr/include/signal.h" 2 3 4
 
 
 extern int sigprocmask (int __how, const sigset_t *__restrict __set,
@@ -6505,123 +6554,129 @@ extern int sigwaitinfo (const sigset_t *__restrict __set,
 
 
 
+
 extern int sigtimedwait (const sigset_t *__restrict __set,
     siginfo_t *__restrict __info,
     const struct timespec *__restrict __timeout)
      __attribute__ ((__nonnull__ (1)));
-
-
-
+# 292 "/usr/include/signal.h" 3 4
 extern int sigqueue (__pid_t __pid, int __sig, const union sigval __val)
      __attribute__ ((__nothrow__ , __leaf__));
-# 286 "/usr/include/signal.h" 3 4
-extern const char *const _sys_siglist[(64 + 1)];
-extern const char *const sys_siglist[(64 + 1)];
 
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/sigcontext.h" 1 3 4
-# 31 "/usr/include/x86_64-linux-gnu/bits/sigcontext.h" 3 4
-struct _fpx_sw_bytes
-{
-  __uint32_t magic1;
-  __uint32_t extended_size;
-  __uint64_t xstate_bv;
-  __uint32_t xstate_size;
-  __uint32_t __glibc_reserved1[7];
+
+
+
+
+# 1 "/usr/include/aarch64-linux-gnu/bits/sigcontext.h" 1 3 4
+# 30 "/usr/include/aarch64-linux-gnu/bits/sigcontext.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/asm/sigcontext.h" 1 3 4
+# 22 "/usr/include/aarch64-linux-gnu/asm/sigcontext.h" 3 4
+# 1 "/usr/include/linux/types.h" 1 3 4
+
+
+
+
+# 1 "/usr/include/aarch64-linux-gnu/asm/types.h" 1 3 4
+# 1 "/usr/include/asm-generic/types.h" 1 3 4
+
+
+
+
+
+
+# 1 "/usr/include/asm-generic/int-ll64.h" 1 3 4
+# 20 "/usr/include/asm-generic/int-ll64.h" 3 4
+typedef __signed__ char __s8;
+typedef unsigned char __u8;
+
+typedef __signed__ short __s16;
+typedef unsigned short __u16;
+
+typedef __signed__ int __s32;
+typedef unsigned int __u32;
+
+
+__extension__ typedef __signed__ long long __s64;
+__extension__ typedef unsigned long long __u64;
+# 8 "/usr/include/asm-generic/types.h" 2 3 4
+# 2 "/usr/include/aarch64-linux-gnu/asm/types.h" 2 3 4
+# 6 "/usr/include/linux/types.h" 2 3 4
+# 24 "/usr/include/linux/types.h" 3 4
+typedef __u16 __le16;
+typedef __u16 __be16;
+typedef __u32 __le32;
+typedef __u32 __be32;
+typedef __u64 __le64;
+typedef __u64 __be64;
+
+typedef __u16 __sum16;
+typedef __u32 __wsum;
+# 47 "/usr/include/linux/types.h" 3 4
+typedef unsigned __poll_t;
+# 23 "/usr/include/aarch64-linux-gnu/asm/sigcontext.h" 2 3 4
+
+
+
+
+
+struct sigcontext {
+ __u64 fault_address;
+
+ __u64 regs[31];
+ __u64 sp;
+ __u64 pc;
+ __u64 pstate;
+
+ __u8 __reserved[4096] __attribute__((__aligned__(16)));
 };
-
-struct _fpreg
-{
-  unsigned short significand[4];
-  unsigned short exponent;
-};
-
-struct _fpxreg
-{
-  unsigned short significand[4];
-  unsigned short exponent;
-  unsigned short __glibc_reserved1[3];
-};
-
-struct _xmmreg
-{
-  __uint32_t element[4];
-};
-# 123 "/usr/include/x86_64-linux-gnu/bits/sigcontext.h" 3 4
-struct _fpstate
-{
-
-  __uint16_t cwd;
-  __uint16_t swd;
-  __uint16_t ftw;
-  __uint16_t fop;
-  __uint64_t rip;
-  __uint64_t rdp;
-  __uint32_t mxcsr;
-  __uint32_t mxcr_mask;
-  struct _fpxreg _st[8];
-  struct _xmmreg _xmm[16];
-  __uint32_t __glibc_reserved1[24];
-};
-
-struct sigcontext
-{
-  __uint64_t r8;
-  __uint64_t r9;
-  __uint64_t r10;
-  __uint64_t r11;
-  __uint64_t r12;
-  __uint64_t r13;
-  __uint64_t r14;
-  __uint64_t r15;
-  __uint64_t rdi;
-  __uint64_t rsi;
-  __uint64_t rbp;
-  __uint64_t rbx;
-  __uint64_t rdx;
-  __uint64_t rax;
-  __uint64_t rcx;
-  __uint64_t rsp;
-  __uint64_t rip;
-  __uint64_t eflags;
-  unsigned short cs;
-  unsigned short gs;
-  unsigned short fs;
-  unsigned short __pad0;
-  __uint64_t err;
-  __uint64_t trapno;
-  __uint64_t oldmask;
-  __uint64_t cr2;
-  __extension__ union
-    {
-      struct _fpstate * fpstate;
-      __uint64_t __fpstate_word;
-    };
-  __uint64_t __reserved1 [8];
+# 66 "/usr/include/aarch64-linux-gnu/asm/sigcontext.h" 3 4
+struct _aarch64_ctx {
+ __u32 magic;
+ __u32 size;
 };
 
 
 
-struct _xsave_hdr
-{
-  __uint64_t xstate_bv;
-  __uint64_t __glibc_reserved1[2];
-  __uint64_t __glibc_reserved2[5];
+struct fpsimd_context {
+ struct _aarch64_ctx head;
+ __u32 fpsr;
+ __u32 fpcr;
+ __uint128_t vregs[32];
+};
+# 92 "/usr/include/aarch64-linux-gnu/asm/sigcontext.h" 3 4
+struct esr_context {
+ struct _aarch64_ctx head;
+ __u64 esr;
+};
+# 125 "/usr/include/aarch64-linux-gnu/asm/sigcontext.h" 3 4
+struct extra_context {
+ struct _aarch64_ctx head;
+ __u64 datap;
+ __u32 size;
+ __u32 __reserved[3];
 };
 
-struct _ymmh_state
-{
-  __uint32_t ymmh_space[64];
+
+
+struct sve_context {
+ struct _aarch64_ctx head;
+ __u16 vl;
+ __u16 __reserved[3];
 };
 
-struct _xstate
-{
-  struct _fpstate fpstate;
-  struct _xsave_hdr xstate_hdr;
-  struct _ymmh_state ymmh;
-};
-# 292 "/usr/include/signal.h" 2 3 4
+
+
+# 1 "/usr/include/aarch64-linux-gnu/asm/sve_context.h" 1 3 4
+# 143 "/usr/include/aarch64-linux-gnu/asm/sigcontext.h" 2 3 4
+# 31 "/usr/include/aarch64-linux-gnu/bits/sigcontext.h" 2 3 4
+
+
+
+# 1 "/usr/lib/gcc/aarch64-linux-gnu/11/include/stddef.h" 1 3 4
+# 35 "/usr/include/aarch64-linux-gnu/bits/sigcontext.h" 2 3 4
+# 302 "/usr/include/signal.h" 2 3 4
 
 
 extern int sigreturn (struct sigcontext *__scp) __attribute__ ((__nothrow__ , __leaf__));
@@ -6631,13 +6686,13 @@ extern int sigreturn (struct sigcontext *__scp) __attribute__ ((__nothrow__ , __
 
 
 
-# 1 "/usr/lib/gcc/x86_64-linux-gnu/7/include/stddef.h" 1 3 4
-# 302 "/usr/include/signal.h" 2 3 4
+# 1 "/usr/lib/gcc/aarch64-linux-gnu/11/include/stddef.h" 1 3 4
+# 312 "/usr/include/signal.h" 2 3 4
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/types/stack_t.h" 1 3 4
-# 23 "/usr/include/x86_64-linux-gnu/bits/types/stack_t.h" 3 4
-# 1 "/usr/lib/gcc/x86_64-linux-gnu/7/include/stddef.h" 1 3 4
-# 24 "/usr/include/x86_64-linux-gnu/bits/types/stack_t.h" 2 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/types/stack_t.h" 1 3 4
+# 23 "/usr/include/aarch64-linux-gnu/bits/types/stack_t.h" 3 4
+# 1 "/usr/lib/gcc/aarch64-linux-gnu/11/include/stddef.h" 1 3 4
+# 24 "/usr/include/aarch64-linux-gnu/bits/types/stack_t.h" 2 3 4
 
 
 typedef struct
@@ -6646,79 +6701,274 @@ typedef struct
     int ss_flags;
     size_t ss_size;
   } stack_t;
-# 304 "/usr/include/signal.h" 2 3 4
+# 314 "/usr/include/signal.h" 2 3 4
 
 
-# 1 "/usr/include/x86_64-linux-gnu/sys/ucontext.h" 1 3 4
-# 37 "/usr/include/x86_64-linux-gnu/sys/ucontext.h" 3 4
-__extension__ typedef long long int greg_t;
-# 46 "/usr/include/x86_64-linux-gnu/sys/ucontext.h" 3 4
-typedef greg_t gregset_t[23];
-# 101 "/usr/include/x86_64-linux-gnu/sys/ucontext.h" 3 4
-struct _libc_fpxreg
+# 1 "/usr/include/aarch64-linux-gnu/sys/ucontext.h" 1 3 4
+# 36 "/usr/include/aarch64-linux-gnu/sys/ucontext.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/sys/procfs.h" 1 3 4
+# 33 "/usr/include/aarch64-linux-gnu/sys/procfs.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/sys/time.h" 1 3 4
+# 34 "/usr/include/aarch64-linux-gnu/sys/time.h" 3 4
+
+# 52 "/usr/include/aarch64-linux-gnu/sys/time.h" 3 4
+struct timezone
+  {
+    int tz_minuteswest;
+    int tz_dsttime;
+  };
+# 67 "/usr/include/aarch64-linux-gnu/sys/time.h" 3 4
+extern int gettimeofday (struct timeval *__restrict __tv,
+    void *__restrict __tz) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)));
+# 86 "/usr/include/aarch64-linux-gnu/sys/time.h" 3 4
+extern int settimeofday (const struct timeval *__tv,
+    const struct timezone *__tz)
+     __attribute__ ((__nothrow__ , __leaf__));
+
+
+
+
+
+extern int adjtime (const struct timeval *__delta,
+      struct timeval *__olddelta) __attribute__ ((__nothrow__ , __leaf__));
+# 114 "/usr/include/aarch64-linux-gnu/sys/time.h" 3 4
+enum __itimer_which
+  {
+
+    ITIMER_REAL = 0,
+
+
+    ITIMER_VIRTUAL = 1,
+
+
+
+    ITIMER_PROF = 2
+
+  };
+
+
+
+struct itimerval
+  {
+
+    struct timeval it_interval;
+
+    struct timeval it_value;
+  };
+
+
+
+
+
+
+typedef int __itimer_which_t;
+
+
+
+
+
+extern int getitimer (__itimer_which_t __which,
+        struct itimerval *__value) __attribute__ ((__nothrow__ , __leaf__));
+
+
+
+
+extern int setitimer (__itimer_which_t __which,
+        const struct itimerval *__restrict __new,
+        struct itimerval *__restrict __old) __attribute__ ((__nothrow__ , __leaf__));
+
+
+
+
+extern int utimes (const char *__file, const struct timeval __tvp[2])
+     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)));
+# 189 "/usr/include/aarch64-linux-gnu/sys/time.h" 3 4
+extern int lutimes (const char *__file, const struct timeval __tvp[2])
+     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)));
+
+
+extern int futimes (int __fd, const struct timeval __tvp[2]) __attribute__ ((__nothrow__ , __leaf__));
+# 258 "/usr/include/aarch64-linux-gnu/sys/time.h" 3 4
+
+# 34 "/usr/include/aarch64-linux-gnu/sys/procfs.h" 2 3 4
+
+# 1 "/usr/include/aarch64-linux-gnu/sys/user.h" 1 3 4
+# 22 "/usr/include/aarch64-linux-gnu/sys/user.h" 3 4
+struct user_regs_struct
 {
-  unsigned short int significand[4];
-  unsigned short int exponent;
-  unsigned short int __glibc_reserved1[3];
+  unsigned long long regs[31];
+  unsigned long long sp;
+  unsigned long long pc;
+  unsigned long long pstate;
 };
 
-struct _libc_xmmreg
+struct user_fpsimd_struct
 {
-  __uint32_t element[4];
+  __uint128_t vregs[32];
+  unsigned int fpsr;
+  unsigned int fpcr;
 };
-
-struct _libc_fpstate
-{
-
-  __uint16_t cwd;
-  __uint16_t swd;
-  __uint16_t ftw;
-  __uint16_t fop;
-  __uint64_t rip;
-  __uint64_t rdp;
-  __uint32_t mxcsr;
-  __uint32_t mxcr_mask;
-  struct _libc_fpxreg _st[8];
-  struct _libc_xmmreg _xmm[16];
-  __uint32_t __glibc_reserved1[24];
-};
+# 36 "/usr/include/aarch64-linux-gnu/sys/procfs.h" 2 3 4
 
 
-typedef struct _libc_fpstate *fpregset_t;
+
+
+# 1 "/usr/include/aarch64-linux-gnu/bits/procfs.h" 1 3 4
+# 25 "/usr/include/aarch64-linux-gnu/bits/procfs.h" 3 4
+typedef __uint64_t elf_greg_t;
+
+
+
+
+
+
+typedef elf_greg_t elf_gregset_t[(sizeof (struct user_regs_struct) / sizeof (elf_greg_t))];
+
+
+typedef struct user_fpsimd_struct elf_fpregset_t;
+# 41 "/usr/include/aarch64-linux-gnu/sys/procfs.h" 2 3 4
+
+
+
+# 1 "/usr/include/aarch64-linux-gnu/bits/procfs-id.h" 1 3 4
+# 24 "/usr/include/aarch64-linux-gnu/bits/procfs-id.h" 3 4
+typedef unsigned int __pr_uid_t;
+typedef unsigned int __pr_gid_t;
+# 45 "/usr/include/aarch64-linux-gnu/sys/procfs.h" 2 3 4
+
+
+
+
+struct elf_siginfo
+  {
+    int si_signo;
+    int si_code;
+    int si_errno;
+  };
+# 63 "/usr/include/aarch64-linux-gnu/sys/procfs.h" 3 4
+struct elf_prstatus
+  {
+    struct elf_siginfo pr_info;
+    short int pr_cursig;
+    unsigned long int pr_sigpend;
+    unsigned long int pr_sighold;
+    __pid_t pr_pid;
+    __pid_t pr_ppid;
+    __pid_t pr_pgrp;
+    __pid_t pr_sid;
+    struct timeval pr_utime;
+    struct timeval pr_stime;
+    struct timeval pr_cutime;
+    struct timeval pr_cstime;
+    elf_gregset_t pr_reg;
+    int pr_fpvalid;
+  };
+
+
+
+
+struct elf_prpsinfo
+  {
+    char pr_state;
+    char pr_sname;
+    char pr_zomb;
+    char pr_nice;
+    unsigned long int pr_flag;
+    __pr_uid_t pr_uid;
+    __pr_gid_t pr_gid;
+    int pr_pid, pr_ppid, pr_pgrp, pr_sid;
+
+    char pr_fname[16];
+    char pr_psargs[(80)];
+  };
+
+
+
+
+
+
+typedef void *psaddr_t;
+
+# 1 "/usr/include/aarch64-linux-gnu/bits/procfs-prregset.h" 1 3 4
+# 24 "/usr/include/aarch64-linux-gnu/bits/procfs-prregset.h" 3 4
+typedef elf_gregset_t __prgregset_t;
+typedef elf_fpregset_t __prfpregset_t;
+# 107 "/usr/include/aarch64-linux-gnu/sys/procfs.h" 2 3 4
+
+
+typedef __prgregset_t prgregset_t;
+typedef __prfpregset_t prfpregset_t;
+
+
+
+typedef __pid_t lwpid_t;
+
+
+typedef struct elf_prstatus prstatus_t;
+typedef struct elf_prpsinfo prpsinfo_t;
+
+
+
+
+
+# 1 "/usr/include/aarch64-linux-gnu/bits/procfs-extra.h" 1 3 4
+# 125 "/usr/include/aarch64-linux-gnu/sys/procfs.h" 2 3 4
+# 37 "/usr/include/aarch64-linux-gnu/sys/ucontext.h" 2 3 4
+
+
+typedef elf_greg_t greg_t;
+
+
+typedef elf_gregset_t gregset_t;
+
+
+typedef elf_fpregset_t fpregset_t;
+
+
+
+
 
 
 typedef struct
   {
-    gregset_t gregs;
+    unsigned long long int fault_address;
+    unsigned long long int regs[31];
+    unsigned long long int sp;
+    unsigned long long int pc;
+    unsigned long long int pstate;
 
-    fpregset_t fpregs;
-    __extension__ unsigned long long __reserved1 [8];
-} mcontext_t;
+
+
+
+    unsigned char __reserved[4096] __attribute__ ((__aligned__ (16)));
+  } mcontext_t;
 
 
 typedef struct ucontext_t
   {
-    unsigned long int uc_flags;
+    unsigned long uc_flags;
     struct ucontext_t *uc_link;
     stack_t uc_stack;
-    mcontext_t uc_mcontext;
     sigset_t uc_sigmask;
-    struct _libc_fpstate __fpregs_mem;
+    mcontext_t uc_mcontext;
   } ucontext_t;
-# 307 "/usr/include/signal.h" 2 3 4
-
-
-
-
-
-
-
-extern int siginterrupt (int __sig, int __interrupt) __attribute__ ((__nothrow__ , __leaf__));
-
-# 1 "/usr/include/x86_64-linux-gnu/bits/sigstack.h" 1 3 4
 # 317 "/usr/include/signal.h" 2 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/ss_flags.h" 1 3 4
-# 27 "/usr/include/x86_64-linux-gnu/bits/ss_flags.h" 3 4
+
+
+
+
+
+
+
+extern int siginterrupt (int __sig, int __interrupt) __attribute__ ((__nothrow__ , __leaf__))
+  __attribute__ ((__deprecated__ ("Use sigaction with SA_RESTART instead")));
+
+# 1 "/usr/include/aarch64-linux-gnu/bits/sigstack.h" 1 3 4
+# 328 "/usr/include/signal.h" 2 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/sigstksz.h" 1 3 4
+# 329 "/usr/include/signal.h" 2 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/ss_flags.h" 1 3 4
+# 27 "/usr/include/aarch64-linux-gnu/bits/ss_flags.h" 3 4
 enum
 {
   SS_ONSTACK = 1,
@@ -6726,7 +6976,7 @@ enum
   SS_DISABLE
 
 };
-# 318 "/usr/include/signal.h" 2 3 4
+# 330 "/usr/include/signal.h" 2 3 4
 
 
 
@@ -6736,14 +6986,14 @@ extern int sigaltstack (const stack_t *__restrict __ss,
 
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/types/struct_sigstack.h" 1 3 4
-# 23 "/usr/include/x86_64-linux-gnu/bits/types/struct_sigstack.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/types/struct_sigstack.h" 1 3 4
+# 23 "/usr/include/aarch64-linux-gnu/bits/types/struct_sigstack.h" 3 4
 struct sigstack
   {
     void *ss_sp;
     int ss_onstack;
   };
-# 328 "/usr/include/signal.h" 2 3 4
+# 340 "/usr/include/signal.h" 2 3 4
 
 
 
@@ -6753,16 +7003,16 @@ struct sigstack
 
 extern int sigstack (struct sigstack *__ss, struct sigstack *__oss)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__deprecated__));
-# 359 "/usr/include/signal.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/sigthread.h" 1 3 4
-# 31 "/usr/include/x86_64-linux-gnu/bits/sigthread.h" 3 4
+# 376 "/usr/include/signal.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/sigthread.h" 1 3 4
+# 31 "/usr/include/aarch64-linux-gnu/bits/sigthread.h" 3 4
 extern int pthread_sigmask (int __how,
        const __sigset_t *__restrict __newmask,
        __sigset_t *__restrict __oldmask)__attribute__ ((__nothrow__ , __leaf__));
 
 
 extern int pthread_kill (pthread_t __threadid, int __signo) __attribute__ ((__nothrow__ , __leaf__));
-# 360 "/usr/include/signal.h" 2 3 4
+# 377 "/usr/include/signal.h" 2 3 4
 
 
 
@@ -6777,16 +7027,27 @@ extern int __libc_current_sigrtmax (void) __attribute__ ((__nothrow__ , __leaf__
 
 
 
-# 53 "/workspace/acl/lib_acl/StdAfx.h" 2
+# 1 "/usr/include/aarch64-linux-gnu/bits/signal_ext.h" 1 3 4
+# 392 "/usr/include/signal.h" 2 3 4
 
-# 1 "/usr/include/x86_64-linux-gnu/sys/wait.h" 1 3 4
-# 27 "/usr/include/x86_64-linux-gnu/sys/wait.h" 3 4
 
-# 77 "/usr/include/x86_64-linux-gnu/sys/wait.h" 3 4
+# 53 "/acl/lib_acl/StdAfx.h" 2
+
+# 1 "/usr/include/aarch64-linux-gnu/sys/wait.h" 1 3 4
+# 27 "/usr/include/aarch64-linux-gnu/sys/wait.h" 3 4
+
+# 74 "/usr/include/aarch64-linux-gnu/sys/wait.h" 3 4
+typedef enum
+{
+  P_ALL,
+  P_PID,
+  P_PGID
+} idtype_t;
+# 88 "/usr/include/aarch64-linux-gnu/sys/wait.h" 3 4
 extern __pid_t wait (int *__stat_loc);
-# 100 "/usr/include/x86_64-linux-gnu/sys/wait.h" 3 4
+# 111 "/usr/include/aarch64-linux-gnu/sys/wait.h" 3 4
 extern __pid_t waitpid (__pid_t __pid, int *__stat_loc, int __options);
-# 121 "/usr/include/x86_64-linux-gnu/sys/wait.h" 3 4
+# 132 "/usr/include/aarch64-linux-gnu/sys/wait.h" 3 4
 extern int waitid (idtype_t __idtype, __id_t __id, siginfo_t *__infop,
      int __options);
 
@@ -6802,39 +7063,38 @@ struct rusage;
 
 
 
+
 extern __pid_t wait3 (int *__stat_loc, int __options,
         struct rusage * __usage) __attribute__ ((__nothrow__));
-
-
-
-
+# 164 "/usr/include/aarch64-linux-gnu/sys/wait.h" 3 4
 extern __pid_t wait4 (__pid_t __pid, int *__stat_loc, int __options,
         struct rusage *__usage) __attribute__ ((__nothrow__));
+# 178 "/usr/include/aarch64-linux-gnu/sys/wait.h" 3 4
 
-
-
-
-# 55 "/workspace/acl/lib_acl/StdAfx.h" 2
+# 55 "/acl/lib_acl/StdAfx.h" 2
 # 1 "/usr/include/pthread.h" 1 3 4
-# 23 "/usr/include/pthread.h" 3 4
+# 22 "/usr/include/pthread.h" 3 4
 # 1 "/usr/include/sched.h" 1 3 4
 # 29 "/usr/include/sched.h" 3 4
-# 1 "/usr/lib/gcc/x86_64-linux-gnu/7/include/stddef.h" 1 3 4
+# 1 "/usr/lib/gcc/aarch64-linux-gnu/11/include/stddef.h" 1 3 4
 # 30 "/usr/include/sched.h" 2 3 4
 # 43 "/usr/include/sched.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/sched.h" 1 3 4
-# 75 "/usr/include/x86_64-linux-gnu/bits/sched.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/sched.h" 1 3 4
+# 76 "/usr/include/aarch64-linux-gnu/bits/sched.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/types/struct_sched_param.h" 1 3 4
+# 23 "/usr/include/aarch64-linux-gnu/bits/types/struct_sched_param.h" 3 4
 struct sched_param
 {
   int sched_priority;
 };
+# 77 "/usr/include/aarch64-linux-gnu/bits/sched.h" 2 3 4
 
 
-# 97 "/usr/include/x86_64-linux-gnu/bits/sched.h" 3 4
+# 98 "/usr/include/aarch64-linux-gnu/bits/sched.h" 3 4
 
 # 44 "/usr/include/sched.h" 2 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/cpu-set.h" 1 3 4
-# 32 "/usr/include/x86_64-linux-gnu/bits/cpu-set.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/cpu-set.h" 1 3 4
+# 32 "/usr/include/aarch64-linux-gnu/bits/cpu-set.h" 3 4
 typedef unsigned long int __cpu_mask;
 
 
@@ -6846,7 +7106,7 @@ typedef struct
 {
   __cpu_mask __bits[1024 / (8 * sizeof (__cpu_mask))];
 } cpu_set_t;
-# 115 "/usr/include/x86_64-linux-gnu/bits/cpu-set.h" 3 4
+# 115 "/usr/include/aarch64-linux-gnu/bits/cpu-set.h" 3 4
 
 
 extern int __sched_cpucount (size_t __setsize, const cpu_set_t *__setp)
@@ -6888,25 +7148,26 @@ extern int sched_get_priority_max (int __algorithm) __attribute__ ((__nothrow__ 
 extern int sched_get_priority_min (int __algorithm) __attribute__ ((__nothrow__ , __leaf__));
 
 
-extern int sched_rr_get_interval (__pid_t __pid, struct timespec *__t) __attribute__ ((__nothrow__ , __leaf__));
-# 129 "/usr/include/sched.h" 3 4
 
-# 24 "/usr/include/pthread.h" 2 3 4
+extern int sched_rr_get_interval (__pid_t __pid, struct timespec *__t) __attribute__ ((__nothrow__ , __leaf__));
+# 138 "/usr/include/sched.h" 3 4
+
+# 23 "/usr/include/pthread.h" 2 3 4
 # 1 "/usr/include/time.h" 1 3 4
 # 29 "/usr/include/time.h" 3 4
-# 1 "/usr/lib/gcc/x86_64-linux-gnu/7/include/stddef.h" 1 3 4
+# 1 "/usr/lib/gcc/aarch64-linux-gnu/11/include/stddef.h" 1 3 4
 # 30 "/usr/include/time.h" 2 3 4
 
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/time.h" 1 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/time.h" 1 3 4
 # 34 "/usr/include/time.h" 2 3 4
 
 
 
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/types/struct_tm.h" 1 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/types/struct_tm.h" 1 3 4
 
 
 
@@ -6935,7 +7196,7 @@ struct tm
 };
 # 40 "/usr/include/time.h" 2 3 4
 # 48 "/usr/include/time.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/types/struct_itimerspec.h" 1 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/types/struct_itimerspec.h" 1 3 4
 
 
 
@@ -6958,6 +7219,7 @@ struct sigevent;
 extern clock_t clock (void) __attribute__ ((__nothrow__ , __leaf__));
 
 
+
 extern time_t time (time_t *__timer) __attribute__ ((__nothrow__ , __leaf__));
 
 
@@ -6966,29 +7228,22 @@ extern double difftime (time_t __time1, time_t __time0)
 
 
 extern time_t mktime (struct tm *__tp) __attribute__ ((__nothrow__ , __leaf__));
-
-
-
-
-
+# 100 "/usr/include/time.h" 3 4
 extern size_t strftime (char *__restrict __s, size_t __maxsize,
    const char *__restrict __format,
    const struct tm *__restrict __tp) __attribute__ ((__nothrow__ , __leaf__));
-# 104 "/usr/include/time.h" 3 4
+# 116 "/usr/include/time.h" 3 4
 extern size_t strftime_l (char *__restrict __s, size_t __maxsize,
      const char *__restrict __format,
      const struct tm *__restrict __tp,
      locale_t __loc) __attribute__ ((__nothrow__ , __leaf__));
-# 119 "/usr/include/time.h" 3 4
+# 132 "/usr/include/time.h" 3 4
 extern struct tm *gmtime (const time_t *__timer) __attribute__ ((__nothrow__ , __leaf__));
 
 
 
 extern struct tm *localtime (const time_t *__timer) __attribute__ ((__nothrow__ , __leaf__));
-
-
-
-
+# 154 "/usr/include/time.h" 3 4
 extern struct tm *gmtime_r (const time_t *__restrict __timer,
        struct tm *__restrict __tp) __attribute__ ((__nothrow__ , __leaf__));
 
@@ -6996,30 +7251,21 @@ extern struct tm *gmtime_r (const time_t *__restrict __timer,
 
 extern struct tm *localtime_r (const time_t *__restrict __timer,
           struct tm *__restrict __tp) __attribute__ ((__nothrow__ , __leaf__));
-
-
-
-
+# 179 "/usr/include/time.h" 3 4
 extern char *asctime (const struct tm *__tp) __attribute__ ((__nothrow__ , __leaf__));
 
 
+
 extern char *ctime (const time_t *__timer) __attribute__ ((__nothrow__ , __leaf__));
-
-
-
-
-
-
+# 197 "/usr/include/time.h" 3 4
 extern char *asctime_r (const struct tm *__restrict __tp,
    char *__restrict __buf) __attribute__ ((__nothrow__ , __leaf__));
 
 
+
 extern char *ctime_r (const time_t *__restrict __timer,
         char *__restrict __buf) __attribute__ ((__nothrow__ , __leaf__));
-
-
-
-
+# 217 "/usr/include/time.h" 3 4
 extern char *__tzname[2];
 extern int __daylight;
 extern long int __timezone;
@@ -7037,24 +7283,15 @@ extern void tzset (void) __attribute__ ((__nothrow__ , __leaf__));
 
 extern int daylight;
 extern long int timezone;
-
-
-
-
-
-extern int stime (const time_t *__when) __attribute__ ((__nothrow__ , __leaf__));
-# 196 "/usr/include/time.h" 3 4
+# 249 "/usr/include/time.h" 3 4
 extern time_t timegm (struct tm *__tp) __attribute__ ((__nothrow__ , __leaf__));
 
-
 extern time_t timelocal (struct tm *__tp) __attribute__ ((__nothrow__ , __leaf__));
-
-
+# 262 "/usr/include/time.h" 3 4
 extern int dysize (int __year) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__const__));
-# 211 "/usr/include/time.h" 3 4
+# 272 "/usr/include/time.h" 3 4
 extern int nanosleep (const struct timespec *__requested_time,
         struct timespec *__remaining);
-
 
 
 extern int clock_getres (clockid_t __clock_id, struct timespec *__res) __attribute__ ((__nothrow__ , __leaf__));
@@ -7065,17 +7302,11 @@ extern int clock_gettime (clockid_t __clock_id, struct timespec *__tp) __attribu
 
 extern int clock_settime (clockid_t __clock_id, const struct timespec *__tp)
      __attribute__ ((__nothrow__ , __leaf__));
-
-
-
-
-
-
+# 311 "/usr/include/time.h" 3 4
 extern int clock_nanosleep (clockid_t __clock_id, int __flags,
        const struct timespec *__req,
        struct timespec *__rem);
-
-
+# 326 "/usr/include/time.h" 3 4
 extern int clock_getcpuclockid (pid_t __pid, clockid_t *__clock_id) __attribute__ ((__nothrow__ , __leaf__));
 
 
@@ -7089,6 +7320,7 @@ extern int timer_create (clockid_t __clock_id,
 extern int timer_delete (timer_t __timerid) __attribute__ ((__nothrow__ , __leaf__));
 
 
+
 extern int timer_settime (timer_t __timerid, int __flags,
      const struct itimerspec *__restrict __value,
      struct itimerspec *__restrict __ovalue) __attribute__ ((__nothrow__ , __leaf__));
@@ -7096,9 +7328,9 @@ extern int timer_settime (timer_t __timerid, int __flags,
 
 extern int timer_gettime (timer_t __timerid, struct itimerspec *__value)
      __attribute__ ((__nothrow__ , __leaf__));
-
-
+# 364 "/usr/include/time.h" 3 4
 extern int timer_getoverrun (timer_t __timerid) __attribute__ ((__nothrow__ , __leaf__));
+
 
 
 
@@ -7106,23 +7338,34 @@ extern int timer_getoverrun (timer_t __timerid) __attribute__ ((__nothrow__ , __
 
 extern int timespec_get (struct timespec *__ts, int __base)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)));
-# 307 "/usr/include/time.h" 3 4
+# 440 "/usr/include/time.h" 3 4
 
-# 25 "/usr/include/pthread.h" 2 3 4
-
-
-# 1 "/usr/include/x86_64-linux-gnu/bits/setjmp.h" 1 3 4
-# 26 "/usr/include/x86_64-linux-gnu/bits/setjmp.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/wordsize.h" 1 3 4
-# 27 "/usr/include/x86_64-linux-gnu/bits/setjmp.h" 2 3 4
+# 24 "/usr/include/pthread.h" 2 3 4
 
 
 
-
-typedef long int __jmp_buf[8];
+# 1 "/usr/include/aarch64-linux-gnu/bits/setjmp.h" 1 3 4
+# 30 "/usr/include/aarch64-linux-gnu/bits/setjmp.h" 3 4
+__extension__ typedef unsigned long long __jmp_buf [22];
 # 28 "/usr/include/pthread.h" 2 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/wordsize.h" 1 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/wordsize.h" 1 3 4
 # 29 "/usr/include/pthread.h" 2 3 4
+
+
+# 1 "/usr/include/aarch64-linux-gnu/bits/types/struct___jmp_buf_tag.h" 1 3 4
+# 26 "/usr/include/aarch64-linux-gnu/bits/types/struct___jmp_buf_tag.h" 3 4
+struct __jmp_buf_tag
+  {
+
+
+
+
+    __jmp_buf __jmpbuf;
+    int __mask_was_saved;
+    __sigset_t __saved_mask;
+  };
+# 32 "/usr/include/pthread.h" 2 3 4
+
 
 
 
@@ -7177,7 +7420,7 @@ enum
   PTHREAD_PRIO_INHERIT,
   PTHREAD_PRIO_PROTECT
 };
-# 115 "/usr/include/pthread.h" 3 4
+# 104 "/usr/include/pthread.h" 3 4
 enum
 {
   PTHREAD_RWLOCK_PREFER_READER_NP,
@@ -7185,7 +7428,7 @@ enum
   PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP,
   PTHREAD_RWLOCK_DEFAULT_NP = PTHREAD_RWLOCK_PREFER_READER_NP
 };
-# 156 "/usr/include/pthread.h" 3 4
+# 124 "/usr/include/pthread.h" 3 4
 enum
 {
   PTHREAD_INHERIT_SCHED,
@@ -7213,7 +7456,7 @@ enum
   PTHREAD_PROCESS_SHARED
 
 };
-# 191 "/usr/include/pthread.h" 3 4
+# 159 "/usr/include/pthread.h" 3 4
 struct _pthread_cleanup_buffer
 {
   void (*__routine) (void *);
@@ -7237,7 +7480,7 @@ enum
   PTHREAD_CANCEL_ASYNCHRONOUS
 
 };
-# 229 "/usr/include/pthread.h" 3 4
+# 197 "/usr/include/pthread.h" 3 4
 
 
 
@@ -7261,7 +7504,7 @@ extern void pthread_exit (void *__retval) __attribute__ ((__noreturn__));
 
 
 extern int pthread_join (pthread_t __th, void **__thread_return);
-# 272 "/usr/include/pthread.h" 3 4
+# 269 "/usr/include/pthread.h" 3 4
 extern int pthread_detach (pthread_t __th) __attribute__ ((__nothrow__ , __leaf__));
 
 
@@ -7382,7 +7625,7 @@ extern int pthread_attr_getstack (const pthread_attr_t *__restrict __attr,
 
 extern int pthread_attr_setstack (pthread_attr_t *__attr, void *__stackaddr,
       size_t __stacksize) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)));
-# 430 "/usr/include/pthread.h" 3 4
+# 441 "/usr/include/pthread.h" 3 4
 extern int pthread_setschedparam (pthread_t __target_thread, int __policy,
       const struct sched_param *__param)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (3)));
@@ -7396,15 +7639,15 @@ extern int pthread_getschedparam (pthread_t __target_thread,
 
 extern int pthread_setschedprio (pthread_t __target_thread, int __prio)
      __attribute__ ((__nothrow__ , __leaf__));
-# 459 "/usr/include/pthread.h" 3 4
+# 470 "/usr/include/pthread.h" 3 4
 extern int pthread_getconcurrency (void) __attribute__ ((__nothrow__ , __leaf__));
 
 
 extern int pthread_setconcurrency (int __level) __attribute__ ((__nothrow__ , __leaf__));
-# 495 "/usr/include/pthread.h" 3 4
+# 509 "/usr/include/pthread.h" 3 4
 extern int pthread_once (pthread_once_t *__once_control,
     void (*__init_routine) (void)) __attribute__ ((__nonnull__ (1, 2)));
-# 507 "/usr/include/pthread.h" 3 4
+# 521 "/usr/include/pthread.h" 3 4
 extern int pthread_setcancelstate (int __state, int *__oldstate);
 
 
@@ -7422,16 +7665,18 @@ extern void pthread_testcancel (void);
 
 
 
+struct __cancel_jmp_buf_tag
+{
+  __jmp_buf __cancel_jmp_buf;
+  int __mask_was_saved;
+};
+
 typedef struct
 {
-  struct
-  {
-    __jmp_buf __cancel_jmp_buf;
-    int __mask_was_saved;
-  } __cancel_jmp_buf[1];
+  struct __cancel_jmp_buf_tag __cancel_jmp_buf[1];
   void *__pad[4];
 } __pthread_unwind_buf_t __attribute__ ((__aligned__));
-# 541 "/usr/include/pthread.h" 3 4
+# 557 "/usr/include/pthread.h" 3 4
 struct __pthread_cleanup_frame
 {
   void (*__cancel_routine) (void *);
@@ -7439,29 +7684,25 @@ struct __pthread_cleanup_frame
   int __do_it;
   int __cancel_type;
 };
-# 681 "/usr/include/pthread.h" 3 4
+# 697 "/usr/include/pthread.h" 3 4
 extern void __pthread_register_cancel (__pthread_unwind_buf_t *__buf)
      ;
-# 693 "/usr/include/pthread.h" 3 4
+# 709 "/usr/include/pthread.h" 3 4
 extern void __pthread_unregister_cancel (__pthread_unwind_buf_t *__buf)
   ;
-# 734 "/usr/include/pthread.h" 3 4
+# 750 "/usr/include/pthread.h" 3 4
 extern void __pthread_unwind_next (__pthread_unwind_buf_t *__buf)
      __attribute__ ((__noreturn__))
 
      __attribute__ ((__weak__))
 
      ;
+# 766 "/usr/include/pthread.h" 3 4
+extern int __sigsetjmp_cancel (struct __cancel_jmp_buf_tag __env[1], int __savemask) __asm__ ("" "__sigsetjmp") __attribute__ ((__nothrow__))
 
 
-
-struct __jmp_buf_tag;
-extern int __sigsetjmp (struct __jmp_buf_tag *__env, int __savemask) __attribute__ ((__nothrow__));
-
-
-
-
-
+                     __attribute__ ((__returns_twice__));
+# 781 "/usr/include/pthread.h" 3 4
 extern int pthread_mutex_init (pthread_mutex_t *__mutex,
           const pthread_mutexattr_t *__mutexattr)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)));
@@ -7480,12 +7721,11 @@ extern int pthread_mutex_lock (pthread_mutex_t *__mutex)
 
 
 
+
 extern int pthread_mutex_timedlock (pthread_mutex_t *__restrict __mutex,
         const struct timespec *__restrict
         __abstime) __attribute__ ((__nothrow__)) __attribute__ ((__nonnull__ (1, 2)));
-
-
-
+# 835 "/usr/include/pthread.h" 3 4
 extern int pthread_mutex_unlock (pthread_mutex_t *__mutex)
      __attribute__ ((__nothrow__)) __attribute__ ((__nonnull__ (1)));
 
@@ -7508,7 +7748,7 @@ extern int pthread_mutex_setprioceiling (pthread_mutex_t *__restrict __mutex,
 
 extern int pthread_mutex_consistent (pthread_mutex_t *__mutex)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)));
-# 807 "/usr/include/pthread.h" 3 4
+# 874 "/usr/include/pthread.h" 3 4
 extern int pthread_mutexattr_init (pthread_mutexattr_t *__attr)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)));
 
@@ -7568,17 +7808,11 @@ extern int pthread_mutexattr_setprioceiling (pthread_mutexattr_t *__attr,
 extern int pthread_mutexattr_getrobust (const pthread_mutexattr_t *__attr,
      int *__robustness)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1, 2)));
-
-
-
-
-
-
-
+# 946 "/usr/include/pthread.h" 3 4
 extern int pthread_mutexattr_setrobust (pthread_mutexattr_t *__attr,
      int __robustness)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)));
-# 889 "/usr/include/pthread.h" 3 4
+# 967 "/usr/include/pthread.h" 3 4
 extern int pthread_rwlock_init (pthread_rwlock_t *__restrict __rwlock,
     const pthread_rwlockattr_t *__restrict
     __attr) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)));
@@ -7597,12 +7831,11 @@ extern int pthread_rwlock_tryrdlock (pthread_rwlock_t *__rwlock)
 
 
 
+
 extern int pthread_rwlock_timedrdlock (pthread_rwlock_t *__restrict __rwlock,
            const struct timespec *__restrict
            __abstime) __attribute__ ((__nothrow__)) __attribute__ ((__nonnull__ (1, 2)));
-
-
-
+# 1023 "/usr/include/pthread.h" 3 4
 extern int pthread_rwlock_wrlock (pthread_rwlock_t *__rwlock)
      __attribute__ ((__nothrow__)) __attribute__ ((__nonnull__ (1)));
 
@@ -7612,12 +7845,11 @@ extern int pthread_rwlock_trywrlock (pthread_rwlock_t *__rwlock)
 
 
 
+
 extern int pthread_rwlock_timedwrlock (pthread_rwlock_t *__restrict __rwlock,
            const struct timespec *__restrict
            __abstime) __attribute__ ((__nothrow__)) __attribute__ ((__nonnull__ (1, 2)));
-
-
-
+# 1071 "/usr/include/pthread.h" 3 4
 extern int pthread_rwlock_unlock (pthread_rwlock_t *__rwlock)
      __attribute__ ((__nothrow__)) __attribute__ ((__nonnull__ (1)));
 
@@ -7683,15 +7915,12 @@ extern int pthread_cond_broadcast (pthread_cond_t *__cond)
 extern int pthread_cond_wait (pthread_cond_t *__restrict __cond,
          pthread_mutex_t *__restrict __mutex)
      __attribute__ ((__nonnull__ (1, 2)));
-# 1001 "/usr/include/pthread.h" 3 4
+# 1145 "/usr/include/pthread.h" 3 4
 extern int pthread_cond_timedwait (pthread_cond_t *__restrict __cond,
        pthread_mutex_t *__restrict __mutex,
        const struct timespec *__restrict __abstime)
      __attribute__ ((__nonnull__ (1, 2, 3)));
-
-
-
-
+# 1194 "/usr/include/pthread.h" 3 4
 extern int pthread_condattr_init (pthread_condattr_t *__attr)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)));
 
@@ -7720,7 +7949,7 @@ extern int pthread_condattr_getclock (const pthread_condattr_t *
 extern int pthread_condattr_setclock (pthread_condattr_t *__attr,
           __clockid_t __clock_id)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)));
-# 1045 "/usr/include/pthread.h" 3 4
+# 1230 "/usr/include/pthread.h" 3 4
 extern int pthread_spin_init (pthread_spinlock_t *__lock, int __pshared)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)));
 
@@ -7777,7 +8006,7 @@ extern int pthread_barrierattr_getpshared (const pthread_barrierattr_t *
 extern int pthread_barrierattr_setpshared (pthread_barrierattr_t *__attr,
         int __pshared)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)));
-# 1112 "/usr/include/pthread.h" 3 4
+# 1297 "/usr/include/pthread.h" 3 4
 extern int pthread_key_create (pthread_key_t *__key,
           void (*__destr_function) (void *))
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)));
@@ -7790,7 +8019,8 @@ extern void *pthread_getspecific (pthread_key_t __key) __attribute__ ((__nothrow
 
 
 extern int pthread_setspecific (pthread_key_t __key,
-    const void *__pointer) __attribute__ ((__nothrow__ , __leaf__)) ;
+    const void *__pointer)
+  __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__access__ (__none__, 2)));
 
 
 
@@ -7798,7 +8028,7 @@ extern int pthread_setspecific (pthread_key_t __key,
 extern int pthread_getcpuclockid (pthread_t __thread_id,
       __clockid_t *__clock_id)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (2)));
-# 1146 "/usr/include/pthread.h" 3 4
+# 1332 "/usr/include/pthread.h" 3 4
 extern int pthread_atfork (void (*__prepare) (void),
       void (*__parent) (void),
       void (*__child) (void)) __attribute__ ((__nothrow__ , __leaf__));
@@ -7814,16 +8044,16 @@ __attribute__ ((__nothrow__ , __leaf__)) pthread_equal (pthread_t __thread1, pth
 
 
 
-# 56 "/workspace/acl/lib_acl/StdAfx.h" 2
+# 56 "/acl/lib_acl/StdAfx.h" 2
 # 1 "/usr/include/dlfcn.h" 1 3 4
 # 24 "/usr/include/dlfcn.h" 3 4
-# 1 "/usr/lib/gcc/x86_64-linux-gnu/7/include/stddef.h" 1 3 4
+# 1 "/usr/lib/gcc/aarch64-linux-gnu/11/include/stddef.h" 1 3 4
 # 25 "/usr/include/dlfcn.h" 2 3 4
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/dlfcn.h" 1 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/dlfcn.h" 1 3 4
 # 28 "/usr/include/dlfcn.h" 2 3 4
-# 52 "/usr/include/dlfcn.h" 3 4
+# 54 "/usr/include/dlfcn.h" 3 4
 
 
 
@@ -7838,17 +8068,17 @@ extern int dlclose (void *__handle) __attribute__ ((__nothrow__)) __attribute__ 
 
 extern void *dlsym (void *__restrict __handle,
       const char *__restrict __name) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (2)));
-# 82 "/usr/include/dlfcn.h" 3 4
+# 84 "/usr/include/dlfcn.h" 3 4
 extern char *dlerror (void) __attribute__ ((__nothrow__ , __leaf__));
-# 188 "/usr/include/dlfcn.h" 3 4
+# 227 "/usr/include/dlfcn.h" 3 4
 
-# 57 "/workspace/acl/lib_acl/StdAfx.h" 2
+# 57 "/acl/lib_acl/StdAfx.h" 2
 # 1 "/usr/include/dirent.h" 1 3 4
 # 27 "/usr/include/dirent.h" 3 4
 
 # 61 "/usr/include/dirent.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/dirent.h" 1 3 4
-# 22 "/usr/include/x86_64-linux-gnu/bits/dirent.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/dirent.h" 1 3 4
+# 22 "/usr/include/aarch64-linux-gnu/bits/dirent.h" 3 4
 struct dirent
   {
 
@@ -7967,7 +8197,7 @@ extern long int telldir (DIR *__dirp) __attribute__ ((__nothrow__ , __leaf__)) _
 
 extern int dirfd (DIR *__dirp) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)));
 # 245 "/usr/include/dirent.h" 3 4
-# 1 "/usr/lib/gcc/x86_64-linux-gnu/7/include/stddef.h" 1 3 4
+# 1 "/usr/lib/gcc/aarch64-linux-gnu/11/include/stddef.h" 1 3 4
 # 246 "/usr/include/dirent.h" 2 3 4
 # 263 "/usr/include/dirent.h" 3 4
 extern int scandir (const char *__restrict __dir, struct dirent ***__restrict __namelist, int (*__selector) (const struct dirent *), int (*__cmp) (const struct dirent **, const struct dirent **)) __asm__ ("" "scandir64")
@@ -8000,7 +8230,14 @@ extern __ssize_t getdirentries64 (int __fd, char *__restrict __buf,
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (2, 4)));
 # 402 "/usr/include/dirent.h" 3 4
 
-# 58 "/workspace/acl/lib_acl/StdAfx.h" 2
+
+# 1 "/usr/include/aarch64-linux-gnu/bits/dirent_ext.h" 1 3 4
+# 23 "/usr/include/aarch64-linux-gnu/bits/dirent_ext.h" 3 4
+
+# 33 "/usr/include/aarch64-linux-gnu/bits/dirent_ext.h" 3 4
+
+# 405 "/usr/include/dirent.h" 2 3 4
+# 58 "/acl/lib_acl/StdAfx.h" 2
 # 1 "/usr/include/fcntl.h" 1 3 4
 # 28 "/usr/include/fcntl.h" 3 4
 
@@ -8010,19 +8247,14 @@ extern __ssize_t getdirentries64 (int __fd, char *__restrict __buf,
 
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/fcntl.h" 1 3 4
-# 35 "/usr/include/x86_64-linux-gnu/bits/fcntl.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/fcntl.h" 1 3 4
+# 40 "/usr/include/aarch64-linux-gnu/bits/fcntl.h" 3 4
 struct flock
   {
     short int l_type;
     short int l_whence;
-
-
-
-
-    __off64_t l_start;
-    __off64_t l_len;
-
+    __off_t l_start;
+    __off_t l_len;
     __pid_t l_pid;
   };
 
@@ -8038,87 +8270,34 @@ struct flock64
 
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/fcntl-linux.h" 1 3 4
-# 380 "/usr/include/x86_64-linux-gnu/bits/fcntl-linux.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/fcntl-linux.h" 1 3 4
+# 393 "/usr/include/aarch64-linux-gnu/bits/fcntl-linux.h" 3 4
 
-# 454 "/usr/include/x86_64-linux-gnu/bits/fcntl-linux.h" 3 4
+# 467 "/usr/include/aarch64-linux-gnu/bits/fcntl-linux.h" 3 4
 
-# 61 "/usr/include/x86_64-linux-gnu/bits/fcntl.h" 2 3 4
+# 62 "/usr/include/aarch64-linux-gnu/bits/fcntl.h" 2 3 4
 # 36 "/usr/include/fcntl.h" 2 3 4
 # 78 "/usr/include/fcntl.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/stat.h" 1 3 4
-# 46 "/usr/include/x86_64-linux-gnu/bits/stat.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/stat.h" 1 3 4
+# 25 "/usr/include/aarch64-linux-gnu/bits/stat.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/struct_stat.h" 1 3 4
+# 27 "/usr/include/aarch64-linux-gnu/bits/struct_stat.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/wordsize.h" 1 3 4
+# 28 "/usr/include/aarch64-linux-gnu/bits/struct_stat.h" 2 3 4
+# 44 "/usr/include/aarch64-linux-gnu/bits/struct_stat.h" 3 4
 struct stat
   {
     __dev_t st_dev;
-
-
-
-
-    __ino_t st_ino;
-
-
-
-
-
-
-
-    __nlink_t st_nlink;
-    __mode_t st_mode;
-
-    __uid_t st_uid;
-    __gid_t st_gid;
-
-    int __pad0;
-
-    __dev_t st_rdev;
-
-
-
-
-    __off_t st_size;
-
-
-
-    __blksize_t st_blksize;
-
-    __blkcnt_t st_blocks;
-# 91 "/usr/include/x86_64-linux-gnu/bits/stat.h" 3 4
-    struct timespec st_atim;
-    struct timespec st_mtim;
-    struct timespec st_ctim;
-# 106 "/usr/include/x86_64-linux-gnu/bits/stat.h" 3 4
-    __syscall_slong_t __glibc_reserved[3];
-# 115 "/usr/include/x86_64-linux-gnu/bits/stat.h" 3 4
-  };
-
-
-
-struct stat64
-  {
-    __dev_t st_dev;
-
     __ino64_t st_ino;
-    __nlink_t st_nlink;
     __mode_t st_mode;
-
-
-
-
-
-
+    __nlink_t st_nlink;
     __uid_t st_uid;
     __gid_t st_gid;
-
-    int __pad0;
     __dev_t st_rdev;
-    __off_t st_size;
-
-
-
-
-
+    __dev_t __pad1;
+    __off64_t st_size;
     __blksize_t st_blksize;
+    int __pad2;
     __blkcnt64_t st_blocks;
 
 
@@ -8130,16 +8309,51 @@ struct stat64
     struct timespec st_atim;
     struct timespec st_mtim;
     struct timespec st_ctim;
-# 164 "/usr/include/x86_64-linux-gnu/bits/stat.h" 3 4
-    __syscall_slong_t __glibc_reserved[3];
-
-
-
+# 79 "/usr/include/aarch64-linux-gnu/bits/struct_stat.h" 3 4
+    int __glibc_reserved[2];
   };
+
+
+
+
+struct stat64
+  {
+    __dev_t st_dev;
+    __ino64_t st_ino;
+    __mode_t st_mode;
+    __nlink_t st_nlink;
+    __uid_t st_uid;
+    __gid_t st_gid;
+    __dev_t st_rdev;
+    __dev_t __pad1;
+    __off64_t st_size;
+    __blksize_t st_blksize;
+    int __pad2;
+    __blkcnt64_t st_blocks;
+
+
+
+
+
+
+
+    struct timespec st_atim;
+    struct timespec st_mtim;
+    struct timespec st_ctim;
+# 117 "/usr/include/aarch64-linux-gnu/bits/struct_stat.h" 3 4
+    int __glibc_reserved[2];
+  };
+# 26 "/usr/include/aarch64-linux-gnu/bits/stat.h" 2 3 4
 # 79 "/usr/include/fcntl.h" 2 3 4
-# 147 "/usr/include/fcntl.h" 3 4
-extern int fcntl (int __fd, int __cmd, ...);
-# 160 "/usr/include/fcntl.h" 3 4
+# 152 "/usr/include/fcntl.h" 3 4
+extern int fcntl (int __fd, int __cmd, ...) __asm__ ("" "fcntl64");
+
+
+
+
+
+extern int fcntl64 (int __fd, int __cmd, ...);
+# 184 "/usr/include/fcntl.h" 3 4
 extern int open (const char *__file, int __oflag, ...) __asm__ ("" "open64")
      __attribute__ ((__nonnull__ (1)));
 
@@ -8148,7 +8362,7 @@ extern int open (const char *__file, int __oflag, ...) __asm__ ("" "open64")
 
 
 extern int open64 (const char *__file, int __oflag, ...) __attribute__ ((__nonnull__ (1)));
-# 185 "/usr/include/fcntl.h" 3 4
+# 209 "/usr/include/fcntl.h" 3 4
 extern int openat (int __fd, const char *__file, int __oflag, ...) __asm__ ("" "openat64")
                     __attribute__ ((__nonnull__ (2)));
 
@@ -8158,7 +8372,7 @@ extern int openat (int __fd, const char *__file, int __oflag, ...) __asm__ ("" "
 
 extern int openat64 (int __fd, const char *__file, int __oflag, ...)
      __attribute__ ((__nonnull__ (2)));
-# 206 "/usr/include/fcntl.h" 3 4
+# 230 "/usr/include/fcntl.h" 3 4
 extern int creat (const char *__file, mode_t __mode) __asm__ ("" "creat64")
                   __attribute__ ((__nonnull__ (1)));
 
@@ -8167,7 +8381,7 @@ extern int creat (const char *__file, mode_t __mode) __asm__ ("" "creat64")
 
 
 extern int creat64 (const char *__file, mode_t __mode) __attribute__ ((__nonnull__ (1)));
-# 253 "/usr/include/fcntl.h" 3 4
+# 277 "/usr/include/fcntl.h" 3 4
 extern int posix_fadvise (int __fd, __off64_t __offset, __off64_t __len, int __advise) __asm__ ("" "posix_fadvise64") __attribute__ ((__nothrow__ , __leaf__))
 
                       ;
@@ -8178,7 +8392,7 @@ extern int posix_fadvise (int __fd, __off64_t __offset, __off64_t __len, int __a
 
 extern int posix_fadvise64 (int __fd, off64_t __offset, off64_t __len,
        int __advise) __attribute__ ((__nothrow__ , __leaf__));
-# 274 "/usr/include/fcntl.h" 3 4
+# 298 "/usr/include/fcntl.h" 3 4
 extern int posix_fallocate (int __fd, __off64_t __offset, __off64_t __len) __asm__ ("" "posix_fallocate64")
 
                            ;
@@ -8195,8 +8409,8 @@ extern int posix_fallocate64 (int __fd, off64_t __offset, off64_t __len);
 
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/fcntl2.h" 1 3 4
-# 30 "/usr/include/x86_64-linux-gnu/bits/fcntl2.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/fcntl2.h" 1 3 4
+# 30 "/usr/include/aarch64-linux-gnu/bits/fcntl2.h" 3 4
 extern int __open_2 (const char *__path, int __oflag) __asm__ ("" "__open64_2")
                      __attribute__ ((__nonnull__ (1)));
 extern int __open_alias (const char *__path, int __oflag, ...) __asm__ ("" "open64")
@@ -8215,7 +8429,7 @@ open (const char *__path, int __oflag, ...)
 
   if (__builtin_constant_p (__oflag))
     {
-      if ((((__oflag) & 0100) != 0 || ((__oflag) & (020000000 | 0200000)) == (020000000 | 0200000)) && __builtin_va_arg_pack_len () < 1)
+      if ((((__oflag) & 0100) != 0 || ((__oflag) & (020000000 | 040000)) == (020000000 | 040000)) && __builtin_va_arg_pack_len () < 1)
  {
    __open_missing_mode ();
    return __open_2 (__path, __oflag);
@@ -8247,7 +8461,7 @@ open64 (const char *__path, int __oflag, ...)
 
   if (__builtin_constant_p (__oflag))
     {
-      if ((((__oflag) & 0100) != 0 || ((__oflag) & (020000000 | 0200000)) == (020000000 | 0200000)) && __builtin_va_arg_pack_len () < 1)
+      if ((((__oflag) & 0100) != 0 || ((__oflag) & (020000000 | 040000)) == (020000000 | 040000)) && __builtin_va_arg_pack_len () < 1)
  {
    __open64_missing_mode ();
    return __open64_2 (__path, __oflag);
@@ -8260,7 +8474,7 @@ open64 (const char *__path, int __oflag, ...)
 
   return __open64_alias (__path, __oflag, __builtin_va_arg_pack ());
 }
-# 104 "/usr/include/x86_64-linux-gnu/bits/fcntl2.h" 3 4
+# 104 "/usr/include/aarch64-linux-gnu/bits/fcntl2.h" 3 4
 extern int __openat_2 (int __fd, const char *__path, int __oflag) __asm__ ("" "__openat64_2")
 
      __attribute__ ((__nonnull__ (2)));
@@ -8281,7 +8495,7 @@ openat (int __fd, const char *__path, int __oflag, ...)
 
   if (__builtin_constant_p (__oflag))
     {
-      if ((((__oflag) & 0100) != 0 || ((__oflag) & (020000000 | 0200000)) == (020000000 | 0200000)) && __builtin_va_arg_pack_len () < 1)
+      if ((((__oflag) & 0100) != 0 || ((__oflag) & (020000000 | 040000)) == (020000000 | 040000)) && __builtin_va_arg_pack_len () < 1)
  {
    __openat_missing_mode ();
    return __openat_2 (__fd, __path, __oflag);
@@ -8315,7 +8529,7 @@ openat64 (int __fd, const char *__path, int __oflag, ...)
 
   if (__builtin_constant_p (__oflag))
     {
-      if ((((__oflag) & 0100) != 0 || ((__oflag) & (020000000 | 0200000)) == (020000000 | 0200000)) && __builtin_va_arg_pack_len () < 1)
+      if ((((__oflag) & 0100) != 0 || ((__oflag) & (020000000 | 040000)) == (020000000 | 040000)) && __builtin_va_arg_pack_len () < 1)
  {
    __openat64_missing_mode ();
    return __openat64_2 (__fd, __path, __oflag);
@@ -8328,11 +8542,11 @@ openat64 (int __fd, const char *__path, int __oflag, ...)
 
   return __openat64_alias (__fd, __path, __oflag, __builtin_va_arg_pack ());
 }
-# 291 "/usr/include/fcntl.h" 2 3 4
+# 315 "/usr/include/fcntl.h" 2 3 4
 
 
 
-# 59 "/workspace/acl/lib_acl/StdAfx.h" 2
+# 59 "/acl/lib_acl/StdAfx.h" 2
 
 # 1 "/usr/include/netinet/ip.h" 1 3 4
 # 26 "/usr/include/netinet/ip.h" 3 4
@@ -8421,56 +8635,54 @@ struct ip_timestamp
   };
 # 300 "/usr/include/netinet/ip.h" 3 4
 
-# 61 "/workspace/acl/lib_acl/StdAfx.h" 2
+# 61 "/acl/lib_acl/StdAfx.h" 2
 # 1 "/usr/include/netinet/tcp.h" 1 3 4
-# 80 "/usr/include/netinet/tcp.h" 3 4
-# 1 "/usr/lib/gcc/x86_64-linux-gnu/7/include/stdint.h" 1 3 4
-# 9 "/usr/lib/gcc/x86_64-linux-gnu/7/include/stdint.h" 3 4
+# 91 "/usr/include/netinet/tcp.h" 3 4
+# 1 "/usr/lib/gcc/aarch64-linux-gnu/11/include/stdint.h" 1 3 4
+# 9 "/usr/lib/gcc/aarch64-linux-gnu/11/include/stdint.h" 3 4
 # 1 "/usr/include/stdint.h" 1 3 4
 # 26 "/usr/include/stdint.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/libc-header-start.h" 1 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/libc-header-start.h" 1 3 4
 # 27 "/usr/include/stdint.h" 2 3 4
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/wchar.h" 1 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/wchar.h" 1 3 4
 # 29 "/usr/include/stdint.h" 2 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/wordsize.h" 1 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/wordsize.h" 1 3 4
 # 30 "/usr/include/stdint.h" 2 3 4
 # 43 "/usr/include/stdint.h" 3 4
-typedef signed char int_least8_t;
-typedef short int int_least16_t;
-typedef int int_least32_t;
-
-typedef long int int_least64_t;
-
+typedef __int_least8_t int_least8_t;
+typedef __int_least16_t int_least16_t;
+typedef __int_least32_t int_least32_t;
+typedef __int_least64_t int_least64_t;
 
 
+typedef __uint_least8_t uint_least8_t;
+typedef __uint_least16_t uint_least16_t;
+typedef __uint_least32_t uint_least32_t;
+typedef __uint_least64_t uint_least64_t;
 
 
 
-typedef unsigned char uint_least8_t;
-typedef unsigned short int uint_least16_t;
-typedef unsigned int uint_least32_t;
 
-typedef unsigned long int uint_least64_t;
-# 68 "/usr/include/stdint.h" 3 4
+
 typedef signed char int_fast8_t;
 
 typedef long int int_fast16_t;
 typedef long int int_fast32_t;
 typedef long int int_fast64_t;
-# 81 "/usr/include/stdint.h" 3 4
+# 71 "/usr/include/stdint.h" 3 4
 typedef unsigned char uint_fast8_t;
 
 typedef unsigned long int uint_fast16_t;
 typedef unsigned long int uint_fast32_t;
 typedef unsigned long int uint_fast64_t;
-# 100 "/usr/include/stdint.h" 3 4
+# 90 "/usr/include/stdint.h" 3 4
 typedef unsigned long int uintptr_t;
-# 111 "/usr/include/stdint.h" 3 4
+# 101 "/usr/include/stdint.h" 3 4
 typedef __intmax_t intmax_t;
 typedef __uintmax_t uintmax_t;
-# 10 "/usr/lib/gcc/x86_64-linux-gnu/7/include/stdint.h" 2 3 4
-# 81 "/usr/include/netinet/tcp.h" 2 3 4
+# 10 "/usr/lib/gcc/aarch64-linux-gnu/11/include/stdint.h" 2 3 4
+# 92 "/usr/include/netinet/tcp.h" 2 3 4
 
 typedef uint32_t tcp_seq;
 
@@ -8522,7 +8734,7 @@ struct tcphdr
  uint16_t ack:1;
  uint16_t urg:1;
  uint16_t res2:2;
-# 145 "/usr/include/netinet/tcp.h" 3 4
+# 156 "/usr/include/netinet/tcp.h" 3 4
  uint16_t window;
  uint16_t check;
  uint16_t urg_ptr;
@@ -8544,7 +8756,7 @@ enum
   TCP_LISTEN,
   TCP_CLOSING
 };
-# 206 "/usr/include/netinet/tcp.h" 3 4
+# 217 "/usr/include/netinet/tcp.h" 3 4
 enum tcp_ca_state
 {
   TCP_CA_Open = 0,
@@ -8596,7 +8808,7 @@ struct tcp_info
 
   uint32_t tcpi_total_retrans;
 };
-# 265 "/usr/include/netinet/tcp.h" 3 4
+# 276 "/usr/include/netinet/tcp.h" 3 4
 struct tcp_md5sig
 {
   struct sockaddr_storage tcpm_addr;
@@ -8622,7 +8834,7 @@ enum
   TCP_SEND_QUEUE,
   TCP_QUEUES_NR,
 };
-# 308 "/usr/include/netinet/tcp.h" 3 4
+# 319 "/usr/include/netinet/tcp.h" 3 4
 struct tcp_cookie_transactions
 {
   uint16_t tcpct_flags;
@@ -8642,48 +8854,46 @@ struct tcp_repair_window
   uint32_t rcv_wnd;
   uint32_t rcv_wup;
 };
-# 62 "/workspace/acl/lib_acl/StdAfx.h" 2
-
-# 1 "/usr/lib/gcc/x86_64-linux-gnu/7/include/stdarg.h" 1 3 4
-# 64 "/workspace/acl/lib_acl/StdAfx.h" 2
 
 
-# 1 "/usr/include/x86_64-linux-gnu/sys/stat.h" 1 3 4
-# 99 "/usr/include/x86_64-linux-gnu/sys/stat.h" 3 4
+struct tcp_zerocopy_receive
+{
+  uint64_t address;
+  uint32_t length;
+  uint32_t recv_skip_hint;
+};
+# 62 "/acl/lib_acl/StdAfx.h" 2
+
+# 1 "/usr/lib/gcc/aarch64-linux-gnu/11/include/stdarg.h" 1 3 4
+# 64 "/acl/lib_acl/StdAfx.h" 2
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/stat.h" 1 3 4
-# 102 "/usr/include/x86_64-linux-gnu/sys/stat.h" 2 3 4
-# 213 "/usr/include/x86_64-linux-gnu/sys/stat.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/sys/stat.h" 1 3 4
+# 99 "/usr/include/aarch64-linux-gnu/sys/stat.h" 3 4
+
+
+# 1 "/usr/include/aarch64-linux-gnu/bits/stat.h" 1 3 4
+# 102 "/usr/include/aarch64-linux-gnu/sys/stat.h" 2 3 4
+# 227 "/usr/include/aarch64-linux-gnu/sys/stat.h" 3 4
 extern int stat (const char *__restrict __file, struct stat *__restrict __buf) __asm__ ("" "stat64") __attribute__ ((__nothrow__ , __leaf__))
 
      __attribute__ ((__nonnull__ (1, 2)));
 extern int fstat (int __fd, struct stat *__buf) __asm__ ("" "fstat64") __attribute__ ((__nothrow__ , __leaf__))
      __attribute__ ((__nonnull__ (2)));
-
-
-
-
-
-
+# 240 "/usr/include/aarch64-linux-gnu/sys/stat.h" 3 4
 extern int stat64 (const char *__restrict __file,
      struct stat64 *__restrict __buf) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1, 2)));
 extern int fstat64 (int __fd, struct stat64 *__buf) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (2)));
-# 239 "/usr/include/x86_64-linux-gnu/sys/stat.h" 3 4
+# 279 "/usr/include/aarch64-linux-gnu/sys/stat.h" 3 4
 extern int fstatat (int __fd, const char *__restrict __file, struct stat *__restrict __buf, int __flag) __asm__ ("" "fstatat64") __attribute__ ((__nothrow__ , __leaf__))
 
 
                  __attribute__ ((__nonnull__ (2, 3)));
-
-
-
-
-
-
+# 291 "/usr/include/aarch64-linux-gnu/sys/stat.h" 3 4
 extern int fstatat64 (int __fd, const char *__restrict __file,
         struct stat64 *__restrict __buf, int __flag)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (2, 3)));
-# 263 "/usr/include/x86_64-linux-gnu/sys/stat.h" 3 4
+# 327 "/usr/include/aarch64-linux-gnu/sys/stat.h" 3 4
 extern int lstat (const char *__restrict __file, struct stat *__restrict __buf) __asm__ ("" "lstat64") __attribute__ ((__nothrow__ , __leaf__))
 
 
@@ -8693,14 +8903,12 @@ extern int lstat (const char *__restrict __file, struct stat *__restrict __buf) 
 
 
 
+
+
 extern int lstat64 (const char *__restrict __file,
       struct stat64 *__restrict __buf)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1, 2)));
-
-
-
-
-
+# 352 "/usr/include/aarch64-linux-gnu/sys/stat.h" 3 4
 extern int chmod (const char *__file, __mode_t __mode)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)));
 
@@ -8730,7 +8938,7 @@ extern int fchmodat (int __fd, const char *__file, __mode_t __mode,
 
 
 extern __mode_t umask (__mode_t __mask) __attribute__ ((__nothrow__ , __leaf__));
-# 317 "/usr/include/x86_64-linux-gnu/sys/stat.h" 3 4
+# 389 "/usr/include/aarch64-linux-gnu/sys/stat.h" 3 4
 extern int mkdir (const char *__path, __mode_t __mode)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)));
 
@@ -8774,137 +8982,19 @@ extern int mkfifoat (int __fd, const char *__path, __mode_t __mode)
 
 
 
+
 extern int utimensat (int __fd, const char *__path,
         const struct timespec __times[2],
         int __flags)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (2)));
-
-
-
-
+# 452 "/usr/include/aarch64-linux-gnu/sys/stat.h" 3 4
 extern int futimens (int __fd, const struct timespec __times[2]) __attribute__ ((__nothrow__ , __leaf__));
-# 406 "/usr/include/x86_64-linux-gnu/sys/stat.h" 3 4
-extern int __fxstat (int __ver, int __fildes, struct stat *__stat_buf) __asm__ ("" "__fxstat64") __attribute__ ((__nothrow__ , __leaf__))
+# 468 "/usr/include/aarch64-linux-gnu/sys/stat.h" 3 4
 
-     __attribute__ ((__nonnull__ (3)));
-extern int __xstat (int __ver, const char *__filename, struct stat *__stat_buf) __asm__ ("" "__xstat64") __attribute__ ((__nothrow__ , __leaf__))
+# 67 "/acl/lib_acl/StdAfx.h" 2
 
-     __attribute__ ((__nonnull__ (2, 3)));
-extern int __lxstat (int __ver, const char *__filename, struct stat *__stat_buf) __asm__ ("" "__lxstat64") __attribute__ ((__nothrow__ , __leaf__))
-
-     __attribute__ ((__nonnull__ (2, 3)));
-extern int __fxstatat (int __ver, int __fildes, const char *__filename, struct stat *__stat_buf, int __flag) __asm__ ("" "__fxstatat64") __attribute__ ((__nothrow__ , __leaf__))
-
-
-                    __attribute__ ((__nonnull__ (3, 4)));
-# 428 "/usr/include/x86_64-linux-gnu/sys/stat.h" 3 4
-extern int __fxstat64 (int __ver, int __fildes, struct stat64 *__stat_buf)
-     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (3)));
-extern int __xstat64 (int __ver, const char *__filename,
-        struct stat64 *__stat_buf) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (2, 3)));
-extern int __lxstat64 (int __ver, const char *__filename,
-         struct stat64 *__stat_buf) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (2, 3)));
-extern int __fxstatat64 (int __ver, int __fildes, const char *__filename,
-    struct stat64 *__stat_buf, int __flag)
-     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (3, 4)));
-
-extern int __xmknod (int __ver, const char *__path, __mode_t __mode,
-       __dev_t *__dev) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (2, 4)));
-
-extern int __xmknodat (int __ver, int __fd, const char *__path,
-         __mode_t __mode, __dev_t *__dev)
-     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (3, 5)));
-
-
-
-
-extern __inline __attribute__ ((__gnu_inline__)) int
-__attribute__ ((__nothrow__ , __leaf__)) stat (const char *__path, struct stat *__statbuf)
-{
-  return __xstat (1, __path, __statbuf);
-}
-
-
-extern __inline __attribute__ ((__gnu_inline__)) int
-__attribute__ ((__nothrow__ , __leaf__)) lstat (const char *__path, struct stat *__statbuf)
-{
-  return __lxstat (1, __path, __statbuf);
-}
-
-
-extern __inline __attribute__ ((__gnu_inline__)) int
-__attribute__ ((__nothrow__ , __leaf__)) fstat (int __fd, struct stat *__statbuf)
-{
-  return __fxstat (1, __fd, __statbuf);
-}
-
-
-extern __inline __attribute__ ((__gnu_inline__)) int
-__attribute__ ((__nothrow__ , __leaf__)) fstatat (int __fd, const char *__filename, struct stat *__statbuf, int __flag)
-
-{
-  return __fxstatat (1, __fd, __filename, __statbuf, __flag);
-}
-
-
-
-extern __inline __attribute__ ((__gnu_inline__)) int
-__attribute__ ((__nothrow__ , __leaf__)) mknod (const char *__path, __mode_t __mode, __dev_t __dev)
-{
-  return __xmknod (0, __path, __mode, &__dev);
-}
-
-
-
-extern __inline __attribute__ ((__gnu_inline__)) int
-__attribute__ ((__nothrow__ , __leaf__)) mknodat (int __fd, const char *__path, __mode_t __mode, __dev_t __dev)
-
-{
-  return __xmknodat (0, __fd, __path, __mode, &__dev);
-}
-
-
-
-
-
-extern __inline __attribute__ ((__gnu_inline__)) int
-__attribute__ ((__nothrow__ , __leaf__)) stat64 (const char *__path, struct stat64 *__statbuf)
-{
-  return __xstat64 (1, __path, __statbuf);
-}
-
-
-extern __inline __attribute__ ((__gnu_inline__)) int
-__attribute__ ((__nothrow__ , __leaf__)) lstat64 (const char *__path, struct stat64 *__statbuf)
-{
-  return __lxstat64 (1, __path, __statbuf);
-}
-
-
-extern __inline __attribute__ ((__gnu_inline__)) int
-__attribute__ ((__nothrow__ , __leaf__)) fstat64 (int __fd, struct stat64 *__statbuf)
-{
-  return __fxstat64 (1, __fd, __statbuf);
-}
-
-
-extern __inline __attribute__ ((__gnu_inline__)) int
-__attribute__ ((__nothrow__ , __leaf__)) fstatat64 (int __fd, const char *__filename, struct stat64 *__statbuf, int __flag)
-
-{
-  return __fxstatat64 (1, __fd, __filename, __statbuf, __flag);
-}
-
-
-
-
-
-
-
-# 67 "/workspace/acl/lib_acl/StdAfx.h" 2
-
-# 1 "/usr/include/x86_64-linux-gnu/sys/un.h" 1 3 4
-# 26 "/usr/include/x86_64-linux-gnu/sys/un.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/sys/un.h" 1 3 4
+# 26 "/usr/include/aarch64-linux-gnu/sys/un.h" 3 4
 
 
 
@@ -8913,28 +9003,32 @@ struct sockaddr_un
     sa_family_t sun_family;
     char sun_path[108];
   };
-# 44 "/usr/include/x86_64-linux-gnu/sys/un.h" 3 4
+# 44 "/usr/include/aarch64-linux-gnu/sys/un.h" 3 4
 
-# 69 "/workspace/acl/lib_acl/StdAfx.h" 2
-# 1 "/usr/include/x86_64-linux-gnu/sys/mman.h" 1 3 4
-# 25 "/usr/include/x86_64-linux-gnu/sys/mman.h" 3 4
-# 1 "/usr/lib/gcc/x86_64-linux-gnu/7/include/stddef.h" 1 3 4
-# 26 "/usr/include/x86_64-linux-gnu/sys/mman.h" 2 3 4
-# 41 "/usr/include/x86_64-linux-gnu/sys/mman.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/mman.h" 1 3 4
-# 45 "/usr/include/x86_64-linux-gnu/bits/mman.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/mman-linux.h" 1 3 4
-# 115 "/usr/include/x86_64-linux-gnu/bits/mman-linux.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/mman-shared.h" 1 3 4
-# 115 "/usr/include/x86_64-linux-gnu/bits/mman-linux.h" 2 3 4
-# 45 "/usr/include/x86_64-linux-gnu/bits/mman.h" 2 3 4
-# 42 "/usr/include/x86_64-linux-gnu/sys/mman.h" 2 3 4
+# 69 "/acl/lib_acl/StdAfx.h" 2
+# 1 "/usr/include/aarch64-linux-gnu/sys/mman.h" 1 3 4
+# 25 "/usr/include/aarch64-linux-gnu/sys/mman.h" 3 4
+# 1 "/usr/lib/gcc/aarch64-linux-gnu/11/include/stddef.h" 1 3 4
+# 26 "/usr/include/aarch64-linux-gnu/sys/mman.h" 2 3 4
+# 41 "/usr/include/aarch64-linux-gnu/sys/mman.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/mman.h" 1 3 4
+# 29 "/usr/include/aarch64-linux-gnu/bits/mman.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/mman-map-flags-generic.h" 1 3 4
+# 30 "/usr/include/aarch64-linux-gnu/bits/mman.h" 2 3 4
 
 
+# 1 "/usr/include/aarch64-linux-gnu/bits/mman-linux.h" 1 3 4
+# 117 "/usr/include/aarch64-linux-gnu/bits/mman-linux.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/mman-shared.h" 1 3 4
+# 118 "/usr/include/aarch64-linux-gnu/bits/mman-linux.h" 2 3 4
+# 33 "/usr/include/aarch64-linux-gnu/bits/mman.h" 2 3 4
+# 42 "/usr/include/aarch64-linux-gnu/sys/mman.h" 2 3 4
 
 
 
-# 61 "/usr/include/x86_64-linux-gnu/sys/mman.h" 3 4
+
+
+# 61 "/usr/include/aarch64-linux-gnu/sys/mman.h" 3 4
 extern void * mmap (void *__addr, size_t __len, int __prot, int __flags, int __fd, __off64_t __offset) __asm__ ("" "mmap64") __attribute__ ((__nothrow__ , __leaf__))
 
 
@@ -8999,29 +9093,21 @@ extern int munlockall (void) __attribute__ ((__nothrow__ , __leaf__));
 
 extern int mincore (void *__start, size_t __len, unsigned char *__vec)
      __attribute__ ((__nothrow__ , __leaf__));
-# 144 "/usr/include/x86_64-linux-gnu/sys/mman.h" 3 4
+# 144 "/usr/include/aarch64-linux-gnu/sys/mman.h" 3 4
 extern int shm_open (const char *__name, int __oflag, mode_t __mode);
 
 
 extern int shm_unlink (const char *__name);
 
 
-# 70 "/workspace/acl/lib_acl/StdAfx.h" 2
+# 70 "/acl/lib_acl/StdAfx.h" 2
 
 
 
 
 
 
-# 1 "/workspace/acl/lib_acl/include/lib_acl.h" 1
-
-
-
-
-
-
-
-# 1 "/workspace/acl/lib_acl/include/init/acl_init.h" 1
+# 1 "/acl/lib_acl/include/lib_acl.h" 1
 
 
 
@@ -9029,14 +9115,22 @@ extern int shm_unlink (const char *__name);
 
 
 
-# 1 "/workspace/acl/lib_acl/include/init/../stdlib/acl_define.h" 1
-# 9 "/workspace/acl/lib_acl/include/init/acl_init.h" 2
+# 1 "/acl/lib_acl/include/init/acl_init.h" 1
+
+
+
+
+
+
+
+# 1 "/acl/lib_acl/include/init/../stdlib/acl_define.h" 1
+# 9 "/acl/lib_acl/include/init/acl_init.h" 2
 
 
 
 
  
-# 13 "/workspace/acl/lib_acl/include/init/acl_init.h"
+# 13 "/acl/lib_acl/include/init/acl_init.h"
        void acl_lib_init(void);
 
 
@@ -9067,8 +9161,8 @@ extern int shm_unlink (const char *__name);
 
 
  unsigned long acl_main_thread_self(void);
-# 9 "/workspace/acl/lib_acl/include/lib_acl.h" 2
-# 1 "/workspace/acl/lib_acl/include/stdlib/acl_stdlib.h" 1
+# 9 "/acl/lib_acl/include/lib_acl.h" 2
+# 1 "/acl/lib_acl/include/stdlib/acl_stdlib.h" 1
 
 
 
@@ -9076,157 +9170,68 @@ extern int shm_unlink (const char *__name);
 
 
 
-# 1 "/workspace/acl/lib_acl/include/stdlib/acl_define.h" 1
-# 9 "/workspace/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
-# 1 "/workspace/acl/lib_acl/include/stdlib/acl_sys_patch.h" 1
-# 9 "/workspace/acl/lib_acl/include/stdlib/acl_sys_patch.h"
-# 1 "/workspace/acl/lib_acl/include/stdlib/acl_vstream.h" 1
-# 13 "/workspace/acl/lib_acl/include/stdlib/acl_vstream.h"
-# 1 "/usr/include/x86_64-linux-gnu/sys/time.h" 1 3 4
-# 34 "/usr/include/x86_64-linux-gnu/sys/time.h" 3 4
+# 1 "/acl/lib_acl/include/stdlib/acl_define.h" 1
+# 9 "/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
+# 1 "/acl/lib_acl/include/stdlib/acl_sys_patch.h" 1
+# 9 "/acl/lib_acl/include/stdlib/acl_sys_patch.h"
+# 1 "/acl/lib_acl/include/stdlib/acl_vstream.h" 1
+# 15 "/acl/lib_acl/include/stdlib/acl_vstream.h"
+# 1 "/usr/include/aarch64-linux-gnu/sys/uio.h" 1 3 4
+# 24 "/usr/include/aarch64-linux-gnu/sys/uio.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/uio_lim.h" 1 3 4
+# 25 "/usr/include/aarch64-linux-gnu/sys/uio.h" 2 3 4
 
-# 52 "/usr/include/x86_64-linux-gnu/sys/time.h" 3 4
 
-# 52 "/usr/include/x86_64-linux-gnu/sys/time.h" 3 4
-struct timezone
-  {
-    int tz_minuteswest;
-    int tz_dsttime;
-  };
 
-typedef struct timezone *__restrict __timezone_ptr_t;
-# 68 "/usr/include/x86_64-linux-gnu/sys/time.h" 3 4
-extern int gettimeofday (struct timeval *__restrict __tv,
-    __timezone_ptr_t __tz) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)));
 
 
 
 
-extern int settimeofday (const struct timeval *__tv,
-    const struct timezone *__tz)
-     __attribute__ ((__nothrow__ , __leaf__));
+# 41 "/usr/include/aarch64-linux-gnu/sys/uio.h" 3 4
 
-
-
-
-
-extern int adjtime (const struct timeval *__delta,
-      struct timeval *__olddelta) __attribute__ ((__nothrow__ , __leaf__));
-
-
-
-
-enum __itimer_which
-  {
-
-    ITIMER_REAL = 0,
-
-
-    ITIMER_VIRTUAL = 1,
-
-
-
-    ITIMER_PROF = 2
-
-  };
-
-
-
-struct itimerval
-  {
-
-    struct timeval it_interval;
-
-    struct timeval it_value;
-  };
-
-
-
-
-
-
-typedef int __itimer_which_t;
-
-
-
-
-extern int getitimer (__itimer_which_t __which,
-        struct itimerval *__value) __attribute__ ((__nothrow__ , __leaf__));
-
-
-
-
-extern int setitimer (__itimer_which_t __which,
-        const struct itimerval *__restrict __new,
-        struct itimerval *__restrict __old) __attribute__ ((__nothrow__ , __leaf__));
-
-
-
-
-extern int utimes (const char *__file, const struct timeval __tvp[2])
-     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)));
-
-
-
-extern int lutimes (const char *__file, const struct timeval __tvp[2])
-     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)));
-
-
-extern int futimes (int __fd, const struct timeval __tvp[2]) __attribute__ ((__nothrow__ , __leaf__));
-# 186 "/usr/include/x86_64-linux-gnu/sys/time.h" 3 4
-
-# 14 "/workspace/acl/lib_acl/include/stdlib/acl_vstream.h" 2
-
-# 1 "/usr/include/x86_64-linux-gnu/sys/uio.h" 1 3 4
-# 24 "/usr/include/x86_64-linux-gnu/sys/uio.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/uio_lim.h" 1 3 4
-# 25 "/usr/include/x86_64-linux-gnu/sys/uio.h" 2 3 4
-
-
-
-
-
-
-
-# 41 "/usr/include/x86_64-linux-gnu/sys/uio.h" 3 4
+# 41 "/usr/include/aarch64-linux-gnu/sys/uio.h" 3 4
 extern ssize_t readv (int __fd, const struct iovec *__iovec, int __count)
-  __attribute__ ((__warn_unused_result__));
-# 52 "/usr/include/x86_64-linux-gnu/sys/uio.h" 3 4
+  __attribute__ ((__warn_unused_result__)) __attribute__ ((__access__ (__read_only__, 2, 3)));
+# 52 "/usr/include/aarch64-linux-gnu/sys/uio.h" 3 4
 extern ssize_t writev (int __fd, const struct iovec *__iovec, int __count)
-  __attribute__ ((__warn_unused_result__));
-# 84 "/usr/include/x86_64-linux-gnu/sys/uio.h" 3 4
+  __attribute__ ((__warn_unused_result__)) __attribute__ ((__access__ (__read_only__, 2, 3)));
+# 86 "/usr/include/aarch64-linux-gnu/sys/uio.h" 3 4
 extern ssize_t preadv (int __fd, const struct iovec *__iovec, int __count, __off64_t __offset) __asm__ ("" "preadv64")
 
-                __attribute__ ((__warn_unused_result__));
+
+  __attribute__ ((__warn_unused_result__)) __attribute__ ((__access__ (__read_only__, 2, 3)));
 extern ssize_t pwritev (int __fd, const struct iovec *__iovec, int __count, __off64_t __offset) __asm__ ("" "pwritev64")
 
-                 __attribute__ ((__warn_unused_result__));
-# 106 "/usr/include/x86_64-linux-gnu/sys/uio.h" 3 4
+
+  __attribute__ ((__warn_unused_result__)) __attribute__ ((__access__ (__read_only__, 2, 3)));
+# 110 "/usr/include/aarch64-linux-gnu/sys/uio.h" 3 4
 extern ssize_t preadv64 (int __fd, const struct iovec *__iovec, int __count,
-    __off64_t __offset) __attribute__ ((__warn_unused_result__));
-# 118 "/usr/include/x86_64-linux-gnu/sys/uio.h" 3 4
+    __off64_t __offset)
+  __attribute__ ((__warn_unused_result__)) __attribute__ ((__access__ (__read_only__, 2, 3)));
+# 123 "/usr/include/aarch64-linux-gnu/sys/uio.h" 3 4
 extern ssize_t pwritev64 (int __fd, const struct iovec *__iovec, int __count,
-     __off64_t __offset) __attribute__ ((__warn_unused_result__));
-# 163 "/usr/include/x86_64-linux-gnu/sys/uio.h" 3 4
+     __off64_t __offset)
+  __attribute__ ((__warn_unused_result__)) __attribute__ ((__access__ (__read_only__, 2, 3)));
+# 174 "/usr/include/aarch64-linux-gnu/sys/uio.h" 3 4
 
-# 16 "/workspace/acl/lib_acl/include/stdlib/acl_vstream.h" 2
-
-
-
-
-
-# 1 "/workspace/acl/lib_acl/include/stdlib/acl_array.h" 1
-# 9 "/workspace/acl/lib_acl/include/stdlib/acl_array.h"
-# 1 "/workspace/acl/lib_acl/include/stdlib/acl_dbuf_pool.h" 1
+# 16 "/acl/lib_acl/include/stdlib/acl_vstream.h" 2
 
 
 
 
 
+# 1 "/acl/lib_acl/include/stdlib/acl_array.h" 1
+# 9 "/acl/lib_acl/include/stdlib/acl_array.h"
+# 1 "/acl/lib_acl/include/stdlib/acl_dbuf_pool.h" 1
 
 
 
-# 8 "/workspace/acl/lib_acl/include/stdlib/acl_dbuf_pool.h"
+
+
+
+
+
+# 8 "/acl/lib_acl/include/stdlib/acl_dbuf_pool.h"
 typedef struct ACL_DBUF_POOL ACL_DBUF_POOL;
 
 
@@ -9273,13 +9278,13 @@ typedef struct ACL_DBUF_POOL ACL_DBUF_POOL;
 
 
  char *acl_dbuf_pool_strdup(ACL_DBUF_POOL *pool, const char *s);
-# 62 "/workspace/acl/lib_acl/include/stdlib/acl_dbuf_pool.h"
+# 62 "/acl/lib_acl/include/stdlib/acl_dbuf_pool.h"
  char *acl_dbuf_pool_strndup(ACL_DBUF_POOL *pool,
  const char *s, size_t len);
-# 72 "/workspace/acl/lib_acl/include/stdlib/acl_dbuf_pool.h"
+# 72 "/acl/lib_acl/include/stdlib/acl_dbuf_pool.h"
  void *acl_dbuf_pool_memdup(ACL_DBUF_POOL *pool,
   const void *addr, size_t len);
-# 82 "/workspace/acl/lib_acl/include/stdlib/acl_dbuf_pool.h"
+# 82 "/acl/lib_acl/include/stdlib/acl_dbuf_pool.h"
  int acl_dbuf_pool_free(ACL_DBUF_POOL *pool, const void *addr);
 
 
@@ -9302,8 +9307,8 @@ typedef struct ACL_DBUF_POOL ACL_DBUF_POOL;
 
 
  void acl_dbuf_pool_test(size_t max);
-# 10 "/workspace/acl/lib_acl/include/stdlib/acl_array.h" 2
-# 1 "/workspace/acl/lib_acl/include/stdlib/acl_iterator.h" 1
+# 10 "/acl/lib_acl/include/stdlib/acl_array.h" 2
+# 1 "/acl/lib_acl/include/stdlib/acl_iterator.h" 1
 
 
 
@@ -9321,7 +9326,7 @@ struct ACL_ITER {
  int i;
  int size;
 };
-# 11 "/workspace/acl/lib_acl/include/stdlib/acl_array.h" 2
+# 11 "/acl/lib_acl/include/stdlib/acl_array.h" 2
 
 
 
@@ -9385,7 +9390,7 @@ struct ACL_ARRAY{
 
 
  void acl_array_free(ACL_ARRAY *a, void (*free_fn)(void *));
-# 82 "/workspace/acl/lib_acl/include/stdlib/acl_array.h"
+# 82 "/acl/lib_acl/include/stdlib/acl_array.h"
  int acl_array_append(ACL_ARRAY *a, void *obj);
 
 
@@ -9395,19 +9400,19 @@ struct ACL_ARRAY{
 
 
  int acl_array_prepend(ACL_ARRAY *a, void *obj);
-# 99 "/workspace/acl/lib_acl/include/stdlib/acl_array.h"
+# 99 "/acl/lib_acl/include/stdlib/acl_array.h"
  int acl_array_pred_insert(ACL_ARRAY *a, int position, void *obj);
-# 108 "/workspace/acl/lib_acl/include/stdlib/acl_array.h"
+# 108 "/acl/lib_acl/include/stdlib/acl_array.h"
  int acl_array_succ_insert(ACL_ARRAY *a, int position, void *obj);
-# 121 "/workspace/acl/lib_acl/include/stdlib/acl_array.h"
+# 121 "/acl/lib_acl/include/stdlib/acl_array.h"
  int acl_array_delete_idx(ACL_ARRAY *a, int position, void (*free_fn)(void *));
-# 132 "/workspace/acl/lib_acl/include/stdlib/acl_array.h"
+# 132 "/acl/lib_acl/include/stdlib/acl_array.h"
  int acl_array_delete(ACL_ARRAY *a, int position, void (*free_fn)(void*));
-# 144 "/workspace/acl/lib_acl/include/stdlib/acl_array.h"
+# 144 "/acl/lib_acl/include/stdlib/acl_array.h"
  int acl_array_delete_obj(ACL_ARRAY *a, void *obj, void (*free_fn)(void *));
-# 155 "/workspace/acl/lib_acl/include/stdlib/acl_array.h"
+# 155 "/acl/lib_acl/include/stdlib/acl_array.h"
  int acl_array_delete_range(ACL_ARRAY *a, int ibegin, int iend, void (*free_fn)(void*));
-# 167 "/workspace/acl/lib_acl/include/stdlib/acl_array.h"
+# 167 "/acl/lib_acl/include/stdlib/acl_array.h"
  int acl_array_mv_idx(ACL_ARRAY *a, int ito, int ifrom, void (*free_fn)(void *) );
 
 
@@ -9431,10 +9436,10 @@ struct ACL_ARRAY{
 
 
  int acl_array_size(const ACL_ARRAY *a);
-# 22 "/workspace/acl/lib_acl/include/stdlib/acl_vstream.h" 2
-# 1 "/workspace/acl/lib_acl/include/stdlib/acl_htable.h" 1
-# 9 "/workspace/acl/lib_acl/include/stdlib/acl_htable.h"
-# 1 "/workspace/acl/lib_acl/include/stdlib/../thread/acl_thread.h" 1
+# 22 "/acl/lib_acl/include/stdlib/acl_vstream.h" 2
+# 1 "/acl/lib_acl/include/stdlib/acl_htable.h" 1
+# 9 "/acl/lib_acl/include/stdlib/acl_htable.h"
+# 1 "/acl/lib_acl/include/stdlib/../thread/acl_thread.h" 1
 
 
 
@@ -9442,7 +9447,7 @@ struct ACL_ARRAY{
 
 
 
-# 1 "/workspace/acl/lib_acl/include/stdlib/../thread/acl_pthread.h" 1
+# 1 "/acl/lib_acl/include/stdlib/../thread/acl_pthread.h" 1
 
 
 
@@ -9450,9 +9455,9 @@ struct ACL_ARRAY{
 
 
 
-# 1 "/workspace/acl/lib_acl/include/stdlib/../thread/../stdlib/acl_define.h" 1
-# 9 "/workspace/acl/lib_acl/include/stdlib/../thread/acl_pthread.h" 2
-# 26 "/workspace/acl/lib_acl/include/stdlib/../thread/acl_pthread.h"
+# 1 "/acl/lib_acl/include/stdlib/../thread/../stdlib/acl_define.h" 1
+# 9 "/acl/lib_acl/include/stdlib/../thread/acl_pthread.h" 2
+# 26 "/acl/lib_acl/include/stdlib/../thread/acl_pthread.h"
 typedef pthread_t acl_pthread_t;
 typedef pthread_attr_t acl_pthread_attr_t;
 typedef pthread_mutex_t acl_pthread_mutex_t;
@@ -9461,7 +9466,7 @@ typedef pthread_mutexattr_t acl_pthread_mutexattr_t;
 typedef pthread_condattr_t acl_pthread_condattr_t;
 typedef pthread_key_t acl_pthread_key_t;
 typedef pthread_once_t acl_pthread_once_t;
-# 217 "/workspace/acl/lib_acl/include/stdlib/../thread/acl_pthread.h"
+# 217 "/acl/lib_acl/include/stdlib/../thread/acl_pthread.h"
  int acl_thread_mutex_lock(acl_pthread_mutex_t *mutex);
  int acl_thread_mutex_unlock(acl_pthread_mutex_t *mutex);
  int acl_thread_mutex_nested(acl_pthread_mutex_t *mutex);
@@ -9480,12 +9485,12 @@ typedef pthread_once_t acl_pthread_once_t;
  void acl_pthread_tls_once_set(acl_pthread_once_t control_once);
  acl_pthread_key_t acl_pthread_tls_key_get(void);
  void acl_pthread_tls_key_set(acl_pthread_key_t key);
-# 9 "/workspace/acl/lib_acl/include/stdlib/../thread/acl_thread.h" 2
-# 1 "/workspace/acl/lib_acl/include/stdlib/../thread/acl_pthread_rwlock.h" 1
-# 51 "/workspace/acl/lib_acl/include/stdlib/../thread/acl_pthread_rwlock.h"
-# 1 "/workspace/acl/lib_acl/include/stdlib/../thread/../thread/acl_pthread.h" 1
-# 52 "/workspace/acl/lib_acl/include/stdlib/../thread/acl_pthread_rwlock.h" 2
-# 68 "/workspace/acl/lib_acl/include/stdlib/../thread/acl_pthread_rwlock.h"
+# 9 "/acl/lib_acl/include/stdlib/../thread/acl_thread.h" 2
+# 1 "/acl/lib_acl/include/stdlib/../thread/acl_pthread_rwlock.h" 1
+# 51 "/acl/lib_acl/include/stdlib/../thread/acl_pthread_rwlock.h"
+# 1 "/acl/lib_acl/include/stdlib/../thread/../thread/acl_pthread.h" 1
+# 52 "/acl/lib_acl/include/stdlib/../thread/acl_pthread_rwlock.h" 2
+# 68 "/acl/lib_acl/include/stdlib/../thread/acl_pthread_rwlock.h"
 struct acl_pthread_rwlock {
  acl_pthread_mutex_t lock;
  int state;
@@ -9517,11 +9522,11 @@ typedef struct acl_pthread_rwlockattr *acl_pthread_rwlockattr_t;
  int acl_pthread_rwlockattr_getpshared(const acl_pthread_rwlockattr_t *, int *);
  int acl_pthread_rwlockattr_setpshared(acl_pthread_rwlockattr_t *, int);
  int acl_pthread_rwlockattr_destroy(acl_pthread_rwlockattr_t *);
-# 10 "/workspace/acl/lib_acl/include/stdlib/../thread/acl_thread.h" 2
-# 1 "/workspace/acl/lib_acl/include/stdlib/../thread/acl_pthread_pool.h" 1
-# 15 "/workspace/acl/lib_acl/include/stdlib/../thread/acl_pthread_pool.h"
+# 10 "/acl/lib_acl/include/stdlib/../thread/acl_thread.h" 2
+# 1 "/acl/lib_acl/include/stdlib/../thread/acl_pthread_pool.h" 1
+# 15 "/acl/lib_acl/include/stdlib/../thread/acl_pthread_pool.h"
 typedef struct acl_pthread_job_t acl_pthread_job_t;
-# 24 "/workspace/acl/lib_acl/include/stdlib/../thread/acl_pthread_pool.h"
+# 24 "/acl/lib_acl/include/stdlib/../thread/acl_pthread_pool.h"
  acl_pthread_job_t *acl_pthread_pool_alloc_job(void (*run_fn)(void*),
   void *run_arg, int fixed);
 
@@ -9564,13 +9569,13 @@ typedef struct acl_pthread_pool_attr_t {
 
  acl_pthread_pool_t *acl_pthread_pool_create(
   const acl_pthread_pool_attr_t *attr);
-# 74 "/workspace/acl/lib_acl/include/stdlib/../thread/acl_pthread_pool.h"
+# 74 "/acl/lib_acl/include/stdlib/../thread/acl_pthread_pool.h"
  int acl_pthread_pool_set_timewait(
   acl_pthread_pool_t *thr_pool, int timewait_sec);
-# 85 "/workspace/acl/lib_acl/include/stdlib/../thread/acl_pthread_pool.h"
+# 85 "/acl/lib_acl/include/stdlib/../thread/acl_pthread_pool.h"
  int acl_pthread_pool_atinit(acl_pthread_pool_t *thr_pool,
   int (*init_fn)(void *), void *init_arg);
-# 95 "/workspace/acl/lib_acl/include/stdlib/../thread/acl_pthread_pool.h"
+# 95 "/acl/lib_acl/include/stdlib/../thread/acl_pthread_pool.h"
  int acl_pthread_pool_atfree(acl_pthread_pool_t *thr_pool,
   void (*free_fn)(void *), void *free_arg);
 
@@ -9633,7 +9638,7 @@ typedef struct acl_pthread_pool_attr_t {
 
 
  void acl_pthread_pool_bat_add_end(acl_pthread_pool_t *thr_pool);
-# 168 "/workspace/acl/lib_acl/include/stdlib/../thread/acl_pthread_pool.h"
+# 168 "/acl/lib_acl/include/stdlib/../thread/acl_pthread_pool.h"
  void acl_pthread_pool_set_poller(acl_pthread_pool_t *thr_pool,
   int (*poller_fn)(void *), void *poller_arg);
 
@@ -9649,7 +9654,7 @@ typedef struct acl_pthread_pool_attr_t {
 
  int acl_pthread_pool_add_dispatch(void *dispatch_arg,
   void (*run_fn)(void *), void *run_arg);
-# 191 "/workspace/acl/lib_acl/include/stdlib/../thread/acl_pthread_pool.h"
+# 191 "/acl/lib_acl/include/stdlib/../thread/acl_pthread_pool.h"
  int acl_pthread_pool_dispatch(void *dispatch_arg,
   void (*run_fn)(void *), void *run_arg);
 
@@ -9748,12 +9753,12 @@ typedef struct acl_pthread_pool_attr_t {
 
  void acl_pthread_pool_attr_set_idle_timeout(
   acl_pthread_pool_attr_t *attr, int idle_timeout);
-# 11 "/workspace/acl/lib_acl/include/stdlib/../thread/acl_thread.h" 2
-# 1 "/workspace/acl/lib_acl/include/stdlib/../thread/acl_sem.h" 1
-# 12 "/workspace/acl/lib_acl/include/stdlib/../thread/acl_thread.h" 2
-# 10 "/workspace/acl/lib_acl/include/stdlib/acl_htable.h" 2
-# 1 "/workspace/acl/lib_acl/include/stdlib/acl_hash.h" 1
-# 16 "/workspace/acl/lib_acl/include/stdlib/acl_hash.h"
+# 11 "/acl/lib_acl/include/stdlib/../thread/acl_thread.h" 2
+# 1 "/acl/lib_acl/include/stdlib/../thread/acl_sem.h" 1
+# 12 "/acl/lib_acl/include/stdlib/../thread/acl_thread.h" 2
+# 10 "/acl/lib_acl/include/stdlib/acl_htable.h" 2
+# 1 "/acl/lib_acl/include/stdlib/acl_hash.h" 1
+# 16 "/acl/lib_acl/include/stdlib/acl_hash.h"
 typedef unsigned (*ACL_HASH_FN)(const void *buf, size_t len);
 
  unsigned short acl_hash_crc16(const void *buf, size_t len);
@@ -9766,9 +9771,9 @@ typedef unsigned (*ACL_HASH_FN)(const void *buf, size_t len);
  unsigned acl_hash_func4(const void *buf, size_t len);
  unsigned acl_hash_func5(const void *buf, size_t len);
  unsigned acl_hash_func6(const void *buf, size_t len);
-# 11 "/workspace/acl/lib_acl/include/stdlib/acl_htable.h" 2
-# 1 "/workspace/acl/lib_acl/include/stdlib/acl_slice.h" 1
-# 20 "/workspace/acl/lib_acl/include/stdlib/acl_slice.h"
+# 11 "/acl/lib_acl/include/stdlib/acl_htable.h" 2
+# 1 "/acl/lib_acl/include/stdlib/acl_slice.h" 1
+# 20 "/acl/lib_acl/include/stdlib/acl_slice.h"
 typedef struct ACL_SLICE_STAT {
  int nslots;
  int islots;
@@ -9783,7 +9788,7 @@ typedef struct ACL_SLICE_STAT {
 } ACL_SLICE_STAT;
 
 typedef struct ACL_SLICE ACL_SLICE;
-# 43 "/workspace/acl/lib_acl/include/stdlib/acl_slice.h"
+# 43 "/acl/lib_acl/include/stdlib/acl_slice.h"
  ACL_SLICE *acl_slice_create(const char *name, int page_size,
  int slice_size, unsigned int flag);
 
@@ -9876,7 +9881,7 @@ typedef struct ACL_SLICE_POOL {
   void *(*realloc_hook)(const char*, int, void*, size_t),
   void (*free_hook)(const char*, int, void*));
  void acl_slice_mem_unhook(void);
-# 12 "/workspace/acl/lib_acl/include/stdlib/acl_htable.h" 2
+# 12 "/acl/lib_acl/include/stdlib/acl_htable.h" 2
 
 
 
@@ -9950,35 +9955,35 @@ typedef struct ACL_HTABLE_ITER {
 
 
  ACL_HTABLE *acl_htable_create(int size, unsigned int flag);
-# 97 "/workspace/acl/lib_acl/include/stdlib/acl_htable.h"
+# 97 "/acl/lib_acl/include/stdlib/acl_htable.h"
  ACL_HTABLE *acl_htable_create3(int size, unsigned int flag,
   ACL_SLICE_POOL *slice);
-# 108 "/workspace/acl/lib_acl/include/stdlib/acl_htable.h"
+# 108 "/acl/lib_acl/include/stdlib/acl_htable.h"
  void acl_htable_ctl(ACL_HTABLE *table, int name, ...);
-# 118 "/workspace/acl/lib_acl/include/stdlib/acl_htable.h"
+# 118 "/acl/lib_acl/include/stdlib/acl_htable.h"
  int acl_htable_errno(ACL_HTABLE *table);
-# 128 "/workspace/acl/lib_acl/include/stdlib/acl_htable.h"
+# 128 "/acl/lib_acl/include/stdlib/acl_htable.h"
  void acl_htable_set_errno(ACL_HTABLE *table, int error);
-# 140 "/workspace/acl/lib_acl/include/stdlib/acl_htable.h"
+# 140 "/acl/lib_acl/include/stdlib/acl_htable.h"
  ACL_HTABLE_INFO *acl_htable_enter(ACL_HTABLE *table,
   const char *key, void *value);
-# 155 "/workspace/acl/lib_acl/include/stdlib/acl_htable.h"
+# 155 "/acl/lib_acl/include/stdlib/acl_htable.h"
  int acl_htable_enter_r(ACL_HTABLE *table, const char *key, void *value,
   void (*callback)(ACL_HTABLE_INFO *ht, void *arg), void *arg);
-# 165 "/workspace/acl/lib_acl/include/stdlib/acl_htable.h"
+# 165 "/acl/lib_acl/include/stdlib/acl_htable.h"
  ACL_HTABLE_INFO *acl_htable_locate(ACL_HTABLE *table, const char *key);
-# 177 "/workspace/acl/lib_acl/include/stdlib/acl_htable.h"
+# 177 "/acl/lib_acl/include/stdlib/acl_htable.h"
  int acl_htable_locate_r(ACL_HTABLE *table, const char *key,
   void (*callback)(ACL_HTABLE_INFO *ht, void *arg), void *arg);
-# 187 "/workspace/acl/lib_acl/include/stdlib/acl_htable.h"
+# 187 "/acl/lib_acl/include/stdlib/acl_htable.h"
  void *acl_htable_find(ACL_HTABLE *table, const char *key);
-# 199 "/workspace/acl/lib_acl/include/stdlib/acl_htable.h"
+# 199 "/acl/lib_acl/include/stdlib/acl_htable.h"
  int acl_htable_find_r(ACL_HTABLE *table, const char *key,
   void (*callback)(void *value, void *arg), void *arg);
-# 210 "/workspace/acl/lib_acl/include/stdlib/acl_htable.h"
+# 210 "/acl/lib_acl/include/stdlib/acl_htable.h"
  int acl_htable_delete(ACL_HTABLE *table, const char *key,
   void (*free_fn) (void *));
-# 221 "/workspace/acl/lib_acl/include/stdlib/acl_htable.h"
+# 221 "/acl/lib_acl/include/stdlib/acl_htable.h"
  void acl_htable_delete_entry(ACL_HTABLE *table, ACL_HTABLE_INFO *ht,
   void (*free_fn) (void *));
 
@@ -9989,9 +9994,9 @@ typedef struct ACL_HTABLE_ITER {
 
 
  void acl_htable_free(ACL_HTABLE *table, void (*free_fn) (void *));
-# 239 "/workspace/acl/lib_acl/include/stdlib/acl_htable.h"
+# 239 "/acl/lib_acl/include/stdlib/acl_htable.h"
  int acl_htable_reset(ACL_HTABLE *table, void (*free_fn) (void *));
-# 248 "/workspace/acl/lib_acl/include/stdlib/acl_htable.h"
+# 248 "/acl/lib_acl/include/stdlib/acl_htable.h"
  void acl_htable_walk(ACL_HTABLE *table,
   void (*walk_fn) (ACL_HTABLE_INFO *, void *), void *arg);
 
@@ -10031,11 +10036,11 @@ typedef struct ACL_HTABLE_ITER {
  const ACL_HTABLE_INFO *acl_htable_iter_tail(
   ACL_HTABLE *table, ACL_HTABLE_ITER *iter);
  const ACL_HTABLE_INFO *acl_htable_iter_prev(ACL_HTABLE_ITER *iter);
-# 23 "/workspace/acl/lib_acl/include/stdlib/acl_vstream.h" 2
-# 1 "/workspace/acl/lib_acl/include/stdlib/acl_vstring.h" 1
-# 10 "/workspace/acl/lib_acl/include/stdlib/acl_vstring.h"
-# 1 "/workspace/acl/lib_acl/include/stdlib/acl_vbuf.h" 1
-# 13 "/workspace/acl/lib_acl/include/stdlib/acl_vbuf.h"
+# 23 "/acl/lib_acl/include/stdlib/acl_vstream.h" 2
+# 1 "/acl/lib_acl/include/stdlib/acl_vstring.h" 1
+# 10 "/acl/lib_acl/include/stdlib/acl_vstring.h"
+# 1 "/acl/lib_acl/include/stdlib/acl_vbuf.h" 1
+# 13 "/acl/lib_acl/include/stdlib/acl_vbuf.h"
 typedef struct ACL_VBUF ACL_VBUF;
 typedef int (*ACL_VBUF_GET_READY_FN) (ACL_VBUF *);
 typedef int (*ACL_VBUF_PUT_READY_FN) (ACL_VBUF *);
@@ -10063,12 +10068,12 @@ struct ACL_VBUF {
 
 
 };
-# 73 "/workspace/acl/lib_acl/include/stdlib/acl_vbuf.h"
+# 73 "/acl/lib_acl/include/stdlib/acl_vbuf.h"
  int acl_vbuf_space(struct ACL_VBUF *bp, ssize_t len);
-# 83 "/workspace/acl/lib_acl/include/stdlib/acl_vbuf.h"
+# 83 "/acl/lib_acl/include/stdlib/acl_vbuf.h"
  int acl_vbuf_put(ACL_VBUF *, int);
  int acl_vbuf_write(ACL_VBUF *, const char *, int);
-# 11 "/workspace/acl/lib_acl/include/stdlib/acl_vstring.h" 2
+# 11 "/acl/lib_acl/include/stdlib/acl_vstring.h" 2
 
 
 
@@ -10077,7 +10082,7 @@ typedef struct ACL_VSTRING {
  ACL_VBUF vbuf;
  ssize_t maxlen;
 } ACL_VSTRING;
-# 27 "/workspace/acl/lib_acl/include/stdlib/acl_vstring.h"
+# 27 "/acl/lib_acl/include/stdlib/acl_vstring.h"
  void acl_vstring_init(ACL_VSTRING *vp, size_t len);
 
 
@@ -10092,7 +10097,7 @@ typedef struct ACL_VSTRING {
 
 
  ACL_VSTRING *acl_vstring_alloc(size_t len);
-# 49 "/workspace/acl/lib_acl/include/stdlib/acl_vstring.h"
+# 49 "/acl/lib_acl/include/stdlib/acl_vstring.h"
  ACL_VSTRING *acl_vstring_slice_alloc(ACL_SLICE_POOL *slice, size_t len);
 
 
@@ -10102,10 +10107,10 @@ typedef struct ACL_VSTRING {
 
 
  ACL_VSTRING *acl_vstring_dbuf_alloc(ACL_DBUF_POOL *dbuf, size_t len);
-# 66 "/workspace/acl/lib_acl/include/stdlib/acl_vstring.h"
+# 66 "/acl/lib_acl/include/stdlib/acl_vstring.h"
  ACL_VSTRING *acl_vstring_mmap_alloc(int fd,
  size_t max_len, size_t init_len);
-# 77 "/workspace/acl/lib_acl/include/stdlib/acl_vstring.h"
+# 77 "/acl/lib_acl/include/stdlib/acl_vstring.h"
  ACL_VSTRING *acl_vstring_mmap_alloc2(int fd,
  size_t max_len, size_t init_len, size_t offset);
 
@@ -10116,7 +10121,7 @@ typedef struct ACL_VSTRING {
 
 
  void acl_vstring_ctl(ACL_VSTRING *vp,...);
-# 97 "/workspace/acl/lib_acl/include/stdlib/acl_vstring.h"
+# 97 "/acl/lib_acl/include/stdlib/acl_vstring.h"
  ACL_VSTRING *acl_vstring_truncate(ACL_VSTRING *vp, size_t len);
 
 
@@ -10132,7 +10137,7 @@ typedef struct ACL_VSTRING {
 
 
  ACL_VSTRING *acl_vstring_strcpy(ACL_VSTRING *vp, const char *src);
-# 120 "/workspace/acl/lib_acl/include/stdlib/acl_vstring.h"
+# 120 "/acl/lib_acl/include/stdlib/acl_vstring.h"
  ACL_VSTRING *acl_vstring_strncpy(ACL_VSTRING *vp,
   const char *src, size_t len);
 
@@ -10143,41 +10148,41 @@ typedef struct ACL_VSTRING {
 
 
  ACL_VSTRING *acl_vstring_strcat(ACL_VSTRING *vp, const char *src);
-# 138 "/workspace/acl/lib_acl/include/stdlib/acl_vstring.h"
+# 138 "/acl/lib_acl/include/stdlib/acl_vstring.h"
  ACL_VSTRING *acl_vstring_strncat(ACL_VSTRING *vp,
   const char *src, size_t len);
-# 148 "/workspace/acl/lib_acl/include/stdlib/acl_vstring.h"
+# 148 "/acl/lib_acl/include/stdlib/acl_vstring.h"
  ACL_VSTRING *acl_vstring_memcpy(ACL_VSTRING *vp,
   const char *src, size_t len);
-# 159 "/workspace/acl/lib_acl/include/stdlib/acl_vstring.h"
+# 159 "/acl/lib_acl/include/stdlib/acl_vstring.h"
  ACL_VSTRING *acl_vstring_memmove(ACL_VSTRING *vp,
   const char *src, size_t len);
-# 169 "/workspace/acl/lib_acl/include/stdlib/acl_vstring.h"
+# 169 "/acl/lib_acl/include/stdlib/acl_vstring.h"
  ACL_VSTRING *acl_vstring_memcat(ACL_VSTRING *vp,
   const char *src, size_t len);
-# 179 "/workspace/acl/lib_acl/include/stdlib/acl_vstring.h"
+# 179 "/acl/lib_acl/include/stdlib/acl_vstring.h"
  char *acl_vstring_memchr(ACL_VSTRING *vp, int ch);
-# 188 "/workspace/acl/lib_acl/include/stdlib/acl_vstring.h"
+# 188 "/acl/lib_acl/include/stdlib/acl_vstring.h"
  char *acl_vstring_strstr(ACL_VSTRING *vp, const char *needle);
-# 197 "/workspace/acl/lib_acl/include/stdlib/acl_vstring.h"
+# 197 "/acl/lib_acl/include/stdlib/acl_vstring.h"
  char *acl_vstring_strcasestr(ACL_VSTRING *vp, const char *needle);
-# 206 "/workspace/acl/lib_acl/include/stdlib/acl_vstring.h"
+# 206 "/acl/lib_acl/include/stdlib/acl_vstring.h"
  char *acl_vstring_rstrstr(ACL_VSTRING *vp, const char *needle);
-# 215 "/workspace/acl/lib_acl/include/stdlib/acl_vstring.h"
+# 215 "/acl/lib_acl/include/stdlib/acl_vstring.h"
  char *acl_vstring_rstrcasestr(ACL_VSTRING *vp, const char *needle);
-# 225 "/workspace/acl/lib_acl/include/stdlib/acl_vstring.h"
+# 225 "/acl/lib_acl/include/stdlib/acl_vstring.h"
  ACL_VSTRING *acl_vstring_insert(ACL_VSTRING *vp, size_t start,
   const char *buf, size_t len);
-# 235 "/workspace/acl/lib_acl/include/stdlib/acl_vstring.h"
+# 235 "/acl/lib_acl/include/stdlib/acl_vstring.h"
  ACL_VSTRING *acl_vstring_prepend(ACL_VSTRING *vp,
   const char *buf, size_t len);
-# 245 "/workspace/acl/lib_acl/include/stdlib/acl_vstring.h"
+# 245 "/acl/lib_acl/include/stdlib/acl_vstring.h"
  ACL_VSTRING *__attribute__((__format__ (__printf__, (2), (3)))) acl_vstring_sprintf(ACL_VSTRING *vp,
   const char *format,...);
-# 255 "/workspace/acl/lib_acl/include/stdlib/acl_vstring.h"
+# 255 "/acl/lib_acl/include/stdlib/acl_vstring.h"
  ACL_VSTRING *__attribute__((__format__ (__printf__, (2), (3)))) acl_vstring_sprintf_append(
   ACL_VSTRING *vp, const char *format,...);
-# 265 "/workspace/acl/lib_acl/include/stdlib/acl_vstring.h"
+# 265 "/acl/lib_acl/include/stdlib/acl_vstring.h"
  char *acl_vstring_export(ACL_VSTRING *vp);
 
 
@@ -10186,7 +10191,7 @@ typedef struct ACL_VSTRING {
 
 
  ACL_VSTRING *acl_vstring_import(char *str);
-# 284 "/workspace/acl/lib_acl/include/stdlib/acl_vstring.h"
+# 284 "/acl/lib_acl/include/stdlib/acl_vstring.h"
  void acl_vstring_glue(ACL_VSTRING *vp, void *buf, size_t len);
 
 
@@ -10196,26 +10201,26 @@ typedef struct ACL_VSTRING {
 
 
  char acl_vstring_charat(ACL_VSTRING *vp, size_t len);
-# 302 "/workspace/acl/lib_acl/include/stdlib/acl_vstring.h"
+# 302 "/acl/lib_acl/include/stdlib/acl_vstring.h"
  ACL_VSTRING *acl_vstring_vsprintf(ACL_VSTRING *vp,
   const char *format, va_list ap);
-# 312 "/workspace/acl/lib_acl/include/stdlib/acl_vstring.h"
+# 312 "/acl/lib_acl/include/stdlib/acl_vstring.h"
  ACL_VSTRING *acl_vstring_vsprintf_append(ACL_VSTRING *vp,
   const char *format, va_list ap);
-# 322 "/workspace/acl/lib_acl/include/stdlib/acl_vstring.h"
+# 322 "/acl/lib_acl/include/stdlib/acl_vstring.h"
  ACL_VSTRING *__attribute__((__format__ (__printf__, (2), (3)))) acl_vstring_sprintf_prepend(
   ACL_VSTRING *vp, const char *format, ...);
-# 336 "/workspace/acl/lib_acl/include/stdlib/acl_vstring.h"
+# 336 "/acl/lib_acl/include/stdlib/acl_vstring.h"
  const ACL_VSTRING *acl_buffer_gets_nonl(ACL_VSTRING *vp,
   const char **src, size_t dlen);
-# 350 "/workspace/acl/lib_acl/include/stdlib/acl_vstring.h"
+# 350 "/acl/lib_acl/include/stdlib/acl_vstring.h"
  const ACL_VSTRING *acl_buffer_gets(ACL_VSTRING *vp,
   const char **src, size_t dlen);
-# 433 "/workspace/acl/lib_acl/include/stdlib/acl_vstring.h"
+# 433 "/acl/lib_acl/include/stdlib/acl_vstring.h"
  int acl_vstring_space(ACL_VBUF *bp, ssize_t len);
  int acl_vstring_put_ready(ACL_VBUF *bp);
-# 24 "/workspace/acl/lib_acl/include/stdlib/acl_vstream.h" 2
-# 42 "/workspace/acl/lib_acl/include/stdlib/acl_vstream.h"
+# 24 "/acl/lib_acl/include/stdlib/acl_vstream.h" 2
+# 42 "/acl/lib_acl/include/stdlib/acl_vstream.h"
 typedef struct ACL_VSTREAM ACL_VSTREAM;
 
 typedef int (*ACL_VSTREAM_RD_FN)(int fd, void *buf, size_t size,
@@ -10248,7 +10253,7 @@ struct ACL_VSTREAM {
 
  int is_nonblock;
  int type;
-# 84 "/workspace/acl/lib_acl/include/stdlib/acl_vstream.h"
+# 84 "/acl/lib_acl/include/stdlib/acl_vstream.h"
  acl_off_t offset;
  acl_off_t sys_offset;
 
@@ -10270,7 +10275,7 @@ struct ACL_VSTREAM {
  void *fdp;
 
  unsigned int flag;
-# 152 "/workspace/acl/lib_acl/include/stdlib/acl_vstream.h"
+# 152 "/acl/lib_acl/include/stdlib/acl_vstream.h"
  int errnum;
  int rw_timeout;
  char *addr_local;
@@ -10302,7 +10307,7 @@ struct ACL_VSTREAM {
  int (*fclose_fn)(int);
 
  unsigned int oflags;
-# 191 "/workspace/acl/lib_acl/include/stdlib/acl_vstream.h"
+# 191 "/acl/lib_acl/include/stdlib/acl_vstream.h"
  unsigned int omode;
 
  int nrefer;
@@ -10318,7 +10323,7 @@ struct ACL_VSTREAM {
 };
 
 extern ACL_VSTREAM acl_vstream_fstd[];
-# 215 "/workspace/acl/lib_acl/include/stdlib/acl_vstream.h"
+# 215 "/acl/lib_acl/include/stdlib/acl_vstream.h"
  void acl_vstream_init(void);
 
 
@@ -10328,7 +10333,7 @@ extern ACL_VSTREAM acl_vstream_fstd[];
 
 
  int acl_vstream_peekfd(ACL_VSTREAM *fp);
-# 232 "/workspace/acl/lib_acl/include/stdlib/acl_vstream.h"
+# 232 "/acl/lib_acl/include/stdlib/acl_vstream.h"
  ACL_VSTREAM *acl_vstream_clone(const ACL_VSTREAM *stream_src);
 
 
@@ -10338,12 +10343,12 @@ extern ACL_VSTREAM acl_vstream_fstd[];
 
 
  int acl_vstream_set_fdtype(ACL_VSTREAM *fp, int type);
-# 252 "/workspace/acl/lib_acl/include/stdlib/acl_vstream.h"
+# 252 "/acl/lib_acl/include/stdlib/acl_vstream.h"
  ACL_VSTREAM *acl_vstream_fhopen(int fh, unsigned int oflags);
-# 268 "/workspace/acl/lib_acl/include/stdlib/acl_vstream.h"
+# 268 "/acl/lib_acl/include/stdlib/acl_vstream.h"
  ACL_VSTREAM *acl_vstream_fdopen(int fd, unsigned int oflags,
   size_t buflen, int rw_timeout, int fdtype);
-# 282 "/workspace/acl/lib_acl/include/stdlib/acl_vstream.h"
+# 282 "/acl/lib_acl/include/stdlib/acl_vstream.h"
  ACL_VSTREAM *acl_vstream_fopen(const char *path, unsigned int oflags,
   int mode, size_t buflen);
 
@@ -10354,7 +10359,7 @@ extern ACL_VSTREAM acl_vstream_fstd[];
 
 
  char *acl_vstream_loadfile(const char *path);
-# 301 "/workspace/acl/lib_acl/include/stdlib/acl_vstream.h"
+# 301 "/acl/lib_acl/include/stdlib/acl_vstream.h"
  char *acl_vstream_loadfile2(const char *path, ssize_t *size);
 
 
@@ -10364,9 +10369,9 @@ extern ACL_VSTREAM acl_vstream_fstd[];
 
 
  void acl_vstream_ctl(ACL_VSTREAM *fp, int name,...);
-# 329 "/workspace/acl/lib_acl/include/stdlib/acl_vstream.h"
+# 329 "/acl/lib_acl/include/stdlib/acl_vstream.h"
  acl_off_t acl_vstream_fseek(ACL_VSTREAM *fp, acl_off_t offset, int whence);
-# 340 "/workspace/acl/lib_acl/include/stdlib/acl_vstream.h"
+# 340 "/acl/lib_acl/include/stdlib/acl_vstream.h"
  acl_off_t acl_vstream_fseek2(ACL_VSTREAM *fp, acl_off_t offset, int whence);
 
 
@@ -10414,36 +10419,36 @@ extern ACL_VSTREAM acl_vstream_fstd[];
 
 
  int acl_vstream_getc(ACL_VSTREAM *fp);
-# 397 "/workspace/acl/lib_acl/include/stdlib/acl_vstream.h"
+# 397 "/acl/lib_acl/include/stdlib/acl_vstream.h"
  int acl_vstream_nonb_readn(ACL_VSTREAM *fp, char *buf, int size);
-# 407 "/workspace/acl/lib_acl/include/stdlib/acl_vstream.h"
+# 407 "/acl/lib_acl/include/stdlib/acl_vstream.h"
  int acl_vstream_probe_status(ACL_VSTREAM *fp);
-# 416 "/workspace/acl/lib_acl/include/stdlib/acl_vstream.h"
+# 416 "/acl/lib_acl/include/stdlib/acl_vstream.h"
  int acl_vstream_ungetc(ACL_VSTREAM *fp, int ch);
-# 426 "/workspace/acl/lib_acl/include/stdlib/acl_vstream.h"
+# 426 "/acl/lib_acl/include/stdlib/acl_vstream.h"
  int acl_vstream_unread(ACL_VSTREAM *fp, const void *ptr, size_t length);
-# 440 "/workspace/acl/lib_acl/include/stdlib/acl_vstream.h"
+# 440 "/acl/lib_acl/include/stdlib/acl_vstream.h"
  int acl_vstream_gets(ACL_VSTREAM *fp, void *vptr, size_t maxlen);
-# 453 "/workspace/acl/lib_acl/include/stdlib/acl_vstream.h"
+# 453 "/acl/lib_acl/include/stdlib/acl_vstream.h"
  int acl_vstream_gets_nonl(ACL_VSTREAM *fp, void *vptr, size_t maxlen);
-# 466 "/workspace/acl/lib_acl/include/stdlib/acl_vstream.h"
+# 466 "/acl/lib_acl/include/stdlib/acl_vstream.h"
  int acl_vstream_readtags(ACL_VSTREAM *fp, void *vptr, size_t maxlen,
   const char *tag, size_t taglen);
-# 478 "/workspace/acl/lib_acl/include/stdlib/acl_vstream.h"
+# 478 "/acl/lib_acl/include/stdlib/acl_vstream.h"
  int acl_vstream_readn(ACL_VSTREAM *fp, void *vptr, size_t maxlen);
-# 488 "/workspace/acl/lib_acl/include/stdlib/acl_vstream.h"
+# 488 "/acl/lib_acl/include/stdlib/acl_vstream.h"
  int acl_vstream_bfcp_some(ACL_VSTREAM *fp, void *vptr, size_t maxlen);
-# 503 "/workspace/acl/lib_acl/include/stdlib/acl_vstream.h"
+# 503 "/acl/lib_acl/include/stdlib/acl_vstream.h"
  int acl_vstream_read(ACL_VSTREAM *fp, void *vptr, size_t maxlen);
-# 520 "/workspace/acl/lib_acl/include/stdlib/acl_vstream.h"
+# 520 "/acl/lib_acl/include/stdlib/acl_vstream.h"
  int acl_vstream_gets_peek(ACL_VSTREAM *fp, ACL_VSTRING *buf, int *ready);
-# 538 "/workspace/acl/lib_acl/include/stdlib/acl_vstream.h"
+# 538 "/acl/lib_acl/include/stdlib/acl_vstream.h"
  int acl_vstream_gets_nonl_peek(ACL_VSTREAM *fp, ACL_VSTRING *buf, int *ready);
-# 553 "/workspace/acl/lib_acl/include/stdlib/acl_vstream.h"
+# 553 "/acl/lib_acl/include/stdlib/acl_vstream.h"
  int acl_vstream_readn_peek(ACL_VSTREAM *fp, ACL_VSTRING *buf, int cnt, int *ready);
-# 564 "/workspace/acl/lib_acl/include/stdlib/acl_vstream.h"
+# 564 "/acl/lib_acl/include/stdlib/acl_vstream.h"
  int acl_vstream_read_peek(ACL_VSTREAM *fp, ACL_VSTRING *buf);
-# 576 "/workspace/acl/lib_acl/include/stdlib/acl_vstream.h"
+# 576 "/acl/lib_acl/include/stdlib/acl_vstream.h"
  int acl_vstream_read_peek3(ACL_VSTREAM *fp, void *buf, size_t size);
 
 
@@ -10452,7 +10457,7 @@ extern ACL_VSTREAM acl_vstream_fstd[];
 
 
  int acl_vstream_can_read(ACL_VSTREAM *fp);
-# 592 "/workspace/acl/lib_acl/include/stdlib/acl_vstream.h"
+# 592 "/acl/lib_acl/include/stdlib/acl_vstream.h"
  int acl_vstream_readable(ACL_VSTREAM *fp);
 
 
@@ -10474,11 +10479,11 @@ extern ACL_VSTREAM acl_vstream_fstd[];
 
 
  int acl_vstream_fflush(ACL_VSTREAM *fp);
-# 621 "/workspace/acl/lib_acl/include/stdlib/acl_vstream.h"
+# 621 "/acl/lib_acl/include/stdlib/acl_vstream.h"
  int acl_vstream_buffed_writen(ACL_VSTREAM *fp, const void *vptr, size_t dlen);
-# 632 "/workspace/acl/lib_acl/include/stdlib/acl_vstream.h"
+# 632 "/acl/lib_acl/include/stdlib/acl_vstream.h"
  int acl_vstream_buffed_vfprintf(ACL_VSTREAM *fp, const char *fmt, va_list ap);
-# 642 "/workspace/acl/lib_acl/include/stdlib/acl_vstream.h"
+# 642 "/acl/lib_acl/include/stdlib/acl_vstream.h"
  int __attribute__((__format__ (__printf__, (2), (3)))) acl_vstream_buffed_fprintf(ACL_VSTREAM *fp,
  const char *fmt, ...);
 
@@ -10503,15 +10508,15 @@ extern ACL_VSTREAM acl_vstream_fstd[];
 
 
  int acl_vstream_buffed_puts(const char *s);
-# 675 "/workspace/acl/lib_acl/include/stdlib/acl_vstream.h"
+# 675 "/acl/lib_acl/include/stdlib/acl_vstream.h"
  int acl_vstream_write(ACL_VSTREAM *fp, const void *vptr, int dlen);
-# 684 "/workspace/acl/lib_acl/include/stdlib/acl_vstream.h"
+# 684 "/acl/lib_acl/include/stdlib/acl_vstream.h"
  int acl_vstream_writev(ACL_VSTREAM *fp, const struct iovec *vector, int count);
-# 693 "/workspace/acl/lib_acl/include/stdlib/acl_vstream.h"
+# 693 "/acl/lib_acl/include/stdlib/acl_vstream.h"
  int acl_vstream_writevn(ACL_VSTREAM *fp, const struct iovec *vector, int count);
-# 703 "/workspace/acl/lib_acl/include/stdlib/acl_vstream.h"
+# 703 "/acl/lib_acl/include/stdlib/acl_vstream.h"
  int acl_vstream_vfprintf(ACL_VSTREAM *fp, const char *fmt, va_list ap);
-# 713 "/workspace/acl/lib_acl/include/stdlib/acl_vstream.h"
+# 713 "/acl/lib_acl/include/stdlib/acl_vstream.h"
  int __attribute__((__format__ (__printf__, (2), (3)))) acl_vstream_fprintf(ACL_VSTREAM *fp,
  const char *fmt, ...);
 
@@ -10536,7 +10541,7 @@ extern ACL_VSTREAM acl_vstream_fstd[];
 
 
  int acl_vstream_puts(const char *s);
-# 746 "/workspace/acl/lib_acl/include/stdlib/acl_vstream.h"
+# 746 "/acl/lib_acl/include/stdlib/acl_vstream.h"
  int acl_vstream_writen(ACL_VSTREAM *fp, const void *vptr, size_t dlen);
 
 
@@ -10594,9 +10599,9 @@ extern ACL_VSTREAM acl_vstream_fstd[];
 
 
  const char *acl_vstream_strerror(ACL_VSTREAM *fp);
-# 856 "/workspace/acl/lib_acl/include/stdlib/acl_vstream.h"
+# 856 "/acl/lib_acl/include/stdlib/acl_vstream.h"
  void acl_vstream_set_path(ACL_VSTREAM *fp, const char *path);
-# 868 "/workspace/acl/lib_acl/include/stdlib/acl_vstream.h"
+# 868 "/acl/lib_acl/include/stdlib/acl_vstream.h"
  void acl_vstream_set_peer(ACL_VSTREAM *fp, const char *addr);
 
 
@@ -10606,7 +10611,7 @@ extern ACL_VSTREAM acl_vstream_fstd[];
 
 
  int acl_vstream_set_peer_addr(ACL_VSTREAM *fp, const struct sockaddr *sa);
-# 888 "/workspace/acl/lib_acl/include/stdlib/acl_vstream.h"
+# 888 "/acl/lib_acl/include/stdlib/acl_vstream.h"
  void acl_vstream_set_local(ACL_VSTREAM *fp, const char *addr);
 
 
@@ -10625,8 +10630,8 @@ extern ACL_VSTREAM acl_vstream_fstd[];
  void acl_socket_write_hook(ACL_VSTREAM_WR_FN write_fn);
  void acl_socket_writev_hook(ACL_VSTREAM_WV_FN writev_fn);
  void acl_socket_close_hook(int (*close_fn)(int));
-# 10 "/workspace/acl/lib_acl/include/stdlib/acl_sys_patch.h" 2
-# 56 "/workspace/acl/lib_acl/include/stdlib/acl_sys_patch.h"
+# 10 "/acl/lib_acl/include/stdlib/acl_sys_patch.h" 2
+# 56 "/acl/lib_acl/include/stdlib/acl_sys_patch.h"
  int acl_socket_init(void);
 
 
@@ -10641,15 +10646,15 @@ extern ACL_VSTREAM acl_vstream_fstd[];
 
 
  int acl_socket_close(int fd);
-# 88 "/workspace/acl/lib_acl/include/stdlib/acl_sys_patch.h"
+# 88 "/acl/lib_acl/include/stdlib/acl_sys_patch.h"
  int acl_socket_shutdown(int fd, int how);
-# 101 "/workspace/acl/lib_acl/include/stdlib/acl_sys_patch.h"
+# 101 "/acl/lib_acl/include/stdlib/acl_sys_patch.h"
  int acl_socket_read(int fd, void *buf, size_t size,
  int timeout, ACL_VSTREAM *fp, void *arg);
-# 115 "/workspace/acl/lib_acl/include/stdlib/acl_sys_patch.h"
+# 115 "/acl/lib_acl/include/stdlib/acl_sys_patch.h"
  int acl_socket_write(int fd, const void *buf,
  size_t size, int timeout, ACL_VSTREAM *fp, void *arg);
-# 129 "/workspace/acl/lib_acl/include/stdlib/acl_sys_patch.h"
+# 129 "/acl/lib_acl/include/stdlib/acl_sys_patch.h"
  int acl_socket_writev(int fd, const struct iovec *vec,
  int count, int timeout, ACL_VSTREAM *fp, void *arg);
 
@@ -10659,7 +10664,7 @@ extern ACL_VSTREAM acl_vstream_fstd[];
 
 
  int acl_socket_alive(int fd);
-# 147 "/workspace/acl/lib_acl/include/stdlib/acl_sys_patch.h"
+# 147 "/acl/lib_acl/include/stdlib/acl_sys_patch.h"
  int acl_file_open(const char *filepath, int flags, int mode);
 
 
@@ -10668,18 +10673,18 @@ extern ACL_VSTREAM acl_vstream_fstd[];
 
 
  int acl_file_close(int fh);
-# 163 "/workspace/acl/lib_acl/include/stdlib/acl_sys_patch.h"
+# 163 "/acl/lib_acl/include/stdlib/acl_sys_patch.h"
  acl_off_t acl_lseek(int fh, acl_off_t offset, int whence);
-# 175 "/workspace/acl/lib_acl/include/stdlib/acl_sys_patch.h"
+# 175 "/acl/lib_acl/include/stdlib/acl_sys_patch.h"
  int acl_file_read(int fh, void *buf, size_t size,
  int timeout, ACL_VSTREAM *fp, void *arg);
-# 188 "/workspace/acl/lib_acl/include/stdlib/acl_sys_patch.h"
+# 188 "/acl/lib_acl/include/stdlib/acl_sys_patch.h"
  int acl_file_write(int fh, const void *buf, size_t size,
  int timeout, ACL_VSTREAM *fp, void *arg);
-# 201 "/workspace/acl/lib_acl/include/stdlib/acl_sys_patch.h"
+# 201 "/acl/lib_acl/include/stdlib/acl_sys_patch.h"
  int acl_file_writev(int fh, const struct iovec *vec,
  int count, int timeout, ACL_VSTREAM *fp, void *arg);
-# 211 "/workspace/acl/lib_acl/include/stdlib/acl_sys_patch.h"
+# 211 "/acl/lib_acl/include/stdlib/acl_sys_patch.h"
  int acl_file_fflush(int fh, ACL_VSTREAM *fp, void *arg);
 
 
@@ -10688,12 +10693,12 @@ extern ACL_VSTREAM acl_vstream_fstd[];
 
 
  long long int acl_file_size(const char *filename);
-# 227 "/workspace/acl/lib_acl/include/stdlib/acl_sys_patch.h"
+# 227 "/acl/lib_acl/include/stdlib/acl_sys_patch.h"
  long long int acl_file_fsize(int fh, ACL_VSTREAM *fp, void *arg);
-# 237 "/workspace/acl/lib_acl/include/stdlib/acl_sys_patch.h"
+# 237 "/acl/lib_acl/include/stdlib/acl_sys_patch.h"
  int acl_sane_socketpair(int domain, int type, int protocol,
   int result[2]);
-# 247 "/workspace/acl/lib_acl/include/stdlib/acl_sys_patch.h"
+# 247 "/acl/lib_acl/include/stdlib/acl_sys_patch.h"
 typedef int (*acl_close_socket_fn)(int);
 typedef ssize_t (*acl_read_fn)(int, void *, size_t);
 typedef ssize_t (*acl_recv_fn)(int, void *, size_t, int);
@@ -10711,10 +10716,10 @@ typedef ssize_t (*acl_send_fn)(int, const void *, size_t, int);
  void acl_set_close_socket(acl_close_socket_fn fn);
  void acl_set_recv(acl_recv_fn fn);
  void acl_set_send(acl_send_fn fn);
-# 10 "/workspace/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
+# 10 "/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
 
-# 1 "/workspace/acl/lib_acl/include/stdlib/acl_argv.h" 1
-# 15 "/workspace/acl/lib_acl/include/stdlib/acl_argv.h"
+# 1 "/acl/lib_acl/include/stdlib/acl_argv.h" 1
+# 15 "/acl/lib_acl/include/stdlib/acl_argv.h"
 typedef struct ACL_ARGV {
  int len;
  int argc;
@@ -10762,7 +10767,7 @@ typedef struct ACL_ARGV {
 
 
  void acl_argv_add(ACL_ARGV *argvp,...);
-# 70 "/workspace/acl/lib_acl/include/stdlib/acl_argv.h"
+# 70 "/acl/lib_acl/include/stdlib/acl_argv.h"
  int acl_argv_set(ACL_ARGV *argvp, int idx, const char *value);
 
 
@@ -10813,31 +10818,31 @@ typedef struct ACL_ARGV {
 
 
  int acl_argv_size(ACL_ARGV *argvp);
-# 128 "/workspace/acl/lib_acl/include/stdlib/acl_argv.h"
+# 128 "/acl/lib_acl/include/stdlib/acl_argv.h"
  ACL_ARGV *acl_argv_split(const char *str, const char *delim);
-# 139 "/workspace/acl/lib_acl/include/stdlib/acl_argv.h"
+# 139 "/acl/lib_acl/include/stdlib/acl_argv.h"
  ACL_ARGV *acl_argv_split3(const char *str, const char *delim,
  ACL_DBUF_POOL *dbuf);
-# 149 "/workspace/acl/lib_acl/include/stdlib/acl_argv.h"
+# 149 "/acl/lib_acl/include/stdlib/acl_argv.h"
  ACL_ARGV *acl_argv_splitn(const char *str, const char *delim, size_t n);
-# 161 "/workspace/acl/lib_acl/include/stdlib/acl_argv.h"
+# 161 "/acl/lib_acl/include/stdlib/acl_argv.h"
  ACL_ARGV *acl_argv_splitn4(const char *str, const char *delim,
  size_t n, ACL_DBUF_POOL *dbuf);
-# 171 "/workspace/acl/lib_acl/include/stdlib/acl_argv.h"
+# 171 "/acl/lib_acl/include/stdlib/acl_argv.h"
  ACL_ARGV *acl_argv_split_append(ACL_ARGV *argvp, const char *str,
  const char *delim);
-# 182 "/workspace/acl/lib_acl/include/stdlib/acl_argv.h"
+# 182 "/acl/lib_acl/include/stdlib/acl_argv.h"
  ACL_ARGV *acl_argv_splitn_append(ACL_ARGV *argvp, const char *str,
  const char *delim, size_t n);
-# 192 "/workspace/acl/lib_acl/include/stdlib/acl_argv.h"
+# 192 "/acl/lib_acl/include/stdlib/acl_argv.h"
  ACL_ARGV *acl_argv_quote_split(const char *str, const char *delim);
-# 203 "/workspace/acl/lib_acl/include/stdlib/acl_argv.h"
+# 203 "/acl/lib_acl/include/stdlib/acl_argv.h"
  ACL_ARGV *acl_argv_quote_split4(const char *str, const char *delim,
  ACL_DBUF_POOL *dbuf);
-# 12 "/workspace/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
+# 12 "/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
 
-# 1 "/workspace/acl/lib_acl/include/stdlib/acl_stack.h" 1
-# 13 "/workspace/acl/lib_acl/include/stdlib/acl_stack.h"
+# 1 "/acl/lib_acl/include/stdlib/acl_stack.h" 1
+# 13 "/acl/lib_acl/include/stdlib/acl_stack.h"
 typedef struct ACL_STACK ACL_STACK;
 
 
@@ -10905,7 +10910,7 @@ struct ACL_STACK {
 
 
  void acl_stack_append(ACL_STACK *s, void *obj);
-# 88 "/workspace/acl/lib_acl/include/stdlib/acl_stack.h"
+# 88 "/acl/lib_acl/include/stdlib/acl_stack.h"
  void acl_stack_prepend(ACL_STACK *s, void *obj);
 
 
@@ -10952,10 +10957,10 @@ struct ACL_STACK {
 
 
  void *acl_stack_top(ACL_STACK *s);
-# 14 "/workspace/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
+# 14 "/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
 
-# 1 "/workspace/acl/lib_acl/include/stdlib/acl_binhash.h" 1
-# 13 "/workspace/acl/lib_acl/include/stdlib/acl_binhash.h"
+# 1 "/acl/lib_acl/include/stdlib/acl_binhash.h" 1
+# 13 "/acl/lib_acl/include/stdlib/acl_binhash.h"
 typedef struct ACL_BINHASH ACL_BINHASH;
 typedef struct ACL_BINHASH_INFO ACL_BINHASH_INFO;
 
@@ -11022,13 +11027,13 @@ typedef struct ACL_BINHASH_ITER {
 
 
  ACL_BINHASH *acl_binhash_create(int size, unsigned int flag);
-# 93 "/workspace/acl/lib_acl/include/stdlib/acl_binhash.h"
+# 93 "/acl/lib_acl/include/stdlib/acl_binhash.h"
  ACL_BINHASH_INFO *acl_binhash_enter(ACL_BINHASH *table, const void *key, int key_len, void *value);
-# 102 "/workspace/acl/lib_acl/include/stdlib/acl_binhash.h"
+# 102 "/acl/lib_acl/include/stdlib/acl_binhash.h"
  ACL_BINHASH_INFO *acl_binhash_locate(ACL_BINHASH *table, const void *key, int key_len);
-# 111 "/workspace/acl/lib_acl/include/stdlib/acl_binhash.h"
+# 111 "/acl/lib_acl/include/stdlib/acl_binhash.h"
  void *acl_binhash_find(ACL_BINHASH *table, const void *key, int key_len);
-# 121 "/workspace/acl/lib_acl/include/stdlib/acl_binhash.h"
+# 121 "/acl/lib_acl/include/stdlib/acl_binhash.h"
  int acl_binhash_delete(ACL_BINHASH *table, const void *key, int key_len, void (*free_fn) (void *));
 
 
@@ -11060,7 +11065,7 @@ typedef struct ACL_BINHASH_ITER {
 
 
  int acl_binhash_errno(ACL_BINHASH *table);
-# 162 "/workspace/acl/lib_acl/include/stdlib/acl_binhash.h"
+# 162 "/acl/lib_acl/include/stdlib/acl_binhash.h"
  int acl_binhash_size(const ACL_BINHASH *table);
 
 
@@ -11075,12 +11080,12 @@ typedef struct ACL_BINHASH_ITER {
  const ACL_BINHASH_INFO *acl_binhash_iter_next(ACL_BINHASH_ITER *iter);
  const ACL_BINHASH_INFO *acl_binhash_iter_tail(ACL_BINHASH *table, ACL_BINHASH_ITER *iter);
  const ACL_BINHASH_INFO *acl_binhash_iter_prev(ACL_BINHASH_ITER *iter);
-# 16 "/workspace/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
+# 16 "/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
 
-# 1 "/workspace/acl/lib_acl/include/stdlib/acl_ring.h" 1
-# 9 "/workspace/acl/lib_acl/include/stdlib/acl_ring.h"
-# 1 "/usr/lib/gcc/x86_64-linux-gnu/7/include/stddef.h" 1 3 4
-# 10 "/workspace/acl/lib_acl/include/stdlib/acl_ring.h" 2
+# 1 "/acl/lib_acl/include/stdlib/acl_ring.h" 1
+# 9 "/acl/lib_acl/include/stdlib/acl_ring.h"
+# 1 "/usr/lib/gcc/aarch64-linux-gnu/11/include/stddef.h" 1 3 4
+# 10 "/acl/lib_acl/include/stdlib/acl_ring.h" 2
 
 typedef struct ACL_RING ACL_RING;
 
@@ -11145,9 +11150,9 @@ typedef struct ACL_RING_ITER {
 
 
  ACL_RING *acl_ring_pop_tail(ACL_RING *ring);
-# 18 "/workspace/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
-# 1 "/workspace/acl/lib_acl/include/stdlib/acl_fifo.h" 1
-# 12 "/workspace/acl/lib_acl/include/stdlib/acl_fifo.h"
+# 18 "/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
+# 1 "/acl/lib_acl/include/stdlib/acl_fifo.h" 1
+# 12 "/acl/lib_acl/include/stdlib/acl_fifo.h"
 typedef struct ACL_FIFO_INFO ACL_FIFO_INFO;
 typedef struct ACL_FIFO_ITER ACL_FIFO_ITER;
 typedef struct ACL_FIFO ACL_FIFO;
@@ -11194,7 +11199,7 @@ struct ACL_FIFO {
 
  ACL_SLICE_POOL *slice;
 };
-# 69 "/workspace/acl/lib_acl/include/stdlib/acl_fifo.h"
+# 69 "/acl/lib_acl/include/stdlib/acl_fifo.h"
  void acl_fifo_init(ACL_FIFO *fifo);
 
 
@@ -11277,11 +11282,11 @@ struct ACL_FIFO {
 
 
  int acl_fifo_size(ACL_FIFO *fifo);
-# 19 "/workspace/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
-# 1 "/workspace/acl/lib_acl/include/stdlib/acl_iplink.h" 1
-# 16 "/workspace/acl/lib_acl/include/stdlib/acl_iplink.h"
-# 1 "/workspace/acl/lib_acl/include/stdlib/acl_dlink.h" 1
-# 15 "/workspace/acl/lib_acl/include/stdlib/acl_dlink.h"
+# 19 "/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
+# 1 "/acl/lib_acl/include/stdlib/acl_iplink.h" 1
+# 16 "/acl/lib_acl/include/stdlib/acl_iplink.h"
+# 1 "/acl/lib_acl/include/stdlib/acl_dlink.h" 1
+# 15 "/acl/lib_acl/include/stdlib/acl_dlink.h"
 typedef struct {
  long long int begin;
  long long int end;
@@ -11328,7 +11333,7 @@ typedef struct ACL_DLINK {
 
  ACL_DITEM *acl_dlink_lookup_by_item(const ACL_DLINK *plink,
  ACL_DITEM *pitem);
-# 69 "/workspace/acl/lib_acl/include/stdlib/acl_dlink.h"
+# 69 "/acl/lib_acl/include/stdlib/acl_dlink.h"
  ACL_DITEM *acl_dlink_lookup2_by_item(const ACL_DLINK *plink,
  ACL_DITEM *pitem, int *pidx);
 
@@ -11339,19 +11344,19 @@ typedef struct ACL_DLINK {
 
 
  ACL_DITEM *acl_dlink_lookup(const ACL_DLINK *plink, long long int n);
-# 87 "/workspace/acl/lib_acl/include/stdlib/acl_dlink.h"
+# 87 "/acl/lib_acl/include/stdlib/acl_dlink.h"
  ACL_DITEM *acl_dlink_lookup2(const ACL_DLINK *plink,
  long long int n, int *pidx);
-# 98 "/workspace/acl/lib_acl/include/stdlib/acl_dlink.h"
+# 98 "/acl/lib_acl/include/stdlib/acl_dlink.h"
  ACL_DITEM *acl_dlink_lookup_range(const ACL_DLINK *plink,
  long long int begin, long long int end, int *pidx);
-# 108 "/workspace/acl/lib_acl/include/stdlib/acl_dlink.h"
+# 108 "/acl/lib_acl/include/stdlib/acl_dlink.h"
  ACL_DITEM *acl_dlink_lookup_larger(const ACL_DLINK *plink,
  long long int off, int *pidx);
-# 118 "/workspace/acl/lib_acl/include/stdlib/acl_dlink.h"
+# 118 "/acl/lib_acl/include/stdlib/acl_dlink.h"
  ACL_DITEM *acl_dlink_lookup_lower(const ACL_DLINK *plink,
  long long int off, int *pidx);
-# 128 "/workspace/acl/lib_acl/include/stdlib/acl_dlink.h"
+# 128 "/acl/lib_acl/include/stdlib/acl_dlink.h"
  ACL_DITEM *acl_dlink_insert(ACL_DLINK *plink,
  long long int begin, long long int end);
 
@@ -11377,7 +11382,7 @@ typedef struct ACL_DLINK {
 
  ACL_DITEM *acl_dlink_modify(ACL_DLINK *plink,
  long long int begin, long long int end);
-# 162 "/workspace/acl/lib_acl/include/stdlib/acl_dlink.h"
+# 162 "/acl/lib_acl/include/stdlib/acl_dlink.h"
  int acl_dlink_delete_range(ACL_DLINK *plink,
  long long int begin, long long int end);
 
@@ -11402,7 +11407,7 @@ typedef struct ACL_DLINK {
 
 
  int acl_dlink_list(const ACL_DLINK *plink);
-# 17 "/workspace/acl/lib_acl/include/stdlib/acl_iplink.h" 2
+# 17 "/acl/lib_acl/include/stdlib/acl_iplink.h" 2
 
 
 
@@ -11427,10 +11432,10 @@ typedef struct ACL_DLINK {
  const char *pstrip_begin, const char *pstrip_end);
  int acl_iplink_count_item(ACL_DLINK *plink);
  int acl_iplink_list(const ACL_DLINK *plink);
-# 20 "/workspace/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
+# 20 "/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
 
-# 1 "/workspace/acl/lib_acl/include/stdlib/acl_btree.h" 1
-# 13 "/workspace/acl/lib_acl/include/stdlib/acl_btree.h"
+# 1 "/acl/lib_acl/include/stdlib/acl_btree.h" 1
+# 13 "/acl/lib_acl/include/stdlib/acl_btree.h"
 typedef struct ACL_BTREE ACL_BTREE;
 
 
@@ -11485,7 +11490,7 @@ typedef struct ACL_BTREE ACL_BTREE;
 
 
  int acl_btree_get_max_key(ACL_BTREE *tree, unsigned int *key);
-# 75 "/workspace/acl/lib_acl/include/stdlib/acl_btree.h"
+# 75 "/acl/lib_acl/include/stdlib/acl_btree.h"
  int acl_btree_get_next_key(ACL_BTREE *tree,
  unsigned int cur_key, unsigned int *next_key);
 
@@ -11496,9 +11501,9 @@ typedef struct ACL_BTREE ACL_BTREE;
 
  int acl_btree_depth(ACL_BTREE *tree);
  void acl_btree_dump(ACL_BTREE *b);
-# 22 "/workspace/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
-# 1 "/workspace/acl/lib_acl/include/stdlib/acl_cache.h" 1
-# 15 "/workspace/acl/lib_acl/include/stdlib/acl_cache.h"
+# 22 "/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
+# 1 "/acl/lib_acl/include/stdlib/acl_cache.h" 1
+# 15 "/acl/lib_acl/include/stdlib/acl_cache.h"
 typedef struct ACL_CACHE_INFO {
  char *key;
  void *value;
@@ -11535,7 +11540,7 @@ typedef struct ACL_CACHE {
 
  ACL_CACHE_INFO *(*iter_info)(ACL_ITER*, struct ACL_CACHE*);
 } ACL_CACHE;
-# 59 "/workspace/acl/lib_acl/include/stdlib/acl_cache.h"
+# 59 "/acl/lib_acl/include/stdlib/acl_cache.h"
  ACL_CACHE *acl_cache_create(int max_size, int timeout,
  void (*free_fn)(const ACL_CACHE_INFO*, void*));
 
@@ -11544,7 +11549,7 @@ typedef struct ACL_CACHE {
 
 
  void acl_cache_free(ACL_CACHE *cache);
-# 78 "/workspace/acl/lib_acl/include/stdlib/acl_cache.h"
+# 78 "/acl/lib_acl/include/stdlib/acl_cache.h"
  ACL_CACHE_INFO *acl_cache_enter(ACL_CACHE *cache, const char *key, void *value);
 
 
@@ -11662,9 +11667,9 @@ typedef struct ACL_CACHE {
 
 
  int acl_cache_size(ACL_CACHE *cache);
-# 23 "/workspace/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
-# 1 "/workspace/acl/lib_acl/include/stdlib/acl_cache2.h" 1
-# 10 "/workspace/acl/lib_acl/include/stdlib/acl_cache2.h"
+# 23 "/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
+# 1 "/acl/lib_acl/include/stdlib/acl_cache2.h" 1
+# 10 "/acl/lib_acl/include/stdlib/acl_cache2.h"
 typedef struct ACL_CACHE2 ACL_CACHE2;
 
 
@@ -11717,7 +11722,7 @@ struct ACL_CACHE2 {
 
 
  void acl_cache2_free(ACL_CACHE2 *cache2);
-# 74 "/workspace/acl/lib_acl/include/stdlib/acl_cache2.h"
+# 74 "/acl/lib_acl/include/stdlib/acl_cache2.h"
  ACL_CACHE2_INFO *acl_cache2_enter(ACL_CACHE2 *cache2,
  const char *key, void *value, int timeout);
 
@@ -11759,13 +11764,13 @@ struct ACL_CACHE2 {
 
 
  int acl_cache2_timeout(ACL_CACHE2 *cache2);
-# 123 "/workspace/acl/lib_acl/include/stdlib/acl_cache2.h"
+# 123 "/acl/lib_acl/include/stdlib/acl_cache2.h"
  ACL_CACHE2_INFO *acl_cache2_update2(ACL_CACHE2 *cache2,
  ACL_CACHE2_INFO *info, int timeout);
-# 133 "/workspace/acl/lib_acl/include/stdlib/acl_cache2.h"
+# 133 "/acl/lib_acl/include/stdlib/acl_cache2.h"
  ACL_CACHE2_INFO *acl_cache2_update(ACL_CACHE2 *cache2,
  const char *key, int timeout);
-# 146 "/workspace/acl/lib_acl/include/stdlib/acl_cache2.h"
+# 146 "/acl/lib_acl/include/stdlib/acl_cache2.h"
  ACL_CACHE2_INFO *acl_cache2_upsert(ACL_CACHE2 *cache2,
  const char *key, void *value, int timeout, int *exist);
 
@@ -11844,23 +11849,23 @@ struct ACL_CACHE2 {
 
 
  int acl_cache2_size(ACL_CACHE2 *cache2);
-# 24 "/workspace/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
-# 1 "/workspace/acl/lib_acl/include/stdlib/acl_avl.h" 1
-# 40 "/workspace/acl/lib_acl/include/stdlib/acl_avl.h"
-# 1 "/workspace/acl/lib_acl/include/stdlib/avl_impl.h" 1
-# 37 "/workspace/acl/lib_acl/include/stdlib/avl_impl.h"
-# 1 "/usr/lib/gcc/x86_64-linux-gnu/7/include/stddef.h" 1 3 4
-# 38 "/workspace/acl/lib_acl/include/stdlib/avl_impl.h" 2
-# 59 "/workspace/acl/lib_acl/include/stdlib/avl_impl.h"
+# 24 "/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
+# 1 "/acl/lib_acl/include/stdlib/acl_avl.h" 1
+# 40 "/acl/lib_acl/include/stdlib/acl_avl.h"
+# 1 "/acl/lib_acl/include/stdlib/avl_impl.h" 1
+# 37 "/acl/lib_acl/include/stdlib/avl_impl.h"
+# 1 "/usr/lib/gcc/aarch64-linux-gnu/11/include/stddef.h" 1 3 4
+# 38 "/acl/lib_acl/include/stdlib/avl_impl.h" 2
+# 59 "/acl/lib_acl/include/stdlib/avl_impl.h"
 typedef unsigned int ulong_t;
 
 typedef char acl_boolean_t;
-# 117 "/workspace/acl/lib_acl/include/stdlib/avl_impl.h"
+# 117 "/acl/lib_acl/include/stdlib/avl_impl.h"
 struct avl_node {
  struct avl_node *avl_child[2];
  uintptr_t avl_pcb;
 };
-# 171 "/workspace/acl/lib_acl/include/stdlib/avl_impl.h"
+# 171 "/acl/lib_acl/include/stdlib/avl_impl.h"
 struct avl_tree {
  struct avl_node *avl_root;
  int (*avl_compar)(const void *, const void *);
@@ -11874,20 +11879,20 @@ struct avl_tree {
 
 
  void *avl_walk(struct avl_tree *, void *, int);
-# 41 "/workspace/acl/lib_acl/include/stdlib/acl_avl.h" 2
-# 108 "/workspace/acl/lib_acl/include/stdlib/acl_avl.h"
+# 41 "/acl/lib_acl/include/stdlib/acl_avl.h" 2
+# 108 "/acl/lib_acl/include/stdlib/acl_avl.h"
 typedef struct avl_tree avl_tree_t;
 
 
 
 
 typedef struct avl_node avl_node_t;
-# 126 "/workspace/acl/lib_acl/include/stdlib/acl_avl.h"
+# 126 "/acl/lib_acl/include/stdlib/acl_avl.h"
 typedef uintptr_t avl_index_t;
-# 159 "/workspace/acl/lib_acl/include/stdlib/acl_avl.h"
+# 159 "/acl/lib_acl/include/stdlib/acl_avl.h"
  void avl_create(avl_tree_t *tree,
  int (*compar) (const void *, const void *), size_t size, size_t offset);
-# 171 "/workspace/acl/lib_acl/include/stdlib/acl_avl.h"
+# 171 "/acl/lib_acl/include/stdlib/acl_avl.h"
  void *avl_find(avl_tree_t *tree, void *node, avl_index_t *where);
 
 
@@ -11897,7 +11902,7 @@ typedef uintptr_t avl_index_t;
 
 
  void avl_insert(avl_tree_t *tree, void *node, avl_index_t where);
-# 192 "/workspace/acl/lib_acl/include/stdlib/acl_avl.h"
+# 192 "/acl/lib_acl/include/stdlib/acl_avl.h"
  void avl_insert_here(avl_tree_t *tree, void *new_data, void *here,
     int direction);
 
@@ -11909,9 +11914,9 @@ typedef uintptr_t avl_index_t;
 
  void *avl_first(avl_tree_t *tree);
  void *avl_last(avl_tree_t *tree);
-# 238 "/workspace/acl/lib_acl/include/stdlib/acl_avl.h"
+# 238 "/acl/lib_acl/include/stdlib/acl_avl.h"
  void *avl_nearest(avl_tree_t *tree, avl_index_t where, int direction);
-# 248 "/workspace/acl/lib_acl/include/stdlib/acl_avl.h"
+# 248 "/acl/lib_acl/include/stdlib/acl_avl.h"
  void avl_add(avl_tree_t *tree, void *node);
 
 
@@ -11921,7 +11926,7 @@ typedef uintptr_t avl_index_t;
 
 
  void avl_remove(avl_tree_t *tree, void *node);
-# 265 "/workspace/acl/lib_acl/include/stdlib/acl_avl.h"
+# 265 "/acl/lib_acl/include/stdlib/acl_avl.h"
  acl_boolean_t avl_update(avl_tree_t *, void *);
  acl_boolean_t avl_update_lt(avl_tree_t *, void *);
  acl_boolean_t avl_update_gt(avl_tree_t *, void *);
@@ -11935,7 +11940,7 @@ typedef uintptr_t avl_index_t;
 
 
  acl_boolean_t avl_is_empty(avl_tree_t *tree);
-# 300 "/workspace/acl/lib_acl/include/stdlib/acl_avl.h"
+# 300 "/acl/lib_acl/include/stdlib/acl_avl.h"
  void *avl_destroy_nodes(avl_tree_t *tree, void **cookie);
 
 
@@ -11945,9 +11950,9 @@ typedef uintptr_t avl_index_t;
 
 
  void avl_destroy(avl_tree_t *tree);
-# 25 "/workspace/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
-# 1 "/workspace/acl/lib_acl/include/stdlib/acl_token_tree.h" 1
-# 29 "/workspace/acl/lib_acl/include/stdlib/acl_token_tree.h"
+# 25 "/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
+# 1 "/acl/lib_acl/include/stdlib/acl_token_tree.h" 1
+# 29 "/acl/lib_acl/include/stdlib/acl_token_tree.h"
 typedef struct ACL_TOKEN ACL_TOKEN;
 
 struct ACL_TOKEN {
@@ -11967,7 +11972,7 @@ struct ACL_TOKEN {
  ACL_TOKEN *(*iter_head)(ACL_ITER*, ACL_TOKEN*);
  ACL_TOKEN *(*iter_next)(ACL_ITER*, ACL_TOKEN*);
 };
-# 136 "/workspace/acl/lib_acl/include/stdlib/acl_token_tree.h"
+# 136 "/acl/lib_acl/include/stdlib/acl_token_tree.h"
  char *acl_token_delim_tab_new(const char *delim);
  void acl_token_delim_tab_free(char *delim_tab);
  ACL_TOKEN *acl_token_new(void);
@@ -11991,11 +11996,11 @@ struct ACL_TOKEN {
  void acl_token_tree_destroy(ACL_TOKEN *tree);
  void acl_token_tree_load_deny(const char *filepath, ACL_TOKEN *tree);
  void acl_token_tree_load_pass(const char *filepath, ACL_TOKEN *tree);
-# 26 "/workspace/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
+# 26 "/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
 
 
-# 1 "/workspace/acl/lib_acl/include/stdlib/acl_iostuff.h" 1
-# 23 "/workspace/acl/lib_acl/include/stdlib/acl_iostuff.h"
+# 1 "/acl/lib_acl/include/stdlib/acl_iostuff.h" 1
+# 23 "/acl/lib_acl/include/stdlib/acl_iostuff.h"
  int acl_non_blocking(int fd, int on);
 
 
@@ -12005,19 +12010,19 @@ struct ACL_TOKEN {
 
 
  int acl_is_blocking(int fd);
-# 42 "/workspace/acl/lib_acl/include/stdlib/acl_iostuff.h"
+# 42 "/acl/lib_acl/include/stdlib/acl_iostuff.h"
  int acl_write_wait(int fd, int timeout);
-# 53 "/workspace/acl/lib_acl/include/stdlib/acl_iostuff.h"
+# 53 "/acl/lib_acl/include/stdlib/acl_iostuff.h"
  int acl_write_wait_ms(int fd, int timeout);
-# 64 "/workspace/acl/lib_acl/include/stdlib/acl_iostuff.h"
+# 64 "/acl/lib_acl/include/stdlib/acl_iostuff.h"
  int acl_read_wait(int fd, int timeout);
-# 75 "/workspace/acl/lib_acl/include/stdlib/acl_iostuff.h"
+# 75 "/acl/lib_acl/include/stdlib/acl_iostuff.h"
  int acl_read_wait_ms(int fd, int timeout);
-# 84 "/workspace/acl/lib_acl/include/stdlib/acl_iostuff.h"
+# 84 "/acl/lib_acl/include/stdlib/acl_iostuff.h"
  int acl_read_epoll_wait(int fd, int delay);
-# 94 "/workspace/acl/lib_acl/include/stdlib/acl_iostuff.h"
+# 94 "/acl/lib_acl/include/stdlib/acl_iostuff.h"
  int acl_read_poll_wait(int fd, int delay);
-# 103 "/workspace/acl/lib_acl/include/stdlib/acl_iostuff.h"
+# 103 "/acl/lib_acl/include/stdlib/acl_iostuff.h"
  int acl_read_select_wait(int fd, int delay);
 
 
@@ -12032,13 +12037,13 @@ struct ACL_TOKEN {
 
 
  int acl_readable(int fd);
-# 129 "/workspace/acl/lib_acl/include/stdlib/acl_iostuff.h"
+# 129 "/acl/lib_acl/include/stdlib/acl_iostuff.h"
  int acl_timed_read(int fd, void *buf, unsigned len,
  int timeout, void *unused_context);
-# 143 "/workspace/acl/lib_acl/include/stdlib/acl_iostuff.h"
+# 143 "/acl/lib_acl/include/stdlib/acl_iostuff.h"
  int acl_timed_write(int fd, void *buf, unsigned len,
  int timeout, void *unused_context);
-# 154 "/workspace/acl/lib_acl/include/stdlib/acl_iostuff.h"
+# 154 "/acl/lib_acl/include/stdlib/acl_iostuff.h"
  int acl_write_buf(int fd, const char *buf, int len, int timeout);
 
 
@@ -12068,7 +12073,7 @@ struct ACL_TOKEN {
 
 
  int acl_duplex_pipe(int fds[2]);
-# 191 "/workspace/acl/lib_acl/include/stdlib/acl_iostuff.h"
+# 191 "/acl/lib_acl/include/stdlib/acl_iostuff.h"
  int acl_close_on_exec(int fd, int on);
 
 
@@ -12094,12 +12099,12 @@ struct ACL_TOKEN {
 
 
  void acl_set_delay_slice(int n);
-# 227 "/workspace/acl/lib_acl/include/stdlib/acl_iostuff.h"
+# 227 "/acl/lib_acl/include/stdlib/acl_iostuff.h"
 # 1 "/usr/include/poll.h" 1 3 4
-# 1 "/usr/include/x86_64-linux-gnu/sys/poll.h" 1 3 4
-# 25 "/usr/include/x86_64-linux-gnu/sys/poll.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/poll.h" 1 3 4
-# 26 "/usr/include/x86_64-linux-gnu/sys/poll.h" 2 3 4
+# 1 "/usr/include/aarch64-linux-gnu/sys/poll.h" 1 3 4
+# 25 "/usr/include/aarch64-linux-gnu/sys/poll.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/poll.h" 1 3 4
+# 26 "/usr/include/aarch64-linux-gnu/sys/poll.h" 2 3 4
 
 
 
@@ -12108,7 +12113,7 @@ struct ACL_TOKEN {
 
 
 
-# 33 "/usr/include/x86_64-linux-gnu/sys/poll.h" 3 4
+# 33 "/usr/include/aarch64-linux-gnu/sys/poll.h" 3 4
 typedef unsigned long int nfds_t;
 
 
@@ -12121,60 +12126,56 @@ struct pollfd
 
 
 
-# 54 "/usr/include/x86_64-linux-gnu/sys/poll.h" 3 4
-extern int poll (struct pollfd *__fds, nfds_t __nfds, int __timeout);
-# 68 "/usr/include/x86_64-linux-gnu/sys/poll.h" 3 4
+# 54 "/usr/include/aarch64-linux-gnu/sys/poll.h" 3 4
+extern int poll (struct pollfd *__fds, nfds_t __nfds, int __timeout)
+    __attribute__ ((__access__ (__write_only__, 1, 2)));
+# 82 "/usr/include/aarch64-linux-gnu/sys/poll.h" 3 4
 
 
 
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/poll2.h" 1 3 4
-# 24 "/usr/include/x86_64-linux-gnu/bits/poll2.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/poll2.h" 1 3 4
+# 24 "/usr/include/aarch64-linux-gnu/bits/poll2.h" 3 4
 
 
 extern int __poll_alias (struct pollfd *__fds, nfds_t __nfds, int __timeout) __asm__ ("" "poll")
                                ;
 extern int __poll_chk (struct pollfd *__fds, nfds_t __nfds, int __timeout,
-         long unsigned int __fdslen);
+         long unsigned int __fdslen)
+    __attribute__ ((__access__ (__write_only__, 1, 2)));
 extern int __poll_chk_warn (struct pollfd *__fds, nfds_t __nfds, int __timeout, long unsigned int __fdslen) __asm__ ("" "__poll_chk")
 
 
   __attribute__((__warning__ ("poll called with fds buffer too small file nfds entries")));
 
-extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline__)) __attribute__ ((__artificial__)) int
+extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline__)) __attribute__ ((__artificial__)) __attribute__ ((__access__ (__write_only__, 1, 2))) int
 poll (struct pollfd *__fds, nfds_t __nfds, int __timeout)
 {
-  if (__builtin_object_size (__fds, 2 > 1) != (long unsigned int) -1)
-    {
-      if (! __builtin_constant_p (__nfds))
- return __poll_chk (__fds, __nfds, __timeout, __builtin_object_size (__fds, 2 > 1));
-      else if (__builtin_object_size (__fds, 2 > 1) / sizeof (*__fds) < __nfds)
- return __poll_chk_warn (__fds, __nfds, __timeout, __builtin_object_size (__fds, 2 > 1));
-    }
+  return ((((__typeof (__nfds)) 0 < (__typeof (__nfds)) -1 || (__builtin_constant_p (__nfds) && (__nfds) > 0)) && __builtin_constant_p ((((long unsigned int) (__nfds)) <= (__builtin_object_size (__fds, 2 > 1)) / (sizeof (*__fds)))) && (((long unsigned int) (__nfds)) <= (__builtin_object_size (__fds, 2 > 1)) / (sizeof (*__fds)))) ? __poll_alias (__fds, __nfds, __timeout) : ((((__typeof (__nfds)) 0 < (__typeof (__nfds)) -1 || (__builtin_constant_p (__nfds) && (__nfds) > 0)) && __builtin_constant_p ((((long unsigned int) (__nfds)) <= (__builtin_object_size (__fds, 2 > 1)) / (sizeof (*__fds)))) && !(((long unsigned int) (__nfds)) <= (__builtin_object_size (__fds, 2 > 1)) / (sizeof (*__fds)))) ? __poll_chk_warn (__fds, __nfds, __timeout, __builtin_object_size (__fds, 2 > 1)) : __poll_chk (__fds, __nfds, __timeout, __builtin_object_size (__fds, 2 > 1))))
 
-  return __poll_alias (__fds, __nfds, __timeout);
+                              ;
 }
-# 81 "/usr/include/x86_64-linux-gnu/bits/poll2.h" 3 4
+# 70 "/usr/include/aarch64-linux-gnu/bits/poll2.h" 3 4
 
-# 74 "/usr/include/x86_64-linux-gnu/sys/poll.h" 2 3 4
-# 1 "/usr/include/poll.h" 2 3 4
-# 228 "/workspace/acl/lib_acl/include/stdlib/acl_iostuff.h" 2
+# 88 "/usr/include/aarch64-linux-gnu/sys/poll.h" 2 3 4
+# 2 "/usr/include/poll.h" 2 3 4
+# 228 "/acl/lib_acl/include/stdlib/acl_iostuff.h" 2
 
 
 
-# 230 "/workspace/acl/lib_acl/include/stdlib/acl_iostuff.h"
+# 230 "/acl/lib_acl/include/stdlib/acl_iostuff.h"
 typedef int (*acl_select_fn)(int, fd_set*, fd_set*, fd_set*, struct timeval*);
 typedef int (*acl_poll_fn)(struct pollfd*, nfds_t, int);
  void acl_set_poll(acl_poll_fn fn);
 
 
  void acl_set_select(acl_select_fn fn);
-# 29 "/workspace/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
-# 1 "/workspace/acl/lib_acl/include/stdlib/acl_msg.h" 1
-# 21 "/workspace/acl/lib_acl/include/stdlib/acl_msg.h"
+# 29 "/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
+# 1 "/acl/lib_acl/include/stdlib/acl_msg.h" 1
+# 21 "/acl/lib_acl/include/stdlib/acl_msg.h"
 typedef void (*ACL_MSG_PRE_WRITE_FN)(void *ctx, const char *fmt, va_list ap);
-# 32 "/workspace/acl/lib_acl/include/stdlib/acl_msg.h"
+# 32 "/acl/lib_acl/include/stdlib/acl_msg.h"
 typedef int (*ACL_MSG_OPEN_FN) (const char *file_name, void *ctx);
 
 
@@ -12184,9 +12185,9 @@ typedef int (*ACL_MSG_OPEN_FN) (const char *file_name, void *ctx);
 
 
 typedef void (*ACL_MSG_CLOSE_FN) (void *ctx);
-# 50 "/workspace/acl/lib_acl/include/stdlib/acl_msg.h"
+# 50 "/acl/lib_acl/include/stdlib/acl_msg.h"
 typedef void (*ACL_MSG_WRITE_FN) (void *ctx, const char *fmt, va_list ap);
-# 59 "/workspace/acl/lib_acl/include/stdlib/acl_msg.h"
+# 59 "/acl/lib_acl/include/stdlib/acl_msg.h"
  void acl_msg_register(ACL_MSG_OPEN_FN open_fn, ACL_MSG_CLOSE_FN close_fn,
         ACL_MSG_WRITE_FN write_fn, void *ctx);
 
@@ -12223,7 +12224,7 @@ extern int acl_msg_verbose;
 
 
  void acl_msg_trace_enable(int onoff);
-# 105 "/workspace/acl/lib_acl/include/stdlib/acl_msg.h"
+# 105 "/acl/lib_acl/include/stdlib/acl_msg.h"
  void acl_msg_open(const char *log_file, const char *info_pre);
 
 
@@ -12237,7 +12238,7 @@ extern int acl_msg_verbose;
 
 
  void acl_msg_close(void);
-# 130 "/workspace/acl/lib_acl/include/stdlib/acl_msg.h"
+# 130 "/acl/lib_acl/include/stdlib/acl_msg.h"
  void __attribute__((__format__ (__printf__, (1), (2)))) acl_msg_info(const char *fmt,...);
 
 
@@ -12321,7 +12322,7 @@ extern int acl_msg_verbose;
 
 
  void acl_msg_panic2(const char *fmt, va_list ap);
-# 243 "/workspace/acl/lib_acl/include/stdlib/acl_msg.h"
+# 243 "/acl/lib_acl/include/stdlib/acl_msg.h"
  const char *acl_strerror(unsigned int errnum, char *buffer, int size);
  const char *acl_strerror1(unsigned int errnum);
 
@@ -12358,9 +12359,9 @@ extern int acl_msg_verbose;
 
 
  void __attribute__((__format__ (__printf__, (1), (2)))) acl_msg_printf(const char *fmt,...);
-# 30 "/workspace/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
-# 1 "/workspace/acl/lib_acl/include/stdlib/acl_debug.h" 1
-# 28 "/workspace/acl/lib_acl/include/stdlib/acl_debug.h"
+# 30 "/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
+# 1 "/acl/lib_acl/include/stdlib/acl_debug.h" 1
+# 28 "/acl/lib_acl/include/stdlib/acl_debug.h"
  void acl_debug_end(void);
 
 
@@ -12384,9 +12385,9 @@ extern int acl_msg_verbose;
 
 
  int acl_do_debug(int section, int level);
-# 31 "/workspace/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
-# 1 "/workspace/acl/lib_acl/include/stdlib/acl_mem_hook.h" 1
-# 21 "/workspace/acl/lib_acl/include/stdlib/acl_mem_hook.h"
+# 31 "/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
+# 1 "/acl/lib_acl/include/stdlib/acl_mem_hook.h" 1
+# 21 "/acl/lib_acl/include/stdlib/acl_mem_hook.h"
  void acl_mem_hook(void *(*malloc_hook)(const char*, int, size_t),
   void *(*calloc_hook)(const char*, int, size_t, size_t),
   void *(*realloc_hook)(const char*, int, void*, size_t),
@@ -12399,17 +12400,17 @@ extern int acl_msg_verbose;
 
 
  void acl_mem_unhook(void);
-# 32 "/workspace/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
-# 1 "/workspace/acl/lib_acl/include/stdlib/acl_debug_malloc.h" 1
-# 10 "/workspace/acl/lib_acl/include/stdlib/acl_debug_malloc.h"
+# 32 "/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
+# 1 "/acl/lib_acl/include/stdlib/acl_debug_malloc.h" 1
+# 10 "/acl/lib_acl/include/stdlib/acl_debug_malloc.h"
 typedef struct ACL_DEBUG_MEM ACL_DEBUG_MEM;
 
  void acl_debug_dump(void);
  ACL_DEBUG_MEM *acl_debug_malloc_init(ACL_DEBUG_MEM *debug_mem_ptr,
  const char* dump_file);
-# 33 "/workspace/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
-# 1 "/workspace/acl/lib_acl/include/stdlib/acl_malloc.h" 1
-# 25 "/workspace/acl/lib_acl/include/stdlib/acl_malloc.h"
+# 33 "/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
+# 1 "/acl/lib_acl/include/stdlib/acl_malloc.h" 1
+# 25 "/acl/lib_acl/include/stdlib/acl_malloc.h"
  int *acl_memory_debug_start(void);
  void acl_memory_debug_stop(void);
  void acl_memory_debug_stack(int onoff);
@@ -12433,14 +12434,14 @@ typedef struct ACL_DEBUG_MEM ACL_DEBUG_MEM;
 
 
  void acl_mempool_ctl(int name, ...);
-# 56 "/workspace/acl/lib_acl/include/stdlib/acl_malloc.h"
+# 56 "/acl/lib_acl/include/stdlib/acl_malloc.h"
  int acl_mempool_total_allocated(void);
 
 
 
 
  void acl_mempool_status(void);
-# 73 "/workspace/acl/lib_acl/include/stdlib/acl_malloc.h"
+# 73 "/acl/lib_acl/include/stdlib/acl_malloc.h"
  void acl_default_memstat(const char *filename, int line,
         void *ptr, size_t *len, size_t *real_len);
 
@@ -12458,20 +12459,20 @@ typedef struct ACL_DEBUG_MEM ACL_DEBUG_MEM;
 
 
  size_t acl_default_get_memlimit(void);
-# 100 "/workspace/acl/lib_acl/include/stdlib/acl_malloc.h"
+# 100 "/acl/lib_acl/include/stdlib/acl_malloc.h"
  void *acl_default_malloc(const char *filename, int line, size_t size);
-# 112 "/workspace/acl/lib_acl/include/stdlib/acl_malloc.h"
+# 112 "/acl/lib_acl/include/stdlib/acl_malloc.h"
  void *acl_default_calloc(const char *filename, int line,
   size_t nmemb, size_t size);
-# 124 "/workspace/acl/lib_acl/include/stdlib/acl_malloc.h"
+# 124 "/acl/lib_acl/include/stdlib/acl_malloc.h"
  void *acl_default_realloc(const char *filename, int line,
   void *ptr, size_t size);
-# 134 "/workspace/acl/lib_acl/include/stdlib/acl_malloc.h"
+# 134 "/acl/lib_acl/include/stdlib/acl_malloc.h"
  char *acl_default_strdup(const char *filename, int line, const char *str);
-# 144 "/workspace/acl/lib_acl/include/stdlib/acl_malloc.h"
+# 144 "/acl/lib_acl/include/stdlib/acl_malloc.h"
  char *acl_default_strndup(const char *filename, int line,
   const char *str, size_t len);
-# 155 "/workspace/acl/lib_acl/include/stdlib/acl_malloc.h"
+# 155 "/acl/lib_acl/include/stdlib/acl_malloc.h"
  void *acl_default_memdup(const char *filename, int line,
   const void *ptr, size_t len);
 
@@ -12496,11 +12497,11 @@ typedef struct ACL_DEBUG_MEM ACL_DEBUG_MEM;
  void *acl_memdup_glue(const char *filename, int line, const void *ptr, size_t len);
  void acl_free_glue(const char *filename, int line, void *ptr);
  void acl_free_fn_glue(void *ptr);
-# 34 "/workspace/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
-# 1 "/workspace/acl/lib_acl/include/stdlib/acl_mymalloc.h" 1
-# 35 "/workspace/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
-# 1 "/workspace/acl/lib_acl/include/stdlib/acl_mystring.h" 1
-# 34 "/workspace/acl/lib_acl/include/stdlib/acl_mystring.h"
+# 34 "/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
+# 1 "/acl/lib_acl/include/stdlib/acl_mymalloc.h" 1
+# 35 "/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
+# 1 "/acl/lib_acl/include/stdlib/acl_mystring.h" 1
+# 34 "/acl/lib_acl/include/stdlib/acl_mystring.h"
  char *acl_lowercase(char *s);
 
 
@@ -12510,7 +12511,7 @@ typedef struct ACL_DEBUG_MEM ACL_DEBUG_MEM;
 
 
  char *acl_lowercase2(char *s, size_t n);
-# 51 "/workspace/acl/lib_acl/include/stdlib/acl_mystring.h"
+# 51 "/acl/lib_acl/include/stdlib/acl_mystring.h"
  char *acl_lowercase3(const char *s, char *buf, size_t size);
 
 
@@ -12527,11 +12528,11 @@ typedef struct ACL_DEBUG_MEM ACL_DEBUG_MEM;
 
 
  char *acl_uppercase2(char *s, size_t n);
-# 75 "/workspace/acl/lib_acl/include/stdlib/acl_mystring.h"
+# 75 "/acl/lib_acl/include/stdlib/acl_mystring.h"
  char *acl_uppercase3(const char *s, char *buf, size_t size);
-# 91 "/workspace/acl/lib_acl/include/stdlib/acl_mystring.h"
+# 91 "/acl/lib_acl/include/stdlib/acl_mystring.h"
  char *acl_strtok(char **src, const char *sep);
-# 100 "/workspace/acl/lib_acl/include/stdlib/acl_mystring.h"
+# 100 "/acl/lib_acl/include/stdlib/acl_mystring.h"
  char *acl_strline(char **src);
 
 
@@ -12541,7 +12542,7 @@ typedef struct ACL_DEBUG_MEM ACL_DEBUG_MEM;
 
 
  char *acl_strtrim(char *str);
-# 119 "/workspace/acl/lib_acl/include/stdlib/acl_mystring.h"
+# 119 "/acl/lib_acl/include/stdlib/acl_mystring.h"
  int acl_strstrip(const char *haystack, const char *needle,
   char *buf, int bsize);
 
@@ -12552,9 +12553,9 @@ typedef struct ACL_DEBUG_MEM ACL_DEBUG_MEM;
 
 
  int acl_strtrunc_byln(char *str);
-# 139 "/workspace/acl/lib_acl/include/stdlib/acl_mystring.h"
+# 139 "/acl/lib_acl/include/stdlib/acl_mystring.h"
  int acl_strrncasecmp(const char *s1, const char *s2, size_t n);
-# 149 "/workspace/acl/lib_acl/include/stdlib/acl_mystring.h"
+# 149 "/acl/lib_acl/include/stdlib/acl_mystring.h"
  int acl_strrncmp(const char *s1, const char *s2, size_t n);
 
 
@@ -12580,7 +12581,7 @@ typedef struct ACL_DEBUG_MEM ACL_DEBUG_MEM;
 
 
  char *acl_rstrcasestr(const char *haystack, const char *needle);
-# 182 "/workspace/acl/lib_acl/include/stdlib/acl_mystring.h"
+# 182 "/acl/lib_acl/include/stdlib/acl_mystring.h"
  size_t acl_strnlen(const char * s, size_t count);
 
 
@@ -12590,14 +12591,14 @@ typedef struct ACL_DEBUG_MEM ACL_DEBUG_MEM;
 
 
  int acl_strcasecmp(const char *s1, const char *s2);
-# 199 "/workspace/acl/lib_acl/include/stdlib/acl_mystring.h"
+# 199 "/acl/lib_acl/include/stdlib/acl_mystring.h"
  int acl_strncasecmp(const char *s1, const char *s2, size_t n);
-# 230 "/workspace/acl/lib_acl/include/stdlib/acl_mystring.h"
+# 230 "/acl/lib_acl/include/stdlib/acl_mystring.h"
  int acl_file_path_correct(const char *psrc_file_path,
   char *pbuf, int sizeb);
-# 243 "/workspace/acl/lib_acl/include/stdlib/acl_mystring.h"
+# 243 "/acl/lib_acl/include/stdlib/acl_mystring.h"
  int acl_dir_correct(const char *psrc_dir, char *pbuf, int sizeb);
-# 252 "/workspace/acl/lib_acl/include/stdlib/acl_mystring.h"
+# 252 "/acl/lib_acl/include/stdlib/acl_mystring.h"
  int acl_dir_getpath(const char *pathname, char *pbuf, int bsize);
 
 
@@ -12620,14 +12621,14 @@ typedef struct ACL_DEBUG_MEM ACL_DEBUG_MEM;
 
 
  long long int acl_atoi64(const char *str);
-# 282 "/workspace/acl/lib_acl/include/stdlib/acl_mystring.h"
+# 282 "/acl/lib_acl/include/stdlib/acl_mystring.h"
  const char *acl_ui64toa(unsigned long long int value, char *buf, size_t size);
-# 291 "/workspace/acl/lib_acl/include/stdlib/acl_mystring.h"
+# 291 "/acl/lib_acl/include/stdlib/acl_mystring.h"
  const char *acl_i64toa(long long int value, char *buf, size_t size);
-# 301 "/workspace/acl/lib_acl/include/stdlib/acl_mystring.h"
+# 301 "/acl/lib_acl/include/stdlib/acl_mystring.h"
  const char *acl_i64toa_radix(long long int value, char *buf,
   size_t size, int radix);
-# 312 "/workspace/acl/lib_acl/include/stdlib/acl_mystring.h"
+# 312 "/acl/lib_acl/include/stdlib/acl_mystring.h"
  const char *acl_ui64toa_radix(unsigned long long int value, char *buf,
   size_t size, int radix);
 
@@ -12651,28 +12652,28 @@ typedef struct ACL_LINE_STATE {
 
 
  void acl_line_state_free(ACL_LINE_STATE *state);
-# 344 "/workspace/acl/lib_acl/include/stdlib/acl_mystring.h"
+# 344 "/acl/lib_acl/include/stdlib/acl_mystring.h"
  ACL_LINE_STATE *acl_line_state_reset(ACL_LINE_STATE *state, int offset);
-# 354 "/workspace/acl/lib_acl/include/stdlib/acl_mystring.h"
+# 354 "/acl/lib_acl/include/stdlib/acl_mystring.h"
  int acl_find_blank_line(const char *s, int n, ACL_LINE_STATE *state);
-# 36 "/workspace/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
+# 36 "/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
 
-# 1 "/workspace/acl/lib_acl/include/stdlib/acl_vbuf_print.h" 1
-# 23 "/workspace/acl/lib_acl/include/stdlib/acl_vbuf_print.h"
+# 1 "/acl/lib_acl/include/stdlib/acl_vbuf_print.h" 1
+# 23 "/acl/lib_acl/include/stdlib/acl_vbuf_print.h"
  ACL_VBUF *acl_vbuf_print(ACL_VBUF *, const char *, va_list);
-# 38 "/workspace/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
-# 1 "/workspace/acl/lib_acl/include/stdlib/acl_vsprintf.h" 1
-# 12 "/workspace/acl/lib_acl/include/stdlib/acl_vsprintf.h"
+# 38 "/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
+# 1 "/acl/lib_acl/include/stdlib/acl_vsprintf.h" 1
+# 12 "/acl/lib_acl/include/stdlib/acl_vsprintf.h"
  int acl_vsnprintf(char *buf, size_t size, const char *fmt, va_list args);
  int acl_snprintf(char * buf, size_t size, const char *fmt, ...);
  int acl_vsprintf(char *buf, const char *fmt, va_list args);
  int acl_sprintf(char * buf, const char *fmt, ...);
-# 39 "/workspace/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
+# 39 "/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
 
-# 1 "/workspace/acl/lib_acl/include/stdlib/acl_vstring_vstream.h" 1
-# 18 "/workspace/acl/lib_acl/include/stdlib/acl_vstring_vstream.h"
+# 1 "/acl/lib_acl/include/stdlib/acl_vstring_vstream.h" 1
+# 18 "/acl/lib_acl/include/stdlib/acl_vstring_vstream.h"
  int acl_vstring_gets(ACL_VSTRING *vp, ACL_VSTREAM *fp);
-# 27 "/workspace/acl/lib_acl/include/stdlib/acl_vstring_vstream.h"
+# 27 "/acl/lib_acl/include/stdlib/acl_vstring_vstream.h"
  int acl_vstring_gets_nonl(ACL_VSTRING *vp, ACL_VSTREAM *fp);
 
 
@@ -12682,22 +12683,22 @@ typedef struct ACL_LINE_STATE {
 
 
  int acl_vstring_gets_null(ACL_VSTRING *vp, ACL_VSTREAM *fp);
-# 44 "/workspace/acl/lib_acl/include/stdlib/acl_vstring_vstream.h"
+# 44 "/acl/lib_acl/include/stdlib/acl_vstring_vstream.h"
  int acl_vstring_gets_bound(ACL_VSTRING *vp, ACL_VSTREAM *fp, ssize_t bound);
-# 53 "/workspace/acl/lib_acl/include/stdlib/acl_vstring_vstream.h"
+# 53 "/acl/lib_acl/include/stdlib/acl_vstring_vstream.h"
  int acl_vstring_gets_nonl_bound(ACL_VSTRING *vp, ACL_VSTREAM *fp, ssize_t bound);
-# 62 "/workspace/acl/lib_acl/include/stdlib/acl_vstring_vstream.h"
+# 62 "/acl/lib_acl/include/stdlib/acl_vstring_vstream.h"
  int acl_vstring_gets_null_bound(ACL_VSTRING *vp, ACL_VSTREAM *fp, ssize_t bound);
-# 41 "/workspace/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
-# 1 "/workspace/acl/lib_acl/include/stdlib/acl_file.h" 1
-# 15 "/workspace/acl/lib_acl/include/stdlib/acl_file.h"
+# 41 "/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
+# 1 "/acl/lib_acl/include/stdlib/acl_file.h" 1
+# 15 "/acl/lib_acl/include/stdlib/acl_file.h"
 typedef struct ACL_FILE {
  ACL_VSTREAM *fp;
  unsigned int status;
 
  int errnum;
 } ACL_FILE;
-# 36 "/workspace/acl/lib_acl/include/stdlib/acl_file.h"
+# 36 "/acl/lib_acl/include/stdlib/acl_file.h"
  ACL_FILE *acl_fopen(const char *filename, const char *mode);
 
 
@@ -12718,11 +12719,11 @@ typedef struct ACL_FILE {
 
 
  int acl_feof(ACL_FILE *fp);
-# 65 "/workspace/acl/lib_acl/include/stdlib/acl_file.h"
+# 65 "/acl/lib_acl/include/stdlib/acl_file.h"
  size_t acl_fread(void *buf, size_t size, size_t nitems, ACL_FILE *fp);
-# 74 "/workspace/acl/lib_acl/include/stdlib/acl_file.h"
+# 74 "/acl/lib_acl/include/stdlib/acl_file.h"
  char *acl_fgets(char *buf, int size, ACL_FILE *fp);
-# 83 "/workspace/acl/lib_acl/include/stdlib/acl_file.h"
+# 83 "/acl/lib_acl/include/stdlib/acl_file.h"
  char *acl_fgets_nonl(char *buf, int size, ACL_FILE *fp);
 
 
@@ -12731,7 +12732,7 @@ typedef struct ACL_FILE {
 
 
  int acl_fgetc(ACL_FILE *fp);
-# 99 "/workspace/acl/lib_acl/include/stdlib/acl_file.h"
+# 99 "/acl/lib_acl/include/stdlib/acl_file.h"
  char *acl_gets(char *buf, size_t size);
 
 
@@ -12747,11 +12748,11 @@ typedef struct ACL_FILE {
 
 
  int acl_getchar(void);
-# 122 "/workspace/acl/lib_acl/include/stdlib/acl_file.h"
+# 122 "/acl/lib_acl/include/stdlib/acl_file.h"
  int __attribute__((__format__ (__printf__, (2), (3)))) acl_fprintf(ACL_FILE *fp, const char *fmt, ...);
-# 131 "/workspace/acl/lib_acl/include/stdlib/acl_file.h"
+# 131 "/acl/lib_acl/include/stdlib/acl_file.h"
  int acl_vfprintf(ACL_FILE *fp, const char *fmt, va_list ap);
-# 141 "/workspace/acl/lib_acl/include/stdlib/acl_file.h"
+# 141 "/acl/lib_acl/include/stdlib/acl_file.h"
  size_t acl_fwrite(const void *ptr, size_t size, size_t nitems, ACL_FILE *fp);
 
 
@@ -12800,7 +12801,7 @@ typedef struct ACL_FILE {
 
 
  int acl_putchar(int c);
-# 197 "/workspace/acl/lib_acl/include/stdlib/acl_file.h"
+# 197 "/acl/lib_acl/include/stdlib/acl_file.h"
  acl_off_t acl_fseek(ACL_FILE *fp, acl_off_t offset, int whence);
 
 
@@ -12809,14 +12810,14 @@ typedef struct ACL_FILE {
 
 
  acl_off_t acl_ftell(ACL_FILE *fp);
-# 42 "/workspace/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
-# 1 "/workspace/acl/lib_acl/include/stdlib/acl_readline.h" 1
-# 20 "/workspace/acl/lib_acl/include/stdlib/acl_readline.h"
+# 42 "/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
+# 1 "/acl/lib_acl/include/stdlib/acl_readline.h" 1
+# 20 "/acl/lib_acl/include/stdlib/acl_readline.h"
  ACL_VSTRING *acl_readlline(ACL_VSTRING *buf, ACL_VSTREAM *fp, int *lineno);
-# 43 "/workspace/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
+# 43 "/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
 
-# 1 "/workspace/acl/lib_acl/include/stdlib/acl_mylog.h" 1
-# 17 "/workspace/acl/lib_acl/include/stdlib/acl_mylog.h"
+# 1 "/acl/lib_acl/include/stdlib/acl_mylog.h" 1
+# 17 "/acl/lib_acl/include/stdlib/acl_mylog.h"
 typedef struct ACL_LOG ACL_LOG;
 
 
@@ -12838,7 +12839,7 @@ typedef struct ACL_LOG ACL_LOG;
 
 
  void acl_log_fp_set(ACL_VSTREAM *fp, const char *plog_pre);
-# 49 "/workspace/acl/lib_acl/include/stdlib/acl_mylog.h"
+# 49 "/acl/lib_acl/include/stdlib/acl_mylog.h"
  int acl_open_log(const char *recipients, const char *plog_pre);
 
 
@@ -12855,7 +12856,7 @@ typedef struct ACL_LOG ACL_LOG;
 
 
  int __attribute__((__format__ (__printf__, (1), (2)))) acl_write_to_log(const char *fmt, ...);
-# 73 "/workspace/acl/lib_acl/include/stdlib/acl_mylog.h"
+# 73 "/acl/lib_acl/include/stdlib/acl_mylog.h"
  int acl_write_to_log2(const char *info, const char *fmt, va_list ap);
 
 
@@ -12865,17 +12866,17 @@ typedef struct ACL_LOG ACL_LOG;
 
  ACL_ARRAY *acl_log_get_streams(void);
  void acl_log_free_streams(ACL_ARRAY *a);
-# 45 "/workspace/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
-# 1 "/workspace/acl/lib_acl/include/stdlib/acl_getopt.h" 1
-# 10 "/workspace/acl/lib_acl/include/stdlib/acl_getopt.h"
+# 45 "/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
+# 1 "/acl/lib_acl/include/stdlib/acl_getopt.h" 1
+# 10 "/acl/lib_acl/include/stdlib/acl_getopt.h"
 extern int acl_optind;
 extern char *acl_optarg;
 
  void acl_getopt_init(void);
  int acl_getopt(int argc, char *argv[], const char *opts);
-# 46 "/workspace/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
-# 1 "/workspace/acl/lib_acl/include/stdlib/acl_allocator.h" 1
-# 13 "/workspace/acl/lib_acl/include/stdlib/acl_allocator.h"
+# 46 "/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
+# 1 "/acl/lib_acl/include/stdlib/acl_allocator.h" 1
+# 13 "/acl/lib_acl/include/stdlib/acl_allocator.h"
 typedef enum {
  ACL_MEM_TYPE_NONE,
  ACL_MEM_TYPE_8_BUF,
@@ -12910,9 +12911,9 @@ typedef struct ACL_ALLOCATOR ACL_ALLOCATOR;
 
 
  ACL_ALLOCATOR *acl_allocator_create(size_t mem_limit);
-# 56 "/workspace/acl/lib_acl/include/stdlib/acl_allocator.h"
+# 56 "/acl/lib_acl/include/stdlib/acl_allocator.h"
  void acl_allocator_ctl(int name, ...);
-# 67 "/workspace/acl/lib_acl/include/stdlib/acl_allocator.h"
+# 67 "/acl/lib_acl/include/stdlib/acl_allocator.h"
  void acl_allocator_config(ACL_ALLOCATOR *allocator, size_t mem_limit);
 
 
@@ -12920,7 +12921,7 @@ typedef struct ACL_ALLOCATOR ACL_ALLOCATOR;
 
 
  void acl_allocator_free(ACL_ALLOCATOR *allocator);
-# 87 "/workspace/acl/lib_acl/include/stdlib/acl_allocator.h"
+# 87 "/acl/lib_acl/include/stdlib/acl_allocator.h"
  ACL_MEM_POOL *acl_allocator_pool_add(ACL_ALLOCATOR *allocator,
      const char *label,
      size_t obj_size,
@@ -12966,24 +12967,24 @@ typedef struct ACL_ALLOCATOR ACL_ALLOCATOR;
 
 
  int acl_allocator_pool_total_allocated(ACL_ALLOCATOR *allocator);
-# 141 "/workspace/acl/lib_acl/include/stdlib/acl_allocator.h"
+# 141 "/acl/lib_acl/include/stdlib/acl_allocator.h"
  void *acl_allocator_mem_alloc(const char *filename, int line,
  ACL_ALLOCATOR *allocator, acl_mem_type type);
-# 152 "/workspace/acl/lib_acl/include/stdlib/acl_allocator.h"
+# 152 "/acl/lib_acl/include/stdlib/acl_allocator.h"
  void acl_allocator_mem_free(const char *filename, int line,
  ACL_ALLOCATOR *allocator, acl_mem_type type, void *obj);
-# 164 "/workspace/acl/lib_acl/include/stdlib/acl_allocator.h"
+# 164 "/acl/lib_acl/include/stdlib/acl_allocator.h"
  void *acl_allocator_membuf_alloc(const char *filename, int line,
  ACL_ALLOCATOR *allocator, size_t size);
-# 177 "/workspace/acl/lib_acl/include/stdlib/acl_allocator.h"
+# 177 "/acl/lib_acl/include/stdlib/acl_allocator.h"
  void *acl_allocator_membuf_realloc(const char *filename, int line,
  ACL_ALLOCATOR *allocator, void *oldbuf, size_t size);
-# 188 "/workspace/acl/lib_acl/include/stdlib/acl_allocator.h"
+# 188 "/acl/lib_acl/include/stdlib/acl_allocator.h"
  void acl_allocator_membuf_free(const char *filename, int line,
  ACL_ALLOCATOR *allocator, void *buf);
-# 47 "/workspace/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
-# 1 "/workspace/acl/lib_acl/include/stdlib/acl_chunk_chain.h" 1
-# 13 "/workspace/acl/lib_acl/include/stdlib/acl_chunk_chain.h"
+# 47 "/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
+# 1 "/acl/lib_acl/include/stdlib/acl_chunk_chain.h" 1
+# 13 "/acl/lib_acl/include/stdlib/acl_chunk_chain.h"
 typedef struct ACL_CHAIN ACL_CHAIN;
 
 
@@ -13055,7 +13056,7 @@ typedef struct ACL_CHAIN ACL_CHAIN;
 
 
  int acl_chain_chunk_data_len(ACL_CHAIN *chain);
-# 92 "/workspace/acl/lib_acl/include/stdlib/acl_chunk_chain.h"
+# 92 "/acl/lib_acl/include/stdlib/acl_chunk_chain.h"
  void acl_chain_add(ACL_CHAIN *chain, const void *data,
  long long int from, int dlen);
 
@@ -13064,10 +13065,10 @@ typedef struct ACL_CHAIN ACL_CHAIN;
 
 
  void acl_chain_list(ACL_CHAIN *chain);
-# 48 "/workspace/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
+# 48 "/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
 
 
-# 1 "/workspace/acl/lib_acl/include/stdlib/acl_mem_slice.h" 1
+# 1 "/acl/lib_acl/include/stdlib/acl_mem_slice.h" 1
 
 
 
@@ -13083,9 +13084,9 @@ typedef struct ACL_MEM_SLICE ACL_MEM_SLICE;
  void acl_mem_slice_destroy(void);
  int acl_mem_slice_gc(void);
  void acl_mem_slice_set(ACL_MEM_SLICE *mem_slice);
-# 51 "/workspace/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
+# 51 "/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
 
-# 1 "/workspace/acl/lib_acl/include/stdlib/acl_meter_time.h" 1
+# 1 "/acl/lib_acl/include/stdlib/acl_meter_time.h" 1
 
 
 
@@ -13094,10 +13095,10 @@ typedef struct ACL_MEM_SLICE ACL_MEM_SLICE;
 
 
  double acl_meter_time(const char *filename, int line, const char *info);
-# 53 "/workspace/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
+# 53 "/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
 
-# 1 "/workspace/acl/lib_acl/include/stdlib/acl_xinetd_cfg.h" 1
-# 14 "/workspace/acl/lib_acl/include/stdlib/acl_xinetd_cfg.h"
+# 1 "/acl/lib_acl/include/stdlib/acl_xinetd_cfg.h" 1
+# 14 "/acl/lib_acl/include/stdlib/acl_xinetd_cfg.h"
 typedef struct ACL_XINETD_CFG_PARSER ACL_XINETD_CFG_PARSER;
 
 
@@ -13115,7 +13116,7 @@ typedef struct ACL_XINETD_CFG_PARSER ACL_XINETD_CFG_PARSER;
 
 
  const ACL_ARRAY *acl_xinetd_cfg_get_ex(const ACL_XINETD_CFG_PARSER *xcp, const char *name);
-# 40 "/workspace/acl/lib_acl/include/stdlib/acl_xinetd_cfg.h"
+# 40 "/acl/lib_acl/include/stdlib/acl_xinetd_cfg.h"
  int acl_xinetd_cfg_index(const ACL_XINETD_CFG_PARSER *xcp,
    int idx,
    char **ppname,
@@ -13180,7 +13181,7 @@ typedef struct ACL_CFG_BOOL_TABLE {
  int defval;
  int *target;
 } ACL_CFG_BOOL_TABLE;
-# 112 "/workspace/acl/lib_acl/include/stdlib/acl_xinetd_cfg.h"
+# 112 "/acl/lib_acl/include/stdlib/acl_xinetd_cfg.h"
  void acl_xinetd_params_int_table(ACL_XINETD_CFG_PARSER *cfg,
  ACL_CFG_INT_TABLE *table);
 
@@ -13207,9 +13208,9 @@ typedef struct ACL_CFG_BOOL_TABLE {
 
  void acl_xinetd_params_bool_table(ACL_XINETD_CFG_PARSER *cfg,
  ACL_CFG_BOOL_TABLE *table);
-# 55 "/workspace/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
-# 1 "/workspace/acl/lib_acl/include/stdlib/acl_loadcfg.h" 1
-# 11 "/workspace/acl/lib_acl/include/stdlib/acl_loadcfg.h"
+# 55 "/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
+# 1 "/acl/lib_acl/include/stdlib/acl_loadcfg.h" 1
+# 11 "/acl/lib_acl/include/stdlib/acl_loadcfg.h"
 typedef struct ACL_CFG_PARSER ACL_CFG_PARSER;
 
 typedef struct ACL_CFG_LINE {
@@ -13240,18 +13241,18 @@ typedef void (*ACL_CFG_WALK_FN)(void *arg);
  int acl_cfg_parser_append(ACL_CFG_PARSER *parser, ACL_CFG_LINE *cfg_line);
  int acl_cfg_parser_delete(ACL_CFG_PARSER *parser, const char *name);
  ACL_CFG_LINE *acl_cfg_line_new(const char **value, int ncount);
-# 56 "/workspace/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
-# 1 "/workspace/acl/lib_acl/include/stdlib/acl_cfg_macro.h" 1
-# 57 "/workspace/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
+# 56 "/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
+# 1 "/acl/lib_acl/include/stdlib/acl_cfg_macro.h" 1
+# 57 "/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
 
-# 1 "/workspace/acl/lib_acl/include/stdlib/acl_hex_code.h" 1
-# 18 "/workspace/acl/lib_acl/include/stdlib/acl_hex_code.h"
+# 1 "/acl/lib_acl/include/stdlib/acl_hex_code.h" 1
+# 18 "/acl/lib_acl/include/stdlib/acl_hex_code.h"
  ACL_VSTRING *acl_hex_encode(ACL_VSTRING *buf, const char *ptr, int len);
-# 27 "/workspace/acl/lib_acl/include/stdlib/acl_hex_code.h"
+# 27 "/acl/lib_acl/include/stdlib/acl_hex_code.h"
  ACL_VSTRING *acl_hex_decode(ACL_VSTRING *buf, const char *ptr, int len);
-# 59 "/workspace/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
-# 1 "/workspace/acl/lib_acl/include/stdlib/acl_split_at.h" 1
-# 16 "/workspace/acl/lib_acl/include/stdlib/acl_split_at.h"
+# 59 "/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
+# 1 "/acl/lib_acl/include/stdlib/acl_split_at.h" 1
+# 16 "/acl/lib_acl/include/stdlib/acl_split_at.h"
  char *acl_split_at(char *string, int delimiter);
 
 
@@ -13261,9 +13262,9 @@ typedef void (*ACL_CFG_WALK_FN)(void *arg);
 
 
  char *acl_split_at_right(char *string, int delimiter);
-# 60 "/workspace/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
-# 1 "/workspace/acl/lib_acl/include/stdlib/acl_stringops.h" 1
-# 15 "/workspace/acl/lib_acl/include/stdlib/acl_stringops.h"
+# 60 "/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
+# 1 "/acl/lib_acl/include/stdlib/acl_stringops.h" 1
+# 15 "/acl/lib_acl/include/stdlib/acl_stringops.h"
  int acl_alldig(const char *str);
 
 
@@ -13280,24 +13281,24 @@ typedef void (*ACL_CFG_WALK_FN)(void *arg);
 
 
  char *acl_concatenate(const char *arg0,...);
-# 40 "/workspace/acl/lib_acl/include/stdlib/acl_stringops.h"
+# 40 "/acl/lib_acl/include/stdlib/acl_stringops.h"
  const char *acl_safe_basename(const char *path);
-# 52 "/workspace/acl/lib_acl/include/stdlib/acl_stringops.h"
+# 52 "/acl/lib_acl/include/stdlib/acl_stringops.h"
  const char *acl_split_nameval(char *buf, char **name, char **value);
-# 61 "/workspace/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
-# 1 "/workspace/acl/lib_acl/include/stdlib/acl_timeops.h" 1
-# 24 "/workspace/acl/lib_acl/include/stdlib/acl_timeops.h"
+# 61 "/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
+# 1 "/acl/lib_acl/include/stdlib/acl_timeops.h" 1
+# 24 "/acl/lib_acl/include/stdlib/acl_timeops.h"
  time_t acl_str2time_t(const char *str);
-# 35 "/workspace/acl/lib_acl/include/stdlib/acl_timeops.h"
+# 35 "/acl/lib_acl/include/stdlib/acl_timeops.h"
  struct tm *acl_localtime_r(const time_t *t, struct tm *result);
-# 62 "/workspace/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
+# 62 "/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
 
-# 1 "/workspace/acl/lib_acl/include/stdlib/acl_make_dirs.h" 1
-# 17 "/workspace/acl/lib_acl/include/stdlib/acl_make_dirs.h"
+# 1 "/acl/lib_acl/include/stdlib/acl_make_dirs.h" 1
+# 17 "/acl/lib_acl/include/stdlib/acl_make_dirs.h"
  int acl_make_dirs(const char *path, int perms);
-# 64 "/workspace/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
-# 1 "/workspace/acl/lib_acl/include/stdlib/acl_scan_dir.h" 1
-# 14 "/workspace/acl/lib_acl/include/stdlib/acl_scan_dir.h"
+# 64 "/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
+# 1 "/acl/lib_acl/include/stdlib/acl_scan_dir.h" 1
+# 14 "/acl/lib_acl/include/stdlib/acl_scan_dir.h"
 typedef struct ACL_SCAN_DIR ACL_SCAN_DIR;
 
 
@@ -13352,7 +13353,7 @@ typedef int (*ACL_SCAN_RMDIR_FN)(ACL_SCAN_DIR *scan, const char *path, void *ctx
 
 
  void acl_scan_dir_ctl(ACL_SCAN_DIR *scan, int name, ...);
-# 79 "/workspace/acl/lib_acl/include/stdlib/acl_scan_dir.h"
+# 79 "/acl/lib_acl/include/stdlib/acl_scan_dir.h"
  const char *acl_scan_dir_path(ACL_SCAN_DIR *scan);
 
 
@@ -13420,7 +13421,7 @@ typedef int (*ACL_SCAN_RMDIR_FN)(ACL_SCAN_DIR *scan, const char *path, void *ctx
 
 
  ACL_SCAN_DIR *acl_scan_dir_pop(ACL_SCAN_DIR *scan);
-# 155 "/workspace/acl/lib_acl/include/stdlib/acl_scan_dir.h"
+# 155 "/acl/lib_acl/include/stdlib/acl_scan_dir.h"
  const char *acl_scan_dir_next(ACL_SCAN_DIR *scan);
 
 
@@ -13438,25 +13439,25 @@ typedef int (*ACL_SCAN_RMDIR_FN)(ACL_SCAN_DIR *scan, const char *path, void *ctx
 
 
  const char *acl_scan_dir_next_dir(ACL_SCAN_DIR *scan);
-# 182 "/workspace/acl/lib_acl/include/stdlib/acl_scan_dir.h"
+# 182 "/acl/lib_acl/include/stdlib/acl_scan_dir.h"
  const char *acl_scan_dir_next_name(ACL_SCAN_DIR *scan, int *is_file);
-# 192 "/workspace/acl/lib_acl/include/stdlib/acl_scan_dir.h"
+# 192 "/acl/lib_acl/include/stdlib/acl_scan_dir.h"
  long long int acl_scan_dir_size2(ACL_SCAN_DIR *scan, int *nfile, int *ndir);
-# 202 "/workspace/acl/lib_acl/include/stdlib/acl_scan_dir.h"
+# 202 "/acl/lib_acl/include/stdlib/acl_scan_dir.h"
  long long int acl_scan_dir_size(const char *pathname, int recursive,
   int *nfile, int *ndir);
-# 213 "/workspace/acl/lib_acl/include/stdlib/acl_scan_dir.h"
+# 213 "/acl/lib_acl/include/stdlib/acl_scan_dir.h"
  long long int acl_scan_dir_rm2(ACL_SCAN_DIR *scan, int *nfile, int *ndir);
-# 223 "/workspace/acl/lib_acl/include/stdlib/acl_scan_dir.h"
+# 223 "/acl/lib_acl/include/stdlib/acl_scan_dir.h"
  long long int acl_scan_dir_rm(const char *pathname, int recursive,
   int *ndir, int *nfile);
-# 65 "/workspace/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
-# 1 "/workspace/acl/lib_acl/include/stdlib/acl_myflock.h" 1
-# 18 "/workspace/acl/lib_acl/include/stdlib/acl_myflock.h"
+# 65 "/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
+# 1 "/acl/lib_acl/include/stdlib/acl_myflock.h" 1
+# 18 "/acl/lib_acl/include/stdlib/acl_myflock.h"
  int acl_myflock(int fd, int lock_style, int operation);
-# 66 "/workspace/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
-# 1 "/workspace/acl/lib_acl/include/stdlib/acl_sane_basename.h" 1
-# 15 "/workspace/acl/lib_acl/include/stdlib/acl_sane_basename.h"
+# 66 "/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
+# 1 "/acl/lib_acl/include/stdlib/acl_sane_basename.h" 1
+# 15 "/acl/lib_acl/include/stdlib/acl_sane_basename.h"
  char *acl_sane_basename(ACL_VSTRING *bp, const char *path);
 
 
@@ -13465,9 +13466,9 @@ typedef int (*ACL_SCAN_RMDIR_FN)(ACL_SCAN_DIR *scan, const char *path, void *ctx
 
 
  char *acl_sane_dirname(ACL_VSTRING *bp, const char *path);
-# 67 "/workspace/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
-# 1 "/workspace/acl/lib_acl/include/stdlib/acl_fhandle.h" 1
-# 19 "/workspace/acl/lib_acl/include/stdlib/acl_fhandle.h"
+# 67 "/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
+# 1 "/acl/lib_acl/include/stdlib/acl_fhandle.h" 1
+# 19 "/acl/lib_acl/include/stdlib/acl_fhandle.h"
 typedef struct ACL_FHANDLE ACL_FHANDLE;
 
 struct ACL_FHANDLE {
@@ -13483,7 +13484,7 @@ struct ACL_FHANDLE {
  acl_pthread_t lock_mutex_tid;
 
  unsigned int oflags;
-# 42 "/workspace/acl/lib_acl/include/stdlib/acl_fhandle.h"
+# 42 "/acl/lib_acl/include/stdlib/acl_fhandle.h"
  unsigned int status;
 
 
@@ -13493,7 +13494,7 @@ struct ACL_FHANDLE {
  size_t size;
  void (*on_close)(ACL_FHANDLE*);
 };
-# 60 "/workspace/acl/lib_acl/include/stdlib/acl_fhandle.h"
+# 60 "/acl/lib_acl/include/stdlib/acl_fhandle.h"
 void acl_fhandle_init(int cache_size, int debug_section, unsigned int flags);
 
 
@@ -13501,7 +13502,7 @@ void acl_fhandle_init(int cache_size, int debug_section, unsigned int flags);
 
 
 void acl_fhandle_end(void);
-# 79 "/workspace/acl/lib_acl/include/stdlib/acl_fhandle.h"
+# 79 "/acl/lib_acl/include/stdlib/acl_fhandle.h"
 ACL_FHANDLE *acl_fhandle_open(size_t size, unsigned int oflags,
  const char *file_path,
  int (*on_open)(ACL_FHANDLE*, void*), void *open_arg,
@@ -13526,17 +13527,17 @@ void acl_fhandle_lock(ACL_FHANDLE *fs);
 
 
 void acl_fhandle_unlock(ACL_FHANDLE *fs);
-# 68 "/workspace/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
+# 68 "/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
 
-# 1 "/workspace/acl/lib_acl/include/stdlib/acl_bits_map.h" 1
-# 13 "/workspace/acl/lib_acl/include/stdlib/acl_bits_map.h"
+# 1 "/acl/lib_acl/include/stdlib/acl_bits_map.h" 1
+# 13 "/acl/lib_acl/include/stdlib/acl_bits_map.h"
 typedef struct ACL_BITS_MASK {
  char *data;
  size_t data_len;
 } ACL_BITS_MASK;
-# 70 "/workspace/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
-# 1 "/workspace/acl/lib_acl/include/stdlib/acl_process.h" 1
-# 13 "/workspace/acl/lib_acl/include/stdlib/acl_process.h"
+# 70 "/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
+# 1 "/acl/lib_acl/include/stdlib/acl_process.h" 1
+# 13 "/acl/lib_acl/include/stdlib/acl_process.h"
  const char *acl_process_path(void);
 
 
@@ -13544,8 +13545,8 @@ typedef struct ACL_BITS_MASK {
 
 
  const char *acl_getcwd(void);
-# 71 "/workspace/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
-# 1 "/workspace/acl/lib_acl/include/stdlib/unix/acl_unix.h" 1
+# 71 "/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
+# 1 "/acl/lib_acl/include/stdlib/unix/acl_unix.h" 1
 
 
 
@@ -13553,7 +13554,7 @@ typedef struct ACL_BITS_MASK {
 
 
 
-# 1 "/workspace/acl/lib_acl/include/stdlib/unix/acl_username.h" 1
+# 1 "/acl/lib_acl/include/stdlib/unix/acl_username.h" 1
 
 
 
@@ -13561,18 +13562,18 @@ typedef struct ACL_BITS_MASK {
 
 
 
-# 1 "/workspace/acl/lib_acl/include/stdlib/unix/../acl_define.h" 1
-# 9 "/workspace/acl/lib_acl/include/stdlib/unix/acl_username.h" 2
+# 1 "/acl/lib_acl/include/stdlib/unix/../acl_define.h" 1
+# 9 "/acl/lib_acl/include/stdlib/unix/acl_username.h" 2
 
 
 const char *acl_username(void);
-# 9 "/workspace/acl/lib_acl/include/stdlib/unix/acl_unix.h" 2
-# 1 "/workspace/acl/lib_acl/include/stdlib/unix/acl_timed_wait.h" 1
-# 15 "/workspace/acl/lib_acl/include/stdlib/unix/acl_timed_wait.h"
+# 9 "/acl/lib_acl/include/stdlib/unix/acl_unix.h" 2
+# 1 "/acl/lib_acl/include/stdlib/unix/acl_timed_wait.h" 1
+# 15 "/acl/lib_acl/include/stdlib/unix/acl_timed_wait.h"
 extern int acl_timed_waitpid(pid_t, ACL_WAIT_STATUS_T *, int, int);
-# 10 "/workspace/acl/lib_acl/include/stdlib/unix/acl_unix.h" 2
-# 1 "/workspace/acl/lib_acl/include/stdlib/unix/acl_set_ugid.h" 1
-# 20 "/workspace/acl/lib_acl/include/stdlib/unix/acl_set_ugid.h"
+# 10 "/acl/lib_acl/include/stdlib/unix/acl_unix.h" 2
+# 1 "/acl/lib_acl/include/stdlib/unix/acl_set_ugid.h" 1
+# 20 "/acl/lib_acl/include/stdlib/unix/acl_set_ugid.h"
 int acl_set_ugid(uid_t uid, gid_t gid);
 
 
@@ -13581,44 +13582,44 @@ int acl_set_ugid(uid_t uid, gid_t gid);
 
 
 int acl_change_uid(const char *user);
-# 11 "/workspace/acl/lib_acl/include/stdlib/unix/acl_unix.h" 2
-# 1 "/workspace/acl/lib_acl/include/stdlib/unix/acl_set_eugid.h" 1
-# 20 "/workspace/acl/lib_acl/include/stdlib/unix/acl_set_eugid.h"
+# 11 "/acl/lib_acl/include/stdlib/unix/acl_unix.h" 2
+# 1 "/acl/lib_acl/include/stdlib/unix/acl_set_eugid.h" 1
+# 20 "/acl/lib_acl/include/stdlib/unix/acl_set_eugid.h"
 int acl_set_eugid(uid_t euid, gid_t egid);
-# 12 "/workspace/acl/lib_acl/include/stdlib/unix/acl_unix.h" 2
-# 1 "/workspace/acl/lib_acl/include/stdlib/unix/acl_mychown.h" 1
-# 11 "/workspace/acl/lib_acl/include/stdlib/unix/acl_mychown.h"
+# 12 "/acl/lib_acl/include/stdlib/unix/acl_unix.h" 2
+# 1 "/acl/lib_acl/include/stdlib/unix/acl_mychown.h" 1
+# 11 "/acl/lib_acl/include/stdlib/unix/acl_mychown.h"
 int acl_mychown(const char *path, const char *s_owner, const char *s_group);
 int acl_myfchown(const int fd, const char *s_owner, const char *s_group);
-# 13 "/workspace/acl/lib_acl/include/stdlib/unix/acl_unix.h" 2
-# 1 "/workspace/acl/lib_acl/include/stdlib/unix/acl_chroot_uid.h" 1
-# 13 "/workspace/acl/lib_acl/include/stdlib/unix/acl_chroot_uid.h"
+# 13 "/acl/lib_acl/include/stdlib/unix/acl_unix.h" 2
+# 1 "/acl/lib_acl/include/stdlib/unix/acl_chroot_uid.h" 1
+# 13 "/acl/lib_acl/include/stdlib/unix/acl_chroot_uid.h"
 extern int acl_chroot_uid(const char *, const char *);
-# 14 "/workspace/acl/lib_acl/include/stdlib/unix/acl_unix.h" 2
-# 1 "/workspace/acl/lib_acl/include/stdlib/unix/acl_safe_open.h" 1
-# 21 "/workspace/acl/lib_acl/include/stdlib/unix/acl_safe_open.h"
-# 1 "/workspace/acl/lib_acl/include/stdlib/unix/../acl_vstream.h" 1
-# 22 "/workspace/acl/lib_acl/include/stdlib/unix/acl_safe_open.h" 2
-# 1 "/workspace/acl/lib_acl/include/stdlib/unix/../acl_vstring.h" 1
-# 23 "/workspace/acl/lib_acl/include/stdlib/unix/acl_safe_open.h" 2
+# 14 "/acl/lib_acl/include/stdlib/unix/acl_unix.h" 2
+# 1 "/acl/lib_acl/include/stdlib/unix/acl_safe_open.h" 1
+# 21 "/acl/lib_acl/include/stdlib/unix/acl_safe_open.h"
+# 1 "/acl/lib_acl/include/stdlib/unix/../acl_vstream.h" 1
+# 22 "/acl/lib_acl/include/stdlib/unix/acl_safe_open.h" 2
+# 1 "/acl/lib_acl/include/stdlib/unix/../acl_vstring.h" 1
+# 23 "/acl/lib_acl/include/stdlib/unix/acl_safe_open.h" 2
 
 
 
 
 extern ACL_VSTREAM *acl_safe_open(const char *path, int flags, int mode,
  struct stat * st, uid_t user, gid_t group, ACL_VSTRING *why);
-# 15 "/workspace/acl/lib_acl/include/stdlib/unix/acl_unix.h" 2
-# 1 "/workspace/acl/lib_acl/include/stdlib/unix/acl_open_lock.h" 1
-# 25 "/workspace/acl/lib_acl/include/stdlib/unix/acl_open_lock.h"
+# 15 "/acl/lib_acl/include/stdlib/unix/acl_unix.h" 2
+# 1 "/acl/lib_acl/include/stdlib/unix/acl_open_lock.h" 1
+# 25 "/acl/lib_acl/include/stdlib/unix/acl_open_lock.h"
 extern ACL_VSTREAM *acl_open_lock(const char *, int, int, ACL_VSTRING *);
-# 16 "/workspace/acl/lib_acl/include/stdlib/unix/acl_unix.h" 2
-# 1 "/workspace/acl/lib_acl/include/stdlib/unix/acl_transfer_fd.h" 1
-# 29 "/workspace/acl/lib_acl/include/stdlib/unix/acl_transfer_fd.h"
+# 16 "/acl/lib_acl/include/stdlib/unix/acl_unix.h" 2
+# 1 "/acl/lib_acl/include/stdlib/unix/acl_transfer_fd.h" 1
+# 29 "/acl/lib_acl/include/stdlib/unix/acl_transfer_fd.h"
 int acl_read_fd(int fd, void *ptr, int nbytes, int *recv_fd);
 int acl_write_fd(int fd, void *ptr, int nbytes, int send_fd);
-# 17 "/workspace/acl/lib_acl/include/stdlib/unix/acl_unix.h" 2
-# 1 "/workspace/acl/lib_acl/include/stdlib/unix/acl_watchdog.h" 1
-# 15 "/workspace/acl/lib_acl/include/stdlib/unix/acl_watchdog.h"
+# 17 "/acl/lib_acl/include/stdlib/unix/acl_unix.h" 2
+# 1 "/acl/lib_acl/include/stdlib/unix/acl_watchdog.h" 1
+# 15 "/acl/lib_acl/include/stdlib/unix/acl_watchdog.h"
 typedef struct ACL_WATCHDOG ACL_WATCHDOG;
 typedef void (*ACL_WATCHDOG_FN) (ACL_WATCHDOG *, char *);
 extern ACL_WATCHDOG *acl_watchdog_create(unsigned, ACL_WATCHDOG_FN, char *);
@@ -13626,48 +13627,48 @@ extern void acl_watchdog_start(ACL_WATCHDOG *);
 extern void acl_watchdog_stop(ACL_WATCHDOG *);
 extern void acl_watchdog_destroy(ACL_WATCHDOG *);
 extern void acl_watchdog_pat(void);
-# 18 "/workspace/acl/lib_acl/include/stdlib/unix/acl_unix.h" 2
-# 1 "/workspace/acl/lib_acl/include/stdlib/unix/acl_trace.h" 1
-# 12 "/workspace/acl/lib_acl/include/stdlib/unix/acl_trace.h"
+# 18 "/acl/lib_acl/include/stdlib/unix/acl_unix.h" 2
+# 1 "/acl/lib_acl/include/stdlib/unix/acl_trace.h" 1
+# 12 "/acl/lib_acl/include/stdlib/unix/acl_trace.h"
 void acl_trace_save(const char *filepath);
 
 
 
 
 void acl_trace_info(void);
-# 19 "/workspace/acl/lib_acl/include/stdlib/unix/acl_unix.h" 2
-# 1 "/workspace/acl/lib_acl/include/stdlib/unix/acl_core_limit.h" 1
-# 18 "/workspace/acl/lib_acl/include/stdlib/unix/acl_core_limit.h"
+# 19 "/acl/lib_acl/include/stdlib/unix/acl_unix.h" 2
+# 1 "/acl/lib_acl/include/stdlib/unix/acl_core_limit.h" 1
+# 18 "/acl/lib_acl/include/stdlib/unix/acl_core_limit.h"
 void acl_set_core_limit(long long int max);
-# 20 "/workspace/acl/lib_acl/include/stdlib/unix/acl_unix.h" 2
-# 72 "/workspace/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
+# 20 "/acl/lib_acl/include/stdlib/unix/acl_unix.h" 2
+# 72 "/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
 
-# 1 "/workspace/acl/lib_acl/include/stdlib/acl_vstream_popen.h" 1
-# 15 "/workspace/acl/lib_acl/include/stdlib/acl_vstream_popen.h"
+# 1 "/acl/lib_acl/include/stdlib/acl_vstream_popen.h" 1
+# 15 "/acl/lib_acl/include/stdlib/acl_vstream_popen.h"
  ACL_VSTREAM *acl_vstream_popen(int,...);
  int acl_vstream_pclose(ACL_VSTREAM *);
-# 74 "/workspace/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
-# 1 "/workspace/acl/lib_acl/include/stdlib/acl_safe.h" 1
-# 10 "/workspace/acl/lib_acl/include/stdlib/acl_safe.h"
+# 74 "/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
+# 1 "/acl/lib_acl/include/stdlib/acl_safe.h" 1
+# 10 "/acl/lib_acl/include/stdlib/acl_safe.h"
  int acl_unsafe(void);
  char *acl_safe_getenv(const char*name);
-# 75 "/workspace/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
-# 1 "/workspace/acl/lib_acl/include/stdlib/acl_exec_command.h" 1
-# 10 "/workspace/acl/lib_acl/include/stdlib/acl_exec_command.h"
+# 75 "/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
+# 1 "/acl/lib_acl/include/stdlib/acl_exec_command.h" 1
+# 10 "/acl/lib_acl/include/stdlib/acl_exec_command.h"
  void acl_exec_command(const char *command);
-# 76 "/workspace/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
-# 1 "/workspace/acl/lib_acl/include/stdlib/acl_env.h" 1
-# 10 "/workspace/acl/lib_acl/include/stdlib/acl_env.h"
+# 76 "/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
+# 1 "/acl/lib_acl/include/stdlib/acl_env.h" 1
+# 10 "/acl/lib_acl/include/stdlib/acl_env.h"
  void acl_clean_env(char **preserve_list);
  char *acl_getenv(const char *name);
  char *acl_getenv3(const char *name, char *buf, size_t len);
  int acl_setenv(const char *name, const char *val, int overwrite);
  int acl_putenv(char *str);
  const char *acl_getenv_list(void);
-# 77 "/workspace/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
+# 77 "/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
 
-# 1 "/workspace/acl/lib_acl/include/stdlib/acl_dll.h" 1
-# 13 "/workspace/acl/lib_acl/include/stdlib/acl_dll.h"
+# 1 "/acl/lib_acl/include/stdlib/acl_dll.h" 1
+# 13 "/acl/lib_acl/include/stdlib/acl_dll.h"
 typedef struct ACL_DLL_ENV {
  ACL_VSTREAM *logfp;
  ACL_DEBUG_MEM *mmd;
@@ -13678,9 +13679,9 @@ typedef struct ACL_DLL_ENV {
  void acl_dlclose(void* handle);
  void* acl_dlsym(void *handle, const char *name);
  const char *acl_dlerror(void);
-# 79 "/workspace/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
-# 1 "/workspace/acl/lib_acl/include/stdlib/acl_atomic.h" 1
-# 11 "/workspace/acl/lib_acl/include/stdlib/acl_atomic.h"
+# 79 "/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
+# 1 "/acl/lib_acl/include/stdlib/acl_atomic.h" 1
+# 11 "/acl/lib_acl/include/stdlib/acl_atomic.h"
 typedef struct ACL_ATOMIC ACL_ATOMIC;
 
 
@@ -13701,7 +13702,7 @@ typedef struct ACL_ATOMIC ACL_ATOMIC;
 
 
  void acl_atomic_set(ACL_ATOMIC *self, void *value);
-# 40 "/workspace/acl/lib_acl/include/stdlib/acl_atomic.h"
+# 40 "/acl/lib_acl/include/stdlib/acl_atomic.h"
  void *acl_atomic_cas(ACL_ATOMIC *self, void *cmp, void *value);
 
 
@@ -13735,7 +13736,7 @@ typedef struct ACL_ATOMIC ACL_ATOMIC;
 
 
  long long acl_atomic_int64_add_fetch(ACL_ATOMIC *self, long long n);
-# 82 "/workspace/acl/lib_acl/include/stdlib/acl_atomic.h"
+# 82 "/acl/lib_acl/include/stdlib/acl_atomic.h"
  long long acl_atomic_int64_cas(ACL_ATOMIC *self, long long cmp, long long n);
 
 
@@ -13750,9 +13751,9 @@ typedef struct ACL_ATOMIC_CLOCK ACL_ATOMIC_CLOCK;
  long long acl_atomic_clock_count(ACL_ATOMIC_CLOCK *clk);
  long long acl_atomic_clock_atime(ACL_ATOMIC_CLOCK *clk);
  long long acl_atomic_clock_users(ACL_ATOMIC_CLOCK *clk);
-# 80 "/workspace/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
-# 1 "/workspace/acl/lib_acl/include/stdlib/acl_yqueue.h" 1
-# 11 "/workspace/acl/lib_acl/include/stdlib/acl_yqueue.h"
+# 80 "/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
+# 1 "/acl/lib_acl/include/stdlib/acl_yqueue.h" 1
+# 11 "/acl/lib_acl/include/stdlib/acl_yqueue.h"
 typedef struct ACL_YQUEUE ACL_YQUEUE;
 
  ACL_YQUEUE* acl_yqueue_new(void);
@@ -13761,9 +13762,9 @@ typedef struct ACL_YQUEUE ACL_YQUEUE;
  void **acl_yqueue_back(ACL_YQUEUE *yqueue);
  void acl_yqueue_push(ACL_YQUEUE *yqueue);
  void acl_yqueue_pop(ACL_YQUEUE *yqueue);
-# 81 "/workspace/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
-# 1 "/workspace/acl/lib_acl/include/stdlib/acl_ypipe.h" 1
-# 11 "/workspace/acl/lib_acl/include/stdlib/acl_ypipe.h"
+# 81 "/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
+# 1 "/acl/lib_acl/include/stdlib/acl_ypipe.h" 1
+# 11 "/acl/lib_acl/include/stdlib/acl_ypipe.h"
 typedef struct ACL_YPIPE ACL_YPIPE;
 
  ACL_YPIPE *acl_ypipe_new(void);
@@ -13772,10 +13773,10 @@ typedef struct ACL_YPIPE ACL_YPIPE;
  void acl_ypipe_write(ACL_YPIPE *self, void *data);
  int acl_ypipe_flush(ACL_YPIPE *self);
  void acl_ypipe_free(ACL_YPIPE *self, void(*free_fun)(void*));
-# 82 "/workspace/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
+# 82 "/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
 
-# 1 "/workspace/acl/lib_acl/include/stdlib/acl_mbox.h" 1
-# 10 "/workspace/acl/lib_acl/include/stdlib/acl_mbox.h"
+# 1 "/acl/lib_acl/include/stdlib/acl_mbox.h" 1
+# 10 "/acl/lib_acl/include/stdlib/acl_mbox.h"
 typedef struct ACL_MBOX ACL_MBOX;
 
 
@@ -13803,7 +13804,7 @@ typedef struct ACL_MBOX ACL_MBOX;
 
 
  int acl_mbox_send(ACL_MBOX *mbox, void *msg);
-# 46 "/workspace/acl/lib_acl/include/stdlib/acl_mbox.h"
+# 46 "/acl/lib_acl/include/stdlib/acl_mbox.h"
  void *acl_mbox_read(ACL_MBOX *mbox, int timeout, int *success);
 
 
@@ -13819,9 +13820,9 @@ typedef struct ACL_MBOX ACL_MBOX;
 
 
  size_t acl_mbox_nread(ACL_MBOX *mbox);
-# 84 "/workspace/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
-# 10 "/workspace/acl/lib_acl/include/lib_acl.h" 2
-# 1 "/workspace/acl/lib_acl/include/net/acl_net.h" 1
+# 84 "/acl/lib_acl/include/stdlib/acl_stdlib.h" 2
+# 10 "/acl/lib_acl/include/lib_acl.h" 2
+# 1 "/acl/lib_acl/include/net/acl_net.h" 1
 
 
 
@@ -13829,7 +13830,7 @@ typedef struct ACL_MBOX ACL_MBOX;
 
 
 
-# 1 "/workspace/acl/lib_acl/include/net/acl_connect.h" 1
+# 1 "/acl/lib_acl/include/net/acl_connect.h" 1
 
 
 
@@ -13837,8 +13838,8 @@ typedef struct ACL_MBOX ACL_MBOX;
 
 
 
-# 1 "/workspace/acl/lib_acl/include/net/../stdlib/acl_define.h" 1
-# 9 "/workspace/acl/lib_acl/include/net/acl_connect.h" 2
+# 1 "/acl/lib_acl/include/net/../stdlib/acl_define.h" 1
+# 9 "/acl/lib_acl/include/net/acl_connect.h" 2
 
 
 
@@ -13894,7 +13895,8 @@ extern int inet_aton (const char *__cp, struct in_addr *__inp) __attribute__ ((_
 
 
 
-extern char *inet_neta (in_addr_t __net, char *__buf, size_t __len) __attribute__ ((__nothrow__ , __leaf__));
+extern char *inet_neta (in_addr_t __net, char *__buf, size_t __len) __attribute__ ((__nothrow__ , __leaf__))
+  __attribute__ ((__deprecated__ ("Use inet_ntop instead")));
 
 
 
@@ -13921,40 +13923,40 @@ extern char *inet_nsap_ntoa (int __len, const unsigned char *__cp,
 
 
 
-# 14 "/workspace/acl/lib_acl/include/net/acl_connect.h" 2
-# 25 "/workspace/acl/lib_acl/include/net/acl_connect.h"
+# 14 "/acl/lib_acl/include/net/acl_connect.h" 2
+# 25 "/acl/lib_acl/include/net/acl_connect.h"
  
-# 25 "/workspace/acl/lib_acl/include/net/acl_connect.h"
+# 25 "/acl/lib_acl/include/net/acl_connect.h"
        int acl_sane_connect(int sock, const struct sockaddr * sa,
   socklen_t len);
-# 38 "/workspace/acl/lib_acl/include/net/acl_connect.h"
+# 38 "/acl/lib_acl/include/net/acl_connect.h"
  int acl_timed_connect(int fd, const struct sockaddr * sa,
   socklen_t len, int timeout);
-# 49 "/workspace/acl/lib_acl/include/net/acl_connect.h"
+# 49 "/acl/lib_acl/include/net/acl_connect.h"
  int acl_timed_connect_ms(int fd, const struct sockaddr * sa,
   socklen_t len, int timeout);
-# 63 "/workspace/acl/lib_acl/include/net/acl_connect.h"
+# 63 "/acl/lib_acl/include/net/acl_connect.h"
  int acl_inet_connect(const char *addr, int blocking, int timeout);
-# 75 "/workspace/acl/lib_acl/include/net/acl_connect.h"
+# 75 "/acl/lib_acl/include/net/acl_connect.h"
  int acl_inet_connect_ex(const char *addr, int blocking,
   int timeout, int *h_error);
-# 88 "/workspace/acl/lib_acl/include/net/acl_connect.h"
+# 88 "/acl/lib_acl/include/net/acl_connect.h"
  int acl_inet_timed_connect(const char *addr, int blocking,
   int timeout, int *h_error);
-# 103 "/workspace/acl/lib_acl/include/net/acl_connect.h"
+# 103 "/acl/lib_acl/include/net/acl_connect.h"
  int acl_unix_connect(const char *addr, int blocking, int timeout);
-# 115 "/workspace/acl/lib_acl/include/net/acl_connect.h"
+# 115 "/acl/lib_acl/include/net/acl_connect.h"
 typedef int (*acl_connect_fn)(int, const struct sockaddr*, socklen_t);
 
 
  void acl_set_connect(acl_connect_fn fn);
-# 9 "/workspace/acl/lib_acl/include/net/acl_net.h" 2
-# 1 "/workspace/acl/lib_acl/include/net/acl_netdb.h" 1
-# 10 "/workspace/acl/lib_acl/include/net/acl_netdb.h"
-# 1 "/workspace/acl/lib_acl/include/net/../stdlib/acl_array.h" 1
-# 11 "/workspace/acl/lib_acl/include/net/acl_netdb.h" 2
-# 1 "/workspace/acl/lib_acl/include/net/acl_sane_inet.h" 1
-# 15 "/workspace/acl/lib_acl/include/net/acl_sane_inet.h"
+# 9 "/acl/lib_acl/include/net/acl_net.h" 2
+# 1 "/acl/lib_acl/include/net/acl_netdb.h" 1
+# 10 "/acl/lib_acl/include/net/acl_netdb.h"
+# 1 "/acl/lib_acl/include/net/../stdlib/acl_array.h" 1
+# 11 "/acl/lib_acl/include/net/acl_netdb.h" 2
+# 1 "/acl/lib_acl/include/net/acl_sane_inet.h" 1
+# 15 "/acl/lib_acl/include/net/acl_sane_inet.h"
 typedef union {
  struct sockaddr_storage ss;
 
@@ -13966,15 +13968,15 @@ typedef union {
 
  struct sockaddr sa;
 } ACL_SOCKADDR;
-# 36 "/workspace/acl/lib_acl/include/net/acl_sane_inet.h"
+# 36 "/acl/lib_acl/include/net/acl_sane_inet.h"
  size_t acl_inet_ntop(const struct sockaddr *sa, char *buf, size_t size);
-# 47 "/workspace/acl/lib_acl/include/net/acl_sane_inet.h"
+# 47 "/acl/lib_acl/include/net/acl_sane_inet.h"
  size_t acl_inet_pton(int af, const char *src, struct sockaddr *dst);
-# 58 "/workspace/acl/lib_acl/include/net/acl_sane_inet.h"
+# 58 "/acl/lib_acl/include/net/acl_sane_inet.h"
  size_t acl_sane_pton(const char *src, struct sockaddr *dst);
-# 67 "/workspace/acl/lib_acl/include/net/acl_sane_inet.h"
+# 67 "/acl/lib_acl/include/net/acl_sane_inet.h"
  const char *acl_inet_ntop4(const unsigned char *src, char *dst, size_t size);
-# 76 "/workspace/acl/lib_acl/include/net/acl_sane_inet.h"
+# 76 "/acl/lib_acl/include/net/acl_sane_inet.h"
  const char *acl_inet_ntoa(const struct in_addr in, char *dst, size_t size);
 
 
@@ -13996,7 +13998,7 @@ typedef union {
 
 
  int acl_ipv4_addr_valid(const char *addr);
-# 12 "/workspace/acl/lib_acl/include/net/acl_netdb.h" 2
+# 12 "/acl/lib_acl/include/net/acl_netdb.h" 2
 
 
 
@@ -14042,7 +14044,7 @@ typedef struct ACL_DNS_DB {
 
  const ACL_HOSTNAME *(*iter_info)(ACL_ITER*, struct ACL_DNS_DB*);
 } ACL_DNS_DB;
-# 66 "/workspace/acl/lib_acl/include/net/acl_netdb.h"
+# 66 "/acl/lib_acl/include/net/acl_netdb.h"
  const ACL_HOSTNAME *acl_netdb_index(const ACL_DNS_DB *h_dns_db, int i);
 
 
@@ -14131,9 +14133,9 @@ typedef struct ACL_DNS_DB {
 
 
  ACL_DNS_DB *acl_netdb_clone(const ACL_DNS_DB *h_dns_db);
-# 162 "/workspace/acl/lib_acl/include/net/acl_netdb.h"
+# 162 "/acl/lib_acl/include/net/acl_netdb.h"
  ACL_DNS_DB *acl_gethostbyname(const char *name, int *h_error);
-# 175 "/workspace/acl/lib_acl/include/net/acl_netdb.h"
+# 175 "/acl/lib_acl/include/net/acl_netdb.h"
  ACL_DNS_DB *acl_gethostbyname2(const char *name, int socktype,
   int family, int *h_error);
 
@@ -14143,7 +14145,7 @@ typedef struct ACL_DNS_DB {
 
 
  const char *acl_netdb_strerror(int errnum);
-# 192 "/workspace/acl/lib_acl/include/net/acl_netdb.h"
+# 192 "/acl/lib_acl/include/net/acl_netdb.h"
  void acl_netdb_cache_push(const ACL_DNS_DB *h_dns_db, int timeout);
 
 
@@ -14166,11 +14168,11 @@ typedef struct ACL_DNS_DB {
 
 
  void acl_netdb_cache_init(int timeout, int thread_safe);
-# 10 "/workspace/acl/lib_acl/include/net/acl_net.h" 2
-# 1 "/workspace/acl/lib_acl/include/net/acl_sane_socket.h" 1
-# 24 "/workspace/acl/lib_acl/include/net/acl_sane_socket.h"
+# 10 "/acl/lib_acl/include/net/acl_net.h" 2
+# 1 "/acl/lib_acl/include/net/acl_sane_socket.h" 1
+# 24 "/acl/lib_acl/include/net/acl_sane_socket.h"
  int acl_getpeername(int fd, char *buf, size_t bsize);
-# 33 "/workspace/acl/lib_acl/include/net/acl_sane_socket.h"
+# 33 "/acl/lib_acl/include/net/acl_sane_socket.h"
  int acl_getsockname(int fd, char *buf, size_t bsize);
 
 
@@ -14202,10 +14204,10 @@ typedef struct ACL_DNS_DB {
 
 
  int acl_is_listening_socket(int fd);
-# 11 "/workspace/acl/lib_acl/include/net/acl_net.h" 2
+# 11 "/acl/lib_acl/include/net/acl_net.h" 2
 
-# 1 "/workspace/acl/lib_acl/include/net/acl_tcp_ctl.h" 1
-# 18 "/workspace/acl/lib_acl/include/net/acl_tcp_ctl.h"
+# 1 "/acl/lib_acl/include/net/acl_tcp_ctl.h" 1
+# 18 "/acl/lib_acl/include/net/acl_tcp_ctl.h"
  void acl_tcp_set_rcvbuf(int fd, int size);
 
 
@@ -14256,9 +14258,9 @@ typedef struct ACL_DNS_DB {
 
 
  void acl_tcp_so_linger(int fd, int onoff, int timeout);
-# 76 "/workspace/acl/lib_acl/include/net/acl_tcp_ctl.h"
+# 76 "/acl/lib_acl/include/net/acl_tcp_ctl.h"
  int acl_get_tcp_solinger(int fd);
-# 85 "/workspace/acl/lib_acl/include/net/acl_tcp_ctl.h"
+# 85 "/acl/lib_acl/include/net/acl_tcp_ctl.h"
  void acl_tcp_defer_accept(int fd, int timeout);
 
 
@@ -14267,15 +14269,15 @@ typedef struct ACL_DNS_DB {
 
 
  void acl_tcp_fastopen(int fd, int on);
-# 13 "/workspace/acl/lib_acl/include/net/acl_net.h" 2
-# 1 "/workspace/acl/lib_acl/include/net/acl_listen.h" 1
-# 27 "/workspace/acl/lib_acl/include/net/acl_listen.h"
+# 13 "/acl/lib_acl/include/net/acl_net.h" 2
+# 1 "/acl/lib_acl/include/net/acl_listen.h" 1
+# 27 "/acl/lib_acl/include/net/acl_listen.h"
  int acl_sane_accept(int sock, struct sockaddr * sa,
   socklen_t *len);
-# 40 "/workspace/acl/lib_acl/include/net/acl_listen.h"
+# 40 "/acl/lib_acl/include/net/acl_listen.h"
  int acl_accept(int sock, char *buf, size_t size,
   int* sock_type);
-# 55 "/workspace/acl/lib_acl/include/net/acl_listen.h"
+# 55 "/acl/lib_acl/include/net/acl_listen.h"
  int acl_inet_listen(const char *addr, int backlog, unsigned flag);
 
 
@@ -14285,20 +14287,20 @@ typedef struct ACL_DNS_DB {
 
 
  int acl_inet_accept(int listen_fd);
-# 72 "/workspace/acl/lib_acl/include/net/acl_listen.h"
+# 72 "/acl/lib_acl/include/net/acl_listen.h"
  int acl_inet_accept_ex(int listen_fd, char *ipbuf,
   size_t size);
-# 83 "/workspace/acl/lib_acl/include/net/acl_listen.h"
+# 83 "/acl/lib_acl/include/net/acl_listen.h"
  int acl_inet_bind(const struct addrinfo *res, unsigned flag);
-# 94 "/workspace/acl/lib_acl/include/net/acl_listen.h"
+# 94 "/acl/lib_acl/include/net/acl_listen.h"
  int acl_sane_bind(const char *addr, unsigned flag,
  int socktype, int *family);
-# 106 "/workspace/acl/lib_acl/include/net/acl_listen.h"
+# 106 "/acl/lib_acl/include/net/acl_listen.h"
  int acl_unix_dgram_bind(const char *addr, unsigned flag);
-# 119 "/workspace/acl/lib_acl/include/net/acl_listen.h"
+# 119 "/acl/lib_acl/include/net/acl_listen.h"
  int acl_udp_bind3(const char *addr, unsigned flag, int *family);
  int acl_udp_bind(const char *addr, unsigned flag);
-# 132 "/workspace/acl/lib_acl/include/net/acl_listen.h"
+# 132 "/acl/lib_acl/include/net/acl_listen.h"
  int acl_unix_listen(const char *addr, int backlog, unsigned flag);
 
 
@@ -14311,37 +14313,37 @@ typedef struct ACL_DNS_DB {
 
 
  int acl_fifo_listen(const char *path, int permissions, int mode);
-# 157 "/workspace/acl/lib_acl/include/net/acl_listen.h"
+# 157 "/acl/lib_acl/include/net/acl_listen.h"
 typedef int (*acl_accept_fn)(int, struct sockaddr*, socklen_t*);
 
 
  void acl_set_accept(acl_accept_fn fn);
-# 14 "/workspace/acl/lib_acl/include/net/acl_net.h" 2
-# 1 "/workspace/acl/lib_acl/include/net/acl_vstream_net.h" 1
-# 9 "/workspace/acl/lib_acl/include/net/acl_vstream_net.h"
-# 1 "/workspace/acl/lib_acl/include/net/../stdlib/acl_vstream.h" 1
-# 10 "/workspace/acl/lib_acl/include/net/acl_vstream_net.h" 2
-# 22 "/workspace/acl/lib_acl/include/net/acl_vstream_net.h"
+# 14 "/acl/lib_acl/include/net/acl_net.h" 2
+# 1 "/acl/lib_acl/include/net/acl_vstream_net.h" 1
+# 9 "/acl/lib_acl/include/net/acl_vstream_net.h"
+# 1 "/acl/lib_acl/include/net/../stdlib/acl_vstream.h" 1
+# 10 "/acl/lib_acl/include/net/acl_vstream_net.h" 2
+# 22 "/acl/lib_acl/include/net/acl_vstream_net.h"
  ACL_VSTREAM *acl_vstream_listen_ex(const char *addr, int qlen,
   unsigned flag, int io_bufsize, int rw_timeout);
-# 33 "/workspace/acl/lib_acl/include/net/acl_vstream_net.h"
+# 33 "/acl/lib_acl/include/net/acl_vstream_net.h"
  ACL_VSTREAM *acl_vstream_listen(const char *addr, int qlen);
-# 44 "/workspace/acl/lib_acl/include/net/acl_vstream_net.h"
+# 44 "/acl/lib_acl/include/net/acl_vstream_net.h"
  ACL_VSTREAM *acl_vstream_accept_ex(ACL_VSTREAM *listen_stream,
   ACL_VSTREAM *client_stream, char *ipbuf, int bsize);
-# 54 "/workspace/acl/lib_acl/include/net/acl_vstream_net.h"
+# 54 "/acl/lib_acl/include/net/acl_vstream_net.h"
  ACL_VSTREAM *acl_vstream_accept(ACL_VSTREAM *listen_stream,
   char *ipbuf, int bsize);
-# 73 "/workspace/acl/lib_acl/include/net/acl_vstream_net.h"
+# 73 "/acl/lib_acl/include/net/acl_vstream_net.h"
  ACL_VSTREAM *acl_vstream_connect_ex(const char *addr, int block_mode,
  int conn_timeout, int rw_timeout, int bufsize, int *error);
-# 85 "/workspace/acl/lib_acl/include/net/acl_vstream_net.h"
+# 85 "/acl/lib_acl/include/net/acl_vstream_net.h"
  ACL_VSTREAM *acl_vstream_connect(const char *addr, int block_mode,
  int connect_timeout, int rw_timeout, int rw_bufsize);
-# 98 "/workspace/acl/lib_acl/include/net/acl_vstream_net.h"
+# 98 "/acl/lib_acl/include/net/acl_vstream_net.h"
  ACL_VSTREAM *acl_vstream_timed_connect(const char *addr, int block_mode,
  int connect_timeout, int rw_timeout, int rw_bufsize, int *error);
-# 112 "/workspace/acl/lib_acl/include/net/acl_vstream_net.h"
+# 112 "/acl/lib_acl/include/net/acl_vstream_net.h"
  ACL_VSTREAM *acl_vstream_bind(const char *addr, int rw_timeout, unsigned flag);
 
 
@@ -14349,9 +14351,9 @@ typedef int (*acl_accept_fn)(int, struct sockaddr*, socklen_t*);
 
 
  void acl_vstream_set_udp_io(ACL_VSTREAM *stream);
-# 15 "/workspace/acl/lib_acl/include/net/acl_net.h" 2
-# 1 "/workspace/acl/lib_acl/include/net/acl_res.h" 1
-# 20 "/workspace/acl/lib_acl/include/net/acl_res.h"
+# 15 "/acl/lib_acl/include/net/acl_net.h" 2
+# 1 "/acl/lib_acl/include/net/acl_res.h" 1
+# 20 "/acl/lib_acl/include/net/acl_res.h"
 typedef struct ACL_RES {
  char dns_ip[64];
  unsigned short dns_port;
@@ -14418,41 +14420,41 @@ typedef struct ACL_RES {
 
 
  const char *acl_res_errmsg(const ACL_RES *res);
-# 16 "/workspace/acl/lib_acl/include/net/acl_net.h" 2
-# 1 "/workspace/acl/lib_acl/include/net/acl_dns.h" 1
-# 9 "/workspace/acl/lib_acl/include/net/acl_dns.h"
-# 1 "/workspace/acl/lib_acl/include/net/../stdlib/acl_htable.h" 1
-# 10 "/workspace/acl/lib_acl/include/net/acl_dns.h" 2
-# 1 "/workspace/acl/lib_acl/include/net/../stdlib/acl_cache2.h" 1
-# 11 "/workspace/acl/lib_acl/include/net/acl_dns.h" 2
+# 16 "/acl/lib_acl/include/net/acl_net.h" 2
+# 1 "/acl/lib_acl/include/net/acl_dns.h" 1
+# 9 "/acl/lib_acl/include/net/acl_dns.h"
+# 1 "/acl/lib_acl/include/net/../stdlib/acl_htable.h" 1
+# 10 "/acl/lib_acl/include/net/acl_dns.h" 2
+# 1 "/acl/lib_acl/include/net/../stdlib/acl_cache2.h" 1
+# 11 "/acl/lib_acl/include/net/acl_dns.h" 2
 
 
 
 
-# 1 "/workspace/acl/lib_acl/include/net/../event/acl_events.h" 1
-
-
-
-
-
-
-
-# 1 "/workspace/acl/lib_acl/include/net/../event/../stdlib/acl_define.h" 1
-# 9 "/workspace/acl/lib_acl/include/net/../event/acl_events.h" 2
-
-# 1 "/workspace/acl/lib_acl/include/net/../event/../stdlib/acl_vstream.h" 1
-# 11 "/workspace/acl/lib_acl/include/net/../event/acl_events.h" 2
-# 1 "/workspace/acl/lib_acl/include/net/../event/acl_timer.h" 1
+# 1 "/acl/lib_acl/include/net/../event/acl_events.h" 1
 
 
 
 
 
-# 1 "/workspace/acl/lib_acl/include/net/../event/../stdlib/acl_iterator.h" 1
-# 7 "/workspace/acl/lib_acl/include/net/../event/acl_timer.h" 2
-# 1 "/workspace/acl/lib_acl/include/net/../event/../stdlib/acl_ring.h" 1
-# 8 "/workspace/acl/lib_acl/include/net/../event/acl_timer.h" 2
-# 16 "/workspace/acl/lib_acl/include/net/../event/acl_timer.h"
+
+
+# 1 "/acl/lib_acl/include/net/../event/../stdlib/acl_define.h" 1
+# 9 "/acl/lib_acl/include/net/../event/acl_events.h" 2
+
+# 1 "/acl/lib_acl/include/net/../event/../stdlib/acl_vstream.h" 1
+# 11 "/acl/lib_acl/include/net/../event/acl_events.h" 2
+# 1 "/acl/lib_acl/include/net/../event/acl_timer.h" 1
+
+
+
+
+
+# 1 "/acl/lib_acl/include/net/../event/../stdlib/acl_iterator.h" 1
+# 7 "/acl/lib_acl/include/net/../event/acl_timer.h" 2
+# 1 "/acl/lib_acl/include/net/../event/../stdlib/acl_ring.h" 1
+# 8 "/acl/lib_acl/include/net/../event/acl_timer.h" 2
+# 16 "/acl/lib_acl/include/net/../event/acl_timer.h"
 typedef struct ACL_TIMER_INFO {
 
  void *obj;
@@ -14488,7 +14490,7 @@ struct ACL_TIMER {
 
  const ACL_TIMER_INFO *(*iter_info)(ACL_ITER*, struct ACL_TIMER*);
 };
-# 59 "/workspace/acl/lib_acl/include/net/../event/acl_timer.h"
+# 59 "/acl/lib_acl/include/net/../event/acl_timer.h"
  long long int acl_timer_request(ACL_TIMER* timer, void *obj, long long int delay);
 
 
@@ -14540,16 +14542,16 @@ struct ACL_TIMER {
 
 
  int acl_timer_size(ACL_TIMER *timer);
-# 12 "/workspace/acl/lib_acl/include/net/../event/acl_events.h" 2
-# 43 "/workspace/acl/lib_acl/include/net/../event/acl_events.h"
+# 12 "/acl/lib_acl/include/net/../event/acl_events.h" 2
+# 43 "/acl/lib_acl/include/net/../event/acl_events.h"
 typedef struct ACL_EVENT ACL_EVENT;
 typedef struct ACL_EVENT_FDTABLE ACL_EVENT_FDTABLE;
-# 54 "/workspace/acl/lib_acl/include/net/../event/acl_events.h"
+# 54 "/acl/lib_acl/include/net/../event/acl_events.h"
 typedef void (*ACL_EVENT_NOTIFY_RDWR)(int event_type, ACL_EVENT *event,
   ACL_VSTREAM *stream, void *context);
 typedef void (*ACL_EVENT_NOTIFY_TIME)(int event_type, ACL_EVENT *event,
   void *context);
-# 73 "/workspace/acl/lib_acl/include/net/../event/acl_events.h"
+# 73 "/acl/lib_acl/include/net/../event/acl_events.h"
  ACL_EVENT *acl_event_new(int event_mode, int use_thr,
  int delay_sec, int delay_usec);
 
@@ -14608,9 +14610,9 @@ typedef void (*ACL_EVENT_NOTIFY_TIME)(int event_type, ACL_EVENT *event,
 
 
  ACL_EVENT *acl_event_new_wmsg(unsigned int nMsg);
-# 141 "/workspace/acl/lib_acl/include/net/../event/acl_events.h"
+# 141 "/acl/lib_acl/include/net/../event/acl_events.h"
  void acl_event_add_dog(ACL_EVENT *eventp);
-# 150 "/workspace/acl/lib_acl/include/net/../event/acl_events.h"
+# 150 "/acl/lib_acl/include/net/../event/acl_events.h"
  void acl_event_set_fire_hook(ACL_EVENT *eventp,
   void (*fire_begin)(ACL_EVENT*, void*),
   void (*fire_end)(ACL_EVENT*, void*),
@@ -14641,13 +14643,13 @@ typedef void (*ACL_EVENT_NOTIFY_TIME)(int event_type, ACL_EVENT *event,
 
 
  void acl_event_drain(ACL_EVENT *eventp);
-# 189 "/workspace/acl/lib_acl/include/net/../event/acl_events.h"
+# 189 "/acl/lib_acl/include/net/../event/acl_events.h"
  void acl_event_enable_read(ACL_EVENT *eventp, ACL_VSTREAM *stream,
  int read_timeout, ACL_EVENT_NOTIFY_RDWR callback, void *context);
-# 200 "/workspace/acl/lib_acl/include/net/../event/acl_events.h"
+# 200 "/acl/lib_acl/include/net/../event/acl_events.h"
  void acl_event_enable_write(ACL_EVENT *eventp, ACL_VSTREAM *stream,
  int write_timeout, ACL_EVENT_NOTIFY_RDWR callback, void *context);
-# 211 "/workspace/acl/lib_acl/include/net/../event/acl_events.h"
+# 211 "/acl/lib_acl/include/net/../event/acl_events.h"
  void acl_event_enable_listen(ACL_EVENT *eventp, ACL_VSTREAM *stream,
  int read_timeout, ACL_EVENT_NOTIFY_RDWR callback, void *context);
 
@@ -14699,16 +14701,16 @@ typedef void (*ACL_EVENT_NOTIFY_TIME)(int event_type, ACL_EVENT *event,
 
 
  int acl_event_isxset(ACL_EVENT *eventp, ACL_VSTREAM *stream);
-# 273 "/workspace/acl/lib_acl/include/net/../event/acl_events.h"
+# 273 "/acl/lib_acl/include/net/../event/acl_events.h"
  long long int acl_event_request_timer(ACL_EVENT *eventp,
  ACL_EVENT_NOTIFY_TIME callback, void *context, long long int delay, int keep);
-# 283 "/workspace/acl/lib_acl/include/net/../event/acl_events.h"
+# 283 "/acl/lib_acl/include/net/../event/acl_events.h"
  long long int acl_event_cancel_timer(ACL_EVENT *eventp,
  ACL_EVENT_NOTIFY_TIME callback, void *context);
-# 294 "/workspace/acl/lib_acl/include/net/../event/acl_events.h"
+# 294 "/acl/lib_acl/include/net/../event/acl_events.h"
  void acl_event_keep_timer(ACL_EVENT *eventp, ACL_EVENT_NOTIFY_TIME callback,
  void *context, int onoff);
-# 304 "/workspace/acl/lib_acl/include/net/../event/acl_events.h"
+# 304 "/acl/lib_acl/include/net/../event/acl_events.h"
  int acl_event_timer_ifkeep(ACL_EVENT *eventp, ACL_EVENT_NOTIFY_TIME callback,
  void *context);
 
@@ -14766,22 +14768,22 @@ typedef void (*ACL_EVENT_NOTIFY_TIME)(int event_type, ACL_EVENT *event,
 
 
  int acl_event_last_nready(ACL_EVENT *eventp);
-# 16 "/workspace/acl/lib_acl/include/net/acl_dns.h" 2
-# 1 "/workspace/acl/lib_acl/include/net/../aio/acl_aio.h" 1
-# 16 "/workspace/acl/lib_acl/include/net/../aio/acl_aio.h"
-# 1 "/workspace/acl/lib_acl/include/net/../aio/../stdlib/acl_define.h" 1
-# 17 "/workspace/acl/lib_acl/include/net/../aio/acl_aio.h" 2
+# 16 "/acl/lib_acl/include/net/acl_dns.h" 2
+# 1 "/acl/lib_acl/include/net/../aio/acl_aio.h" 1
+# 16 "/acl/lib_acl/include/net/../aio/acl_aio.h"
+# 1 "/acl/lib_acl/include/net/../aio/../stdlib/acl_define.h" 1
+# 17 "/acl/lib_acl/include/net/../aio/acl_aio.h" 2
 
 
 
 
 
-# 1 "/workspace/acl/lib_acl/include/net/../aio/../stdlib/acl_stdlib.h" 1
-# 23 "/workspace/acl/lib_acl/include/net/../aio/acl_aio.h" 2
-# 1 "/workspace/acl/lib_acl/include/net/../aio/../event/acl_events.h" 1
-# 24 "/workspace/acl/lib_acl/include/net/../aio/acl_aio.h" 2
-# 1 "/workspace/acl/lib_acl/include/net/../aio/../net/acl_netdb.h" 1
-# 25 "/workspace/acl/lib_acl/include/net/../aio/acl_aio.h" 2
+# 1 "/acl/lib_acl/include/net/../aio/../stdlib/acl_stdlib.h" 1
+# 23 "/acl/lib_acl/include/net/../aio/acl_aio.h" 2
+# 1 "/acl/lib_acl/include/net/../aio/../event/acl_events.h" 1
+# 24 "/acl/lib_acl/include/net/../aio/acl_aio.h" 2
+# 1 "/acl/lib_acl/include/net/../aio/../net/acl_netdb.h" 1
+# 25 "/acl/lib_acl/include/net/../aio/acl_aio.h" 2
 
 
 
@@ -14794,7 +14796,7 @@ typedef struct ACL_AIO ACL_AIO;
 
 
 typedef struct ACL_ASTREAM ACL_ASTREAM;
-# 48 "/workspace/acl/lib_acl/include/net/../aio/acl_aio.h"
+# 48 "/acl/lib_acl/include/net/../aio/acl_aio.h"
 typedef int (*ACL_AIO_READ_FN)(ACL_ASTREAM *astream,
  void *context, char *data, int dlen);
 
@@ -14805,13 +14807,13 @@ typedef int (*ACL_AIO_READ_FN)(ACL_ASTREAM *astream,
 
 
 typedef int (*ACL_AIO_NOTIFY_FN)(ACL_ASTREAM *astream, void *context);
-# 67 "/workspace/acl/lib_acl/include/net/../aio/acl_aio.h"
+# 67 "/acl/lib_acl/include/net/../aio/acl_aio.h"
 typedef int (*ACL_AIO_WRITE_FN)(ACL_ASTREAM *astream, void *context);
-# 77 "/workspace/acl/lib_acl/include/net/../aio/acl_aio.h"
+# 77 "/acl/lib_acl/include/net/../aio/acl_aio.h"
 typedef int (*ACL_AIO_ACCEPT_FN)(ACL_ASTREAM *cstream, void *context);
-# 87 "/workspace/acl/lib_acl/include/net/../aio/acl_aio.h"
+# 87 "/acl/lib_acl/include/net/../aio/acl_aio.h"
 typedef int (*ACL_AIO_LISTEN_FN)(ACL_ASTREAM *sstream, void *context);
-# 96 "/workspace/acl/lib_acl/include/net/../aio/acl_aio.h"
+# 96 "/acl/lib_acl/include/net/../aio/acl_aio.h"
 typedef int (*ACL_AIO_CONNECT_FN)(ACL_ASTREAM *cstream, void *context);
 
 typedef struct ACL_ASTREAM_CTX ACL_ASTREAM_CTX;
@@ -14834,7 +14836,7 @@ typedef struct ACL_ASTREAM_CTX ACL_ASTREAM_CTX;
 
 
 typedef int (*ACL_AIO_CONNECT_ADDR_FN)(const ACL_ASTREAM_CTX *ctx);
-# 126 "/workspace/acl/lib_acl/include/net/../aio/acl_aio.h"
+# 126 "/acl/lib_acl/include/net/../aio/acl_aio.h"
 typedef int (*ACL_AIO_TIMEO_FN)(ACL_ASTREAM *astream, void *context);
 
 
@@ -14897,9 +14899,9 @@ struct ACL_ASTREAM {
 
  void (*event_read_callback)(int event_type, ACL_ASTREAM *astream);
 };
-# 213 "/workspace/acl/lib_acl/include/net/../aio/acl_aio.h"
+# 213 "/acl/lib_acl/include/net/../aio/acl_aio.h"
  ACL_AIO *acl_aio_create(int event_mode);
-# 223 "/workspace/acl/lib_acl/include/net/../aio/acl_aio.h"
+# 223 "/acl/lib_acl/include/net/../aio/acl_aio.h"
  ACL_AIO *acl_aio_create2(int event_mode, unsigned int nMsg);
 
 
@@ -14916,7 +14918,7 @@ struct ACL_ASTREAM {
 
 
  void *acl_aio_dns(ACL_AIO *aio);
-# 249 "/workspace/acl/lib_acl/include/net/../aio/acl_aio.h"
+# 249 "/acl/lib_acl/include/net/../aio/acl_aio.h"
  int acl_aio_set_dns(ACL_AIO *aio, const char *dns_list, int timeout);
 
 
@@ -15064,7 +15066,7 @@ struct ACL_ASTREAM {
 
 
  void *acl_aio_get_ctx(ACL_ASTREAM *stream);
-# 404 "/workspace/acl/lib_acl/include/net/../aio/acl_aio.h"
+# 404 "/acl/lib_acl/include/net/../aio/acl_aio.h"
  ACL_ASTREAM *acl_aio_open(ACL_AIO *aio, ACL_VSTREAM *stream);
 
 
@@ -15072,7 +15074,7 @@ struct ACL_ASTREAM {
 
 
  void acl_aio_iocp_close(ACL_ASTREAM *astream);
-# 419 "/workspace/acl/lib_acl/include/net/../aio/acl_aio.h"
+# 419 "/acl/lib_acl/include/net/../aio/acl_aio.h"
  void acl_aio_flush_on_close(ACL_ASTREAM *astream, int yes);
 
 
@@ -15081,7 +15083,7 @@ struct ACL_ASTREAM {
 
 
  ACL_VSTREAM *acl_aio_cancel(ACL_ASTREAM *astream);
-# 435 "/workspace/acl/lib_acl/include/net/../aio/acl_aio.h"
+# 435 "/acl/lib_acl/include/net/../aio/acl_aio.h"
  int acl_aio_get_accept_max(ACL_ASTREAM *astream);
 
 
@@ -15217,13 +15219,13 @@ struct ACL_ASTREAM {
 
 
  void acl_aio_clean_hooks(ACL_ASTREAM *astream);
-# 578 "/workspace/acl/lib_acl/include/net/../aio/acl_aio.h"
+# 578 "/acl/lib_acl/include/net/../aio/acl_aio.h"
  void acl_aio_ctl(ACL_ASTREAM *astream, int name, ...);
-# 605 "/workspace/acl/lib_acl/include/net/../aio/acl_aio.h"
+# 605 "/acl/lib_acl/include/net/../aio/acl_aio.h"
  ACL_VSTREAM *acl_aio_vstream(ACL_ASTREAM *astream);
-# 619 "/workspace/acl/lib_acl/include/net/../aio/acl_aio.h"
+# 619 "/acl/lib_acl/include/net/../aio/acl_aio.h"
  void acl_aio_gets(ACL_ASTREAM *astream);
-# 631 "/workspace/acl/lib_acl/include/net/../aio/acl_aio.h"
+# 631 "/acl/lib_acl/include/net/../aio/acl_aio.h"
  void acl_aio_gets_nonl(ACL_ASTREAM *astream);
 
 
@@ -15233,7 +15235,7 @@ struct ACL_ASTREAM {
 
 
  void acl_aio_read(ACL_ASTREAM *astream);
-# 649 "/workspace/acl/lib_acl/include/net/../aio/acl_aio.h"
+# 649 "/acl/lib_acl/include/net/../aio/acl_aio.h"
  void acl_aio_readn(ACL_ASTREAM *astream, int count);
 
 
@@ -15243,11 +15245,11 @@ struct ACL_ASTREAM {
 
 
  ACL_VSTRING *acl_aio_gets_peek(ACL_ASTREAM *astream);
-# 667 "/workspace/acl/lib_acl/include/net/../aio/acl_aio.h"
+# 667 "/acl/lib_acl/include/net/../aio/acl_aio.h"
  ACL_VSTRING *acl_aio_gets_nonl_peek(ACL_ASTREAM *astream);
-# 676 "/workspace/acl/lib_acl/include/net/../aio/acl_aio.h"
+# 676 "/acl/lib_acl/include/net/../aio/acl_aio.h"
  ACL_VSTRING *acl_aio_read_peek(ACL_ASTREAM *astream, int *count);
-# 686 "/workspace/acl/lib_acl/include/net/../aio/acl_aio.h"
+# 686 "/acl/lib_acl/include/net/../aio/acl_aio.h"
  ACL_VSTRING *acl_aio_readn_peek(ACL_ASTREAM *astream, int *count);
 
 
@@ -15308,9 +15310,9 @@ struct ACL_ASTREAM {
 
 
  int acl_aio_stream_get_keep_read(ACL_ASTREAM *astream);
-# 755 "/workspace/acl/lib_acl/include/net/../aio/acl_aio.h"
+# 755 "/acl/lib_acl/include/net/../aio/acl_aio.h"
  void acl_aio_writen(ACL_ASTREAM *astream, const char *data, int dlen);
-# 764 "/workspace/acl/lib_acl/include/net/../aio/acl_aio.h"
+# 764 "/acl/lib_acl/include/net/../aio/acl_aio.h"
  void acl_aio_writev(ACL_ASTREAM *astream,
   const struct iovec *vector, int count);
 
@@ -15373,9 +15375,9 @@ struct ACL_ASTREAM {
 
 
  void acl_aio_listen(ACL_ASTREAM *astream);
-# 836 "/workspace/acl/lib_acl/include/net/../aio/acl_aio.h"
+# 836 "/acl/lib_acl/include/net/../aio/acl_aio.h"
  ACL_ASTREAM *acl_aio_connect(ACL_AIO *aio, const char *addr, int timeout);
-# 849 "/workspace/acl/lib_acl/include/net/../aio/acl_aio.h"
+# 849 "/acl/lib_acl/include/net/../aio/acl_aio.h"
  int acl_aio_connect_addr(ACL_AIO *aio, const char *addr, int timeout,
   ACL_AIO_CONNECT_ADDR_FN callback, void *context);
 
@@ -15412,25 +15414,25 @@ struct ACL_ASTREAM {
 
 
  void acl_aio_unrefer(ACL_ASTREAM *astream);
-# 895 "/workspace/acl/lib_acl/include/net/../aio/acl_aio.h"
+# 895 "/acl/lib_acl/include/net/../aio/acl_aio.h"
  long long int acl_aio_request_timer(ACL_AIO *aio,
   ACL_EVENT_NOTIFY_TIME timer_fn, void *context,
   long long int idle_limit, int keep);
-# 906 "/workspace/acl/lib_acl/include/net/../aio/acl_aio.h"
+# 906 "/acl/lib_acl/include/net/../aio/acl_aio.h"
  long long int acl_aio_cancel_timer(ACL_AIO *aio,
   ACL_EVENT_NOTIFY_TIME timer_fn, void *context);
-# 916 "/workspace/acl/lib_acl/include/net/../aio/acl_aio.h"
+# 916 "/acl/lib_acl/include/net/../aio/acl_aio.h"
  void acl_aio_keep_timer(ACL_AIO *aio, ACL_EVENT_NOTIFY_TIME timer_fn,
   void *context, int onoff);
-# 926 "/workspace/acl/lib_acl/include/net/../aio/acl_aio.h"
+# 926 "/acl/lib_acl/include/net/../aio/acl_aio.h"
  int acl_aio_timer_ifkeep(ACL_AIO *aio, ACL_EVENT_NOTIFY_TIME timer_fn,
   void *context);
-# 17 "/workspace/acl/lib_acl/include/net/acl_dns.h" 2
-# 1 "/workspace/acl/lib_acl/include/net/acl_rfc1035.h" 1
-# 9 "/workspace/acl/lib_acl/include/net/acl_rfc1035.h"
-# 1 "/workspace/acl/lib_acl/include/net/../stdlib/acl_argv.h" 1
-# 10 "/workspace/acl/lib_acl/include/net/acl_rfc1035.h" 2
-# 18 "/workspace/acl/lib_acl/include/net/acl_rfc1035.h"
+# 17 "/acl/lib_acl/include/net/acl_dns.h" 2
+# 1 "/acl/lib_acl/include/net/acl_rfc1035.h" 1
+# 9 "/acl/lib_acl/include/net/acl_rfc1035.h"
+# 1 "/acl/lib_acl/include/net/../stdlib/acl_argv.h" 1
+# 10 "/acl/lib_acl/include/net/acl_rfc1035.h" 2
+# 18 "/acl/lib_acl/include/net/acl_rfc1035.h"
 typedef struct ACL_RFC1035_RR {
     char name[256];
     unsigned short type;
@@ -15484,19 +15486,19 @@ typedef struct ACL_RFC1035_MESSAGE {
 
 
  const char *acl_rfc1035_strerror(int errnum);
-# 87 "/workspace/acl/lib_acl/include/net/acl_rfc1035.h"
+# 87 "/acl/lib_acl/include/net/acl_rfc1035.h"
  size_t acl_rfc1035_build_query4a(const char *hostname, char *buf,
   size_t sz, unsigned short qid, ACL_RFC1035_QUERY *query);
-# 100 "/workspace/acl/lib_acl/include/net/acl_rfc1035.h"
+# 100 "/acl/lib_acl/include/net/acl_rfc1035.h"
  size_t acl_rfc1035_build_query4aaaa(const char *hostname, char *buf,
   size_t sz, unsigned short qid, ACL_RFC1035_QUERY *query);
-# 113 "/workspace/acl/lib_acl/include/net/acl_rfc1035.h"
+# 113 "/acl/lib_acl/include/net/acl_rfc1035.h"
  size_t acl_rfc1035_build_query4mx(const char *hostname, char *buf,
   size_t sz, unsigned short qid, ACL_RFC1035_QUERY *query);
-# 129 "/workspace/acl/lib_acl/include/net/acl_rfc1035.h"
+# 129 "/acl/lib_acl/include/net/acl_rfc1035.h"
  size_t acl_rfc1035_build_query4ptr(const struct in_addr addr, char *buf,
   size_t sz, unsigned short qid, ACL_RFC1035_QUERY *query);
-# 140 "/workspace/acl/lib_acl/include/net/acl_rfc1035.h"
+# 140 "/acl/lib_acl/include/net/acl_rfc1035.h"
  void acl_rfc1035_set_query_id(char *buf, size_t sz, unsigned short qid);
 
 
@@ -15507,9 +15509,9 @@ typedef struct ACL_RFC1035_MESSAGE {
 
  int acl_rfc1035_query_compare(const ACL_RFC1035_QUERY *a,
   const ACL_RFC1035_QUERY *b);
-# 159 "/workspace/acl/lib_acl/include/net/acl_rfc1035.h"
+# 159 "/acl/lib_acl/include/net/acl_rfc1035.h"
  ACL_RFC1035_MESSAGE *acl_rfc1035_response_unpack(const char *buf, size_t sz);
-# 169 "/workspace/acl/lib_acl/include/net/acl_rfc1035.h"
+# 169 "/acl/lib_acl/include/net/acl_rfc1035.h"
  ACL_RFC1035_MESSAGE *acl_rfc1035_request_unpack(const char *buf, size_t sz);
 
 
@@ -15517,7 +15519,7 @@ typedef struct ACL_RFC1035_MESSAGE {
 
 
  void acl_rfc1035_message_destroy(ACL_RFC1035_MESSAGE *message);
-# 189 "/workspace/acl/lib_acl/include/net/acl_rfc1035.h"
+# 189 "/acl/lib_acl/include/net/acl_rfc1035.h"
  size_t acl_rfc1035_build_reply4a(const char *hostname, const ACL_ARGV *ips,
   const char *domain_root, const char *dnsname, const char *dnsip,
   unsigned short qid, char *buf, size_t sz);
@@ -15540,8 +15542,8 @@ typedef struct ACL_RFC1035_REPLY {
 
  size_t acl_rfc1035_build_reply(const ACL_RFC1035_REPLY *reply,
   char *buf, size_t sz);
-# 18 "/workspace/acl/lib_acl/include/net/acl_dns.h" 2
-# 40 "/workspace/acl/lib_acl/include/net/acl_dns.h"
+# 18 "/acl/lib_acl/include/net/acl_dns.h" 2
+# 40 "/acl/lib_acl/include/net/acl_dns.h"
 typedef struct ACL_DNS_ADDR {
  char ip[64];
  unsigned short port;
@@ -15574,7 +15576,7 @@ typedef struct ACL_DNS {
 } ACL_DNS;
 
 typedef struct ACL_DNS_REQ ACL_DNS_REQ;
-# 80 "/workspace/acl/lib_acl/include/net/acl_dns.h"
+# 80 "/acl/lib_acl/include/net/acl_dns.h"
  int acl_dns_init(ACL_DNS *dns, ACL_AIO *aio, int timeout);
 
 
@@ -15591,7 +15593,7 @@ typedef struct ACL_DNS_REQ ACL_DNS_REQ;
 
 
  void acl_dns_open_cache(ACL_DNS *dns, int limit);
-# 104 "/workspace/acl/lib_acl/include/net/acl_dns.h"
+# 104 "/acl/lib_acl/include/net/acl_dns.h"
  void acl_dns_add_dns(ACL_DNS *dns, const char *dns_ip,
  unsigned short dns_port, int mask_length);
 
@@ -15656,11 +15658,11 @@ typedef struct ACL_DNS_REQ ACL_DNS_REQ;
 
 
  void acl_dns_set_retry_limit(ACL_DNS *dns, int retry_limit);
-# 178 "/workspace/acl/lib_acl/include/net/acl_dns.h"
+# 178 "/acl/lib_acl/include/net/acl_dns.h"
  void acl_dns_lookup(ACL_DNS *dns, const char *domain,
  void (*callback)(ACL_DNS_DB*, void*, int, const ACL_RFC1035_MESSAGE*),
  void *ctx);
-# 192 "/workspace/acl/lib_acl/include/net/acl_dns.h"
+# 192 "/acl/lib_acl/include/net/acl_dns.h"
  void acl_dns_lookup2(ACL_DNS *dns, const char *domain, unsigned short type,
  void (*callback)(ACL_DNS_DB*, void*, int, const ACL_RFC1035_MESSAGE*),
  void *ctx);
@@ -15672,7 +15674,7 @@ typedef struct ACL_DNS_REQ ACL_DNS_REQ;
 
 
  void acl_dns_add_host(ACL_DNS *dns, const char *domain, const char *ip_list);
-# 214 "/workspace/acl/lib_acl/include/net/acl_dns.h"
+# 214 "/acl/lib_acl/include/net/acl_dns.h"
  void acl_dns_add_group(ACL_DNS *dns, const char *group, const char *refer,
   const char *ip_list, const char *excepts);
 
@@ -15687,8 +15689,8 @@ typedef struct ACL_DNS_REQ ACL_DNS_REQ;
 
 
  const char *acl_dns_serror(int errnum);
-# 17 "/workspace/acl/lib_acl/include/net/acl_net.h" 2
-# 1 "/workspace/acl/lib_acl/include/net/acl_access.h" 1
+# 17 "/acl/lib_acl/include/net/acl_net.h" 2
+# 1 "/acl/lib_acl/include/net/acl_access.h" 1
 
 
 
@@ -15696,11 +15698,11 @@ typedef struct ACL_DNS_REQ ACL_DNS_REQ;
 
 
 
-# 1 "/workspace/acl/lib_acl/include/net/../stdlib/acl_stdlib.h" 1
-# 9 "/workspace/acl/lib_acl/include/net/acl_access.h" 2
-# 18 "/workspace/acl/lib_acl/include/net/acl_access.h"
+# 1 "/acl/lib_acl/include/net/../stdlib/acl_stdlib.h" 1
+# 9 "/acl/lib_acl/include/net/acl_access.h" 2
+# 18 "/acl/lib_acl/include/net/acl_access.h"
  int acl_access_add(const char *data, const char *sep1, const char *sep2);
-# 27 "/workspace/acl/lib_acl/include/net/acl_access.h"
+# 27 "/acl/lib_acl/include/net/acl_access.h"
  int acl_access_cfg(ACL_XINETD_CFG_PARSER *xcp, const char *name);
 
 
@@ -15721,30 +15723,30 @@ typedef struct ACL_DNS_REQ ACL_DNS_REQ;
 
 
  void acl_access_debug(void);
-# 18 "/workspace/acl/lib_acl/include/net/acl_net.h" 2
-# 1 "/workspace/acl/lib_acl/include/net/acl_mask_addr.h" 1
-# 17 "/workspace/acl/lib_acl/include/net/acl_mask_addr.h"
+# 18 "/acl/lib_acl/include/net/acl_net.h" 2
+# 1 "/acl/lib_acl/include/net/acl_mask_addr.h" 1
+# 17 "/acl/lib_acl/include/net/acl_mask_addr.h"
  void acl_mask_addr(unsigned char *addr_bytes,
   unsigned addr_byte_count, unsigned network_bits);
-# 19 "/workspace/acl/lib_acl/include/net/acl_net.h" 2
-# 1 "/workspace/acl/lib_acl/include/net/acl_valid_hostname.h" 1
-# 17 "/workspace/acl/lib_acl/include/net/acl_valid_hostname.h"
+# 19 "/acl/lib_acl/include/net/acl_net.h" 2
+# 1 "/acl/lib_acl/include/net/acl_valid_hostname.h" 1
+# 17 "/acl/lib_acl/include/net/acl_valid_hostname.h"
  int acl_valid_hostname(const char *, int);
  int acl_valid_hostaddr(const char *, int);
  int acl_valid_ipv4_hostaddr(const char *, int);
  int acl_valid_ipv6_hostaddr(const char *, int);
  int acl_valid_unix(const char *);
-# 20 "/workspace/acl/lib_acl/include/net/acl_net.h" 2
-# 1 "/workspace/acl/lib_acl/include/net/acl_host_port.h" 1
-# 17 "/workspace/acl/lib_acl/include/net/acl_host_port.h"
+# 20 "/acl/lib_acl/include/net/acl_net.h" 2
+# 1 "/acl/lib_acl/include/net/acl_host_port.h" 1
+# 17 "/acl/lib_acl/include/net/acl_host_port.h"
  const char *acl_host_port(char *buf, char **host,
  char *def_host, char **port, char *def_service);
 
  struct addrinfo *acl_host_addrinfo(const char *addr, int type);
  struct addrinfo *acl_host_addrinfo2(const char *addr, int type, int family);
-# 21 "/workspace/acl/lib_acl/include/net/acl_net.h" 2
-# 1 "/workspace/acl/lib_acl/include/net/acl_ifconf.h" 1
-# 12 "/workspace/acl/lib_acl/include/net/acl_ifconf.h"
+# 21 "/acl/lib_acl/include/net/acl_net.h" 2
+# 1 "/acl/lib_acl/include/net/acl_ifconf.h" 1
+# 12 "/acl/lib_acl/include/net/acl_ifconf.h"
 typedef struct ACL_IFADDR {
  char name[256];
 
@@ -15781,21 +15783,21 @@ typedef struct ACL_IFCONF {
 
 
  void acl_free_ifaddrs(ACL_IFCONF *ifconf);
-# 57 "/workspace/acl/lib_acl/include/net/acl_ifconf.h"
+# 57 "/acl/lib_acl/include/net/acl_ifconf.h"
  ACL_IFCONF *acl_ifconf_search(const char *pattern);
-# 22 "/workspace/acl/lib_acl/include/net/acl_net.h" 2
-# 11 "/workspace/acl/lib_acl/include/lib_acl.h" 2
-# 1 "/workspace/acl/lib_acl/include/thread/acl_thread.h" 1
-# 12 "/workspace/acl/lib_acl/include/lib_acl.h" 2
-# 1 "/workspace/acl/lib_acl/include/msg/acl_aqueue.h" 1
+# 22 "/acl/lib_acl/include/net/acl_net.h" 2
+# 11 "/acl/lib_acl/include/lib_acl.h" 2
+# 1 "/acl/lib_acl/include/thread/acl_thread.h" 1
+# 12 "/acl/lib_acl/include/lib_acl.h" 2
+# 1 "/acl/lib_acl/include/msg/acl_aqueue.h" 1
 
 
 
-# 1 "/workspace/acl/lib_acl/include/msg/../stdlib/acl_define.h" 1
-# 5 "/workspace/acl/lib_acl/include/msg/acl_aqueue.h" 2
-# 1 "/workspace/acl/lib_acl/include/msg/../thread/acl_thread.h" 1
-# 6 "/workspace/acl/lib_acl/include/msg/acl_aqueue.h" 2
-# 19 "/workspace/acl/lib_acl/include/msg/acl_aqueue.h"
+# 1 "/acl/lib_acl/include/msg/../stdlib/acl_define.h" 1
+# 5 "/acl/lib_acl/include/msg/acl_aqueue.h" 2
+# 1 "/acl/lib_acl/include/msg/../thread/acl_thread.h" 1
+# 6 "/acl/lib_acl/include/msg/acl_aqueue.h" 2
+# 19 "/acl/lib_acl/include/msg/acl_aqueue.h"
 typedef struct ACL_AQUEUE_ITEM ACL_AQUEUE_ITEM;
 typedef struct ACL_AQUEUE ACL_AQUEUE;
 
@@ -15834,7 +15836,7 @@ typedef void (*ACL_AQUEUE_FREE_FN)(void *);
 
 
  void *acl_aqueue_pop(ACL_AQUEUE *queue);
-# 65 "/workspace/acl/lib_acl/include/msg/acl_aqueue.h"
+# 65 "/acl/lib_acl/include/msg/acl_aqueue.h"
  void *acl_aqueue_pop_timedwait(ACL_AQUEUE *queue, int tmo_sec, int tmo_usec);
 
 
@@ -15864,22 +15866,22 @@ typedef void (*ACL_AQUEUE_FREE_FN)(void *);
 
 
  int acl_aqueue_qlen(ACL_AQUEUE* queue);
-# 13 "/workspace/acl/lib_acl/include/lib_acl.h" 2
-# 1 "/workspace/acl/lib_acl/include/msg/acl_msgio.h" 1
-# 9 "/workspace/acl/lib_acl/include/msg/acl_msgio.h"
-# 1 "/workspace/acl/lib_acl/include/msg/../stdlib/acl_vstring.h" 1
-# 10 "/workspace/acl/lib_acl/include/msg/acl_msgio.h" 2
-# 1 "/workspace/acl/lib_acl/include/msg/../stdlib/acl_ring.h" 1
-# 11 "/workspace/acl/lib_acl/include/msg/acl_msgio.h" 2
-# 1 "/workspace/acl/lib_acl/include/msg/../aio/acl_aio.h" 1
-# 12 "/workspace/acl/lib_acl/include/msg/acl_msgio.h" 2
+# 13 "/acl/lib_acl/include/lib_acl.h" 2
+# 1 "/acl/lib_acl/include/msg/acl_msgio.h" 1
+# 9 "/acl/lib_acl/include/msg/acl_msgio.h"
+# 1 "/acl/lib_acl/include/msg/../stdlib/acl_vstring.h" 1
+# 10 "/acl/lib_acl/include/msg/acl_msgio.h" 2
+# 1 "/acl/lib_acl/include/msg/../stdlib/acl_ring.h" 1
+# 11 "/acl/lib_acl/include/msg/acl_msgio.h" 2
+# 1 "/acl/lib_acl/include/msg/../aio/acl_aio.h" 1
+# 12 "/acl/lib_acl/include/msg/acl_msgio.h" 2
 
 typedef struct ACL_MSGIO ACL_MSGIO;
 typedef struct ACL_MSGIO_INFO ACL_MSGIO_INFO;
 
 typedef int (*ACL_MSGIO_NOTIFY_FN)(int msg_type, ACL_MSGIO *peer,
        const ACL_MSGIO_INFO *info, void *arg);
-# 32 "/workspace/acl/lib_acl/include/msg/acl_msgio.h"
+# 32 "/acl/lib_acl/include/msg/acl_msgio.h"
 struct ACL_MSGIO_INFO {
  struct {
   int type;
@@ -15913,10 +15915,10 @@ struct ACL_MSGIO_INFO {
  ACL_AIO *acl_msgio_aio(ACL_MSGIO *mio);
  ACL_VSTREAM *acl_msgio_vstream(ACL_MSGIO *mio);
  ACL_ASTREAM *acl_msgio_astream(ACL_MSGIO *mio);
-# 14 "/workspace/acl/lib_acl/include/lib_acl.h" 2
-# 1 "/workspace/acl/lib_acl/include/event/acl_events.h" 1
-# 15 "/workspace/acl/lib_acl/include/lib_acl.h" 2
-# 1 "/workspace/acl/lib_acl/include/ioctl/acl_ioctl.h" 1
+# 14 "/acl/lib_acl/include/lib_acl.h" 2
+# 1 "/acl/lib_acl/include/event/acl_events.h" 1
+# 15 "/acl/lib_acl/include/lib_acl.h" 2
+# 1 "/acl/lib_acl/include/ioctl/acl_ioctl.h" 1
 
 
 
@@ -15924,24 +15926,24 @@ struct ACL_MSGIO_INFO {
 
 
 
-# 1 "/workspace/acl/lib_acl/include/ioctl/../stdlib/acl_define.h" 1
-# 9 "/workspace/acl/lib_acl/include/ioctl/acl_ioctl.h" 2
-# 1 "/workspace/acl/lib_acl/include/ioctl/../event/acl_events.h" 1
-# 10 "/workspace/acl/lib_acl/include/ioctl/acl_ioctl.h" 2
-# 1 "/workspace/acl/lib_acl/include/ioctl/../stdlib/acl_vstream.h" 1
-# 11 "/workspace/acl/lib_acl/include/ioctl/acl_ioctl.h" 2
+# 1 "/acl/lib_acl/include/ioctl/../stdlib/acl_define.h" 1
+# 9 "/acl/lib_acl/include/ioctl/acl_ioctl.h" 2
+# 1 "/acl/lib_acl/include/ioctl/../event/acl_events.h" 1
+# 10 "/acl/lib_acl/include/ioctl/acl_ioctl.h" 2
+# 1 "/acl/lib_acl/include/ioctl/../stdlib/acl_vstream.h" 1
+# 11 "/acl/lib_acl/include/ioctl/acl_ioctl.h" 2
 
 typedef struct ACL_IOCTL ACL_IOCTL;
-# 25 "/workspace/acl/lib_acl/include/ioctl/acl_ioctl.h"
+# 25 "/acl/lib_acl/include/ioctl/acl_ioctl.h"
 typedef void (*ACL_IOCTL_NOTIFY_FN)(int event_type, ACL_IOCTL *ioc,
  ACL_VSTREAM *stream, void *context);
 
 typedef void (*ACL_IOCTL_WORKER_FN)(ACL_IOCTL *ioc, void *arg);
 typedef void (*ACL_IOCTL_THREAD_INIT_FN)(void *);
 typedef void (*ACL_IOCTL_THREAD_EXIT_FN)(void *);
-# 41 "/workspace/acl/lib_acl/include/ioctl/acl_ioctl.h"
+# 41 "/acl/lib_acl/include/ioctl/acl_ioctl.h"
  ACL_IOCTL *acl_ioctl_create(int max_threads, int idle_timeout);
-# 53 "/workspace/acl/lib_acl/include/ioctl/acl_ioctl.h"
+# 53 "/acl/lib_acl/include/ioctl/acl_ioctl.h"
  ACL_IOCTL *acl_ioctl_create_ex(int event_mode, int max_threads,
  int idle_timeout, int delay_sec, int delay_usec);
 
@@ -15959,7 +15961,7 @@ typedef void (*ACL_IOCTL_THREAD_EXIT_FN)(void *);
 
 
  void acl_ioctl_ctl(ACL_IOCTL *ioc, int name, ...);
-# 85 "/workspace/acl/lib_acl/include/ioctl/acl_ioctl.h"
+# 85 "/acl/lib_acl/include/ioctl/acl_ioctl.h"
  void acl_ioctl_free(ACL_IOCTL *ioc);
 
 
@@ -16026,37 +16028,37 @@ typedef void (*ACL_IOCTL_THREAD_EXIT_FN)(void *);
 
 
  int acl_ioctl_iswset(ACL_IOCTL *ioc, ACL_VSTREAM *stream);
-# 160 "/workspace/acl/lib_acl/include/ioctl/acl_ioctl.h"
+# 160 "/acl/lib_acl/include/ioctl/acl_ioctl.h"
  int acl_ioctl_iocp_close(ACL_IOCTL *ioc, ACL_VSTREAM *stream);
-# 171 "/workspace/acl/lib_acl/include/ioctl/acl_ioctl.h"
+# 171 "/acl/lib_acl/include/ioctl/acl_ioctl.h"
  void acl_ioctl_enable_read(ACL_IOCTL *ioc, ACL_VSTREAM *stream,
  int timeout, ACL_IOCTL_NOTIFY_FN callback, void *context);
-# 183 "/workspace/acl/lib_acl/include/ioctl/acl_ioctl.h"
+# 183 "/acl/lib_acl/include/ioctl/acl_ioctl.h"
  void acl_ioctl_enable_write(ACL_IOCTL *ioc, ACL_VSTREAM *stream,
  int timeout, ACL_IOCTL_NOTIFY_FN callback, void *context);
-# 195 "/workspace/acl/lib_acl/include/ioctl/acl_ioctl.h"
+# 195 "/acl/lib_acl/include/ioctl/acl_ioctl.h"
  void acl_ioctl_enable_connect(ACL_IOCTL *ioc, ACL_VSTREAM *stream,
  int timeout, ACL_IOCTL_NOTIFY_FN callback, void *context);
-# 209 "/workspace/acl/lib_acl/include/ioctl/acl_ioctl.h"
+# 209 "/acl/lib_acl/include/ioctl/acl_ioctl.h"
  void acl_ioctl_enable_listen(ACL_IOCTL *ioc, ACL_VSTREAM *stream,
  int timeout, ACL_IOCTL_NOTIFY_FN callback, void *context);
-# 227 "/workspace/acl/lib_acl/include/ioctl/acl_ioctl.h"
+# 227 "/acl/lib_acl/include/ioctl/acl_ioctl.h"
  ACL_VSTREAM *acl_ioctl_connect(const char *addr, int timeout);
-# 237 "/workspace/acl/lib_acl/include/ioctl/acl_ioctl.h"
+# 237 "/acl/lib_acl/include/ioctl/acl_ioctl.h"
  ACL_VSTREAM *acl_ioctl_listen(const char *addr, int qlen);
-# 251 "/workspace/acl/lib_acl/include/ioctl/acl_ioctl.h"
+# 251 "/acl/lib_acl/include/ioctl/acl_ioctl.h"
  ACL_VSTREAM *acl_ioctl_listen_ex(const char *addr, int qlen,
  int block_mode, int io_bufsize, int io_timeout);
-# 262 "/workspace/acl/lib_acl/include/ioctl/acl_ioctl.h"
+# 262 "/acl/lib_acl/include/ioctl/acl_ioctl.h"
  ACL_VSTREAM *acl_ioctl_accept(ACL_VSTREAM *sstream,
  char *ipbuf, int size);
-# 273 "/workspace/acl/lib_acl/include/ioctl/acl_ioctl.h"
+# 273 "/acl/lib_acl/include/ioctl/acl_ioctl.h"
  long long int acl_ioctl_request_timer(ACL_IOCTL *ioc,
  ACL_EVENT_NOTIFY_TIME timer_fn, void *context, long long int idle_limit);
-# 283 "/workspace/acl/lib_acl/include/ioctl/acl_ioctl.h"
+# 283 "/acl/lib_acl/include/ioctl/acl_ioctl.h"
  long long int acl_ioctl_cancel_timer(ACL_IOCTL *ioc,
  ACL_EVENT_NOTIFY_TIME timer_fn, void *context);
-# 293 "/workspace/acl/lib_acl/include/ioctl/acl_ioctl.h"
+# 293 "/acl/lib_acl/include/ioctl/acl_ioctl.h"
  int acl_ioctl_add(ACL_IOCTL *ioc,
  ACL_IOCTL_WORKER_FN callback, void *arg);
 
@@ -16066,8 +16068,8 @@ typedef void (*ACL_IOCTL_THREAD_EXIT_FN)(void *);
 
 
  int acl_ioctl_nworker(ACL_IOCTL *ioc);
-# 16 "/workspace/acl/lib_acl/include/lib_acl.h" 2
-# 1 "/workspace/acl/lib_acl/include/ioctl/acl_spool.h" 1
+# 16 "/acl/lib_acl/include/lib_acl.h" 2
+# 1 "/acl/lib_acl/include/ioctl/acl_spool.h" 1
 
 
 
@@ -16075,12 +16077,12 @@ typedef void (*ACL_IOCTL_THREAD_EXIT_FN)(void *);
 
 
 
-# 1 "/workspace/acl/lib_acl/include/ioctl/acl_ioctl.h" 1
-# 9 "/workspace/acl/lib_acl/include/ioctl/acl_spool.h" 2
-# 17 "/workspace/acl/lib_acl/include/lib_acl.h" 2
-# 1 "/workspace/acl/lib_acl/include/aio/acl_aio.h" 1
-# 18 "/workspace/acl/lib_acl/include/lib_acl.h" 2
-# 1 "/workspace/acl/lib_acl/include/db/acl_db.h" 1
+# 1 "/acl/lib_acl/include/ioctl/acl_ioctl.h" 1
+# 9 "/acl/lib_acl/include/ioctl/acl_spool.h" 2
+# 17 "/acl/lib_acl/include/lib_acl.h" 2
+# 1 "/acl/lib_acl/include/aio/acl_aio.h" 1
+# 18 "/acl/lib_acl/include/lib_acl.h" 2
+# 1 "/acl/lib_acl/include/db/acl_db.h" 1
 
 
 
@@ -16088,13 +16090,13 @@ typedef void (*ACL_IOCTL_THREAD_EXIT_FN)(void *);
 
 
 
-# 1 "/workspace/acl/lib_acl/include/db/acl_dbpool.h" 1
-# 10 "/workspace/acl/lib_acl/include/db/acl_dbpool.h"
-# 1 "/workspace/acl/lib_acl/include/db/../stdlib/acl_define.h" 1
-# 11 "/workspace/acl/lib_acl/include/db/acl_dbpool.h" 2
+# 1 "/acl/lib_acl/include/db/acl_dbpool.h" 1
+# 10 "/acl/lib_acl/include/db/acl_dbpool.h"
+# 1 "/acl/lib_acl/include/db/../stdlib/acl_define.h" 1
+# 11 "/acl/lib_acl/include/db/acl_dbpool.h" 2
 
-# 1 "/workspace/acl/lib_acl/include/db/../stdlib/acl_stdlib.h" 1
-# 13 "/workspace/acl/lib_acl/include/db/acl_dbpool.h" 2
+# 1 "/acl/lib_acl/include/db/../stdlib/acl_stdlib.h" 1
+# 13 "/acl/lib_acl/include/db/acl_dbpool.h" 2
 
 
 
@@ -16175,7 +16177,7 @@ struct ACL_DB_POOL {
  int db_ready;
  int db_inuse;
 };
-# 104 "/workspace/acl/lib_acl/include/db/acl_dbpool.h"
+# 104 "/acl/lib_acl/include/db/acl_dbpool.h"
  ACL_DB_POOL *acl_dbpool_create(const char *db_type, const ACL_DB_INFO *db_info);
 
 
@@ -16221,11 +16223,11 @@ struct ACL_DB_POOL {
 
 
  void acl_dbpool_set_ping(ACL_DB_POOL *db_pool, int (*ping_fn)(ACL_DB_HANDLE*));
-# 9 "/workspace/acl/lib_acl/include/db/acl_db.h" 2
-# 1 "/workspace/acl/lib_acl/include/db/acl_dberr.h" 1
-# 10 "/workspace/acl/lib_acl/include/db/acl_db.h" 2
-# 1 "/workspace/acl/lib_acl/include/db/acl_dbsql.h" 1
-# 42 "/workspace/acl/lib_acl/include/db/acl_dbsql.h"
+# 9 "/acl/lib_acl/include/db/acl_db.h" 2
+# 1 "/acl/lib_acl/include/db/acl_dberr.h" 1
+# 10 "/acl/lib_acl/include/db/acl_db.h" 2
+# 1 "/acl/lib_acl/include/db/acl_dbsql.h" 1
+# 42 "/acl/lib_acl/include/db/acl_dbsql.h"
  ACL_SQL_RES *acl_dbsql_select(ACL_DB_HANDLE *handle,
  const char *sql, int *error);
 
@@ -16235,17 +16237,17 @@ struct ACL_DB_POOL {
 
 
  void acl_dbsql_free_result(ACL_DB_HANDLE *handle, ACL_SQL_RES *res);
-# 69 "/workspace/acl/lib_acl/include/db/acl_dbsql.h"
+# 69 "/acl/lib_acl/include/db/acl_dbsql.h"
  int acl_dbsql_results(ACL_DB_HANDLE *handle, const char *sql, int *error,
  int (*walk_fn)(const void** result_row, void *arg), void *arg);
-# 88 "/workspace/acl/lib_acl/include/db/acl_dbsql.h"
+# 88 "/acl/lib_acl/include/db/acl_dbsql.h"
  int acl_dbsql_result(ACL_DB_HANDLE *handle, const char *sql, int *error,
  int (*walk_fn)(const void** result_row, void *arg), void *arg);
-# 101 "/workspace/acl/lib_acl/include/db/acl_dbsql.h"
+# 101 "/acl/lib_acl/include/db/acl_dbsql.h"
  int acl_dbsql_update(ACL_DB_HANDLE *handle, const char *sql, int *error);
-# 11 "/workspace/acl/lib_acl/include/db/acl_db.h" 2
-# 1 "/workspace/acl/lib_acl/include/db/acl_mdb.h" 1
-# 10 "/workspace/acl/lib_acl/include/db/acl_mdb.h"
+# 11 "/acl/lib_acl/include/db/acl_db.h" 2
+# 1 "/acl/lib_acl/include/db/acl_mdb.h" 1
+# 10 "/acl/lib_acl/include/db/acl_mdb.h"
 typedef struct ACL_MDT_NOD ACL_MDT_NOD;
 typedef struct ACL_MDT_RES ACL_MDT_RES;
 typedef struct ACL_MDT_REC ACL_MDT_REC;
@@ -16253,7 +16255,7 @@ typedef struct ACL_MDT_REF ACL_MDT_REF;
 typedef struct ACL_MDT_IDX ACL_MDT_IDX;
 typedef struct ACL_MDT ACL_MDT;
 typedef struct ACL_MDB ACL_MDB;
-# 38 "/workspace/acl/lib_acl/include/db/acl_mdb.h"
+# 38 "/acl/lib_acl/include/db/acl_mdb.h"
  ACL_MDB *acl_mdb_create(const char *dbname, const char *dbtype);
 
 
@@ -16261,28 +16263,28 @@ typedef struct ACL_MDB ACL_MDB;
 
 
  void acl_mdb_free(ACL_MDB *mdb);
-# 56 "/workspace/acl/lib_acl/include/db/acl_mdb.h"
+# 56 "/acl/lib_acl/include/db/acl_mdb.h"
  ACL_MDT *acl_mdb_tbl_create(ACL_MDB *mdb, const char *tbl_name,
  unsigned int tbl_flag, size_t init_capacity,
  const char *key_labels[], unsigned int flags[]);
-# 70 "/workspace/acl/lib_acl/include/db/acl_mdb.h"
+# 70 "/acl/lib_acl/include/db/acl_mdb.h"
  ACL_MDT_NOD *acl_mdb_add(ACL_MDB *mdb, const char *tbl_name,
  void *data, unsigned int dlen,
  const char *key_labels[], const char *keys[]);
-# 82 "/workspace/acl/lib_acl/include/db/acl_mdb.h"
+# 82 "/acl/lib_acl/include/db/acl_mdb.h"
  int acl_mdb_probe(ACL_MDB *mdb, const char *tbl_name,
  const char *key_label, const char *key);
-# 95 "/workspace/acl/lib_acl/include/db/acl_mdb.h"
+# 95 "/acl/lib_acl/include/db/acl_mdb.h"
  ACL_MDT_RES *acl_mdb_find(ACL_MDB *mdb, const char *tbl_name,
  const char *key_label, const char *key, int from, int limit);
-# 106 "/workspace/acl/lib_acl/include/db/acl_mdb.h"
+# 106 "/acl/lib_acl/include/db/acl_mdb.h"
  ACL_MDT_RES *acl_mdb_list(ACL_MDB *mdb, const char *tbl_name,
  int from, int limit);
-# 119 "/workspace/acl/lib_acl/include/db/acl_mdb.h"
+# 119 "/acl/lib_acl/include/db/acl_mdb.h"
  int acl_mdb_del(ACL_MDB *mdb, const char *tbl_name,
  const char *key_label, const char *key,
  void (*onfree_fn)(void*, unsigned int));
-# 132 "/workspace/acl/lib_acl/include/db/acl_mdb.h"
+# 132 "/acl/lib_acl/include/db/acl_mdb.h"
  int acl_mdb_walk(ACL_MDB *mdb, const char *tbl_name,
  int (*walk_fn)(const void*, unsigned int),
  int from, int limit);
@@ -16294,7 +16296,7 @@ typedef struct ACL_MDB ACL_MDB;
 
 
  int acl_mdb_cnt(ACL_MDB *mdb, const char *tbl_name);
-# 158 "/workspace/acl/lib_acl/include/db/acl_mdb.h"
+# 158 "/acl/lib_acl/include/db/acl_mdb.h"
  ACL_MDT *acl_mdt_create(const char *dbtype, const char *tbl_name,
  unsigned int tbl_flag, size_t init_capacity,
  const char *key_labels[], unsigned int flags[]);
@@ -16304,20 +16306,20 @@ typedef struct ACL_MDB ACL_MDB;
 
 
  void acl_mdt_free(ACL_MDT *mdt);
-# 178 "/workspace/acl/lib_acl/include/db/acl_mdb.h"
+# 178 "/acl/lib_acl/include/db/acl_mdb.h"
  ACL_MDT_NOD *acl_mdt_add(ACL_MDT *mdt, void *data,
  unsigned int dlen, const char *key_labels[], const char *keys[]);
-# 188 "/workspace/acl/lib_acl/include/db/acl_mdb.h"
+# 188 "/acl/lib_acl/include/db/acl_mdb.h"
  int acl_mdt_probe(ACL_MDT *mdt, const char *key_label, const char *key);
-# 199 "/workspace/acl/lib_acl/include/db/acl_mdb.h"
+# 199 "/acl/lib_acl/include/db/acl_mdb.h"
  ACL_MDT_RES *acl_mdt_find(ACL_MDT *mdt, const char *key_label,
  const char *key, int from, int limit);
-# 209 "/workspace/acl/lib_acl/include/db/acl_mdb.h"
+# 209 "/acl/lib_acl/include/db/acl_mdb.h"
  ACL_MDT_RES *acl_mdt_list(ACL_MDT *mdt, int from, int limit);
-# 220 "/workspace/acl/lib_acl/include/db/acl_mdb.h"
+# 220 "/acl/lib_acl/include/db/acl_mdb.h"
  int acl_mdt_delete(ACL_MDT *mdt, const char *key_label,
  const char *key, void (*onfree_fn)(void*, unsigned int));
-# 231 "/workspace/acl/lib_acl/include/db/acl_mdb.h"
+# 231 "/acl/lib_acl/include/db/acl_mdb.h"
  int acl_mdt_walk(ACL_MDT *mdt, int (*walk_fn)(const void*, unsigned int),
  int from, int len);
 
@@ -16347,9 +16349,9 @@ typedef struct ACL_MDB ACL_MDB;
 
 
  int acl_mdt_cnt(ACL_MDT *mdt);
-# 12 "/workspace/acl/lib_acl/include/db/acl_db.h" 2
-# 19 "/workspace/acl/lib_acl/include/lib_acl.h" 2
-# 1 "/workspace/acl/lib_acl/include/unit_test/acl_unit_test.h" 1
+# 12 "/acl/lib_acl/include/db/acl_db.h" 2
+# 19 "/acl/lib_acl/include/lib_acl.h" 2
+# 1 "/acl/lib_acl/include/unit_test/acl_unit_test.h" 1
 
 
 
@@ -16357,7 +16359,7 @@ typedef struct ACL_MDB ACL_MDB;
 
 
 
-# 1 "/workspace/acl/lib_acl/include/unit_test/acl_test_struct.h" 1
+# 1 "/acl/lib_acl/include/unit_test/acl_test_struct.h" 1
 
 
 
@@ -16365,8 +16367,8 @@ typedef struct ACL_MDB ACL_MDB;
 
 
 
-# 1 "/workspace/acl/lib_acl/include/unit_test/../stdlib/acl_array.h" 1
-# 9 "/workspace/acl/lib_acl/include/unit_test/acl_test_struct.h" 2
+# 1 "/acl/lib_acl/include/unit_test/../stdlib/acl_array.h" 1
+# 9 "/acl/lib_acl/include/unit_test/acl_test_struct.h" 2
 
 typedef struct AUT_LINE {
  char cmd_name[128];
@@ -16421,8 +16423,8 @@ typedef struct {
  int offset_valid_line_idx;
  int loop_sleep;
 } AUT_CMD_TOKEN;
-# 9 "/workspace/acl/lib_acl/include/unit_test/acl_unit_test.h" 2
-# 1 "/workspace/acl/lib_acl/include/unit_test/acl_test_global.h" 1
+# 9 "/acl/lib_acl/include/unit_test/acl_unit_test.h" 2
+# 1 "/acl/lib_acl/include/unit_test/acl_test_global.h" 1
 
 
 
@@ -16430,10 +16432,10 @@ typedef struct {
 
 
 
-# 1 "/workspace/acl/lib_acl/include/unit_test/../stdlib/acl_define.h" 1
-# 9 "/workspace/acl/lib_acl/include/unit_test/acl_test_global.h" 2
-# 1 "/workspace/acl/lib_acl/include/unit_test/../stdlib/acl_loadcfg.h" 1
-# 10 "/workspace/acl/lib_acl/include/unit_test/acl_test_global.h" 2
+# 1 "/acl/lib_acl/include/unit_test/../stdlib/acl_define.h" 1
+# 9 "/acl/lib_acl/include/unit_test/acl_test_global.h" 2
+# 1 "/acl/lib_acl/include/unit_test/../stdlib/acl_loadcfg.h" 1
+# 10 "/acl/lib_acl/include/unit_test/acl_test_global.h" 2
 
 
 
@@ -16458,7 +16460,7 @@ typedef struct {
 
 
  void aut_line_free(void *ctx);
-# 44 "/workspace/acl/lib_acl/include/unit_test/acl_test_global.h"
+# 44 "/acl/lib_acl/include/unit_test/acl_test_global.h"
  int aut_cfg_parse(const char *pathname);
 
 
@@ -16550,7 +16552,7 @@ typedef struct {
 
 
  const char *aut_line_argstr(const AUT_LINE *test_line);
-# 143 "/workspace/acl/lib_acl/include/unit_test/acl_test_global.h"
+# 143 "/acl/lib_acl/include/unit_test/acl_test_global.h"
  int aut_line_result(const AUT_LINE *test_line);
 
 
@@ -16595,9 +16597,9 @@ typedef struct {
 
 
  int aut_end_linenum(int start_linenum);
-# 195 "/workspace/acl/lib_acl/include/unit_test/acl_test_global.h"
+# 195 "/acl/lib_acl/include/unit_test/acl_test_global.h"
  const AUT_LINE *aut_lookup_from_line(const AUT_LINE *test_line, int flag);
-# 204 "/workspace/acl/lib_acl/include/unit_test/acl_test_global.h"
+# 204 "/acl/lib_acl/include/unit_test/acl_test_global.h"
  int aut_start(void);
 
 
@@ -16628,19 +16630,19 @@ typedef struct {
  void aut_log_error(const char *format, ...);
  void aut_log_fatal(const char *format, ...);
  void aut_log_panic(const char *format, ...);
-# 10 "/workspace/acl/lib_acl/include/unit_test/acl_unit_test.h" 2
-# 1 "/workspace/acl/lib_acl/include/unit_test/acl_test_var.h" 1
-# 10 "/workspace/acl/lib_acl/include/unit_test/acl_test_var.h"
+# 10 "/acl/lib_acl/include/unit_test/acl_unit_test.h" 2
+# 1 "/acl/lib_acl/include/unit_test/acl_test_var.h" 1
+# 10 "/acl/lib_acl/include/unit_test/acl_test_var.h"
 extern int var_aut_log_level;
 extern int var_aut_verbose;
 
 extern ACL_ARRAY *var_aut_line_array;
 extern int var_aut_valid_line_idx;
-# 11 "/workspace/acl/lib_acl/include/unit_test/acl_unit_test.h" 2
-# 1 "/workspace/acl/lib_acl/include/unit_test/acl_test_macro.h" 1
-# 12 "/workspace/acl/lib_acl/include/unit_test/acl_unit_test.h" 2
-# 20 "/workspace/acl/lib_acl/include/lib_acl.h" 2
-# 1 "/workspace/acl/lib_acl/include/code/acl_code.h" 1
+# 11 "/acl/lib_acl/include/unit_test/acl_unit_test.h" 2
+# 1 "/acl/lib_acl/include/unit_test/acl_test_macro.h" 1
+# 12 "/acl/lib_acl/include/unit_test/acl_unit_test.h" 2
+# 20 "/acl/lib_acl/include/lib_acl.h" 2
+# 1 "/acl/lib_acl/include/code/acl_code.h" 1
 
 
 
@@ -16648,7 +16650,7 @@ extern int var_aut_valid_line_idx;
 
 
 
-# 1 "/workspace/acl/lib_acl/include/code/acl_base64.h" 1
+# 1 "/acl/lib_acl/include/code/acl_base64.h" 1
 
 
 
@@ -16656,8 +16658,8 @@ extern int var_aut_valid_line_idx;
 
 
 
-# 1 "/workspace/acl/lib_acl/include/code/../stdlib/acl_define.h" 1
-# 9 "/workspace/acl/lib_acl/include/code/acl_base64.h" 2
+# 1 "/acl/lib_acl/include/code/../stdlib/acl_define.h" 1
+# 9 "/acl/lib_acl/include/code/acl_base64.h" 2
 
 
 
@@ -16666,52 +16668,52 @@ extern int var_aut_valid_line_idx;
 
 
  unsigned char *acl_base64_encode(const char *plain_in, int len);
-# 27 "/workspace/acl/lib_acl/include/code/acl_base64.h"
+# 27 "/acl/lib_acl/include/code/acl_base64.h"
  int acl_base64_decode(const char *code_in, char **ppresult);
-# 9 "/workspace/acl/lib_acl/include/code/acl_code.h" 2
-# 1 "/workspace/acl/lib_acl/include/code/acl_vstring_base64.h" 1
-# 9 "/workspace/acl/lib_acl/include/code/acl_vstring_base64.h"
-# 1 "/workspace/acl/lib_acl/include/code/../stdlib/acl_vstring.h" 1
-# 10 "/workspace/acl/lib_acl/include/code/acl_vstring_base64.h" 2
-# 18 "/workspace/acl/lib_acl/include/code/acl_vstring_base64.h"
+# 9 "/acl/lib_acl/include/code/acl_code.h" 2
+# 1 "/acl/lib_acl/include/code/acl_vstring_base64.h" 1
+# 9 "/acl/lib_acl/include/code/acl_vstring_base64.h"
+# 1 "/acl/lib_acl/include/code/../stdlib/acl_vstring.h" 1
+# 10 "/acl/lib_acl/include/code/acl_vstring_base64.h" 2
+# 18 "/acl/lib_acl/include/code/acl_vstring_base64.h"
  ACL_VSTRING *acl_vstring_base64_encode(ACL_VSTRING *vp,
  const char *in, int len);
-# 28 "/workspace/acl/lib_acl/include/code/acl_vstring_base64.h"
+# 28 "/acl/lib_acl/include/code/acl_vstring_base64.h"
  ACL_VSTRING *acl_vstring_base64_decode(ACL_VSTRING *vp,
  const char *in, int len);
-# 10 "/workspace/acl/lib_acl/include/code/acl_code.h" 2
-# 1 "/workspace/acl/lib_acl/include/code/acl_urlcode.h" 1
-# 9 "/workspace/acl/lib_acl/include/code/acl_urlcode.h"
-# 1 "/workspace/acl/lib_acl/include/code/../stdlib/acl_dbuf_pool.h" 1
-# 10 "/workspace/acl/lib_acl/include/code/acl_urlcode.h" 2
-# 18 "/workspace/acl/lib_acl/include/code/acl_urlcode.h"
+# 10 "/acl/lib_acl/include/code/acl_code.h" 2
+# 1 "/acl/lib_acl/include/code/acl_urlcode.h" 1
+# 9 "/acl/lib_acl/include/code/acl_urlcode.h"
+# 1 "/acl/lib_acl/include/code/../stdlib/acl_dbuf_pool.h" 1
+# 10 "/acl/lib_acl/include/code/acl_urlcode.h" 2
+# 18 "/acl/lib_acl/include/code/acl_urlcode.h"
  char *acl_url_encode(const char *str, ACL_DBUF_POOL *dbuf);
-# 27 "/workspace/acl/lib_acl/include/code/acl_urlcode.h"
+# 27 "/acl/lib_acl/include/code/acl_urlcode.h"
  char *acl_url_decode(const char *str, ACL_DBUF_POOL *dbuf);
-# 11 "/workspace/acl/lib_acl/include/code/acl_code.h" 2
-# 1 "/workspace/acl/lib_acl/include/code/acl_gbcode.h" 1
-# 18 "/workspace/acl/lib_acl/include/code/acl_gbcode.h"
+# 11 "/acl/lib_acl/include/code/acl_code.h" 2
+# 1 "/acl/lib_acl/include/code/acl_gbcode.h" 1
+# 18 "/acl/lib_acl/include/code/acl_gbcode.h"
  void acl_gbjt2ft(const char *data, size_t dlen, char *buf, size_t size);
-# 28 "/workspace/acl/lib_acl/include/code/acl_gbcode.h"
+# 28 "/acl/lib_acl/include/code/acl_gbcode.h"
  void acl_gbft2jt(const char *data, size_t dlen, char *buf, size_t size);
-# 12 "/workspace/acl/lib_acl/include/code/acl_code.h" 2
-# 1 "/workspace/acl/lib_acl/include/code/acl_htmlcode.h" 1
-# 13 "/workspace/acl/lib_acl/include/code/acl_htmlcode.h"
+# 12 "/acl/lib_acl/include/code/acl_code.h" 2
+# 1 "/acl/lib_acl/include/code/acl_htmlcode.h" 1
+# 13 "/acl/lib_acl/include/code/acl_htmlcode.h"
  int acl_html_encode(const char *in, ACL_VSTRING *out);
  int acl_html_decode(const char *in, ACL_VSTRING *out);
-# 13 "/workspace/acl/lib_acl/include/code/acl_code.h" 2
-# 1 "/workspace/acl/lib_acl/include/code/acl_xmlcode.h" 1
-# 11 "/workspace/acl/lib_acl/include/code/acl_xmlcode.h"
+# 13 "/acl/lib_acl/include/code/acl_code.h" 2
+# 1 "/acl/lib_acl/include/code/acl_xmlcode.h" 1
+# 11 "/acl/lib_acl/include/code/acl_xmlcode.h"
  int acl_xml_encode(const char *in, ACL_VSTRING *out);
  int acl_xml_decode(const char *in, ACL_VSTRING *out);
-# 35 "/workspace/acl/lib_acl/include/code/acl_xmlcode.h"
+# 35 "/acl/lib_acl/include/code/acl_xmlcode.h"
  size_t acl_xml_encode2(const char** in, size_t ilen,
   char* out, size_t olen);
 
  const char *acl_xml_decode2(const char *in, char **out, size_t *size);
-# 14 "/workspace/acl/lib_acl/include/code/acl_code.h" 2
-# 21 "/workspace/acl/lib_acl/include/lib_acl.h" 2
-# 1 "/workspace/acl/lib_acl/include/master/acl_master.h" 1
+# 14 "/acl/lib_acl/include/code/acl_code.h" 2
+# 21 "/acl/lib_acl/include/lib_acl.h" 2
+# 1 "/acl/lib_acl/include/master/acl_master.h" 1
 
 
 
@@ -16719,48 +16721,48 @@ extern int var_aut_valid_line_idx;
 
 
 
-# 1 "/workspace/acl/lib_acl/include/master/acl_master_type.h" 1
+# 1 "/acl/lib_acl/include/master/acl_master_type.h" 1
 
 
 
-# 1 "/workspace/acl/lib_acl/include/master/../stdlib/acl_xinetd_cfg.h" 1
-# 5 "/workspace/acl/lib_acl/include/master/acl_master_type.h" 2
-# 9 "/workspace/acl/lib_acl/include/master/acl_master.h" 2
-# 1 "/workspace/acl/lib_acl/include/master/acl_master_proto.h" 1
+# 1 "/acl/lib_acl/include/master/../stdlib/acl_xinetd_cfg.h" 1
+# 5 "/acl/lib_acl/include/master/acl_master_type.h" 2
+# 9 "/acl/lib_acl/include/master/acl_master.h" 2
+# 1 "/acl/lib_acl/include/master/acl_master_proto.h" 1
 
 
 
-# 1 "/workspace/acl/lib_acl/include/master/../stdlib/acl_define.h" 1
-# 5 "/workspace/acl/lib_acl/include/master/acl_master_proto.h" 2
-# 42 "/workspace/acl/lib_acl/include/master/acl_master_proto.h"
+# 1 "/acl/lib_acl/include/master/../stdlib/acl_define.h" 1
+# 5 "/acl/lib_acl/include/master/acl_master_proto.h" 2
+# 42 "/acl/lib_acl/include/master/acl_master_proto.h"
 typedef struct ACL_MASTER_STATUS {
  int pid;
  unsigned gen;
  int status;
 } ACL_MASTER_STATUS;
-# 57 "/workspace/acl/lib_acl/include/master/acl_master_proto.h"
+# 57 "/acl/lib_acl/include/master/acl_master_proto.h"
 int acl_master_notify(int, unsigned, int);
-# 10 "/workspace/acl/lib_acl/include/master/acl_master.h" 2
-# 1 "/workspace/acl/lib_acl/include/master/acl_master_flow.h" 1
-# 17 "/workspace/acl/lib_acl/include/master/acl_master_flow.h"
+# 10 "/acl/lib_acl/include/master/acl_master.h" 2
+# 1 "/acl/lib_acl/include/master/acl_master_flow.h" 1
+# 17 "/acl/lib_acl/include/master/acl_master_flow.h"
 extern int acl_var_master_flow_pipe[2];
 
 extern void acl_master_flow_init(void);
 extern int acl_master_flow_get(int);
 extern int acl_master_flow_put(int);
 extern int acl_master_flow_count(void);
-# 11 "/workspace/acl/lib_acl/include/master/acl_master.h" 2
-# 1 "/workspace/acl/lib_acl/include/master/acl_server_api.h" 1
-# 9 "/workspace/acl/lib_acl/include/master/acl_server_api.h"
-# 1 "/workspace/acl/lib_acl/include/master/../stdlib/acl_vstream.h" 1
-# 10 "/workspace/acl/lib_acl/include/master/acl_server_api.h" 2
-# 1 "/workspace/acl/lib_acl/include/master/../ioctl/acl_ioctl.h" 1
-# 11 "/workspace/acl/lib_acl/include/master/acl_server_api.h" 2
-# 1 "/workspace/acl/lib_acl/include/master/../aio/acl_aio.h" 1
-# 12 "/workspace/acl/lib_acl/include/master/acl_server_api.h" 2
-# 1 "/workspace/acl/lib_acl/include/master/../event/acl_events.h" 1
-# 13 "/workspace/acl/lib_acl/include/master/acl_server_api.h" 2
-# 71 "/workspace/acl/lib_acl/include/master/acl_server_api.h"
+# 11 "/acl/lib_acl/include/master/acl_master.h" 2
+# 1 "/acl/lib_acl/include/master/acl_server_api.h" 1
+# 9 "/acl/lib_acl/include/master/acl_server_api.h"
+# 1 "/acl/lib_acl/include/master/../stdlib/acl_vstream.h" 1
+# 10 "/acl/lib_acl/include/master/acl_server_api.h" 2
+# 1 "/acl/lib_acl/include/master/../ioctl/acl_ioctl.h" 1
+# 11 "/acl/lib_acl/include/master/acl_server_api.h" 2
+# 1 "/acl/lib_acl/include/master/../aio/acl_aio.h" 1
+# 12 "/acl/lib_acl/include/master/acl_server_api.h" 2
+# 1 "/acl/lib_acl/include/master/../event/acl_events.h" 1
+# 13 "/acl/lib_acl/include/master/acl_server_api.h" 2
+# 71 "/acl/lib_acl/include/master/acl_server_api.h"
 typedef void (*ACL_MASTER_SERVER_INIT_FN) (void *);
 typedef int (*ACL_MASTER_SERVER_LOOP_FN) (void *);
 typedef void (*ACL_MASTER_SERVER_EXIT_FN) (void *);
@@ -16885,10 +16887,10 @@ extern int acl_var_server_gotsighup;
 
  void acl_master_log_enable(int yes);
  int acl_master_log_enabled(void);
-# 12 "/workspace/acl/lib_acl/include/master/acl_master.h" 2
+# 12 "/acl/lib_acl/include/master/acl_master.h" 2
 
-# 1 "/workspace/acl/lib_acl/include/master/acl_single_params.h" 1
-# 14 "/workspace/acl/lib_acl/include/master/acl_single_params.h"
+# 1 "/acl/lib_acl/include/master/acl_single_params.h" 1
+# 14 "/acl/lib_acl/include/master/acl_single_params.h"
 extern int acl_var_single_pid;
 extern char *acl_var_single_procname;
 extern char *acl_var_single_log_file;
@@ -16924,9 +16926,9 @@ extern int acl_var_single_disable_core_onexit;
 extern long long int acl_var_single_core_limit;
 extern char *acl_var_single_log_debug;
 extern int acl_var_single_max_debug;
-# 14 "/workspace/acl/lib_acl/include/master/acl_master.h" 2
-# 1 "/workspace/acl/lib_acl/include/master/acl_aio_params.h" 1
-# 14 "/workspace/acl/lib_acl/include/master/acl_aio_params.h"
+# 14 "/acl/lib_acl/include/master/acl_master.h" 2
+# 1 "/acl/lib_acl/include/master/acl_aio_params.h" 1
+# 14 "/acl/lib_acl/include/master/acl_aio_params.h"
 extern int acl_var_aio_pid;
 extern char *acl_var_aio_procname;
 extern char *acl_var_aio_log_file;
@@ -16961,9 +16963,9 @@ extern int acl_var_aio_status_notify;
 extern char *acl_var_aio_dispatch_addr;
 extern char *acl_var_aio_dispatch_type;
 extern char *acl_var_aio_deny_info;
-# 15 "/workspace/acl/lib_acl/include/master/acl_master.h" 2
-# 1 "/workspace/acl/lib_acl/include/master/acl_udp_params.h" 1
-# 12 "/workspace/acl/lib_acl/include/master/acl_udp_params.h"
+# 15 "/acl/lib_acl/include/master/acl_master.h" 2
+# 1 "/acl/lib_acl/include/master/acl_udp_params.h" 1
+# 12 "/acl/lib_acl/include/master/acl_udp_params.h"
 extern int acl_var_udp_pid;
 extern char *acl_var_udp_procname;
 extern char *acl_var_udp_log_file;
@@ -16993,14 +16995,14 @@ extern int acl_var_udp_monitor_netlink;
 extern int acl_var_udp_non_block;
 extern char *acl_var_udp_reuse_port;
 extern char *acl_var_udp_private;
-# 16 "/workspace/acl/lib_acl/include/master/acl_master.h" 2
-# 1 "/workspace/acl/lib_acl/include/master/acl_master_conf.h" 1
+# 16 "/acl/lib_acl/include/master/acl_master.h" 2
+# 1 "/acl/lib_acl/include/master/acl_master_conf.h" 1
 
 
 
 
-# 1 "/workspace/acl/lib_acl/include/master/../master/acl_master_type.h" 1
-# 6 "/workspace/acl/lib_acl/include/master/acl_master_conf.h" 2
+# 1 "/acl/lib_acl/include/master/../master/acl_master_type.h" 1
+# 6 "/acl/lib_acl/include/master/acl_master_conf.h" 2
 
 
 
@@ -17015,9 +17017,9 @@ extern char *acl_var_udp_private;
  void acl_get_app_conf_str_table(ACL_CFG_STR_TABLE *table);
  void acl_get_app_conf_bool_table(ACL_CFG_BOOL_TABLE *table);
  void acl_free_app_conf_str_table(ACL_CFG_STR_TABLE *table);
-# 17 "/workspace/acl/lib_acl/include/master/acl_master.h" 2
-# 1 "/workspace/acl/lib_acl/include/master/acl_threads_params.h" 1
-# 12 "/workspace/acl/lib_acl/include/master/acl_threads_params.h"
+# 17 "/acl/lib_acl/include/master/acl_master.h" 2
+# 1 "/acl/lib_acl/include/master/acl_threads_params.h" 1
+# 12 "/acl/lib_acl/include/master/acl_threads_params.h"
 extern char *acl_var_threads_procname;
 extern char *acl_var_threads_log_file;
 
@@ -17056,15 +17058,15 @@ extern char *acl_var_threads_dispatch_addr;
 extern char *acl_var_threads_dispatch_type;
 extern char *acl_var_threads_master_service;
 extern char *acl_var_threads_master_reuseport;
-# 18 "/workspace/acl/lib_acl/include/master/acl_master.h" 2
-# 22 "/workspace/acl/lib_acl/include/lib_acl.h" 2
-# 1 "/workspace/acl/lib_acl/include/proctl/acl_proctl.h" 1
+# 18 "/acl/lib_acl/include/master/acl_master.h" 2
+# 22 "/acl/lib_acl/include/lib_acl.h" 2
+# 1 "/acl/lib_acl/include/proctl/acl_proctl.h" 1
 
 
 
-# 1 "/workspace/acl/lib_acl/include/proctl/../stdlib/acl_define.h" 1
-# 5 "/workspace/acl/lib_acl/include/proctl/acl_proctl.h" 2
-# 18 "/workspace/acl/lib_acl/include/proctl/acl_proctl.h"
+# 1 "/acl/lib_acl/include/proctl/../stdlib/acl_define.h" 1
+# 5 "/acl/lib_acl/include/proctl/acl_proctl.h" 2
+# 18 "/acl/lib_acl/include/proctl/acl_proctl.h"
  void acl_proctl_daemon_path(char *buf, size_t size);
 
 
@@ -17078,12 +17080,12 @@ extern char *acl_var_threads_master_reuseport;
 
 
  void acl_proctl_daemon_loop(void);
-# 39 "/workspace/acl/lib_acl/include/proctl/acl_proctl.h"
+# 39 "/acl/lib_acl/include/proctl/acl_proctl.h"
  int acl_proctl_deamon_start_one(const char *progchild, int argc, char *argv[]);
-# 48 "/workspace/acl/lib_acl/include/proctl/acl_proctl.h"
+# 48 "/acl/lib_acl/include/proctl/acl_proctl.h"
  void acl_proctl_start_one(const char *progname,
  const char *progchild, int argc, char *argv[]);
-# 58 "/workspace/acl/lib_acl/include/proctl/acl_proctl.h"
+# 58 "/acl/lib_acl/include/proctl/acl_proctl.h"
  void acl_proctl_stop_one(const char *progname,
  const char *progchild, int argc, char *argv[]);
 
@@ -17119,8 +17121,8 @@ extern char *acl_var_threads_master_reuseport;
 
 
  void acl_proctl_child(const char *progname, void (*onexit_fn)(void *), void *arg);
-# 23 "/workspace/acl/lib_acl/include/lib_acl.h" 2
-# 1 "/workspace/acl/lib_acl/include/xml/acl_xml.h" 1
+# 23 "/acl/lib_acl/include/lib_acl.h" 2
+# 1 "/acl/lib_acl/include/xml/acl_xml.h" 1
 
 
 
@@ -17128,20 +17130,20 @@ extern char *acl_var_threads_master_reuseport;
 
 
 
-# 1 "/workspace/acl/lib_acl/include/xml/../stdlib/acl_array.h" 1
-# 9 "/workspace/acl/lib_acl/include/xml/acl_xml.h" 2
-# 1 "/workspace/acl/lib_acl/include/xml/../stdlib/acl_ring.h" 1
-# 10 "/workspace/acl/lib_acl/include/xml/acl_xml.h" 2
-# 1 "/workspace/acl/lib_acl/include/xml/../stdlib/acl_vstream.h" 1
-# 11 "/workspace/acl/lib_acl/include/xml/acl_xml.h" 2
-# 1 "/workspace/acl/lib_acl/include/xml/../stdlib/acl_htable.h" 1
-# 12 "/workspace/acl/lib_acl/include/xml/acl_xml.h" 2
-# 1 "/workspace/acl/lib_acl/include/xml/../stdlib/acl_vstring.h" 1
-# 13 "/workspace/acl/lib_acl/include/xml/acl_xml.h" 2
-# 1 "/workspace/acl/lib_acl/include/xml/../stdlib/acl_iterator.h" 1
-# 14 "/workspace/acl/lib_acl/include/xml/acl_xml.h" 2
-# 1 "/workspace/acl/lib_acl/include/xml/../stdlib/acl_dbuf_pool.h" 1
-# 15 "/workspace/acl/lib_acl/include/xml/acl_xml.h" 2
+# 1 "/acl/lib_acl/include/xml/../stdlib/acl_array.h" 1
+# 9 "/acl/lib_acl/include/xml/acl_xml.h" 2
+# 1 "/acl/lib_acl/include/xml/../stdlib/acl_ring.h" 1
+# 10 "/acl/lib_acl/include/xml/acl_xml.h" 2
+# 1 "/acl/lib_acl/include/xml/../stdlib/acl_vstream.h" 1
+# 11 "/acl/lib_acl/include/xml/acl_xml.h" 2
+# 1 "/acl/lib_acl/include/xml/../stdlib/acl_htable.h" 1
+# 12 "/acl/lib_acl/include/xml/acl_xml.h" 2
+# 1 "/acl/lib_acl/include/xml/../stdlib/acl_vstring.h" 1
+# 13 "/acl/lib_acl/include/xml/acl_xml.h" 2
+# 1 "/acl/lib_acl/include/xml/../stdlib/acl_iterator.h" 1
+# 14 "/acl/lib_acl/include/xml/acl_xml.h" 2
+# 1 "/acl/lib_acl/include/xml/../stdlib/acl_dbuf_pool.h" 1
+# 15 "/acl/lib_acl/include/xml/acl_xml.h" 2
 
 typedef struct ACL_XML ACL_XML;
 typedef struct ACL_XML_NODE ACL_XML_NODE;
@@ -17178,9 +17180,9 @@ struct ACL_XML_NODE {
  int nlt;
  char meta[3];
  unsigned int flag;
-# 66 "/workspace/acl/lib_acl/include/xml/acl_xml.h"
+# 66 "/acl/lib_acl/include/xml/acl_xml.h"
  int status;
-# 88 "/workspace/acl/lib_acl/include/xml/acl_xml.h"
+# 88 "/acl/lib_acl/include/xml/acl_xml.h"
  ACL_XML_NODE *(*iter_head)(ACL_ITER*, ACL_XML_NODE*);
 
  ACL_XML_NODE *(*iter_next)(ACL_ITER*, ACL_XML_NODE*);
@@ -17207,7 +17209,7 @@ struct ACL_XML {
  size_t space;
 
  unsigned flag;
-# 127 "/workspace/acl/lib_acl/include/xml/acl_xml.h"
+# 127 "/acl/lib_acl/include/xml/acl_xml.h"
  ACL_VSTRING *decode_buf;
 
 
@@ -17221,9 +17223,9 @@ struct ACL_XML {
 
  ACL_XML_NODE *(*iter_prev)(ACL_ITER*, ACL_XML*);
 };
-# 153 "/workspace/acl/lib_acl/include/xml/acl_xml.h"
+# 153 "/acl/lib_acl/include/xml/acl_xml.h"
  int acl_xml_is_closure(ACL_XML *xml);
-# 164 "/workspace/acl/lib_acl/include/xml/acl_xml.h"
+# 164 "/acl/lib_acl/include/xml/acl_xml.h"
  int acl_xml_is_complete(ACL_XML *xml, const char *tag);
 
 
@@ -17252,7 +17254,7 @@ struct ACL_XML {
 
 
  void acl_xml_space_clear(ACL_XML *xml);
-# 200 "/workspace/acl/lib_acl/include/xml/acl_xml.h"
+# 200 "/acl/lib_acl/include/xml/acl_xml.h"
  void acl_xml_foreach_init(ACL_XML *xml, ACL_XML_NODE *node);
 
 
@@ -17262,7 +17264,7 @@ struct ACL_XML {
 
 
  void acl_xml_multi_root(ACL_XML *xml, int on);
-# 218 "/workspace/acl/lib_acl/include/xml/acl_xml.h"
+# 218 "/acl/lib_acl/include/xml/acl_xml.h"
  void acl_xml_slash(ACL_XML *xml, int ignore);
 
 
@@ -17289,9 +17291,9 @@ struct ACL_XML {
 
 
  void acl_xml_reset(ACL_XML *xml);
-# 257 "/workspace/acl/lib_acl/include/xml/acl_xml.h"
+# 257 "/acl/lib_acl/include/xml/acl_xml.h"
  const char *acl_xml_update(ACL_XML *xml, const char *data);
-# 267 "/workspace/acl/lib_acl/include/xml/acl_xml.h"
+# 267 "/acl/lib_acl/include/xml/acl_xml.h"
  void acl_xml_tag_init(void);
 
 
@@ -17314,28 +17316,28 @@ struct ACL_XML {
 
 
  int acl_xml_tag_leaf(const char *tag);
-# 298 "/workspace/acl/lib_acl/include/xml/acl_xml.h"
+# 298 "/acl/lib_acl/include/xml/acl_xml.h"
  void acl_xml_free_array(ACL_ARRAY *a);
-# 307 "/workspace/acl/lib_acl/include/xml/acl_xml.h"
+# 307 "/acl/lib_acl/include/xml/acl_xml.h"
  ACL_XML_NODE *acl_xml_getFirstElementByTagName(
  ACL_XML *xml, const char *tag);
-# 317 "/workspace/acl/lib_acl/include/xml/acl_xml.h"
+# 317 "/acl/lib_acl/include/xml/acl_xml.h"
  ACL_ARRAY *acl_xml_getElementsByTagName(
  ACL_XML *xml, const char *tag);
-# 331 "/workspace/acl/lib_acl/include/xml/acl_xml.h"
+# 331 "/acl/lib_acl/include/xml/acl_xml.h"
  ACL_ARRAY *acl_xml_getElementsByTags(ACL_XML *xml, const char *tags);
-# 340 "/workspace/acl/lib_acl/include/xml/acl_xml.h"
+# 340 "/acl/lib_acl/include/xml/acl_xml.h"
  ACL_ARRAY *acl_xml_getElementsByName(ACL_XML *xml, const char *value);
-# 350 "/workspace/acl/lib_acl/include/xml/acl_xml.h"
+# 350 "/acl/lib_acl/include/xml/acl_xml.h"
  ACL_ARRAY *acl_xml_getElementsByAttr(ACL_XML *xml,
  const char *name, const char *value);
-# 360 "/workspace/acl/lib_acl/include/xml/acl_xml.h"
+# 360 "/acl/lib_acl/include/xml/acl_xml.h"
  ACL_XML_ATTR *acl_xml_getAttrById(ACL_XML *xml, const char *id);
-# 369 "/workspace/acl/lib_acl/include/xml/acl_xml.h"
+# 369 "/acl/lib_acl/include/xml/acl_xml.h"
  const char *acl_xml_getAttrValueById(ACL_XML *xml, const char *id);
-# 378 "/workspace/acl/lib_acl/include/xml/acl_xml.h"
+# 378 "/acl/lib_acl/include/xml/acl_xml.h"
  ACL_XML_NODE *acl_xml_getElementById(ACL_XML *xml, const char *id);
-# 387 "/workspace/acl/lib_acl/include/xml/acl_xml.h"
+# 387 "/acl/lib_acl/include/xml/acl_xml.h"
  ACL_XML_NODE *acl_xml_getElementMeta(ACL_XML *xml, const char *tag);
 
 
@@ -17375,16 +17377,16 @@ struct ACL_XML {
 
 
  int acl_xml_removeElementAttr(ACL_XML_NODE *node, const char *name);
-# 436 "/workspace/acl/lib_acl/include/xml/acl_xml.h"
+# 436 "/acl/lib_acl/include/xml/acl_xml.h"
  ACL_XML_ATTR *acl_xml_addElementAttr(ACL_XML_NODE *node,
         const char *name, const char *value);
-# 447 "/workspace/acl/lib_acl/include/xml/acl_xml.h"
+# 447 "/acl/lib_acl/include/xml/acl_xml.h"
  ACL_XML_NODE *acl_xml_create_node(ACL_XML *xml,
  const char* tagname, const char* text);
-# 460 "/workspace/acl/lib_acl/include/xml/acl_xml.h"
+# 460 "/acl/lib_acl/include/xml/acl_xml.h"
  ACL_XML_NODE *acl_xml_create_node_with_text_stream(ACL_XML *xml,
  const char *tag, ACL_VSTREAM *in, size_t off, size_t len);
-# 471 "/workspace/acl/lib_acl/include/xml/acl_xml.h"
+# 471 "/acl/lib_acl/include/xml/acl_xml.h"
  ACL_XML_ATTR *acl_xml_node_add_attr(ACL_XML_NODE *node,
  const char *name, const char *value);
 
@@ -17411,10 +17413,10 @@ struct ACL_XML {
 
 
  void acl_xml_node_add_text(ACL_XML_NODE *node, const char *text);
-# 505 "/workspace/acl/lib_acl/include/xml/acl_xml.h"
+# 505 "/acl/lib_acl/include/xml/acl_xml.h"
  void acl_xml_node_set_text_stream(ACL_XML_NODE *node,
  ACL_VSTREAM *fp, size_t off, size_t len);
-# 517 "/workspace/acl/lib_acl/include/xml/acl_xml.h"
+# 517 "/acl/lib_acl/include/xml/acl_xml.h"
  ACL_VSTRING* acl_xml_build(ACL_XML* xml, ACL_VSTRING *buf);
 
 
@@ -17430,7 +17432,7 @@ struct ACL_XML {
 
 
  void acl_xml_dump2(ACL_XML *xml, ACL_VSTRING *buf);
-# 544 "/workspace/acl/lib_acl/include/xml/acl_xml.h"
+# 544 "/acl/lib_acl/include/xml/acl_xml.h"
  ACL_XML_ATTR *acl_xml_attr_alloc(ACL_XML_NODE *node);
 
 
@@ -17482,9 +17484,9 @@ struct ACL_XML {
 
 
  ACL_XML_NODE *acl_xml_node_prev(ACL_XML_NODE *node);
-# 24 "/workspace/acl/lib_acl/include/lib_acl.h" 2
-# 1 "/workspace/acl/lib_acl/include/xml/acl_xml2.h" 1
-# 16 "/workspace/acl/lib_acl/include/xml/acl_xml2.h"
+# 24 "/acl/lib_acl/include/lib_acl.h" 2
+# 1 "/acl/lib_acl/include/xml/acl_xml2.h" 1
+# 16 "/acl/lib_acl/include/xml/acl_xml2.h"
 typedef struct ACL_XML2 ACL_XML2;
 typedef struct ACL_XML2_NODE ACL_XML2_NODE;
 typedef struct ACL_XML2_ATTR ACL_XML2_ATTR;
@@ -17528,9 +17530,9 @@ struct ACL_XML2_NODE {
  char meta[3];
 
  unsigned int flag;
-# 74 "/workspace/acl/lib_acl/include/xml/acl_xml2.h"
+# 74 "/acl/lib_acl/include/xml/acl_xml2.h"
  int status;
-# 96 "/workspace/acl/lib_acl/include/xml/acl_xml2.h"
+# 96 "/acl/lib_acl/include/xml/acl_xml2.h"
  ACL_XML2_NODE *(*iter_head)(ACL_ITER*, ACL_XML2_NODE*);
 
  ACL_XML2_NODE *(*iter_next)(ACL_ITER*, ACL_XML2_NODE*);
@@ -17562,7 +17564,7 @@ struct ACL_XML2 {
  size_t dbuf_keep;
 
  unsigned flag;
-# 143 "/workspace/acl/lib_acl/include/xml/acl_xml2.h"
+# 143 "/acl/lib_acl/include/xml/acl_xml2.h"
  ACL_XML2_NODE *(*iter_head)(ACL_ITER*, const ACL_XML2*);
 
  ACL_XML2_NODE *(*iter_next)(ACL_ITER*, const ACL_XML2*);
@@ -17571,9 +17573,9 @@ struct ACL_XML2 {
 
  ACL_XML2_NODE *(*iter_prev)(ACL_ITER*, const ACL_XML2*);
 };
-# 164 "/workspace/acl/lib_acl/include/xml/acl_xml2.h"
+# 164 "/acl/lib_acl/include/xml/acl_xml2.h"
  int acl_xml2_is_closure(ACL_XML2 *xml);
-# 175 "/workspace/acl/lib_acl/include/xml/acl_xml2.h"
+# 175 "/acl/lib_acl/include/xml/acl_xml2.h"
  int acl_xml2_is_complete(ACL_XML2 *xml, const char *tag);
 
 
@@ -17582,12 +17584,12 @@ struct ACL_XML2 {
 
 
  ACL_XML2 *acl_xml2_alloc(ACL_VSTRING *vbuf);
-# 191 "/workspace/acl/lib_acl/include/xml/acl_xml2.h"
+# 191 "/acl/lib_acl/include/xml/acl_xml2.h"
  ACL_XML2 *acl_xml2_dbuf_alloc(ACL_VSTRING *vbuf, ACL_DBUF_POOL *dbuf);
-# 202 "/workspace/acl/lib_acl/include/xml/acl_xml2.h"
+# 202 "/acl/lib_acl/include/xml/acl_xml2.h"
  ACL_XML2 *acl_xml2_mmap_file(const char *filepath, size_t max_len,
   size_t init_len, ACL_DBUF_POOL *dbuf);
-# 215 "/workspace/acl/lib_acl/include/xml/acl_xml2.h"
+# 215 "/acl/lib_acl/include/xml/acl_xml2.h"
  ACL_XML2 *acl_xml2_mmap_fd(int fd, size_t max_len,
   size_t init_len, ACL_DBUF_POOL *dbuf);
 
@@ -17603,7 +17605,7 @@ struct ACL_XML2 {
 
 
  void acl_xml2_space_clear(ACL_XML2 *xml);
-# 238 "/workspace/acl/lib_acl/include/xml/acl_xml2.h"
+# 238 "/acl/lib_acl/include/xml/acl_xml2.h"
  void acl_xml2_foreach_init(ACL_XML2 *xml, ACL_XML2_NODE *node);
 
 
@@ -17613,7 +17615,7 @@ struct ACL_XML2 {
 
 
  void acl_xml2_multi_root(ACL_XML2 *xml, int on);
-# 256 "/workspace/acl/lib_acl/include/xml/acl_xml2.h"
+# 256 "/acl/lib_acl/include/xml/acl_xml2.h"
  void acl_xml2_slash(ACL_XML2 *xml, int ignore);
 
 
@@ -17640,9 +17642,9 @@ struct ACL_XML2 {
 
 
  void acl_xml2_reset(ACL_XML2 *xml);
-# 295 "/workspace/acl/lib_acl/include/xml/acl_xml2.h"
+# 295 "/acl/lib_acl/include/xml/acl_xml2.h"
  const char *acl_xml2_update(ACL_XML2 *xml, const char *data);
-# 305 "/workspace/acl/lib_acl/include/xml/acl_xml2.h"
+# 305 "/acl/lib_acl/include/xml/acl_xml2.h"
  void acl_xml2_tag_init(void);
 
 
@@ -17665,28 +17667,28 @@ struct ACL_XML2 {
 
 
  int acl_xml2_tag_leaf(const char *tag);
-# 336 "/workspace/acl/lib_acl/include/xml/acl_xml2.h"
+# 336 "/acl/lib_acl/include/xml/acl_xml2.h"
  void acl_xml2_free_array(ACL_ARRAY *a);
-# 345 "/workspace/acl/lib_acl/include/xml/acl_xml2.h"
+# 345 "/acl/lib_acl/include/xml/acl_xml2.h"
  ACL_XML2_NODE *acl_xml2_getFirstElementByTagName(
  ACL_XML2 *xml, const char *tag);
-# 355 "/workspace/acl/lib_acl/include/xml/acl_xml2.h"
+# 355 "/acl/lib_acl/include/xml/acl_xml2.h"
  ACL_ARRAY *acl_xml2_getElementsByTagName(
  ACL_XML2 *xml, const char *tag);
-# 369 "/workspace/acl/lib_acl/include/xml/acl_xml2.h"
+# 369 "/acl/lib_acl/include/xml/acl_xml2.h"
  ACL_ARRAY *acl_xml2_getElementsByTags(ACL_XML2 *xml, const char *tags);
-# 378 "/workspace/acl/lib_acl/include/xml/acl_xml2.h"
+# 378 "/acl/lib_acl/include/xml/acl_xml2.h"
  ACL_ARRAY *acl_xml2_getElementsByName(ACL_XML2 *xml, const char *value);
-# 388 "/workspace/acl/lib_acl/include/xml/acl_xml2.h"
+# 388 "/acl/lib_acl/include/xml/acl_xml2.h"
  ACL_ARRAY *acl_xml2_getElementsByAttr(ACL_XML2 *xml,
  const char *name, const char *value);
-# 398 "/workspace/acl/lib_acl/include/xml/acl_xml2.h"
+# 398 "/acl/lib_acl/include/xml/acl_xml2.h"
  ACL_XML2_ATTR *acl_xml2_getAttrById(ACL_XML2 *xml, const char *id);
-# 407 "/workspace/acl/lib_acl/include/xml/acl_xml2.h"
+# 407 "/acl/lib_acl/include/xml/acl_xml2.h"
  const char *acl_xml2_getAttrValueById(ACL_XML2 *xml, const char *id);
-# 416 "/workspace/acl/lib_acl/include/xml/acl_xml2.h"
+# 416 "/acl/lib_acl/include/xml/acl_xml2.h"
  ACL_XML2_NODE *acl_xml2_getElementById(ACL_XML2 *xml, const char *id);
-# 425 "/workspace/acl/lib_acl/include/xml/acl_xml2.h"
+# 425 "/acl/lib_acl/include/xml/acl_xml2.h"
  ACL_XML2_NODE *acl_xml2_getElementMeta(ACL_XML2 *xml, const char *tag);
 
 
@@ -17726,16 +17728,16 @@ struct ACL_XML2 {
 
 
  int acl_xml2_removeElementAttr(ACL_XML2_NODE *node, const char *name);
-# 474 "/workspace/acl/lib_acl/include/xml/acl_xml2.h"
+# 474 "/acl/lib_acl/include/xml/acl_xml2.h"
  ACL_XML2_ATTR *acl_xml2_addElementAttr(ACL_XML2_NODE *node,
         const char *name, const char *value);
-# 485 "/workspace/acl/lib_acl/include/xml/acl_xml2.h"
+# 485 "/acl/lib_acl/include/xml/acl_xml2.h"
  ACL_XML2_NODE *acl_xml2_create_node(ACL_XML2 *xml,
  const char* tagname, const char* text);
-# 498 "/workspace/acl/lib_acl/include/xml/acl_xml2.h"
+# 498 "/acl/lib_acl/include/xml/acl_xml2.h"
  ACL_XML2_NODE *acl_xml2_create_node_with_text_stream(ACL_XML2 *xml,
  const char *tag, ACL_VSTREAM *in, size_t off, size_t len);
-# 509 "/workspace/acl/lib_acl/include/xml/acl_xml2.h"
+# 509 "/acl/lib_acl/include/xml/acl_xml2.h"
  ACL_XML2_ATTR *acl_xml2_node_add_attr(ACL_XML2_NODE *node,
  const char *name, const char *value);
 
@@ -17762,7 +17764,7 @@ struct ACL_XML2 {
 
 
  void acl_xml2_node_add_text(ACL_XML2_NODE *node, const char *text);
-# 543 "/workspace/acl/lib_acl/include/xml/acl_xml2.h"
+# 543 "/acl/lib_acl/include/xml/acl_xml2.h"
  void acl_xml2_node_set_text_stream(ACL_XML2_NODE *node,
  ACL_VSTREAM *in, size_t off, size_t len);
 
@@ -17794,7 +17796,7 @@ struct ACL_XML2 {
 
 
  void acl_xml2_dump2(ACL_XML2 *xml, ACL_VSTRING *buf);
-# 586 "/workspace/acl/lib_acl/include/xml/acl_xml2.h"
+# 586 "/acl/lib_acl/include/xml/acl_xml2.h"
  ACL_XML2_ATTR *acl_xml2_attr_alloc(ACL_XML2_NODE *node);
 
 
@@ -17846,9 +17848,9 @@ struct ACL_XML2 {
 
 
  ACL_XML2_NODE *acl_xml2_node_prev(ACL_XML2_NODE *node);
-# 25 "/workspace/acl/lib_acl/include/lib_acl.h" 2
-# 1 "/workspace/acl/lib_acl/include/xml/acl_xml3.h" 1
-# 16 "/workspace/acl/lib_acl/include/xml/acl_xml3.h"
+# 25 "/acl/lib_acl/include/lib_acl.h" 2
+# 1 "/acl/lib_acl/include/xml/acl_xml3.h" 1
+# 16 "/acl/lib_acl/include/xml/acl_xml3.h"
 typedef struct ACL_XML3 ACL_XML3;
 typedef struct ACL_XML3_NODE ACL_XML3_NODE;
 typedef struct ACL_XML3_ATTR ACL_XML3_ATTR;
@@ -17892,9 +17894,9 @@ struct ACL_XML3_NODE {
  char meta[3];
 
  unsigned int flag;
-# 71 "/workspace/acl/lib_acl/include/xml/acl_xml3.h"
+# 71 "/acl/lib_acl/include/xml/acl_xml3.h"
  int status;
-# 92 "/workspace/acl/lib_acl/include/xml/acl_xml3.h"
+# 92 "/acl/lib_acl/include/xml/acl_xml3.h"
  ACL_XML3_NODE *(*iter_head)(ACL_ITER*, ACL_XML3_NODE*);
 
  ACL_XML3_NODE *(*iter_next)(ACL_ITER*, ACL_XML3_NODE*);
@@ -17921,7 +17923,7 @@ struct ACL_XML3 {
  size_t dbuf_keep;
 
  unsigned flag;
-# 128 "/workspace/acl/lib_acl/include/xml/acl_xml3.h"
+# 128 "/acl/lib_acl/include/xml/acl_xml3.h"
  ACL_XML3_NODE *(*iter_head)(ACL_ITER*, ACL_XML3*);
 
  ACL_XML3_NODE *(*iter_next)(ACL_ITER*, ACL_XML3*);
@@ -17930,9 +17932,9 @@ struct ACL_XML3 {
 
  ACL_XML3_NODE *(*iter_prev)(ACL_ITER*, ACL_XML3*);
 };
-# 149 "/workspace/acl/lib_acl/include/xml/acl_xml3.h"
+# 149 "/acl/lib_acl/include/xml/acl_xml3.h"
  int acl_xml3_is_closure(ACL_XML3 *xml);
-# 160 "/workspace/acl/lib_acl/include/xml/acl_xml3.h"
+# 160 "/acl/lib_acl/include/xml/acl_xml3.h"
  int acl_xml3_is_complete(ACL_XML3 *xml, const char *tag);
 
 
@@ -17948,7 +17950,7 @@ struct ACL_XML3 {
 
 
  ACL_XML3 *acl_xml3_dbuf_alloc(ACL_DBUF_POOL *dbuf);
-# 183 "/workspace/acl/lib_acl/include/xml/acl_xml3.h"
+# 183 "/acl/lib_acl/include/xml/acl_xml3.h"
  void acl_xml3_foreach_init(ACL_XML3 *xml, ACL_XML3_NODE *node);
 
 
@@ -17958,7 +17960,7 @@ struct ACL_XML3 {
 
 
  void acl_xml3_multi_root(ACL_XML3 *xml, int on);
-# 201 "/workspace/acl/lib_acl/include/xml/acl_xml3.h"
+# 201 "/acl/lib_acl/include/xml/acl_xml3.h"
  void acl_xml3_slash(ACL_XML3 *xml, int ignore);
 
 
@@ -17973,9 +17975,9 @@ struct ACL_XML3 {
 
 
  void acl_xml3_reset(ACL_XML3 *xml);
-# 228 "/workspace/acl/lib_acl/include/xml/acl_xml3.h"
+# 228 "/acl/lib_acl/include/xml/acl_xml3.h"
  char *acl_xml3_update(ACL_XML3 *xml, char *data);
-# 238 "/workspace/acl/lib_acl/include/xml/acl_xml3.h"
+# 238 "/acl/lib_acl/include/xml/acl_xml3.h"
  void acl_xml3_tag_init(void);
 
 
@@ -17998,28 +18000,28 @@ struct ACL_XML3 {
 
 
  int acl_xml3_tag_leaf(const char *tag);
-# 269 "/workspace/acl/lib_acl/include/xml/acl_xml3.h"
+# 269 "/acl/lib_acl/include/xml/acl_xml3.h"
  void acl_xml3_free_array(ACL_ARRAY *a);
-# 278 "/workspace/acl/lib_acl/include/xml/acl_xml3.h"
+# 278 "/acl/lib_acl/include/xml/acl_xml3.h"
  ACL_XML3_NODE *acl_xml3_getFirstElementByTagName(
  ACL_XML3 *xml, const char *tag);
-# 288 "/workspace/acl/lib_acl/include/xml/acl_xml3.h"
+# 288 "/acl/lib_acl/include/xml/acl_xml3.h"
  ACL_ARRAY *acl_xml3_getElementsByTagName(
  ACL_XML3 *xml, const char *tag);
-# 302 "/workspace/acl/lib_acl/include/xml/acl_xml3.h"
+# 302 "/acl/lib_acl/include/xml/acl_xml3.h"
  ACL_ARRAY *acl_xml3_getElementsByTags(ACL_XML3 *xml, const char *tags);
-# 311 "/workspace/acl/lib_acl/include/xml/acl_xml3.h"
+# 311 "/acl/lib_acl/include/xml/acl_xml3.h"
  ACL_ARRAY *acl_xml3_getElementsByName(ACL_XML3 *xml, const char *value);
-# 321 "/workspace/acl/lib_acl/include/xml/acl_xml3.h"
+# 321 "/acl/lib_acl/include/xml/acl_xml3.h"
  ACL_ARRAY *acl_xml3_getElementsByAttr(ACL_XML3 *xml,
  const char *name, const char *value);
-# 331 "/workspace/acl/lib_acl/include/xml/acl_xml3.h"
+# 331 "/acl/lib_acl/include/xml/acl_xml3.h"
  ACL_XML3_ATTR *acl_xml3_getAttrById(ACL_XML3 *xml, const char *id);
-# 340 "/workspace/acl/lib_acl/include/xml/acl_xml3.h"
+# 340 "/acl/lib_acl/include/xml/acl_xml3.h"
  const char *acl_xml3_getAttrValueById(ACL_XML3 *xml, const char *id);
-# 349 "/workspace/acl/lib_acl/include/xml/acl_xml3.h"
+# 349 "/acl/lib_acl/include/xml/acl_xml3.h"
  ACL_XML3_NODE *acl_xml3_getElementById(ACL_XML3 *xml, const char *id);
-# 358 "/workspace/acl/lib_acl/include/xml/acl_xml3.h"
+# 358 "/acl/lib_acl/include/xml/acl_xml3.h"
  ACL_XML3_NODE *acl_xml3_getElementMeta(ACL_XML3 *xml, const char *tag);
 
 
@@ -18061,7 +18063,7 @@ struct ACL_XML3 {
 
 
  int acl_xml3_removeElementAttr(ACL_XML3_NODE *node, const char *name);
-# 488 "/workspace/acl/lib_acl/include/xml/acl_xml3.h"
+# 488 "/acl/lib_acl/include/xml/acl_xml3.h"
  ACL_XML3_ATTR *acl_xml3_attr_alloc(ACL_XML3_NODE *node);
 
 
@@ -18113,8 +18115,8 @@ struct ACL_XML3 {
 
 
  ACL_XML3_NODE *acl_xml3_node_prev(ACL_XML3_NODE *node);
-# 26 "/workspace/acl/lib_acl/include/lib_acl.h" 2
-# 1 "/workspace/acl/lib_acl/include/json/acl_json.h" 1
+# 26 "/acl/lib_acl/include/lib_acl.h" 2
+# 1 "/acl/lib_acl/include/json/acl_json.h" 1
 
 
 
@@ -18122,18 +18124,18 @@ struct ACL_XML3 {
 
 
 
-# 1 "/workspace/acl/lib_acl/include/json/../stdlib/acl_define.h" 1
-# 9 "/workspace/acl/lib_acl/include/json/acl_json.h" 2
-# 1 "/workspace/acl/lib_acl/include/json/../stdlib/acl_dbuf_pool.h" 1
-# 10 "/workspace/acl/lib_acl/include/json/acl_json.h" 2
-# 1 "/workspace/acl/lib_acl/include/json/../stdlib/acl_iterator.h" 1
-# 11 "/workspace/acl/lib_acl/include/json/acl_json.h" 2
-# 1 "/workspace/acl/lib_acl/include/json/../stdlib/acl_vstring.h" 1
-# 12 "/workspace/acl/lib_acl/include/json/acl_json.h" 2
-# 1 "/workspace/acl/lib_acl/include/json/../stdlib/acl_ring.h" 1
-# 13 "/workspace/acl/lib_acl/include/json/acl_json.h" 2
-# 1 "/workspace/acl/lib_acl/include/json/../stdlib/acl_array.h" 1
-# 14 "/workspace/acl/lib_acl/include/json/acl_json.h" 2
+# 1 "/acl/lib_acl/include/json/../stdlib/acl_define.h" 1
+# 9 "/acl/lib_acl/include/json/acl_json.h" 2
+# 1 "/acl/lib_acl/include/json/../stdlib/acl_dbuf_pool.h" 1
+# 10 "/acl/lib_acl/include/json/acl_json.h" 2
+# 1 "/acl/lib_acl/include/json/../stdlib/acl_iterator.h" 1
+# 11 "/acl/lib_acl/include/json/acl_json.h" 2
+# 1 "/acl/lib_acl/include/json/../stdlib/acl_vstring.h" 1
+# 12 "/acl/lib_acl/include/json/acl_json.h" 2
+# 1 "/acl/lib_acl/include/json/../stdlib/acl_ring.h" 1
+# 13 "/acl/lib_acl/include/json/acl_json.h" 2
+# 1 "/acl/lib_acl/include/json/../stdlib/acl_array.h" 1
+# 14 "/acl/lib_acl/include/json/acl_json.h" 2
 
 typedef struct ACL_JSON ACL_JSON;
 typedef struct ACL_JSON_NODE ACL_JSON_NODE;
@@ -18145,7 +18147,7 @@ struct ACL_JSON_NODE {
  ACL_JSON_NODE *parent;
  ACL_RING children;
  unsigned short type;
-# 44 "/workspace/acl/lib_acl/include/json/acl_json.h"
+# 44 "/acl/lib_acl/include/json/acl_json.h"
  unsigned short depth;
 
 
@@ -18213,7 +18215,7 @@ struct ACL_JSON {
  ACL_DBUF_POOL *dbuf_inner;
  size_t dbuf_keep;
 };
-# 119 "/workspace/acl/lib_acl/include/json/acl_json.h"
+# 119 "/acl/lib_acl/include/json/acl_json.h"
  ACL_JSON_NODE *acl_json_node_alloc(ACL_JSON *json);
 
 
@@ -18238,7 +18240,7 @@ struct ACL_JSON {
 
  void acl_json_node_add_child(
  ACL_JSON_NODE *parent, ACL_JSON_NODE *child);
-# 151 "/workspace/acl/lib_acl/include/json/acl_json.h"
+# 151 "/acl/lib_acl/include/json/acl_json.h"
  ACL_JSON_NODE *acl_json_node_duplicate(
  ACL_JSON *json, ACL_JSON_NODE *from);
 
@@ -18283,9 +18285,9 @@ struct ACL_JSON {
 
 
  ACL_JSON *acl_json_create(ACL_JSON_NODE *node);
-# 203 "/workspace/acl/lib_acl/include/json/acl_json.h"
+# 203 "/acl/lib_acl/include/json/acl_json.h"
  ACL_JSON *acl_json_dbuf_create(ACL_DBUF_POOL *dbuf, ACL_JSON_NODE *node);
-# 213 "/workspace/acl/lib_acl/include/json/acl_json.h"
+# 213 "/acl/lib_acl/include/json/acl_json.h"
  void acl_json_foreach_init(ACL_JSON *json, ACL_JSON_NODE *node);
 
 
@@ -18299,7 +18301,7 @@ struct ACL_JSON {
 
 
  void acl_json_reset(ACL_JSON *json);
-# 237 "/workspace/acl/lib_acl/include/json/acl_json.h"
+# 237 "/acl/lib_acl/include/json/acl_json.h"
  const char* acl_json_update(ACL_JSON *json, const char *data);
 
 
@@ -18308,38 +18310,38 @@ struct ACL_JSON {
 
 
  int acl_json_finish(ACL_JSON *json);
-# 255 "/workspace/acl/lib_acl/include/json/acl_json.h"
+# 255 "/acl/lib_acl/include/json/acl_json.h"
  ACL_JSON_NODE *acl_json_getFirstElementByTagName(
  ACL_JSON *json, const char *tag);
-# 266 "/workspace/acl/lib_acl/include/json/acl_json.h"
+# 266 "/acl/lib_acl/include/json/acl_json.h"
  void acl_json_free_array(ACL_ARRAY *a);
-# 275 "/workspace/acl/lib_acl/include/json/acl_json.h"
+# 275 "/acl/lib_acl/include/json/acl_json.h"
  ACL_ARRAY *acl_json_getElementsByTagName(
  ACL_JSON *json, const char *tag);
-# 292 "/workspace/acl/lib_acl/include/json/acl_json.h"
+# 292 "/acl/lib_acl/include/json/acl_json.h"
  ACL_ARRAY *acl_json_getElementsByTags(
  ACL_JSON *json, const char *tags);
-# 303 "/workspace/acl/lib_acl/include/json/acl_json.h"
+# 303 "/acl/lib_acl/include/json/acl_json.h"
  ACL_JSON_NODE *acl_json_create_text(ACL_JSON *json,
  const char *name, const char *value);
-# 315 "/workspace/acl/lib_acl/include/json/acl_json.h"
+# 315 "/acl/lib_acl/include/json/acl_json.h"
  ACL_JSON_NODE *acl_json_create_bool(ACL_JSON *json,
  const char *name, int value);
-# 325 "/workspace/acl/lib_acl/include/json/acl_json.h"
+# 325 "/acl/lib_acl/include/json/acl_json.h"
  ACL_JSON_NODE *acl_json_create_null(ACL_JSON *json, const char *name);
-# 335 "/workspace/acl/lib_acl/include/json/acl_json.h"
+# 335 "/acl/lib_acl/include/json/acl_json.h"
  ACL_JSON_NODE *acl_json_create_int64(ACL_JSON *json,
  const char *name, long long int value);
-# 346 "/workspace/acl/lib_acl/include/json/acl_json.h"
+# 346 "/acl/lib_acl/include/json/acl_json.h"
  ACL_JSON_NODE *acl_json_create_double(ACL_JSON *json,
  const char *name, double value);
-# 358 "/workspace/acl/lib_acl/include/json/acl_json.h"
+# 358 "/acl/lib_acl/include/json/acl_json.h"
  ACL_JSON_NODE *acl_json_create_double2(ACL_JSON *json,
  const char *name, double value, int precision);
-# 368 "/workspace/acl/lib_acl/include/json/acl_json.h"
+# 368 "/acl/lib_acl/include/json/acl_json.h"
  ACL_JSON_NODE *acl_json_create_array_text(ACL_JSON *json,
  const char *text);
-# 378 "/workspace/acl/lib_acl/include/json/acl_json.h"
+# 378 "/acl/lib_acl/include/json/acl_json.h"
  ACL_JSON_NODE *acl_json_create_array_int64(ACL_JSON *json,
  long long int value);
 
@@ -18351,7 +18353,7 @@ struct ACL_JSON {
 
  ACL_JSON_NODE *acl_json_create_array_double(ACL_JSON *json,
  double value);
-# 397 "/workspace/acl/lib_acl/include/json/acl_json.h"
+# 397 "/acl/lib_acl/include/json/acl_json.h"
  ACL_JSON_NODE *acl_json_create_array_bool(ACL_JSON *json, int value);
 
 
@@ -18377,7 +18379,7 @@ struct ACL_JSON {
 
 
  ACL_JSON_NODE *acl_json_create_array(ACL_JSON *json);
-# 431 "/workspace/acl/lib_acl/include/json/acl_json.h"
+# 431 "/acl/lib_acl/include/json/acl_json.h"
  ACL_JSON_NODE *acl_json_create_node(ACL_JSON *json,
  const char *name, ACL_JSON_NODE *value);
 
@@ -18388,19 +18390,19 @@ struct ACL_JSON {
 
  void acl_json_node_append_child(ACL_JSON_NODE *parent,
  ACL_JSON_NODE *child);
-# 452 "/workspace/acl/lib_acl/include/json/acl_json.h"
+# 452 "/acl/lib_acl/include/json/acl_json.h"
  ACL_VSTRING *acl_json_node_build(ACL_JSON_NODE *node, ACL_VSTRING *buf);
-# 463 "/workspace/acl/lib_acl/include/json/acl_json.h"
+# 463 "/acl/lib_acl/include/json/acl_json.h"
  ACL_VSTRING *acl_json_build(ACL_JSON *json, ACL_VSTRING *buf);
-# 478 "/workspace/acl/lib_acl/include/json/acl_json.h"
+# 478 "/acl/lib_acl/include/json/acl_json.h"
  void acl_json_building(ACL_JSON *json, size_t length,
  int (*callback)(ACL_JSON *, ACL_VSTRING *, void *), void *ctx);
-# 27 "/workspace/acl/lib_acl/include/lib_acl.h" 2
-# 1 "/workspace/acl/lib_acl/include/experiment/experiment.h" 1
-# 28 "/workspace/acl/lib_acl/include/lib_acl.h" 2
-# 77 "/workspace/acl/lib_acl/StdAfx.h" 2
-# 2 "/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c" 2
-# 17 "/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c"
+# 27 "/acl/lib_acl/include/lib_acl.h" 2
+# 1 "/acl/lib_acl/include/experiment/experiment.h" 1
+# 28 "/acl/lib_acl/include/lib_acl.h" 2
+# 77 "/acl/lib_acl/StdAfx.h" 2
+# 2 "/acl/lib_acl/src/stdlib/acl_chunk_chain.c" 2
+# 17 "/acl/lib_acl/src/stdlib/acl_chunk_chain.c"
 typedef struct ACL_CHUNK {
  long long int from;
  long long int dlen;
@@ -18419,25 +18421,25 @@ struct ACL_CHAIN {
 
 static ACL_CHUNK *acl_chunk_new(const void *buf, long long int from, int dlen)
 {
- ACL_CHUNK *chunk = (ACL_CHUNK*) acl_calloc_glue("/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c", 35, 1, sizeof(ACL_CHUNK));
+ ACL_CHUNK *chunk = (ACL_CHUNK*) acl_calloc_glue("/acl/lib_acl/src/stdlib/acl_chunk_chain.c", 35, 1, sizeof(ACL_CHUNK));
 
  chunk->from = from;
  chunk->dlen = dlen;
- chunk->buf = (char *) acl_memdup_glue("/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c", 39, (buf), dlen);
+ chunk->buf = (char *) acl_memdup_glue("/acl/lib_acl/src/stdlib/acl_chunk_chain.c", 39, (buf), dlen);
  return (chunk);
 }
 
 static void acl_chunk_free(ACL_CHUNK *chunk)
 {
- do { if (chunk->buf) { acl_free_glue("/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c", 45, (chunk->buf)); (chunk->buf) = 
-# 45 "/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c" 3 4
+ do { if (chunk->buf) { acl_free_glue("/acl/lib_acl/src/stdlib/acl_chunk_chain.c", 45, (chunk->buf)); (chunk->buf) = 
+# 45 "/acl/lib_acl/src/stdlib/acl_chunk_chain.c" 3 4
 ((void *)0)
-# 45 "/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c"
+# 45 "/acl/lib_acl/src/stdlib/acl_chunk_chain.c"
 ; } } while (0);
- do { if (chunk) { acl_free_glue("/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c", 46, (chunk)); (chunk) = 
-# 46 "/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c" 3 4
+ do { if (chunk) { acl_free_glue("/acl/lib_acl/src/stdlib/acl_chunk_chain.c", 46, (chunk)); (chunk) = 
+# 46 "/acl/lib_acl/src/stdlib/acl_chunk_chain.c" 3 4
 ((void *)0)
-# 46 "/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c"
+# 46 "/acl/lib_acl/src/stdlib/acl_chunk_chain.c"
 ; } } while (0);
 }
 
@@ -18458,29 +18460,29 @@ static void acl_chunk_merge(ACL_CHUNK *chunk, const char *pdata,
   if (to < chunk_to) {
 
    n = chunk->from - from;
-   ptr = tmpbuf = acl_malloc_glue("/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c", 66, (int) (chunk->dlen + n));
+   ptr = tmpbuf = acl_malloc_glue("/acl/lib_acl/src/stdlib/acl_chunk_chain.c", 66, (int) (chunk->dlen + n));
    memcpy(ptr, pdata, dlen);
    ptr += dlen;
    n = to - chunk->from;
    pdata = chunk->buf + n;
    memcpy(ptr, pdata, (int) (chunk->dlen - n));
 
-   do { if (chunk->buf) { acl_free_glue("/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c", 73, (chunk->buf)); (chunk->buf) = 
-# 73 "/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c" 3 4
+   do { if (chunk->buf) { acl_free_glue("/acl/lib_acl/src/stdlib/acl_chunk_chain.c", 73, (chunk->buf)); (chunk->buf) = 
+# 73 "/acl/lib_acl/src/stdlib/acl_chunk_chain.c" 3 4
   ((void *)0)
-# 73 "/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c"
+# 73 "/acl/lib_acl/src/stdlib/acl_chunk_chain.c"
   ; } } while (0);
    chunk->buf = tmpbuf;
    chunk->dlen += chunk->from - from;
    chunk->from = from;
   } else {
 
-   do { if (chunk->buf) { acl_free_glue("/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c", 79, (chunk->buf)); (chunk->buf) = 
-# 79 "/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c" 3 4
+   do { if (chunk->buf) { acl_free_glue("/acl/lib_acl/src/stdlib/acl_chunk_chain.c", 79, (chunk->buf)); (chunk->buf) = 
+# 79 "/acl/lib_acl/src/stdlib/acl_chunk_chain.c" 3 4
   ((void *)0)
-# 79 "/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c"
+# 79 "/acl/lib_acl/src/stdlib/acl_chunk_chain.c"
   ; } } while (0);
-   chunk->buf = (char*) acl_memdup_glue("/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c", 80, (pdata), dlen);
+   chunk->buf = (char*) acl_memdup_glue("/acl/lib_acl/src/stdlib/acl_chunk_chain.c", 80, (pdata), dlen);
    chunk->from = from;
    chunk->dlen = dlen;
   }
@@ -18489,17 +18491,17 @@ static void acl_chunk_merge(ACL_CHUNK *chunk, const char *pdata,
   if (to > chunk_to) {
 
    n = to - chunk_to ;
-   ptr = tmpbuf = acl_malloc_glue("/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c", 89, (int) (chunk->dlen + n));
+   ptr = tmpbuf = acl_malloc_glue("/acl/lib_acl/src/stdlib/acl_chunk_chain.c", 89, (int) (chunk->dlen + n));
    memcpy(ptr, chunk->buf, (int) chunk->dlen);
    ptr += chunk->dlen;
    pdata += chunk_to - from;
    n = to - chunk_to;
    memcpy(ptr, pdata, (int) n);
 
-   do { if (chunk->buf) { acl_free_glue("/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c", 96, (chunk->buf)); (chunk->buf) = 
-# 96 "/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c" 3 4
+   do { if (chunk->buf) { acl_free_glue("/acl/lib_acl/src/stdlib/acl_chunk_chain.c", 96, (chunk->buf)); (chunk->buf) = 
+# 96 "/acl/lib_acl/src/stdlib/acl_chunk_chain.c" 3 4
   ((void *)0)
-# 96 "/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c"
+# 96 "/acl/lib_acl/src/stdlib/acl_chunk_chain.c"
   ; } } while (0);
    chunk->buf = tmpbuf;
    chunk->dlen += n;
@@ -18514,7 +18516,7 @@ ACL_CHAIN *acl_chain_new(size_t init_size, long long int off_begin)
 {
  ACL_CHAIN *chain;
 
- chain = (ACL_CHAIN*) acl_calloc_glue("/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c", 110, 1, sizeof(ACL_CHAIN));
+ chain = (ACL_CHAIN*) acl_calloc_glue("/acl/lib_acl/src/stdlib/acl_chunk_chain.c", 110, 1, sizeof(ACL_CHAIN));
  acl_vstring_init(&chain->sbuf, init_size);
  acl_ring_init(&chain->ring);
  chain->off_begin = off_begin;
@@ -18529,25 +18531,25 @@ void acl_chain_free(ACL_CHAIN *chain)
 
  while ((ring_iter = acl_ring_pop_head(&chain->ring))) {
   chunk = ((ACL_CHUNK *) (((char *) (ring_iter)) - 
-# 124 "/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c" 3 4
+# 124 "/acl/lib_acl/src/stdlib/acl_chunk_chain.c" 3 4
          __builtin_offsetof (
-# 124 "/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c"
+# 124 "/acl/lib_acl/src/stdlib/acl_chunk_chain.c"
          ACL_CHUNK
-# 124 "/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c" 3 4
+# 124 "/acl/lib_acl/src/stdlib/acl_chunk_chain.c" 3 4
          , 
-# 124 "/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c"
+# 124 "/acl/lib_acl/src/stdlib/acl_chunk_chain.c"
          entry
-# 124 "/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c" 3 4
+# 124 "/acl/lib_acl/src/stdlib/acl_chunk_chain.c" 3 4
          )
-# 124 "/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c"
+# 124 "/acl/lib_acl/src/stdlib/acl_chunk_chain.c"
          ));
   acl_chunk_free(chunk);
  }
  acl_vstring_free_buf(&chain->sbuf);
- do { if (chain) { acl_free_glue("/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c", 128, (chain)); (chain) = 
-# 128 "/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c" 3 4
+ do { if (chain) { acl_free_glue("/acl/lib_acl/src/stdlib/acl_chunk_chain.c", 128, (chain)); (chain) = 
+# 128 "/acl/lib_acl/src/stdlib/acl_chunk_chain.c" 3 4
 ((void *)0)
-# 128 "/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c"
+# 128 "/acl/lib_acl/src/stdlib/acl_chunk_chain.c"
 ; } } while (0);
 }
 
@@ -18578,9 +18580,9 @@ const char *acl_chain_data(ACL_CHAIN *chain)
 {
  if ((size_t) ((&chain->sbuf)->vbuf.ptr - (&chain->sbuf)->vbuf.data) == 0)
   return (
-# 157 "/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c" 3 4
+# 157 "/acl/lib_acl/src/stdlib/acl_chunk_chain.c" 3 4
          ((void *)0)
-# 157 "/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c"
+# 157 "/acl/lib_acl/src/stdlib/acl_chunk_chain.c"
              );
 
  return (((char *) (&chain->sbuf)->vbuf.data));
@@ -18611,17 +18613,17 @@ int acl_chain_chunk_data_len(ACL_CHAIN *chain)
 
  for ((iter).ptr = (((&chain->ring))->succ); (iter).ptr != (&chain->ring); (iter).ptr = (((iter).ptr)->succ)) {
   chunk_iter = ((ACL_CHUNK *) (((char *) (iter.ptr)) - 
-# 186 "/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c" 3 4
+# 186 "/acl/lib_acl/src/stdlib/acl_chunk_chain.c" 3 4
               __builtin_offsetof (
-# 186 "/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c"
+# 186 "/acl/lib_acl/src/stdlib/acl_chunk_chain.c"
               ACL_CHUNK
-# 186 "/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c" 3 4
+# 186 "/acl/lib_acl/src/stdlib/acl_chunk_chain.c" 3 4
               , 
-# 186 "/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c"
+# 186 "/acl/lib_acl/src/stdlib/acl_chunk_chain.c"
               entry
-# 186 "/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c" 3 4
+# 186 "/acl/lib_acl/src/stdlib/acl_chunk_chain.c" 3 4
               )
-# 186 "/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c"
+# 186 "/acl/lib_acl/src/stdlib/acl_chunk_chain.c"
               ));
   n += (int) chunk_iter->dlen;
  }
@@ -18662,21 +18664,21 @@ void acl_chain_add(ACL_CHAIN *chain, const void *data,
   chain->from_next += dlen;
 
   while ((chunk_iter = (((&chain->ring)->succ) != (&chain->ring) ? ((ACL_CHUNK *) (((char *) (((&chain->ring)->succ))) - 
-# 225 "/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c" 3 4
+# 225 "/acl/lib_acl/src/stdlib/acl_chunk_chain.c" 3 4
                       __builtin_offsetof (
-# 225 "/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c"
+# 225 "/acl/lib_acl/src/stdlib/acl_chunk_chain.c"
                       ACL_CHUNK
-# 225 "/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c" 3 4
+# 225 "/acl/lib_acl/src/stdlib/acl_chunk_chain.c" 3 4
                       , 
-# 225 "/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c"
+# 225 "/acl/lib_acl/src/stdlib/acl_chunk_chain.c"
                       entry
-# 225 "/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c" 3 4
+# 225 "/acl/lib_acl/src/stdlib/acl_chunk_chain.c" 3 4
                       )
-# 225 "/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c"
+# 225 "/acl/lib_acl/src/stdlib/acl_chunk_chain.c"
                       )) : 0)) != 
-# 225 "/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c" 3 4
+# 225 "/acl/lib_acl/src/stdlib/acl_chunk_chain.c" 3 4
                                                                               ((void *)0)
-# 225 "/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c"
+# 225 "/acl/lib_acl/src/stdlib/acl_chunk_chain.c"
                                                                                   ) {
    long long int to_first;
 
@@ -18696,7 +18698,7 @@ void acl_chain_add(ACL_CHAIN *chain, const void *data,
     acl_chunk_free(chunk_iter);
     continue;
    }
-# 252 "/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c"
+# 252 "/acl/lib_acl/src/stdlib/acl_chunk_chain.c"
    n = to_first - to;
    pdata = chunk_iter->buf + chunk_iter->dlen - n;
    acl_vstring_memcat(&chain->sbuf, pdata, (int) n);
@@ -18713,22 +18715,22 @@ void acl_chain_add(ACL_CHAIN *chain, const void *data,
 
 
  chunk_iter = (((&chain->ring)->succ) != (&chain->ring) ? ((ACL_CHUNK *) (((char *) (((&chain->ring)->succ))) - 
-# 267 "/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c" 3 4
+# 267 "/acl/lib_acl/src/stdlib/acl_chunk_chain.c" 3 4
              __builtin_offsetof (
-# 267 "/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c"
+# 267 "/acl/lib_acl/src/stdlib/acl_chunk_chain.c"
              ACL_CHUNK
-# 267 "/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c" 3 4
+# 267 "/acl/lib_acl/src/stdlib/acl_chunk_chain.c" 3 4
              , 
-# 267 "/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c"
+# 267 "/acl/lib_acl/src/stdlib/acl_chunk_chain.c"
              entry
-# 267 "/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c" 3 4
+# 267 "/acl/lib_acl/src/stdlib/acl_chunk_chain.c" 3 4
              )
-# 267 "/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c"
+# 267 "/acl/lib_acl/src/stdlib/acl_chunk_chain.c"
              )) : 0);
  if (chunk_iter == 
-# 268 "/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c" 3 4
+# 268 "/acl/lib_acl/src/stdlib/acl_chunk_chain.c" 3 4
                   ((void *)0)
-# 268 "/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c"
+# 268 "/acl/lib_acl/src/stdlib/acl_chunk_chain.c"
                       ) {
 
   chunk = acl_chunk_new(data, from, dlen);
@@ -18737,24 +18739,24 @@ void acl_chain_add(ACL_CHAIN *chain, const void *data,
  }
 
  chunk_saved = 
-# 275 "/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c" 3 4
+# 275 "/acl/lib_acl/src/stdlib/acl_chunk_chain.c" 3 4
               ((void *)0)
-# 275 "/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c"
+# 275 "/acl/lib_acl/src/stdlib/acl_chunk_chain.c"
                   ;
 
  for ((ring_iter).ptr = (((&chain->ring))->succ); (ring_iter).ptr != (&chain->ring); (ring_iter).ptr = (((ring_iter).ptr)->succ)) {
   chunk_iter = ((ACL_CHUNK *) (((char *) (ring_iter.ptr)) - 
-# 278 "/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c" 3 4
+# 278 "/acl/lib_acl/src/stdlib/acl_chunk_chain.c" 3 4
               __builtin_offsetof (
-# 278 "/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c"
+# 278 "/acl/lib_acl/src/stdlib/acl_chunk_chain.c"
               ACL_CHUNK
-# 278 "/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c" 3 4
+# 278 "/acl/lib_acl/src/stdlib/acl_chunk_chain.c" 3 4
               , 
-# 278 "/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c"
+# 278 "/acl/lib_acl/src/stdlib/acl_chunk_chain.c"
               entry
-# 278 "/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c" 3 4
+# 278 "/acl/lib_acl/src/stdlib/acl_chunk_chain.c" 3 4
               )
-# 278 "/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c"
+# 278 "/acl/lib_acl/src/stdlib/acl_chunk_chain.c"
               ));
   chunk_to = chunk_iter->from + chunk_iter->dlen;
 
@@ -18794,9 +18796,9 @@ void acl_chain_add(ACL_CHAIN *chain, const void *data,
  }
 
  if (chunk_saved == 
-# 316 "/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c" 3 4
+# 316 "/acl/lib_acl/src/stdlib/acl_chunk_chain.c" 3 4
                    ((void *)0)
-# 316 "/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c"
+# 316 "/acl/lib_acl/src/stdlib/acl_chunk_chain.c"
                        ) {
 
 
@@ -18815,17 +18817,17 @@ void acl_chain_add(ACL_CHAIN *chain, const void *data,
  ring_next = ((ring_iter.ptr)->succ);
  while (ring_next != &chain->ring) {
   chunk = ((ACL_CHUNK *) (((char *) (ring_next)) - 
-# 333 "/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c" 3 4
+# 333 "/acl/lib_acl/src/stdlib/acl_chunk_chain.c" 3 4
          __builtin_offsetof (
-# 333 "/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c"
+# 333 "/acl/lib_acl/src/stdlib/acl_chunk_chain.c"
          ACL_CHUNK
-# 333 "/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c" 3 4
+# 333 "/acl/lib_acl/src/stdlib/acl_chunk_chain.c" 3 4
          , 
-# 333 "/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c"
+# 333 "/acl/lib_acl/src/stdlib/acl_chunk_chain.c"
          entry
-# 333 "/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c" 3 4
+# 333 "/acl/lib_acl/src/stdlib/acl_chunk_chain.c" 3 4
          )
-# 333 "/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c"
+# 333 "/acl/lib_acl/src/stdlib/acl_chunk_chain.c"
          ));
   if (to < chunk->from)
    break;
@@ -18867,17 +18869,17 @@ void acl_chain_list(ACL_CHAIN *chain)
 
  for ((ring_iter).ptr = (((&chain->ring))->succ); (ring_iter).ptr != (&chain->ring); (ring_iter).ptr = (((ring_iter).ptr)->succ)) {
   chunk = ((ACL_CHUNK *) (((char *) (ring_iter.ptr)) - 
-# 373 "/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c" 3 4
+# 373 "/acl/lib_acl/src/stdlib/acl_chunk_chain.c" 3 4
          __builtin_offsetof (
-# 373 "/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c"
+# 373 "/acl/lib_acl/src/stdlib/acl_chunk_chain.c"
          ACL_CHUNK
-# 373 "/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c" 3 4
+# 373 "/acl/lib_acl/src/stdlib/acl_chunk_chain.c" 3 4
          , 
-# 373 "/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c"
+# 373 "/acl/lib_acl/src/stdlib/acl_chunk_chain.c"
          entry
-# 373 "/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c" 3 4
+# 373 "/acl/lib_acl/src/stdlib/acl_chunk_chain.c" 3 4
          )
-# 373 "/workspace/acl/lib_acl/src/stdlib/acl_chunk_chain.c"
+# 373 "/acl/lib_acl/src/stdlib/acl_chunk_chain.c"
          ));
   chunk_to = chunk->from + chunk->dlen;
   printf("from=" "%lld" ", next to=" "%lld" ", dlen=%d\r\n",

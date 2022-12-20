@@ -1,55 +1,78 @@
-# 1 "/workspace/acl/lib_fiber/c/src/common/avl.c"
-# 1 "/workspace/acl/build/fiber//"
-# 1 "<built-in>"
-# 1 "<command-line>"
+# 0 "/acl/lib_fiber/c/src/common/avl.c"
+# 1 "/acl/build/fiber//"
+# 0 "<built-in>"
+# 0 "<command-line>"
 # 1 "/usr/include/stdc-predef.h" 1 3 4
-# 1 "<command-line>" 2
-# 1 "/workspace/acl/lib_fiber/c/src/common/avl.c"
-# 91 "/workspace/acl/lib_fiber/c/src/common/avl.c"
-# 1 "/workspace/acl/lib_fiber/c/src/stdafx.h" 1
+# 0 "<command-line>" 2
+# 1 "/acl/lib_fiber/c/src/common/avl.c"
+# 91 "/acl/lib_fiber/c/src/common/avl.c"
+# 1 "/acl/lib_fiber/c/src/stdafx.h" 1
 
 
 
-# 1 "/workspace/acl/lib_fiber/c/src/define.h" 1
-# 5 "/workspace/acl/lib_fiber/c/src/stdafx.h" 2
-# 18 "/workspace/acl/lib_fiber/c/src/stdafx.h"
+# 1 "/acl/lib_fiber/c/src/define.h" 1
+# 5 "/acl/lib_fiber/c/src/stdafx.h" 2
+# 18 "/acl/lib_fiber/c/src/stdafx.h"
 # 1 "/usr/include/stdio.h" 1 3 4
 # 27 "/usr/include/stdio.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/libc-header-start.h" 1 3 4
-# 33 "/usr/include/x86_64-linux-gnu/bits/libc-header-start.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/libc-header-start.h" 1 3 4
+# 33 "/usr/include/aarch64-linux-gnu/bits/libc-header-start.h" 3 4
 # 1 "/usr/include/features.h" 1 3 4
-# 424 "/usr/include/features.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/sys/cdefs.h" 1 3 4
-# 427 "/usr/include/x86_64-linux-gnu/sys/cdefs.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/wordsize.h" 1 3 4
-# 428 "/usr/include/x86_64-linux-gnu/sys/cdefs.h" 2 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/long-double.h" 1 3 4
-# 429 "/usr/include/x86_64-linux-gnu/sys/cdefs.h" 2 3 4
-# 425 "/usr/include/features.h" 2 3 4
-# 448 "/usr/include/features.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/gnu/stubs.h" 1 3 4
-# 10 "/usr/include/x86_64-linux-gnu/gnu/stubs.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/gnu/stubs-64.h" 1 3 4
-# 11 "/usr/include/x86_64-linux-gnu/gnu/stubs.h" 2 3 4
-# 449 "/usr/include/features.h" 2 3 4
-# 34 "/usr/include/x86_64-linux-gnu/bits/libc-header-start.h" 2 3 4
+# 392 "/usr/include/features.h" 3 4
+# 1 "/usr/include/features-time64.h" 1 3 4
+# 20 "/usr/include/features-time64.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/wordsize.h" 1 3 4
+# 21 "/usr/include/features-time64.h" 2 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/timesize.h" 1 3 4
+# 22 "/usr/include/features-time64.h" 2 3 4
+# 393 "/usr/include/features.h" 2 3 4
+# 486 "/usr/include/features.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/sys/cdefs.h" 1 3 4
+# 559 "/usr/include/aarch64-linux-gnu/sys/cdefs.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/wordsize.h" 1 3 4
+# 560 "/usr/include/aarch64-linux-gnu/sys/cdefs.h" 2 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/long-double.h" 1 3 4
+# 561 "/usr/include/aarch64-linux-gnu/sys/cdefs.h" 2 3 4
+# 487 "/usr/include/features.h" 2 3 4
+# 510 "/usr/include/features.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/gnu/stubs.h" 1 3 4
+
+
+
+
+# 1 "/usr/include/aarch64-linux-gnu/bits/wordsize.h" 1 3 4
+# 6 "/usr/include/aarch64-linux-gnu/gnu/stubs.h" 2 3 4
+
+
+# 1 "/usr/include/aarch64-linux-gnu/gnu/stubs-lp64.h" 1 3 4
+# 9 "/usr/include/aarch64-linux-gnu/gnu/stubs.h" 2 3 4
+# 511 "/usr/include/features.h" 2 3 4
+# 34 "/usr/include/aarch64-linux-gnu/bits/libc-header-start.h" 2 3 4
 # 28 "/usr/include/stdio.h" 2 3 4
 
 
 
 
 
-# 1 "/usr/lib/gcc/x86_64-linux-gnu/7/include/stddef.h" 1 3 4
-# 216 "/usr/lib/gcc/x86_64-linux-gnu/7/include/stddef.h" 3 4
+# 1 "/usr/lib/gcc/aarch64-linux-gnu/11/include/stddef.h" 1 3 4
+# 209 "/usr/lib/gcc/aarch64-linux-gnu/11/include/stddef.h" 3 4
 
-# 216 "/usr/lib/gcc/x86_64-linux-gnu/7/include/stddef.h" 3 4
+# 209 "/usr/lib/gcc/aarch64-linux-gnu/11/include/stddef.h" 3 4
 typedef long unsigned int size_t;
 # 34 "/usr/include/stdio.h" 2 3 4
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/types.h" 1 3 4
-# 27 "/usr/include/x86_64-linux-gnu/bits/types.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/wordsize.h" 1 3 4
-# 28 "/usr/include/x86_64-linux-gnu/bits/types.h" 2 3 4
+
+# 1 "/usr/lib/gcc/aarch64-linux-gnu/11/include/stdarg.h" 1 3 4
+# 40 "/usr/lib/gcc/aarch64-linux-gnu/11/include/stdarg.h" 3 4
+typedef __builtin_va_list __gnuc_va_list;
+# 37 "/usr/include/stdio.h" 2 3 4
+
+# 1 "/usr/include/aarch64-linux-gnu/bits/types.h" 1 3 4
+# 27 "/usr/include/aarch64-linux-gnu/bits/types.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/wordsize.h" 1 3 4
+# 28 "/usr/include/aarch64-linux-gnu/bits/types.h" 2 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/timesize.h" 1 3 4
+# 29 "/usr/include/aarch64-linux-gnu/bits/types.h" 2 3 4
 
 
 typedef unsigned char __u_char;
@@ -73,6 +96,16 @@ typedef unsigned long int __uint64_t;
 
 
 
+typedef __int8_t __int_least8_t;
+typedef __uint8_t __uint_least8_t;
+typedef __int16_t __int_least16_t;
+typedef __uint16_t __uint_least16_t;
+typedef __int32_t __int_least32_t;
+typedef __uint32_t __uint_least32_t;
+typedef __int64_t __int_least64_t;
+typedef __uint64_t __uint_least64_t;
+
+
 
 typedef long int __quad_t;
 typedef unsigned long int __u_quad_t;
@@ -85,9 +118,11 @@ typedef unsigned long int __u_quad_t;
 
 typedef long int __intmax_t;
 typedef unsigned long int __uintmax_t;
-# 130 "/usr/include/x86_64-linux-gnu/bits/types.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/typesizes.h" 1 3 4
-# 131 "/usr/include/x86_64-linux-gnu/bits/types.h" 2 3 4
+# 141 "/usr/include/aarch64-linux-gnu/bits/types.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/typesizes.h" 1 3 4
+# 142 "/usr/include/aarch64-linux-gnu/bits/types.h" 2 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/time64.h" 1 3 4
+# 143 "/usr/include/aarch64-linux-gnu/bits/types.h" 2 3 4
 
 
 typedef unsigned long int __dev_t;
@@ -96,7 +131,7 @@ typedef unsigned int __gid_t;
 typedef unsigned long int __ino_t;
 typedef unsigned long int __ino64_t;
 typedef unsigned int __mode_t;
-typedef unsigned long int __nlink_t;
+typedef unsigned int __nlink_t;
 typedef long int __off_t;
 typedef long int __off64_t;
 typedef int __pid_t;
@@ -108,6 +143,7 @@ typedef unsigned int __id_t;
 typedef long int __time_t;
 typedef unsigned int __useconds_t;
 typedef long int __suseconds_t;
+typedef long int __suseconds64_t;
 
 typedef int __daddr_t;
 typedef int __key_t;
@@ -119,7 +155,7 @@ typedef int __clockid_t;
 typedef void * __timer_t;
 
 
-typedef long int __blksize_t;
+typedef int __blksize_t;
 
 
 
@@ -160,35 +196,14 @@ typedef unsigned int __socklen_t;
 
 
 typedef int __sig_atomic_t;
-# 36 "/usr/include/stdio.h" 2 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/types/__FILE.h" 1 3 4
+# 39 "/usr/include/stdio.h" 2 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/types/__fpos_t.h" 1 3 4
 
 
 
-struct _IO_FILE;
-typedef struct _IO_FILE __FILE;
-# 37 "/usr/include/stdio.h" 2 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/types/FILE.h" 1 3 4
 
-
-
-struct _IO_FILE;
-
-
-typedef struct _IO_FILE FILE;
-# 38 "/usr/include/stdio.h" 2 3 4
-
-
-
-# 1 "/usr/include/x86_64-linux-gnu/bits/libio.h" 1 3 4
-# 35 "/usr/include/x86_64-linux-gnu/bits/libio.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/_G_config.h" 1 3 4
-# 19 "/usr/include/x86_64-linux-gnu/bits/_G_config.h" 3 4
-# 1 "/usr/lib/gcc/x86_64-linux-gnu/7/include/stddef.h" 1 3 4
-# 20 "/usr/include/x86_64-linux-gnu/bits/_G_config.h" 2 3 4
-
-# 1 "/usr/include/x86_64-linux-gnu/bits/types/__mbstate_t.h" 1 3 4
-# 13 "/usr/include/x86_64-linux-gnu/bits/types/__mbstate_t.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/types/__mbstate_t.h" 1 3 4
+# 13 "/usr/include/aarch64-linux-gnu/bits/types/__mbstate_t.h" 3 4
 typedef struct
 {
   int __count;
@@ -198,29 +213,47 @@ typedef struct
     char __wchb[4];
   } __value;
 } __mbstate_t;
-# 22 "/usr/include/x86_64-linux-gnu/bits/_G_config.h" 2 3 4
+# 6 "/usr/include/aarch64-linux-gnu/bits/types/__fpos_t.h" 2 3 4
 
 
 
 
-typedef struct
+typedef struct _G_fpos_t
 {
   __off_t __pos;
   __mbstate_t __state;
-} _G_fpos_t;
-typedef struct
+} __fpos_t;
+# 40 "/usr/include/stdio.h" 2 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/types/__fpos64_t.h" 1 3 4
+# 10 "/usr/include/aarch64-linux-gnu/bits/types/__fpos64_t.h" 3 4
+typedef struct _G_fpos64_t
 {
   __off64_t __pos;
   __mbstate_t __state;
-} _G_fpos64_t;
-# 36 "/usr/include/x86_64-linux-gnu/bits/libio.h" 2 3 4
-# 53 "/usr/include/x86_64-linux-gnu/bits/libio.h" 3 4
-# 1 "/usr/lib/gcc/x86_64-linux-gnu/7/include/stdarg.h" 1 3 4
-# 40 "/usr/lib/gcc/x86_64-linux-gnu/7/include/stdarg.h" 3 4
-typedef __builtin_va_list __gnuc_va_list;
-# 54 "/usr/include/x86_64-linux-gnu/bits/libio.h" 2 3 4
-# 149 "/usr/include/x86_64-linux-gnu/bits/libio.h" 3 4
-struct _IO_jump_t; struct _IO_FILE;
+} __fpos64_t;
+# 41 "/usr/include/stdio.h" 2 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/types/__FILE.h" 1 3 4
+
+
+
+struct _IO_FILE;
+typedef struct _IO_FILE __FILE;
+# 42 "/usr/include/stdio.h" 2 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/types/FILE.h" 1 3 4
+
+
+
+struct _IO_FILE;
+
+
+typedef struct _IO_FILE FILE;
+# 43 "/usr/include/stdio.h" 2 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/types/struct_FILE.h" 1 3 4
+# 35 "/usr/include/aarch64-linux-gnu/bits/types/struct_FILE.h" 3 4
+struct _IO_FILE;
+struct _IO_marker;
+struct _IO_codecvt;
+struct _IO_wide_data;
 
 
 
@@ -231,39 +264,20 @@ typedef void _IO_lock_t;
 
 
 
-struct _IO_marker {
-  struct _IO_marker *_next;
-  struct _IO_FILE *_sbuf;
-
-
-
-  int _pos;
-# 177 "/usr/include/x86_64-linux-gnu/bits/libio.h" 3 4
-};
-
-
-enum __codecvt_result
+struct _IO_FILE
 {
-  __codecvt_ok,
-  __codecvt_partial,
-  __codecvt_error,
-  __codecvt_noconv
-};
-# 245 "/usr/include/x86_64-linux-gnu/bits/libio.h" 3 4
-struct _IO_FILE {
   int _flags;
 
 
+  char *_IO_read_ptr;
+  char *_IO_read_end;
+  char *_IO_read_base;
+  char *_IO_write_base;
+  char *_IO_write_ptr;
+  char *_IO_write_end;
+  char *_IO_buf_base;
+  char *_IO_buf_end;
 
-
-  char* _IO_read_ptr;
-  char* _IO_read_end;
-  char* _IO_read_base;
-  char* _IO_write_base;
-  char* _IO_write_ptr;
-  char* _IO_write_end;
-  char* _IO_buf_base;
-  char* _IO_buf_end;
 
   char *_IO_save_base;
   char *_IO_backup_base;
@@ -274,54 +288,40 @@ struct _IO_FILE {
   struct _IO_FILE *_chain;
 
   int _fileno;
-
-
-
   int _flags2;
-
   __off_t _old_offset;
-
 
 
   unsigned short _cur_column;
   signed char _vtable_offset;
   char _shortbuf[1];
 
-
-
   _IO_lock_t *_lock;
-# 293 "/usr/include/x86_64-linux-gnu/bits/libio.h" 3 4
+
+
+
+
+
+
+
   __off64_t _offset;
 
-
-
-
-
-
-
-  void *__pad1;
-  void *__pad2;
-  void *__pad3;
-  void *__pad4;
-
+  struct _IO_codecvt *_codecvt;
+  struct _IO_wide_data *_wide_data;
+  struct _IO_FILE *_freeres_list;
+  void *_freeres_buf;
   size_t __pad5;
   int _mode;
 
   char _unused2[15 * sizeof (int) - 4 * sizeof (void *) - sizeof (size_t)];
-
 };
+# 44 "/usr/include/stdio.h" 2 3 4
 
 
-typedef struct _IO_FILE _IO_FILE;
-
-
-struct _IO_FILE_plus;
-
-extern struct _IO_FILE_plus _IO_2_1_stdin_;
-extern struct _IO_FILE_plus _IO_2_1_stdout_;
-extern struct _IO_FILE_plus _IO_2_1_stderr_;
-# 337 "/usr/include/x86_64-linux-gnu/bits/libio.h" 3 4
-typedef __ssize_t __io_read_fn (void *__cookie, char *__buf, size_t __nbytes);
+# 1 "/usr/include/aarch64-linux-gnu/bits/types/cookie_io_functions_t.h" 1 3 4
+# 27 "/usr/include/aarch64-linux-gnu/bits/types/cookie_io_functions_t.h" 3 4
+typedef __ssize_t cookie_read_function_t (void *__cookie, char *__buf,
+                                          size_t __nbytes);
 
 
 
@@ -329,8 +329,8 @@ typedef __ssize_t __io_read_fn (void *__cookie, char *__buf, size_t __nbytes);
 
 
 
-typedef __ssize_t __io_write_fn (void *__cookie, const char *__buf,
-     size_t __n);
+typedef __ssize_t cookie_write_function_t (void *__cookie, const char *__buf,
+                                           size_t __nbytes);
 
 
 
@@ -338,78 +338,31 @@ typedef __ssize_t __io_write_fn (void *__cookie, const char *__buf,
 
 
 
-typedef int __io_seek_fn (void *__cookie, __off64_t *__pos, int __w);
+typedef int cookie_seek_function_t (void *__cookie, __off64_t *__pos, int __w);
 
 
-typedef int __io_close_fn (void *__cookie);
+typedef int cookie_close_function_t (void *__cookie);
 
 
 
 
-typedef __io_read_fn cookie_read_function_t;
-typedef __io_write_fn cookie_write_function_t;
-typedef __io_seek_fn cookie_seek_function_t;
-typedef __io_close_fn cookie_close_function_t;
 
 
-typedef struct
+typedef struct _IO_cookie_io_functions_t
 {
-  __io_read_fn *read;
-  __io_write_fn *write;
-  __io_seek_fn *seek;
-  __io_close_fn *close;
-} _IO_cookie_io_functions_t;
-typedef _IO_cookie_io_functions_t cookie_io_functions_t;
+  cookie_read_function_t *read;
+  cookie_write_function_t *write;
+  cookie_seek_function_t *seek;
+  cookie_close_function_t *close;
+} cookie_io_functions_t;
+# 47 "/usr/include/stdio.h" 2 3 4
 
-struct _IO_cookie_file;
-
-
-extern void _IO_cookie_init (struct _IO_cookie_file *__cfile, int __read_write,
-        void *__cookie, _IO_cookie_io_functions_t __fns);
-
-
-
-
-
-
-
-extern int __underflow (_IO_FILE *);
-extern int __uflow (_IO_FILE *);
-extern int __overflow (_IO_FILE *, int);
-# 433 "/usr/include/x86_64-linux-gnu/bits/libio.h" 3 4
-extern int _IO_getc (_IO_FILE *__fp);
-extern int _IO_putc (int __c, _IO_FILE *__fp);
-extern int _IO_feof (_IO_FILE *__fp) __attribute__ ((__nothrow__ , __leaf__));
-extern int _IO_ferror (_IO_FILE *__fp) __attribute__ ((__nothrow__ , __leaf__));
-
-extern int _IO_peekc_locked (_IO_FILE *__fp);
-
-
-
-
-
-extern void _IO_flockfile (_IO_FILE *) __attribute__ ((__nothrow__ , __leaf__));
-extern void _IO_funlockfile (_IO_FILE *) __attribute__ ((__nothrow__ , __leaf__));
-extern int _IO_ftrylockfile (_IO_FILE *) __attribute__ ((__nothrow__ , __leaf__));
-# 462 "/usr/include/x86_64-linux-gnu/bits/libio.h" 3 4
-extern int _IO_vfscanf (_IO_FILE * __restrict, const char * __restrict,
-   __gnuc_va_list, int *__restrict);
-extern int _IO_vfprintf (_IO_FILE *__restrict, const char *__restrict,
-    __gnuc_va_list);
-extern __ssize_t _IO_padn (_IO_FILE *, int, __ssize_t);
-extern size_t _IO_sgetn (_IO_FILE *, void *, size_t);
-
-extern __off64_t _IO_seekoff (_IO_FILE *, __off64_t, int, int);
-extern __off64_t _IO_seekpos (_IO_FILE *, __off64_t, int);
-
-extern void _IO_free_backup_area (_IO_FILE *) __attribute__ ((__nothrow__ , __leaf__));
-# 42 "/usr/include/stdio.h" 2 3 4
 
 
 
 
 typedef __gnuc_va_list va_list;
-# 57 "/usr/include/stdio.h" 3 4
+# 63 "/usr/include/stdio.h" 3 4
 typedef __off_t off_t;
 
 
@@ -431,21 +384,19 @@ typedef __ssize_t ssize_t;
 
 
 
-typedef _G_fpos_t fpos_t;
+typedef __fpos_t fpos_t;
 
 
 
 
-typedef _G_fpos64_t fpos64_t;
-# 131 "/usr/include/stdio.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/stdio_lim.h" 1 3 4
-# 132 "/usr/include/stdio.h" 2 3 4
-
-
-
-extern struct _IO_FILE *stdin;
-extern struct _IO_FILE *stdout;
-extern struct _IO_FILE *stderr;
+typedef __fpos64_t fpos64_t;
+# 133 "/usr/include/stdio.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/stdio_lim.h" 1 3 4
+# 134 "/usr/include/stdio.h" 2 3 4
+# 143 "/usr/include/stdio.h" 3 4
+extern FILE *stdin;
+extern FILE *stdout;
+extern FILE *stderr;
 
 
 
@@ -460,29 +411,9 @@ extern int rename (const char *__old, const char *__new) __attribute__ ((__nothr
 
 extern int renameat (int __oldfd, const char *__old, int __newfd,
        const char *__new) __attribute__ ((__nothrow__ , __leaf__));
-
-
-
-
-
-
-
-extern FILE *tmpfile (void) __attribute__ ((__warn_unused_result__));
-# 169 "/usr/include/stdio.h" 3 4
-extern FILE *tmpfile64 (void) __attribute__ ((__warn_unused_result__));
-
-
-
-extern char *tmpnam (char *__s) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__warn_unused_result__));
-
-
-
-
-extern char *tmpnam_r (char *__s) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__warn_unused_result__));
-# 190 "/usr/include/stdio.h" 3 4
-extern char *tempnam (const char *__dir, const char *__pfx)
-     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__malloc__)) __attribute__ ((__warn_unused_result__));
-
+# 170 "/usr/include/stdio.h" 3 4
+extern int renameat2 (int __oldfd, const char *__old, int __newfd,
+        const char *__new, unsigned int __flags) __attribute__ ((__nothrow__ , __leaf__));
 
 
 
@@ -490,18 +421,39 @@ extern char *tempnam (const char *__dir, const char *__pfx)
 
 
 extern int fclose (FILE *__stream);
+# 188 "/usr/include/stdio.h" 3 4
+extern FILE *tmpfile (void)
+  __attribute__ ((__malloc__)) __attribute__ ((__malloc__ (fclose, 1))) __attribute__ ((__warn_unused_result__));
+# 200 "/usr/include/stdio.h" 3 4
+extern FILE *tmpfile64 (void)
+   __attribute__ ((__malloc__)) __attribute__ ((__malloc__ (fclose, 1))) __attribute__ ((__warn_unused_result__));
+
+
+
+extern char *tmpnam (char[20]) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__warn_unused_result__));
+
+
+
+
+extern char *tmpnam_r (char __s[20]) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__warn_unused_result__));
+# 222 "/usr/include/stdio.h" 3 4
+extern char *tempnam (const char *__dir, const char *__pfx)
+   __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__malloc__)) __attribute__ ((__warn_unused_result__)) __attribute__ ((__malloc__ (__builtin_free, 1)));
+
+
 
 
 
 
 extern int fflush (FILE *__stream);
-# 213 "/usr/include/stdio.h" 3 4
+# 239 "/usr/include/stdio.h" 3 4
 extern int fflush_unlocked (FILE *__stream);
-# 223 "/usr/include/stdio.h" 3 4
+# 249 "/usr/include/stdio.h" 3 4
 extern int fcloseall (void);
-# 232 "/usr/include/stdio.h" 3 4
+# 258 "/usr/include/stdio.h" 3 4
 extern FILE *fopen (const char *__restrict __filename,
-      const char *__restrict __modes) __attribute__ ((__warn_unused_result__));
+      const char *__restrict __modes)
+  __attribute__ ((__malloc__)) __attribute__ ((__malloc__ (fclose, 1))) __attribute__ ((__warn_unused_result__));
 
 
 
@@ -509,9 +461,10 @@ extern FILE *fopen (const char *__restrict __filename,
 extern FILE *freopen (const char *__restrict __filename,
         const char *__restrict __modes,
         FILE *__restrict __stream) __attribute__ ((__warn_unused_result__));
-# 256 "/usr/include/stdio.h" 3 4
+# 283 "/usr/include/stdio.h" 3 4
 extern FILE *fopen64 (const char *__restrict __filename,
-        const char *__restrict __modes) __attribute__ ((__warn_unused_result__));
+        const char *__restrict __modes)
+  __attribute__ ((__malloc__)) __attribute__ ((__malloc__ (fclose, 1))) __attribute__ ((__warn_unused_result__));
 extern FILE *freopen64 (const char *__restrict __filename,
    const char *__restrict __modes,
    FILE *__restrict __stream) __attribute__ ((__warn_unused_result__));
@@ -519,7 +472,8 @@ extern FILE *freopen64 (const char *__restrict __filename,
 
 
 
-extern FILE *fdopen (int __fd, const char *__modes) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__warn_unused_result__));
+extern FILE *fdopen (int __fd, const char *__modes) __attribute__ ((__nothrow__ , __leaf__))
+  __attribute__ ((__malloc__)) __attribute__ ((__malloc__ (fclose, 1))) __attribute__ ((__warn_unused_result__));
 
 
 
@@ -527,23 +481,21 @@ extern FILE *fdopen (int __fd, const char *__modes) __attribute__ ((__nothrow__ 
 
 extern FILE *fopencookie (void *__restrict __magic_cookie,
      const char *__restrict __modes,
-     _IO_cookie_io_functions_t __io_funcs) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__warn_unused_result__));
+     cookie_io_functions_t __io_funcs) __attribute__ ((__nothrow__ , __leaf__))
+  __attribute__ ((__malloc__)) __attribute__ ((__malloc__ (fclose, 1))) __attribute__ ((__warn_unused_result__));
 
 
 
 
 extern FILE *fmemopen (void *__s, size_t __len, const char *__modes)
-  __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__warn_unused_result__));
+  __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__malloc__)) __attribute__ ((__malloc__ (fclose, 1))) __attribute__ ((__warn_unused_result__));
 
 
 
 
-extern FILE *open_memstream (char **__bufloc, size_t *__sizeloc) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__warn_unused_result__));
-
-
-
-
-
+extern FILE *open_memstream (char **__bufloc, size_t *__sizeloc) __attribute__ ((__nothrow__ , __leaf__))
+  __attribute__ ((__malloc__)) __attribute__ ((__malloc__ (fclose, 1))) __attribute__ ((__warn_unused_result__));
+# 328 "/usr/include/stdio.h" 3 4
 extern void setbuf (FILE *__restrict __stream, char *__restrict __buf) __attribute__ ((__nothrow__ , __leaf__));
 
 
@@ -641,7 +593,34 @@ extern int scanf (const char *__restrict __format, ...) __attribute__ ((__warn_u
 
 extern int sscanf (const char *__restrict __s,
      const char *__restrict __format, ...) __attribute__ ((__nothrow__ , __leaf__));
-# 420 "/usr/include/stdio.h" 3 4
+
+
+
+
+
+# 1 "/usr/include/aarch64-linux-gnu/bits/floatn.h" 1 3 4
+# 23 "/usr/include/aarch64-linux-gnu/bits/floatn.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/long-double.h" 1 3 4
+# 24 "/usr/include/aarch64-linux-gnu/bits/floatn.h" 2 3 4
+# 95 "/usr/include/aarch64-linux-gnu/bits/floatn.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/floatn-common.h" 1 3 4
+# 24 "/usr/include/aarch64-linux-gnu/bits/floatn-common.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/long-double.h" 1 3 4
+# 25 "/usr/include/aarch64-linux-gnu/bits/floatn-common.h" 2 3 4
+# 96 "/usr/include/aarch64-linux-gnu/bits/floatn.h" 2 3 4
+# 431 "/usr/include/stdio.h" 2 3 4
+
+
+
+extern int fscanf (FILE *__restrict __stream, const char *__restrict __format, ...) __asm__ ("" "__isoc99_fscanf")
+
+                          __attribute__ ((__warn_unused_result__));
+extern int scanf (const char *__restrict __format, ...) __asm__ ("" "__isoc99_scanf")
+                         __attribute__ ((__warn_unused_result__));
+extern int sscanf (const char *__restrict __s, const char *__restrict __format, ...) __asm__ ("" "__isoc99_sscanf") __attribute__ ((__nothrow__ , __leaf__))
+
+                      ;
+# 459 "/usr/include/stdio.h" 3 4
 extern int vfscanf (FILE *__restrict __s, const char *__restrict __format,
       __gnuc_va_list __arg)
      __attribute__ ((__format__ (__scanf__, 2, 0))) __attribute__ ((__warn_unused_result__));
@@ -657,7 +636,25 @@ extern int vscanf (const char *__restrict __format, __gnuc_va_list __arg)
 extern int vsscanf (const char *__restrict __s,
       const char *__restrict __format, __gnuc_va_list __arg)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__format__ (__scanf__, 2, 0)));
-# 477 "/usr/include/stdio.h" 3 4
+
+
+
+
+
+extern int vfscanf (FILE *__restrict __s, const char *__restrict __format, __gnuc_va_list __arg) __asm__ ("" "__isoc99_vfscanf")
+
+
+
+     __attribute__ ((__format__ (__scanf__, 2, 0))) __attribute__ ((__warn_unused_result__));
+extern int vscanf (const char *__restrict __format, __gnuc_va_list __arg) __asm__ ("" "__isoc99_vscanf")
+
+     __attribute__ ((__format__ (__scanf__, 1, 0))) __attribute__ ((__warn_unused_result__));
+extern int vsscanf (const char *__restrict __s, const char *__restrict __format, __gnuc_va_list __arg) __asm__ ("" "__isoc99_vsscanf") __attribute__ ((__nothrow__ , __leaf__))
+
+
+
+     __attribute__ ((__format__ (__scanf__, 2, 0)));
+# 513 "/usr/include/stdio.h" 3 4
 extern int fgetc (FILE *__stream);
 extern int getc (FILE *__stream);
 
@@ -666,12 +663,17 @@ extern int getc (FILE *__stream);
 
 
 extern int getchar (void);
-# 495 "/usr/include/stdio.h" 3 4
+
+
+
+
+
+
 extern int getc_unlocked (FILE *__stream);
 extern int getchar_unlocked (void);
-# 506 "/usr/include/stdio.h" 3 4
+# 538 "/usr/include/stdio.h" 3 4
 extern int fgetc_unlocked (FILE *__stream);
-# 517 "/usr/include/stdio.h" 3 4
+# 549 "/usr/include/stdio.h" 3 4
 extern int fputc (int __c, FILE *__stream);
 extern int putc (int __c, FILE *__stream);
 
@@ -680,7 +682,7 @@ extern int putc (int __c, FILE *__stream);
 
 
 extern int putchar (int __c);
-# 537 "/usr/include/stdio.h" 3 4
+# 565 "/usr/include/stdio.h" 3 4
 extern int fputc_unlocked (int __c, FILE *__stream);
 
 
@@ -709,17 +711,18 @@ extern int putw (int __w, FILE *__stream);
 
 
 extern char *fgets (char *__restrict __s, int __n, FILE *__restrict __stream)
-     __attribute__ ((__warn_unused_result__));
-# 587 "/usr/include/stdio.h" 3 4
+     __attribute__ ((__warn_unused_result__)) __attribute__ ((__access__ (__write_only__, 1, 2)));
+# 615 "/usr/include/stdio.h" 3 4
 extern char *fgets_unlocked (char *__restrict __s, int __n,
-        FILE *__restrict __stream) __attribute__ ((__warn_unused_result__));
-# 603 "/usr/include/stdio.h" 3 4
+        FILE *__restrict __stream) __attribute__ ((__warn_unused_result__))
+    __attribute__ ((__access__ (__write_only__, 1, 2)));
+# 632 "/usr/include/stdio.h" 3 4
 extern __ssize_t __getdelim (char **__restrict __lineptr,
-          size_t *__restrict __n, int __delimiter,
-          FILE *__restrict __stream) __attribute__ ((__warn_unused_result__));
+                             size_t *__restrict __n, int __delimiter,
+                             FILE *__restrict __stream) __attribute__ ((__warn_unused_result__));
 extern __ssize_t getdelim (char **__restrict __lineptr,
-        size_t *__restrict __n, int __delimiter,
-        FILE *__restrict __stream) __attribute__ ((__warn_unused_result__));
+                           size_t *__restrict __n, int __delimiter,
+                           FILE *__restrict __stream) __attribute__ ((__warn_unused_result__));
 
 
 
@@ -728,8 +731,8 @@ extern __ssize_t getdelim (char **__restrict __lineptr,
 
 
 extern __ssize_t getline (char **__restrict __lineptr,
-       size_t *__restrict __n,
-       FILE *__restrict __stream) __attribute__ ((__warn_unused_result__));
+                          size_t *__restrict __n,
+                          FILE *__restrict __stream) __attribute__ ((__warn_unused_result__));
 
 
 
@@ -765,10 +768,10 @@ extern size_t fread (void *__restrict __ptr, size_t __size,
 
 extern size_t fwrite (const void *__restrict __ptr, size_t __size,
         size_t __n, FILE *__restrict __s);
-# 662 "/usr/include/stdio.h" 3 4
+# 691 "/usr/include/stdio.h" 3 4
 extern int fputs_unlocked (const char *__restrict __s,
       FILE *__restrict __stream);
-# 673 "/usr/include/stdio.h" 3 4
+# 702 "/usr/include/stdio.h" 3 4
 extern size_t fread_unlocked (void *__restrict __ptr, size_t __size,
          size_t __n, FILE *__restrict __stream) __attribute__ ((__warn_unused_result__));
 extern size_t fwrite_unlocked (const void *__restrict __ptr, size_t __size,
@@ -791,21 +794,21 @@ extern long int ftell (FILE *__stream) __attribute__ ((__warn_unused_result__));
 
 
 extern void rewind (FILE *__stream);
-# 707 "/usr/include/stdio.h" 3 4
+# 736 "/usr/include/stdio.h" 3 4
 extern int fseeko (FILE *__stream, __off_t __off, int __whence);
 
 
 
 
 extern __off_t ftello (FILE *__stream) __attribute__ ((__warn_unused_result__));
-# 731 "/usr/include/stdio.h" 3 4
+# 760 "/usr/include/stdio.h" 3 4
 extern int fgetpos (FILE *__restrict __stream, fpos_t *__restrict __pos);
 
 
 
 
 extern int fsetpos (FILE *__stream, const fpos_t *__pos);
-# 750 "/usr/include/stdio.h" 3 4
+# 779 "/usr/include/stdio.h" 3 4
 extern int fseeko64 (FILE *__stream, __off64_t __off, int __whence);
 extern __off64_t ftello64 (FILE *__stream) __attribute__ ((__warn_unused_result__));
 extern int fgetpos64 (FILE *__restrict __stream, fpos64_t *__restrict __pos);
@@ -836,46 +839,36 @@ extern void perror (const char *__s);
 
 
 
-
-# 1 "/usr/include/x86_64-linux-gnu/bits/sys_errlist.h" 1 3 4
-# 26 "/usr/include/x86_64-linux-gnu/bits/sys_errlist.h" 3 4
-extern int sys_nerr;
-extern const char *const sys_errlist[];
-
-
-extern int _sys_nerr;
-extern const char *const _sys_errlist[];
-# 782 "/usr/include/stdio.h" 2 3 4
-
-
-
-
 extern int fileno (FILE *__stream) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__warn_unused_result__));
 
 
 
 
 extern int fileno_unlocked (FILE *__stream) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__warn_unused_result__));
-# 800 "/usr/include/stdio.h" 3 4
-extern FILE *popen (const char *__command, const char *__modes) __attribute__ ((__warn_unused_result__));
-
-
-
-
-
+# 823 "/usr/include/stdio.h" 3 4
 extern int pclose (FILE *__stream);
 
 
 
 
 
-extern char *ctermid (char *__s) __attribute__ ((__nothrow__ , __leaf__));
+extern FILE *popen (const char *__command, const char *__modes)
+  __attribute__ ((__malloc__)) __attribute__ ((__malloc__ (pclose, 1))) __attribute__ ((__warn_unused_result__));
 
 
 
 
 
-extern char *cuserid (char *__s);
+
+extern char *ctermid (char *__s) __attribute__ ((__nothrow__ , __leaf__))
+  __attribute__ ((__access__ (__write_only__, 1)));
+
+
+
+
+
+extern char *cuserid (char *__s)
+  __attribute__ ((__access__ (__write_only__, 1)));
 
 
 
@@ -905,13 +898,19 @@ extern int ftrylockfile (FILE *__stream) __attribute__ ((__nothrow__ , __leaf__)
 
 
 extern void funlockfile (FILE *__stream) __attribute__ ((__nothrow__ , __leaf__));
-# 859 "/usr/include/stdio.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/stdio.h" 1 3 4
-# 43 "/usr/include/x86_64-linux-gnu/bits/stdio.h" 3 4
+# 885 "/usr/include/stdio.h" 3 4
+extern int __uflow (FILE *);
+extern int __overflow (FILE *, int);
+
+
+
+
+# 1 "/usr/include/aarch64-linux-gnu/bits/stdio.h" 1 3 4
+# 46 "/usr/include/aarch64-linux-gnu/bits/stdio.h" 3 4
 extern __inline __attribute__ ((__gnu_inline__)) int
 getchar (void)
 {
-  return _IO_getc (stdin);
+  return getc (stdin);
 }
 
 
@@ -946,7 +945,7 @@ getchar_unlocked (void)
 extern __inline __attribute__ ((__gnu_inline__)) int
 putchar (int __c)
 {
-  return _IO_putc (__c, stdout);
+  return putc (__c, stdout);
 }
 
 
@@ -992,32 +991,35 @@ getline (char **__lineptr, size_t *__n, FILE *__stream)
 extern __inline __attribute__ ((__gnu_inline__)) int
 __attribute__ ((__nothrow__ , __leaf__)) feof_unlocked (FILE *__stream)
 {
-  return (((__stream)->_flags & 0x10) != 0);
+  return (((__stream)->_flags & 0x0010) != 0);
 }
 
 
 extern __inline __attribute__ ((__gnu_inline__)) int
 __attribute__ ((__nothrow__ , __leaf__)) ferror_unlocked (FILE *__stream)
 {
-  return (((__stream)->_flags & 0x20) != 0);
+  return (((__stream)->_flags & 0x0020) != 0);
 }
-# 860 "/usr/include/stdio.h" 2 3 4
+# 892 "/usr/include/stdio.h" 2 3 4
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/stdio2.h" 1 3 4
-# 23 "/usr/include/x86_64-linux-gnu/bits/stdio2.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/stdio2.h" 1 3 4
+# 26 "/usr/include/aarch64-linux-gnu/bits/stdio2.h" 3 4
 extern int __sprintf_chk (char *__restrict __s, int __flag, size_t __slen,
-     const char *__restrict __format, ...) __attribute__ ((__nothrow__ , __leaf__));
+     const char *__restrict __format, ...) __attribute__ ((__nothrow__ , __leaf__))
+    __attribute__ ((__access__ (__write_only__, 1, 3)));
 extern int __vsprintf_chk (char *__restrict __s, int __flag, size_t __slen,
       const char *__restrict __format,
-      __gnuc_va_list __ap) __attribute__ ((__nothrow__ , __leaf__));
+      __gnuc_va_list __ap) __attribute__ ((__nothrow__ , __leaf__))
+    __attribute__ ((__access__ (__write_only__, 1, 3)));
 
 
 extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline__)) __attribute__ ((__artificial__)) int
 __attribute__ ((__nothrow__ , __leaf__)) sprintf (char *__restrict __s, const char *__restrict __fmt, ...)
 {
   return __builtin___sprintf_chk (__s, 2 - 1,
-      __builtin_object_size (__s, 2 > 1), __fmt, __builtin_va_arg_pack ());
+      __builtin_object_size (__s, 2 > 1), __fmt,
+      __builtin_va_arg_pack ());
 }
 
 
@@ -1037,7 +1039,8 @@ __attribute__ ((__nothrow__ , __leaf__)) vsprintf (char *__restrict __s, const c
 
 extern int __snprintf_chk (char *__restrict __s, size_t __n, int __flag,
       size_t __slen, const char *__restrict __format,
-      ...) __attribute__ ((__nothrow__ , __leaf__));
+      ...) __attribute__ ((__nothrow__ , __leaf__))
+    __attribute__ ((__access__ (__write_only__, 1, 2)));
 extern int __vsnprintf_chk (char *__restrict __s, size_t __n, int __flag,
        size_t __slen, const char *__restrict __format,
        __gnuc_va_list __ap) __attribute__ ((__nothrow__ , __leaf__));
@@ -1048,7 +1051,8 @@ __attribute__ ((__nothrow__ , __leaf__)) snprintf (char *__restrict __s, size_t 
 
 {
   return __builtin___snprintf_chk (__s, __n, 2 - 1,
-       __builtin_object_size (__s, 2 > 1), __fmt, __builtin_va_arg_pack ());
+       __builtin_object_size (__s, 2 > 1), __fmt,
+       __builtin_va_arg_pack ());
 }
 
 
@@ -1180,7 +1184,7 @@ __attribute__ ((__nothrow__ , __leaf__)) obstack_printf (struct obstack *__restr
   return __obstack_printf_chk (__obstack, 2 - 1, __fmt,
           __builtin_va_arg_pack ());
 }
-# 206 "/usr/include/x86_64-linux-gnu/bits/stdio2.h" 3 4
+# 214 "/usr/include/aarch64-linux-gnu/bits/stdio2.h" 3 4
 extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline__)) __attribute__ ((__artificial__)) int
 __attribute__ ((__nothrow__ , __leaf__)) vasprintf (char **__restrict __ptr, const char *__restrict __fmt, __gnuc_va_list __ap)
 
@@ -1195,30 +1199,29 @@ __attribute__ ((__nothrow__ , __leaf__)) obstack_vprintf (struct obstack *__rest
   return __obstack_vprintf_chk (__obstack, 2 - 1, __fmt,
     __ap);
 }
-# 240 "/usr/include/x86_64-linux-gnu/bits/stdio2.h" 3 4
+# 248 "/usr/include/aarch64-linux-gnu/bits/stdio2.h" 3 4
 extern char *__fgets_chk (char *__restrict __s, size_t __size, int __n,
-     FILE *__restrict __stream) __attribute__ ((__warn_unused_result__));
+     FILE *__restrict __stream)
+    __attribute__ ((__warn_unused_result__)) __attribute__ ((__access__ (__write_only__, 1, 3)));
 extern char *__fgets_alias (char *__restrict __s, int __n, FILE *__restrict __stream) __asm__ ("" "fgets")
 
-                                        __attribute__ ((__warn_unused_result__));
+
+    __attribute__ ((__warn_unused_result__)) __attribute__ ((__access__ (__write_only__, 1, 2)));
 extern char *__fgets_chk_warn (char *__restrict __s, size_t __size, int __n, FILE *__restrict __stream) __asm__ ("" "__fgets_chk")
 
 
      __attribute__ ((__warn_unused_result__)) __attribute__((__warning__ ("fgets called with bigger size than length " "of destination buffer")))
                                  ;
 
-extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline__)) __attribute__ ((__artificial__)) __attribute__ ((__warn_unused_result__)) char *
+extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline__)) __attribute__ ((__artificial__)) __attribute__ ((__warn_unused_result__)) __attribute__ ((__access__ (__write_only__, 1, 2))) char *
 fgets (char *__restrict __s, int __n, FILE *__restrict __stream)
 {
-  if (__builtin_object_size (__s, 2 > 1) != (size_t) -1)
-    {
-      if (!__builtin_constant_p (__n) || __n <= 0)
- return __fgets_chk (__s, __builtin_object_size (__s, 2 > 1), __n, __stream);
-
-      if ((size_t) __n > __builtin_object_size (__s, 2 > 1))
- return __fgets_chk_warn (__s, __builtin_object_size (__s, 2 > 1), __n, __stream);
-    }
-  return __fgets_alias (__s, __n, __stream);
+  size_t sz = __builtin_object_size (__s, 2 > 1);
+  if ((((__typeof (__n)) 0 < (__typeof (__n)) -1 || (__builtin_constant_p (__n) && (__n) > 0)) && __builtin_constant_p ((((long unsigned int) (__n)) <= (sz) / (sizeof (char)))) && (((long unsigned int) (__n)) <= (sz) / (sizeof (char)))))
+    return __fgets_alias (__s, __n, __stream);
+  if ((((__typeof (__n)) 0 < (__typeof (__n)) -1 || (__builtin_constant_p (__n) && (__n) > 0)) && __builtin_constant_p ((((long unsigned int) (__n)) <= (sz) / (sizeof (char)))) && !(((long unsigned int) (__n)) <= (sz) / (sizeof (char)))))
+    return __fgets_chk_warn (__s, sz, __n, __stream);
+  return __fgets_chk (__s, sz, __n, __stream);
 }
 
 extern size_t __fread_chk (void *__restrict __ptr, size_t __ptrlen,
@@ -1240,43 +1243,37 @@ extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline
 fread (void *__restrict __ptr, size_t __size, size_t __n,
        FILE *__restrict __stream)
 {
-  if (__builtin_object_size (__ptr, 0) != (size_t) -1)
-    {
-      if (!__builtin_constant_p (__size)
-   || !__builtin_constant_p (__n)
-   || (__size | __n) >= (((size_t) 1) << (8 * sizeof (size_t) / 2)))
- return __fread_chk (__ptr, __builtin_object_size (__ptr, 0), __size, __n, __stream);
-
-      if (__size * __n > __builtin_object_size (__ptr, 0))
- return __fread_chk_warn (__ptr, __builtin_object_size (__ptr, 0), __size, __n, __stream);
-    }
-  return __fread_alias (__ptr, __size, __n, __stream);
+  size_t sz = __builtin_object_size (__ptr, 0);
+  if ((((__typeof (__n)) 0 < (__typeof (__n)) -1 || (__builtin_constant_p (__n) && (__n) > 0)) && __builtin_constant_p ((((long unsigned int) (__n)) <= (sz) / (__size))) && (((long unsigned int) (__n)) <= (sz) / (__size))))
+    return __fread_alias (__ptr, __size, __n, __stream);
+  if ((((__typeof (__n)) 0 < (__typeof (__n)) -1 || (__builtin_constant_p (__n) && (__n) > 0)) && __builtin_constant_p ((((long unsigned int) (__n)) <= (sz) / (__size))) && !(((long unsigned int) (__n)) <= (sz) / (__size))))
+    return __fread_chk_warn (__ptr, sz, __size, __n, __stream);
+  return __fread_chk (__ptr, sz, __size, __n, __stream);
 }
 
 
 extern char *__fgets_unlocked_chk (char *__restrict __s, size_t __size,
-       int __n, FILE *__restrict __stream) __attribute__ ((__warn_unused_result__));
+       int __n, FILE *__restrict __stream)
+    __attribute__ ((__warn_unused_result__)) __attribute__ ((__access__ (__write_only__, 1, 3)));
 extern char *__fgets_unlocked_alias (char *__restrict __s, int __n, FILE *__restrict __stream) __asm__ ("" "fgets_unlocked")
 
-                                                 __attribute__ ((__warn_unused_result__));
+
+    __attribute__ ((__warn_unused_result__)) __attribute__ ((__access__ (__write_only__, 1, 2)));
 extern char *__fgets_unlocked_chk_warn (char *__restrict __s, size_t __size, int __n, FILE *__restrict __stream) __asm__ ("" "__fgets_unlocked_chk")
 
 
      __attribute__ ((__warn_unused_result__)) __attribute__((__warning__ ("fgets_unlocked called with bigger size than length " "of destination buffer")))
                                  ;
 
-extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline__)) __attribute__ ((__artificial__)) __attribute__ ((__warn_unused_result__)) char *
+extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline__)) __attribute__ ((__artificial__)) __attribute__ ((__warn_unused_result__)) __attribute__ ((__access__ (__write_only__, 1, 2))) char *
 fgets_unlocked (char *__restrict __s, int __n, FILE *__restrict __stream)
 {
-  if (__builtin_object_size (__s, 2 > 1) != (size_t) -1)
-    {
-      if (!__builtin_constant_p (__n) || __n <= 0)
- return __fgets_unlocked_chk (__s, __builtin_object_size (__s, 2 > 1), __n, __stream);
-
-      if ((size_t) __n > __builtin_object_size (__s, 2 > 1))
- return __fgets_unlocked_chk_warn (__s, __builtin_object_size (__s, 2 > 1), __n, __stream);
-    }
-  return __fgets_unlocked_alias (__s, __n, __stream);
+  size_t sz = __builtin_object_size (__s, 2 > 1);
+  if ((((__typeof (__n)) 0 < (__typeof (__n)) -1 || (__builtin_constant_p (__n) && (__n) > 0)) && __builtin_constant_p ((((long unsigned int) (__n)) <= (sz) / (sizeof (char)))) && (((long unsigned int) (__n)) <= (sz) / (sizeof (char)))))
+    return __fgets_unlocked_alias (__s, __n, __stream);
+  if ((((__typeof (__n)) 0 < (__typeof (__n)) -1 || (__builtin_constant_p (__n) && (__n) > 0)) && __builtin_constant_p ((((long unsigned int) (__n)) <= (sz) / (sizeof (char)))) && !(((long unsigned int) (__n)) <= (sz) / (sizeof (char)))))
+    return __fgets_unlocked_chk_warn (__s, sz, __n, __stream);
+  return __fgets_unlocked_chk (__s, sz, __n, __stream);
 }
 
 
@@ -1301,63 +1298,60 @@ extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline
 fread_unlocked (void *__restrict __ptr, size_t __size, size_t __n,
   FILE *__restrict __stream)
 {
-  if (__builtin_object_size (__ptr, 0) != (size_t) -1)
+  size_t sz = __builtin_object_size (__ptr, 0);
+  if ((((__typeof (__n)) 0 < (__typeof (__n)) -1 || (__builtin_constant_p (__n) && (__n) > 0)) && __builtin_constant_p ((((long unsigned int) (__n)) <= (sz) / (__size))) && (((long unsigned int) (__n)) <= (sz) / (__size))))
     {
-      if (!__builtin_constant_p (__size)
-   || !__builtin_constant_p (__n)
-   || (__size | __n) >= (((size_t) 1) << (8 * sizeof (size_t) / 2)))
- return __fread_unlocked_chk (__ptr, __builtin_object_size (__ptr, 0), __size, __n,
-         __stream);
 
-      if (__size * __n > __builtin_object_size (__ptr, 0))
- return __fread_unlocked_chk_warn (__ptr, __builtin_object_size (__ptr, 0), __size, __n,
-       __stream);
-    }
-
-
-  if (__builtin_constant_p (__size)
-      && __builtin_constant_p (__n)
-      && (__size | __n) < (((size_t) 1) << (8 * sizeof (size_t) / 2))
-      && __size * __n <= 8)
-    {
-      size_t __cnt = __size * __n;
-      char *__cptr = (char *) __ptr;
-      if (__cnt == 0)
- return 0;
-
-      for (; __cnt > 0; --__cnt)
+      if (__builtin_constant_p (__size)
+   && __builtin_constant_p (__n)
+   && (__size | __n) < (((size_t) 1) << (8 * sizeof (size_t) / 2))
+   && __size * __n <= 8)
  {
-   int __c = (__builtin_expect (((__stream)->_IO_read_ptr >= (__stream)->_IO_read_end), 0) ? __uflow (__stream) : *(unsigned char *) (__stream)->_IO_read_ptr++);
-   if (__c == (-1))
-     break;
-   *__cptr++ = __c;
+   size_t __cnt = __size * __n;
+   char *__cptr = (char *) __ptr;
+   if (__cnt == 0)
+     return 0;
+
+   for (; __cnt > 0; --__cnt)
+     {
+       int __c = getc_unlocked (__stream);
+       if (__c == (-1))
+  break;
+       *__cptr++ = __c;
+     }
+   return (__cptr - (char *) __ptr) / __size;
  }
-      return (__cptr - (char *) __ptr) / __size;
+
+      return __fread_unlocked_alias (__ptr, __size, __n, __stream);
     }
+  if ((((__typeof (__n)) 0 < (__typeof (__n)) -1 || (__builtin_constant_p (__n) && (__n) > 0)) && __builtin_constant_p ((((long unsigned int) (__n)) <= (sz) / (__size))) && !(((long unsigned int) (__n)) <= (sz) / (__size))))
+    return __fread_unlocked_chk_warn (__ptr, sz, __size, __n, __stream);
+  return __fread_unlocked_chk (__ptr, sz, __size, __n, __stream);
 
-  return __fread_unlocked_alias (__ptr, __size, __n, __stream);
 }
-# 863 "/usr/include/stdio.h" 2 3 4
+# 895 "/usr/include/stdio.h" 2 3 4
 
 
 
 
 
 
-# 19 "/workspace/acl/lib_fiber/c/src/stdafx.h" 2
+
+
+# 19 "/acl/lib_fiber/c/src/stdafx.h" 2
 # 1 "/usr/include/stdlib.h" 1 3 4
-# 25 "/usr/include/stdlib.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/libc-header-start.h" 1 3 4
-# 26 "/usr/include/stdlib.h" 2 3 4
+# 26 "/usr/include/stdlib.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/libc-header-start.h" 1 3 4
+# 27 "/usr/include/stdlib.h" 2 3 4
 
 
 
 
 
-# 1 "/usr/lib/gcc/x86_64-linux-gnu/7/include/stddef.h" 1 3 4
-# 328 "/usr/lib/gcc/x86_64-linux-gnu/7/include/stddef.h" 3 4
-typedef int wchar_t;
-# 32 "/usr/include/stdlib.h" 2 3 4
+# 1 "/usr/lib/gcc/aarch64-linux-gnu/11/include/stddef.h" 1 3 4
+# 321 "/usr/lib/gcc/aarch64-linux-gnu/11/include/stddef.h" 3 4
+typedef unsigned int wchar_t;
+# 33 "/usr/include/stdlib.h" 2 3 4
 
 
 
@@ -1365,28 +1359,11 @@ typedef int wchar_t;
 
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/waitflags.h" 1 3 4
-# 52 "/usr/include/x86_64-linux-gnu/bits/waitflags.h" 3 4
-typedef enum
-{
-  P_ALL,
-  P_PID,
-  P_PGID
-} idtype_t;
-# 40 "/usr/include/stdlib.h" 2 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/waitstatus.h" 1 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/waitflags.h" 1 3 4
 # 41 "/usr/include/stdlib.h" 2 3 4
-# 55 "/usr/include/stdlib.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/floatn.h" 1 3 4
-# 120 "/usr/include/x86_64-linux-gnu/bits/floatn.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/floatn-common.h" 1 3 4
-# 24 "/usr/include/x86_64-linux-gnu/bits/floatn-common.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/long-double.h" 1 3 4
-# 25 "/usr/include/x86_64-linux-gnu/bits/floatn-common.h" 2 3 4
-# 121 "/usr/include/x86_64-linux-gnu/bits/floatn.h" 2 3 4
-# 56 "/usr/include/stdlib.h" 2 3 4
-
-
+# 1 "/usr/include/aarch64-linux-gnu/bits/waitstatus.h" 1 3 4
+# 42 "/usr/include/stdlib.h" 2 3 4
+# 59 "/usr/include/stdlib.h" 3 4
 typedef struct
   {
     int quot;
@@ -1410,7 +1387,7 @@ __extension__ typedef struct
     long long int quot;
     long long int rem;
   } lldiv_t;
-# 97 "/usr/include/stdlib.h" 3 4
+# 98 "/usr/include/stdlib.h" 3 4
 extern size_t __ctype_get_mb_cur_max (void) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__warn_unused_result__));
 
 
@@ -1443,7 +1420,7 @@ extern float strtof (const char *__restrict __nptr,
 extern long double strtold (const char *__restrict __nptr,
        char **__restrict __endptr)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)));
-# 140 "/usr/include/stdlib.h" 3 4
+# 141 "/usr/include/stdlib.h" 3 4
 extern _Float32 strtof32 (const char *__restrict __nptr,
      char **__restrict __endptr)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)));
@@ -1471,7 +1448,7 @@ extern _Float32x strtof32x (const char *__restrict __nptr,
 extern _Float64x strtof64x (const char *__restrict __nptr,
        char **__restrict __endptr)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)));
-# 176 "/usr/include/stdlib.h" 3 4
+# 177 "/usr/include/stdlib.h" 3 4
 extern long int strtol (const char *__restrict __nptr,
    char **__restrict __endptr, int __base)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)));
@@ -1519,7 +1496,7 @@ extern int strfromf (char *__dest, size_t __size, const char *__format,
 extern int strfroml (char *__dest, size_t __size, const char *__format,
        long double __f)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (3)));
-# 232 "/usr/include/stdlib.h" 3 4
+# 233 "/usr/include/stdlib.h" 3 4
 extern int strfromf32 (char *__dest, size_t __size, const char * __format,
          _Float32 __f)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (3)));
@@ -1547,11 +1524,11 @@ extern int strfromf32x (char *__dest, size_t __size, const char * __format,
 extern int strfromf64x (char *__dest, size_t __size, const char * __format,
    _Float64x __f)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (3)));
-# 272 "/usr/include/stdlib.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/types/locale_t.h" 1 3 4
-# 22 "/usr/include/x86_64-linux-gnu/bits/types/locale_t.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/types/__locale_t.h" 1 3 4
-# 28 "/usr/include/x86_64-linux-gnu/bits/types/__locale_t.h" 3 4
+# 273 "/usr/include/stdlib.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/types/locale_t.h" 1 3 4
+# 22 "/usr/include/aarch64-linux-gnu/bits/types/locale_t.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/types/__locale_t.h" 1 3 4
+# 27 "/usr/include/aarch64-linux-gnu/bits/types/__locale_t.h" 3 4
 struct __locale_struct
 {
 
@@ -1567,10 +1544,10 @@ struct __locale_struct
 };
 
 typedef struct __locale_struct *__locale_t;
-# 23 "/usr/include/x86_64-linux-gnu/bits/types/locale_t.h" 2 3 4
+# 23 "/usr/include/aarch64-linux-gnu/bits/types/locale_t.h" 2 3 4
 
 typedef __locale_t locale_t;
-# 273 "/usr/include/stdlib.h" 2 3 4
+# 274 "/usr/include/stdlib.h" 2 3 4
 
 extern long int strtol_l (const char *__restrict __nptr,
      char **__restrict __endptr, int __base,
@@ -1605,7 +1582,7 @@ extern long double strtold_l (const char *__restrict __nptr,
          char **__restrict __endptr,
          locale_t __loc)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1, 3)));
-# 316 "/usr/include/stdlib.h" 3 4
+# 317 "/usr/include/stdlib.h" 3 4
 extern _Float32 strtof32_l (const char *__restrict __nptr,
        char **__restrict __endptr,
        locale_t __loc)
@@ -1638,7 +1615,7 @@ extern _Float64x strtof64x_l (const char *__restrict __nptr,
          char **__restrict __endptr,
          locale_t __loc)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1, 3)));
-# 360 "/usr/include/stdlib.h" 3 4
+# 361 "/usr/include/stdlib.h" 3 4
 extern __inline __attribute__ ((__gnu_inline__)) int
 __attribute__ ((__nothrow__ , __leaf__)) atoi (const char *__nptr)
 {
@@ -1656,7 +1633,7 @@ __attribute__ ((__nothrow__ , __leaf__)) atoll (const char *__nptr)
 {
   return strtoll (__nptr, (char **) ((void *)0), 10);
 }
-# 385 "/usr/include/stdlib.h" 3 4
+# 386 "/usr/include/stdlib.h" 3 4
 extern char *l64a (long int __n) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__warn_unused_result__));
 
 
@@ -1666,8 +1643,8 @@ extern long int a64l (const char *__s)
 
 
 
-# 1 "/usr/include/x86_64-linux-gnu/sys/types.h" 1 3 4
-# 27 "/usr/include/x86_64-linux-gnu/sys/types.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/sys/types.h" 1 3 4
+# 27 "/usr/include/aarch64-linux-gnu/sys/types.h" 3 4
 
 
 
@@ -1683,9 +1660,8 @@ typedef __u_quad_t u_quad_t;
 typedef __fsid_t fsid_t;
 
 
-
-
 typedef __loff_t loff_t;
+
 
 
 
@@ -1722,7 +1698,7 @@ typedef __nlink_t nlink_t;
 
 
 typedef __uid_t uid_t;
-# 98 "/usr/include/x86_64-linux-gnu/sys/types.h" 3 4
+# 97 "/usr/include/aarch64-linux-gnu/sys/types.h" 3 4
 typedef __pid_t pid_t;
 
 
@@ -1730,7 +1706,7 @@ typedef __pid_t pid_t;
 
 
 typedef __id_t id_t;
-# 115 "/usr/include/x86_64-linux-gnu/sys/types.h" 3 4
+# 114 "/usr/include/aarch64-linux-gnu/sys/types.h" 3 4
 typedef __daddr_t daddr_t;
 typedef __caddr_t caddr_t;
 
@@ -1743,7 +1719,7 @@ typedef __key_t key_t;
 
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/types/clock_t.h" 1 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/types/clock_t.h" 1 3 4
 
 
 
@@ -1751,9 +1727,9 @@ typedef __key_t key_t;
 
 
 typedef __clock_t clock_t;
-# 128 "/usr/include/x86_64-linux-gnu/sys/types.h" 2 3 4
+# 127 "/usr/include/aarch64-linux-gnu/sys/types.h" 2 3 4
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/types/clockid_t.h" 1 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/types/clockid_t.h" 1 3 4
 
 
 
@@ -1761,17 +1737,12 @@ typedef __clock_t clock_t;
 
 
 typedef __clockid_t clockid_t;
-# 130 "/usr/include/x86_64-linux-gnu/sys/types.h" 2 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/types/time_t.h" 1 3 4
-
-
-
-
-
-
+# 129 "/usr/include/aarch64-linux-gnu/sys/types.h" 2 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/types/time_t.h" 1 3 4
+# 10 "/usr/include/aarch64-linux-gnu/bits/types/time_t.h" 3 4
 typedef __time_t time_t;
-# 131 "/usr/include/x86_64-linux-gnu/sys/types.h" 2 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/types/timer_t.h" 1 3 4
+# 130 "/usr/include/aarch64-linux-gnu/sys/types.h" 2 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/types/timer_t.h" 1 3 4
 
 
 
@@ -1779,7 +1750,7 @@ typedef __time_t time_t;
 
 
 typedef __timer_t timer_t;
-# 132 "/usr/include/x86_64-linux-gnu/sys/types.h" 2 3 4
+# 131 "/usr/include/aarch64-linux-gnu/sys/types.h" 2 3 4
 
 
 
@@ -1793,8 +1764,8 @@ typedef __suseconds_t suseconds_t;
 
 
 
-# 1 "/usr/lib/gcc/x86_64-linux-gnu/7/include/stddef.h" 1 3 4
-# 146 "/usr/include/x86_64-linux-gnu/sys/types.h" 2 3 4
+# 1 "/usr/lib/gcc/aarch64-linux-gnu/11/include/stddef.h" 1 3 4
+# 145 "/usr/include/aarch64-linux-gnu/sys/types.h" 2 3 4
 
 
 
@@ -1805,53 +1776,70 @@ typedef unsigned int uint;
 
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/stdint-intn.h" 1 3 4
-# 24 "/usr/include/x86_64-linux-gnu/bits/stdint-intn.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/stdint-intn.h" 1 3 4
+# 24 "/usr/include/aarch64-linux-gnu/bits/stdint-intn.h" 3 4
 typedef __int8_t int8_t;
 typedef __int16_t int16_t;
 typedef __int32_t int32_t;
 typedef __int64_t int64_t;
-# 157 "/usr/include/x86_64-linux-gnu/sys/types.h" 2 3 4
-# 178 "/usr/include/x86_64-linux-gnu/sys/types.h" 3 4
-typedef unsigned int u_int8_t __attribute__ ((__mode__ (__QI__)));
-typedef unsigned int u_int16_t __attribute__ ((__mode__ (__HI__)));
-typedef unsigned int u_int32_t __attribute__ ((__mode__ (__SI__)));
-typedef unsigned int u_int64_t __attribute__ ((__mode__ (__DI__)));
+# 156 "/usr/include/aarch64-linux-gnu/sys/types.h" 2 3 4
+
+
+typedef __uint8_t u_int8_t;
+typedef __uint16_t u_int16_t;
+typedef __uint32_t u_int32_t;
+typedef __uint64_t u_int64_t;
+
 
 typedef int register_t __attribute__ ((__mode__ (__word__)));
-# 194 "/usr/include/x86_64-linux-gnu/sys/types.h" 3 4
+# 176 "/usr/include/aarch64-linux-gnu/sys/types.h" 3 4
 # 1 "/usr/include/endian.h" 1 3 4
-# 36 "/usr/include/endian.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/endian.h" 1 3 4
-# 37 "/usr/include/endian.h" 2 3 4
-# 60 "/usr/include/endian.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/byteswap.h" 1 3 4
-# 28 "/usr/include/x86_64-linux-gnu/bits/byteswap.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/wordsize.h" 1 3 4
-# 29 "/usr/include/x86_64-linux-gnu/bits/byteswap.h" 2 3 4
-
-
-
-
-
-
-# 1 "/usr/include/x86_64-linux-gnu/bits/byteswap-16.h" 1 3 4
-# 36 "/usr/include/x86_64-linux-gnu/bits/byteswap.h" 2 3 4
-# 44 "/usr/include/x86_64-linux-gnu/bits/byteswap.h" 3 4
-static __inline unsigned int
-__bswap_32 (unsigned int __bsx)
+# 24 "/usr/include/endian.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/endian.h" 1 3 4
+# 35 "/usr/include/aarch64-linux-gnu/bits/endian.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/endianness.h" 1 3 4
+# 36 "/usr/include/aarch64-linux-gnu/bits/endian.h" 2 3 4
+# 25 "/usr/include/endian.h" 2 3 4
+# 35 "/usr/include/endian.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/byteswap.h" 1 3 4
+# 33 "/usr/include/aarch64-linux-gnu/bits/byteswap.h" 3 4
+static __inline __uint16_t
+__bswap_16 (__uint16_t __bsx)
 {
-  return __builtin_bswap32 (__bsx);
+
+  return __builtin_bswap16 (__bsx);
+
+
+
 }
-# 108 "/usr/include/x86_64-linux-gnu/bits/byteswap.h" 3 4
-static __inline __uint64_t
+
+
+
+
+
+
+static __inline __uint32_t
+__bswap_32 (__uint32_t __bsx)
+{
+
+  return __builtin_bswap32 (__bsx);
+
+
+
+}
+# 69 "/usr/include/aarch64-linux-gnu/bits/byteswap.h" 3 4
+__extension__ static __inline __uint64_t
 __bswap_64 (__uint64_t __bsx)
 {
+
   return __builtin_bswap64 (__bsx);
+
+
+
 }
-# 61 "/usr/include/endian.h" 2 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/uintn-identity.h" 1 3 4
-# 32 "/usr/include/x86_64-linux-gnu/bits/uintn-identity.h" 3 4
+# 36 "/usr/include/endian.h" 2 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/uintn-identity.h" 1 3 4
+# 32 "/usr/include/aarch64-linux-gnu/bits/uintn-identity.h" 3 4
 static __inline __uint16_t
 __uint16_identity (__uint16_t __x)
 {
@@ -1869,24 +1857,21 @@ __uint64_identity (__uint64_t __x)
 {
   return __x;
 }
-# 62 "/usr/include/endian.h" 2 3 4
-# 195 "/usr/include/x86_64-linux-gnu/sys/types.h" 2 3 4
+# 37 "/usr/include/endian.h" 2 3 4
+# 177 "/usr/include/aarch64-linux-gnu/sys/types.h" 2 3 4
 
 
-# 1 "/usr/include/x86_64-linux-gnu/sys/select.h" 1 3 4
-# 30 "/usr/include/x86_64-linux-gnu/sys/select.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/select.h" 1 3 4
-# 22 "/usr/include/x86_64-linux-gnu/bits/select.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/wordsize.h" 1 3 4
-# 23 "/usr/include/x86_64-linux-gnu/bits/select.h" 2 3 4
-# 31 "/usr/include/x86_64-linux-gnu/sys/select.h" 2 3 4
+# 1 "/usr/include/aarch64-linux-gnu/sys/select.h" 1 3 4
+# 30 "/usr/include/aarch64-linux-gnu/sys/select.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/select.h" 1 3 4
+# 31 "/usr/include/aarch64-linux-gnu/sys/select.h" 2 3 4
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/types/sigset_t.h" 1 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/types/sigset_t.h" 1 3 4
 
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/types/__sigset_t.h" 1 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/types/__sigset_t.h" 1 3 4
 
 
 
@@ -1895,15 +1880,15 @@ typedef struct
 {
   unsigned long int __val[(1024 / (8 * sizeof (unsigned long int)))];
 } __sigset_t;
-# 5 "/usr/include/x86_64-linux-gnu/bits/types/sigset_t.h" 2 3 4
+# 5 "/usr/include/aarch64-linux-gnu/bits/types/sigset_t.h" 2 3 4
 
 
 typedef __sigset_t sigset_t;
-# 34 "/usr/include/x86_64-linux-gnu/sys/select.h" 2 3 4
+# 34 "/usr/include/aarch64-linux-gnu/sys/select.h" 2 3 4
 
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/types/struct_timeval.h" 1 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/types/struct_timeval.h" 1 3 4
 
 
 
@@ -1913,22 +1898,35 @@ typedef __sigset_t sigset_t;
 
 struct timeval
 {
+
+
+
+
   __time_t tv_sec;
   __suseconds_t tv_usec;
-};
-# 38 "/usr/include/x86_64-linux-gnu/sys/select.h" 2 3 4
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/types/struct_timespec.h" 1 3 4
-# 9 "/usr/include/x86_64-linux-gnu/bits/types/struct_timespec.h" 3 4
+};
+# 38 "/usr/include/aarch64-linux-gnu/sys/select.h" 2 3 4
+
+# 1 "/usr/include/aarch64-linux-gnu/bits/types/struct_timespec.h" 1 3 4
+# 11 "/usr/include/aarch64-linux-gnu/bits/types/struct_timespec.h" 3 4
 struct timespec
 {
+
+
+
   __time_t tv_sec;
+
+
+
+
   __syscall_slong_t tv_nsec;
+# 31 "/usr/include/aarch64-linux-gnu/bits/types/struct_timespec.h" 3 4
 };
-# 40 "/usr/include/x86_64-linux-gnu/sys/select.h" 2 3 4
-# 49 "/usr/include/x86_64-linux-gnu/sys/select.h" 3 4
+# 40 "/usr/include/aarch64-linux-gnu/sys/select.h" 2 3 4
+# 49 "/usr/include/aarch64-linux-gnu/sys/select.h" 3 4
 typedef long int __fd_mask;
-# 59 "/usr/include/x86_64-linux-gnu/sys/select.h" 3 4
+# 59 "/usr/include/aarch64-linux-gnu/sys/select.h" 3 4
 typedef struct
   {
 
@@ -1948,63 +1946,30 @@ typedef struct
 
 
 typedef __fd_mask fd_mask;
-# 91 "/usr/include/x86_64-linux-gnu/sys/select.h" 3 4
+# 91 "/usr/include/aarch64-linux-gnu/sys/select.h" 3 4
 
-# 101 "/usr/include/x86_64-linux-gnu/sys/select.h" 3 4
+# 102 "/usr/include/aarch64-linux-gnu/sys/select.h" 3 4
 extern int select (int __nfds, fd_set *__restrict __readfds,
      fd_set *__restrict __writefds,
      fd_set *__restrict __exceptfds,
      struct timeval *__restrict __timeout);
-# 113 "/usr/include/x86_64-linux-gnu/sys/select.h" 3 4
+# 127 "/usr/include/aarch64-linux-gnu/sys/select.h" 3 4
 extern int pselect (int __nfds, fd_set *__restrict __readfds,
       fd_set *__restrict __writefds,
       fd_set *__restrict __exceptfds,
       const struct timespec *__restrict __timeout,
       const __sigset_t *__restrict __sigmask);
-
-
-
-
-
-# 1 "/usr/include/x86_64-linux-gnu/bits/select2.h" 1 3 4
-# 24 "/usr/include/x86_64-linux-gnu/bits/select2.h" 3 4
+# 150 "/usr/include/aarch64-linux-gnu/sys/select.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/select2.h" 1 3 4
+# 24 "/usr/include/aarch64-linux-gnu/bits/select2.h" 3 4
 extern long int __fdelt_chk (long int __d);
 extern long int __fdelt_warn (long int __d)
   __attribute__((__warning__ ("bit outside of fd_set selected")));
-# 124 "/usr/include/x86_64-linux-gnu/sys/select.h" 2 3 4
+# 151 "/usr/include/aarch64-linux-gnu/sys/select.h" 2 3 4
 
 
 
-# 198 "/usr/include/x86_64-linux-gnu/sys/types.h" 2 3 4
-
-
-
-
-
-
-
-# 1 "/usr/include/x86_64-linux-gnu/sys/sysmacros.h" 1 3 4
-# 41 "/usr/include/x86_64-linux-gnu/sys/sysmacros.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/sysmacros.h" 1 3 4
-# 42 "/usr/include/x86_64-linux-gnu/sys/sysmacros.h" 2 3 4
-# 71 "/usr/include/x86_64-linux-gnu/sys/sysmacros.h" 3 4
-
-
-extern unsigned int gnu_dev_major (__dev_t __dev) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__const__));
-extern unsigned int gnu_dev_minor (__dev_t __dev) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__const__));
-extern __dev_t gnu_dev_makedev (unsigned int __major, unsigned int __minor) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__const__));
-
-
-
-__extension__ extern __inline __attribute__ ((__gnu_inline__)) __attribute__ ((__const__)) unsigned int __attribute__ ((__nothrow__ , __leaf__)) gnu_dev_major (__dev_t __dev) { unsigned int __major; __major = ((__dev & (__dev_t) 0x00000000000fff00u) >> 8); __major |= ((__dev & (__dev_t) 0xfffff00000000000u) >> 32); return __major; }
-__extension__ extern __inline __attribute__ ((__gnu_inline__)) __attribute__ ((__const__)) unsigned int __attribute__ ((__nothrow__ , __leaf__)) gnu_dev_minor (__dev_t __dev) { unsigned int __minor; __minor = ((__dev & (__dev_t) 0x00000000000000ffu) >> 0); __minor |= ((__dev & (__dev_t) 0x00000ffffff00000u) >> 12); return __minor; }
-__extension__ extern __inline __attribute__ ((__gnu_inline__)) __attribute__ ((__const__)) __dev_t __attribute__ ((__nothrow__ , __leaf__)) gnu_dev_makedev (unsigned int __major, unsigned int __minor) { __dev_t __dev; __dev = (((__dev_t) (__major & 0x00000fffu)) << 8); __dev |= (((__dev_t) (__major & 0xfffff000u)) << 32); __dev |= (((__dev_t) (__minor & 0x000000ffu)) << 0); __dev |= (((__dev_t) (__minor & 0xffffff00u)) << 12); return __dev; }
-
-
-
-
-# 206 "/usr/include/x86_64-linux-gnu/sys/types.h" 2 3 4
-
+# 180 "/usr/include/aarch64-linux-gnu/sys/types.h" 2 3 4
 
 
 
@@ -2026,7 +1991,7 @@ typedef __fsblkcnt_t fsblkcnt_t;
 
 
 typedef __fsfilcnt_t fsfilcnt_t;
-# 246 "/usr/include/x86_64-linux-gnu/sys/types.h" 3 4
+# 219 "/usr/include/aarch64-linux-gnu/sys/types.h" 3 4
 typedef __blkcnt64_t blkcnt64_t;
 typedef __fsblkcnt64_t fsblkcnt64_t;
 typedef __fsfilcnt64_t fsfilcnt64_t;
@@ -2035,41 +2000,25 @@ typedef __fsfilcnt64_t fsfilcnt64_t;
 
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/pthreadtypes.h" 1 3 4
-# 23 "/usr/include/x86_64-linux-gnu/bits/pthreadtypes.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/thread-shared-types.h" 1 3 4
-# 77 "/usr/include/x86_64-linux-gnu/bits/thread-shared-types.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/pthreadtypes-arch.h" 1 3 4
-# 21 "/usr/include/x86_64-linux-gnu/bits/pthreadtypes-arch.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/wordsize.h" 1 3 4
-# 22 "/usr/include/x86_64-linux-gnu/bits/pthreadtypes-arch.h" 2 3 4
-# 65 "/usr/include/x86_64-linux-gnu/bits/pthreadtypes-arch.h" 3 4
-struct __pthread_rwlock_arch_t
+# 1 "/usr/include/aarch64-linux-gnu/bits/pthreadtypes.h" 1 3 4
+# 23 "/usr/include/aarch64-linux-gnu/bits/pthreadtypes.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/thread-shared-types.h" 1 3 4
+# 44 "/usr/include/aarch64-linux-gnu/bits/thread-shared-types.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/pthreadtypes-arch.h" 1 3 4
+# 45 "/usr/include/aarch64-linux-gnu/bits/thread-shared-types.h" 2 3 4
+
+# 1 "/usr/include/aarch64-linux-gnu/bits/atomic_wide_counter.h" 1 3 4
+# 25 "/usr/include/aarch64-linux-gnu/bits/atomic_wide_counter.h" 3 4
+typedef union
 {
-  unsigned int __readers;
-  unsigned int __writers;
-  unsigned int __wrphase_futex;
-  unsigned int __writers_futex;
-  unsigned int __pad3;
-  unsigned int __pad4;
-
-  int __cur_writer;
-  int __shared;
-  signed char __rwelision;
-
-
-
-
-  unsigned char __pad1[7];
-
-
-  unsigned long int __pad2;
-
-
-  unsigned int __flags;
-# 99 "/usr/include/x86_64-linux-gnu/bits/pthreadtypes-arch.h" 3 4
-};
-# 78 "/usr/include/x86_64-linux-gnu/bits/thread-shared-types.h" 2 3 4
+  __extension__ unsigned long long int __value64;
+  struct
+  {
+    unsigned int __low;
+    unsigned int __high;
+  } __value32;
+} __atomic_wide_counter;
+# 47 "/usr/include/aarch64-linux-gnu/bits/thread-shared-types.h" 2 3 4
 
 
 
@@ -2079,7 +2028,14 @@ typedef struct __pthread_internal_list
   struct __pthread_internal_list *__prev;
   struct __pthread_internal_list *__next;
 } __pthread_list_t;
-# 118 "/usr/include/x86_64-linux-gnu/bits/thread-shared-types.h" 3 4
+
+typedef struct __pthread_internal_slist
+{
+  struct __pthread_internal_slist *__next;
+} __pthread_slist_t;
+# 76 "/usr/include/aarch64-linux-gnu/bits/thread-shared-types.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/struct_mutex.h" 1 3 4
+# 27 "/usr/include/aarch64-linux-gnu/bits/struct_mutex.h" 3 4
 struct __pthread_mutex_s
 {
   int __lock ;
@@ -2087,49 +2043,58 @@ struct __pthread_mutex_s
   int __owner;
 
   unsigned int __nusers;
-# 148 "/usr/include/x86_64-linux-gnu/bits/thread-shared-types.h" 3 4
+# 58 "/usr/include/aarch64-linux-gnu/bits/struct_mutex.h" 3 4
   int __kind;
- 
 
 
 
 
-  short __spins; short __elision;
+  int __spins;
   __pthread_list_t __list;
-# 165 "/usr/include/x86_64-linux-gnu/bits/thread-shared-types.h" 3 4
- 
+# 74 "/usr/include/aarch64-linux-gnu/bits/struct_mutex.h" 3 4
 };
+# 77 "/usr/include/aarch64-linux-gnu/bits/thread-shared-types.h" 2 3 4
+# 89 "/usr/include/aarch64-linux-gnu/bits/thread-shared-types.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/struct_rwlock.h" 1 3 4
+# 23 "/usr/include/aarch64-linux-gnu/bits/struct_rwlock.h" 3 4
+struct __pthread_rwlock_arch_t
+{
+  unsigned int __readers;
+  unsigned int __writers;
+  unsigned int __wrphase_futex;
+  unsigned int __writers_futex;
+  unsigned int __pad3;
+  unsigned int __pad4;
+  int __cur_writer;
+  int __shared;
+  unsigned long int __pad1;
+  unsigned long int __pad2;
+  unsigned int __flags;
+};
+# 90 "/usr/include/aarch64-linux-gnu/bits/thread-shared-types.h" 2 3 4
 
 
 
 
 struct __pthread_cond_s
 {
-  __extension__ union
-  {
-    __extension__ unsigned long long int __wseq;
-    struct
-    {
-      unsigned int __low;
-      unsigned int __high;
-    } __wseq32;
-  };
-  __extension__ union
-  {
-    __extension__ unsigned long long int __g1_start;
-    struct
-    {
-      unsigned int __low;
-      unsigned int __high;
-    } __g1_start32;
-  };
+  __atomic_wide_counter __wseq;
+  __atomic_wide_counter __g1_start;
   unsigned int __g_refs[2] ;
   unsigned int __g_size[2];
   unsigned int __g1_orig_size;
   unsigned int __wrefs;
   unsigned int __g_signals[2];
 };
-# 24 "/usr/include/x86_64-linux-gnu/bits/pthreadtypes.h" 2 3 4
+
+typedef unsigned int __tss_t;
+typedef unsigned long int __thrd_t;
+
+typedef struct
+{
+  int __data ;
+} __once_flag;
+# 24 "/usr/include/aarch64-linux-gnu/bits/pthreadtypes.h" 2 3 4
 
 
 
@@ -2140,7 +2105,7 @@ typedef unsigned long int pthread_t;
 
 typedef union
 {
-  char __size[4];
+  char __size[8];
   int __align;
 } pthread_mutexattr_t;
 
@@ -2149,7 +2114,7 @@ typedef union
 
 typedef union
 {
-  char __size[4];
+  char __size[8];
   int __align;
 } pthread_condattr_t;
 
@@ -2164,7 +2129,7 @@ typedef int pthread_once_t;
 
 union pthread_attr_t
 {
-  char __size[56];
+  char __size[64];
   long int __align;
 };
 
@@ -2176,7 +2141,7 @@ typedef union pthread_attr_t pthread_attr_t;
 typedef union
 {
   struct __pthread_mutex_s __data;
-  char __size[40];
+  char __size[48];
   long int __align;
 } pthread_mutex_t;
 
@@ -2222,14 +2187,14 @@ typedef union
 
 typedef union
 {
-  char __size[4];
+  char __size[8];
   int __align;
 } pthread_barrierattr_t;
-# 255 "/usr/include/x86_64-linux-gnu/sys/types.h" 2 3 4
+# 228 "/usr/include/aarch64-linux-gnu/sys/types.h" 2 3 4
 
 
 
-# 395 "/usr/include/stdlib.h" 2 3 4
+# 396 "/usr/include/stdlib.h" 2 3 4
 
 
 
@@ -2374,10 +2339,11 @@ extern int lcong48_r (unsigned short int __param[7],
 
 
 
-extern void *malloc (size_t __size) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__malloc__)) __attribute__ ((__warn_unused_result__));
+extern void *malloc (size_t __size) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__malloc__))
+     __attribute__ ((__alloc_size__ (1))) __attribute__ ((__warn_unused_result__));
 
 extern void *calloc (size_t __nmemb, size_t __size)
-     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__malloc__)) __attribute__ ((__warn_unused_result__));
+     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__malloc__)) __attribute__ ((__alloc_size__ (1, 2))) __attribute__ ((__warn_unused_result__));
 
 
 
@@ -2385,7 +2351,10 @@ extern void *calloc (size_t __nmemb, size_t __size)
 
 
 extern void *realloc (void *__ptr, size_t __size)
-     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__warn_unused_result__));
+     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__warn_unused_result__)) __attribute__ ((__alloc_size__ (2)));
+
+
+extern void free (void *__ptr) __attribute__ ((__nothrow__ , __leaf__));
 
 
 
@@ -2394,16 +2363,19 @@ extern void *realloc (void *__ptr, size_t __size)
 
 
 extern void *reallocarray (void *__ptr, size_t __nmemb, size_t __size)
-     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__warn_unused_result__));
+     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__warn_unused_result__))
+     __attribute__ ((__alloc_size__ (2, 3)))
+    __attribute__ ((__malloc__ (__builtin_free, 1)));
 
 
+extern void *reallocarray (void *__ptr, size_t __nmemb, size_t __size)
+     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__malloc__ (reallocarray, 1)));
 
-extern void free (void *__ptr) __attribute__ ((__nothrow__ , __leaf__));
 
 
 # 1 "/usr/include/alloca.h" 1 3 4
 # 24 "/usr/include/alloca.h" 3 4
-# 1 "/usr/lib/gcc/x86_64-linux-gnu/7/include/stddef.h" 1 3 4
+# 1 "/usr/lib/gcc/aarch64-linux-gnu/11/include/stddef.h" 1 3 4
 # 25 "/usr/include/alloca.h" 2 3 4
 
 
@@ -2419,13 +2391,14 @@ extern void *alloca (size_t __size) __attribute__ ((__nothrow__ , __leaf__));
 
 
 
-# 567 "/usr/include/stdlib.h" 2 3 4
+# 575 "/usr/include/stdlib.h" 2 3 4
 
 
 
 
 
-extern void *valloc (size_t __size) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__malloc__)) __attribute__ ((__warn_unused_result__));
+extern void *valloc (size_t __size) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__malloc__))
+     __attribute__ ((__alloc_size__ (1))) __attribute__ ((__warn_unused_result__));
 
 
 
@@ -2437,7 +2410,8 @@ extern int posix_memalign (void **__memptr, size_t __alignment, size_t __size)
 
 
 extern void *aligned_alloc (size_t __alignment, size_t __size)
-     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__malloc__)) __attribute__ ((__alloc_size__ (2))) __attribute__ ((__warn_unused_result__));
+     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__malloc__)) __attribute__ ((__alloc_align__ (1)))
+     __attribute__ ((__alloc_size__ (2))) __attribute__ ((__warn_unused_result__));
 
 
 
@@ -2515,30 +2489,30 @@ extern int unsetenv (const char *__name) __attribute__ ((__nothrow__ , __leaf__)
 
 
 extern int clearenv (void) __attribute__ ((__nothrow__ , __leaf__));
-# 672 "/usr/include/stdlib.h" 3 4
+# 682 "/usr/include/stdlib.h" 3 4
 extern char *mktemp (char *__template) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)));
-# 685 "/usr/include/stdlib.h" 3 4
-extern int mkstemp (char *__template) __attribute__ ((__nonnull__ (1))) __attribute__ ((__warn_unused_result__));
 # 695 "/usr/include/stdlib.h" 3 4
+extern int mkstemp (char *__template) __attribute__ ((__nonnull__ (1))) __attribute__ ((__warn_unused_result__));
+# 705 "/usr/include/stdlib.h" 3 4
 extern int mkstemp64 (char *__template) __attribute__ ((__nonnull__ (1))) __attribute__ ((__warn_unused_result__));
-# 707 "/usr/include/stdlib.h" 3 4
-extern int mkstemps (char *__template, int __suffixlen) __attribute__ ((__nonnull__ (1))) __attribute__ ((__warn_unused_result__));
 # 717 "/usr/include/stdlib.h" 3 4
+extern int mkstemps (char *__template, int __suffixlen) __attribute__ ((__nonnull__ (1))) __attribute__ ((__warn_unused_result__));
+# 727 "/usr/include/stdlib.h" 3 4
 extern int mkstemps64 (char *__template, int __suffixlen)
      __attribute__ ((__nonnull__ (1))) __attribute__ ((__warn_unused_result__));
-# 728 "/usr/include/stdlib.h" 3 4
+# 738 "/usr/include/stdlib.h" 3 4
 extern char *mkdtemp (char *__template) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1))) __attribute__ ((__warn_unused_result__));
-# 739 "/usr/include/stdlib.h" 3 4
-extern int mkostemp (char *__template, int __flags) __attribute__ ((__nonnull__ (1))) __attribute__ ((__warn_unused_result__));
 # 749 "/usr/include/stdlib.h" 3 4
-extern int mkostemp64 (char *__template, int __flags) __attribute__ ((__nonnull__ (1))) __attribute__ ((__warn_unused_result__));
+extern int mkostemp (char *__template, int __flags) __attribute__ ((__nonnull__ (1))) __attribute__ ((__warn_unused_result__));
 # 759 "/usr/include/stdlib.h" 3 4
+extern int mkostemp64 (char *__template, int __flags) __attribute__ ((__nonnull__ (1))) __attribute__ ((__warn_unused_result__));
+# 769 "/usr/include/stdlib.h" 3 4
 extern int mkostemps (char *__template, int __suffixlen, int __flags)
      __attribute__ ((__nonnull__ (1))) __attribute__ ((__warn_unused_result__));
-# 771 "/usr/include/stdlib.h" 3 4
+# 781 "/usr/include/stdlib.h" 3 4
 extern int mkostemps64 (char *__template, int __suffixlen, int __flags)
      __attribute__ ((__nonnull__ (1))) __attribute__ ((__warn_unused_result__));
-# 781 "/usr/include/stdlib.h" 3 4
+# 791 "/usr/include/stdlib.h" 3 4
 extern int system (const char *__command) __attribute__ ((__warn_unused_result__));
 
 
@@ -2546,8 +2520,9 @@ extern int system (const char *__command) __attribute__ ((__warn_unused_result__
 
 
 extern char *canonicalize_file_name (const char *__name)
-     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1))) __attribute__ ((__warn_unused_result__));
-# 797 "/usr/include/stdlib.h" 3 4
+     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1))) __attribute__ ((__malloc__))
+     __attribute__ ((__malloc__ (__builtin_free, 1))) __attribute__ ((__warn_unused_result__));
+# 808 "/usr/include/stdlib.h" 3 4
 extern char *realpath (const char *__restrict __name,
          char *__restrict __resolved) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__warn_unused_result__));
 
@@ -2573,8 +2548,8 @@ extern void *bsearch (const void *__key, const void *__base,
      __attribute__ ((__nonnull__ (1, 2, 5))) __attribute__ ((__warn_unused_result__));
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/stdlib-bsearch.h" 1 3 4
-# 19 "/usr/include/x86_64-linux-gnu/bits/stdlib-bsearch.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/stdlib-bsearch.h" 1 3 4
+# 19 "/usr/include/aarch64-linux-gnu/bits/stdlib-bsearch.h" 3 4
 extern __inline __attribute__ ((__gnu_inline__)) void *
 bsearch (const void *__key, const void *__base, size_t __nmemb, size_t __size,
   __compar_fn_t __compar)
@@ -2588,19 +2563,28 @@ bsearch (const void *__key, const void *__base, size_t __nmemb, size_t __size,
   while (__l < __u)
     {
       __idx = (__l + __u) / 2;
-      __p = (void *) (((const char *) __base) + (__idx * __size));
+      __p = (const void *) (((const char *) __base) + (__idx * __size));
       __comparison = (*__compar) (__key, __p);
       if (__comparison < 0)
  __u = __idx;
       else if (__comparison > 0)
  __l = __idx + 1;
       else
- return (void *) __p;
+ {
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wcast-qual"
+
+   return (void *) __p;
+
+#pragma GCC diagnostic pop
+
+ }
     }
 
   return ((void *)0);
 }
-# 823 "/usr/include/stdlib.h" 2 3 4
+# 834 "/usr/include/stdlib.h" 2 3 4
 
 
 
@@ -2636,7 +2620,7 @@ extern ldiv_t ldiv (long int __numer, long int __denom)
 __extension__ extern lldiv_t lldiv (long long int __numer,
         long long int __denom)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__const__)) __attribute__ ((__warn_unused_result__));
-# 869 "/usr/include/stdlib.h" 3 4
+# 880 "/usr/include/stdlib.h" 3 4
 extern char *ecvt (double __value, int __ndigit, int *__restrict __decpt,
      int *__restrict __sign) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (3, 4))) __attribute__ ((__warn_unused_result__));
 
@@ -2699,12 +2683,14 @@ extern int wctomb (char *__s, wchar_t __wchar) __attribute__ ((__nothrow__ , __l
 
 
 extern size_t mbstowcs (wchar_t *__restrict __pwcs,
-   const char *__restrict __s, size_t __n) __attribute__ ((__nothrow__ , __leaf__));
+   const char *__restrict __s, size_t __n) __attribute__ ((__nothrow__ , __leaf__))
+    __attribute__ ((__access__ (__read_only__, 2)));
 
 extern size_t wcstombs (char *__restrict __s,
    const wchar_t *__restrict __pwcs, size_t __n)
-     __attribute__ ((__nothrow__ , __leaf__));
-
+     __attribute__ ((__nothrow__ , __leaf__))
+  __attribute__ ((__access__ (__write_only__, 1, 3)))
+  __attribute__ ((__access__ (__read_only__, 2)));
 
 
 
@@ -2712,17 +2698,11 @@ extern size_t wcstombs (char *__restrict __s,
 
 
 extern int rpmatch (const char *__response) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1))) __attribute__ ((__warn_unused_result__));
-# 954 "/usr/include/stdlib.h" 3 4
+# 967 "/usr/include/stdlib.h" 3 4
 extern int getsubopt (char **__restrict __optionp,
         char *const *__restrict __tokens,
         char **__restrict __valuep)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1, 2, 3))) __attribute__ ((__warn_unused_result__));
-
-
-
-
-
-extern void setkey (const char *__key) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)));
 
 
 
@@ -2755,7 +2735,7 @@ extern char *ptsname (int __fd) __attribute__ ((__nothrow__ , __leaf__)) __attri
 
 
 extern int ptsname_r (int __fd, char *__buf, size_t __buflen)
-     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (2)));
+     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (2))) __attribute__ ((__access__ (__write_only__, 2, 3)));
 
 
 extern int getpt (void);
@@ -2767,20 +2747,20 @@ extern int getpt (void);
 
 extern int getloadavg (double __loadavg[], int __nelem)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)));
-# 1016 "/usr/include/stdlib.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/stdlib-float.h" 1 3 4
-# 24 "/usr/include/x86_64-linux-gnu/bits/stdlib-float.h" 3 4
+# 1023 "/usr/include/stdlib.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/stdlib-float.h" 1 3 4
+# 24 "/usr/include/aarch64-linux-gnu/bits/stdlib-float.h" 3 4
 extern __inline __attribute__ ((__gnu_inline__)) double
 __attribute__ ((__nothrow__ , __leaf__)) atof (const char *__nptr)
 {
   return strtod (__nptr, (char **) ((void *)0));
 }
-# 1017 "/usr/include/stdlib.h" 2 3 4
+# 1024 "/usr/include/stdlib.h" 2 3 4
 
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/stdlib.h" 1 3 4
-# 23 "/usr/include/x86_64-linux-gnu/bits/stdlib.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/stdlib.h" 1 3 4
+# 23 "/usr/include/aarch64-linux-gnu/bits/stdlib.h" 3 4
 extern char *__realpath_chk (const char *__restrict __name,
         char *__restrict __resolved,
         size_t __resolvedlen) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__warn_unused_result__));
@@ -2797,24 +2777,25 @@ extern char *__realpath_chk_warn (const char *__restrict __name, char *__restric
 extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline__)) __attribute__ ((__artificial__)) __attribute__ ((__warn_unused_result__)) char *
 __attribute__ ((__nothrow__ , __leaf__)) realpath (const char *__restrict __name, char *__restrict __resolved)
 {
-  if (__builtin_object_size (__resolved, 2 > 1) != (size_t) -1)
-    {
+  size_t sz = __builtin_object_size (__resolved, 2 > 1);
+
+  if (sz == (size_t) -1)
+    return __realpath_alias (__name, __resolved);
 
 
 
 
-      return __realpath_chk (__name, __resolved, __builtin_object_size (__resolved, 2 > 1));
-    }
 
-  return __realpath_alias (__name, __resolved);
+  return __realpath_chk (__name, __resolved, sz);
 }
 
 
 extern int __ptsname_r_chk (int __fd, char *__buf, size_t __buflen,
-       size_t __nreal) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (2)));
+       size_t __nreal) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (2)))
+    __attribute__ ((__access__ (__write_only__, 2, 3)));
 extern int __ptsname_r_alias (int __fd, char *__buf, size_t __buflen) __asm__ ("" "ptsname_r") __attribute__ ((__nothrow__ , __leaf__))
 
-     __attribute__ ((__nonnull__ (2)));
+     __attribute__ ((__nonnull__ (2))) __attribute__ ((__access__ (__write_only__, 2, 3)));
 extern int __ptsname_r_chk_warn (int __fd, char *__buf, size_t __buflen, size_t __nreal) __asm__ ("" "__ptsname_r_chk") __attribute__ ((__nothrow__ , __leaf__))
 
 
@@ -2824,14 +2805,9 @@ extern int __ptsname_r_chk_warn (int __fd, char *__buf, size_t __buflen, size_t 
 extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline__)) __attribute__ ((__artificial__)) int
 __attribute__ ((__nothrow__ , __leaf__)) ptsname_r (int __fd, char *__buf, size_t __buflen)
 {
-  if (__builtin_object_size (__buf, 2 > 1) != (size_t) -1)
-    {
-      if (!__builtin_constant_p (__buflen))
- return __ptsname_r_chk (__fd, __buf, __buflen, __builtin_object_size (__buf, 2 > 1));
-      if (__buflen > __builtin_object_size (__buf, 2 > 1))
- return __ptsname_r_chk_warn (__fd, __buf, __buflen, __builtin_object_size (__buf, 2 > 1));
-    }
-  return __ptsname_r_alias (__fd, __buf, __buflen);
+  return ((((__typeof (__buflen)) 0 < (__typeof (__buflen)) -1 || (__builtin_constant_p (__buflen) && (__buflen) > 0)) && __builtin_constant_p ((((long unsigned int) (__buflen)) <= (__builtin_object_size (__buf, 2 > 1)) / (sizeof (char)))) && (((long unsigned int) (__buflen)) <= (__builtin_object_size (__buf, 2 > 1)) / (sizeof (char)))) ? __ptsname_r_alias (__fd, __buf, __buflen) : ((((__typeof (__buflen)) 0 < (__typeof (__buflen)) -1 || (__builtin_constant_p (__buflen) && (__buflen) > 0)) && __builtin_constant_p ((((long unsigned int) (__buflen)) <= (__builtin_object_size (__buf, 2 > 1)) / (sizeof (char)))) && !(((long unsigned int) (__buflen)) <= (__builtin_object_size (__buf, 2 > 1)) / (sizeof (char)))) ? __ptsname_r_chk_warn (__fd, __buf, __buflen, __builtin_object_size (__buf, 2 > 1)) : __ptsname_r_chk (__fd, __buf, __buflen, __builtin_object_size (__buf, 2 > 1))))
+
+                           ;
 }
 
 
@@ -2850,7 +2826,8 @@ __attribute__ ((__nothrow__ , __leaf__)) wctomb (char *__s, wchar_t __wchar)
 
 
 
-  if (__builtin_object_size (__s, 2 > 1) != (size_t) -1 && 16 > __builtin_object_size (__s, 2 > 1))
+  if (__builtin_object_size (__s, 2 > 1) != (size_t) -1
+      && 16 > __builtin_object_size (__s, 2 > 1))
     return __wctomb_chk (__s, __wchar, __builtin_object_size (__s, 2 > 1));
   return __wctomb_alias (__s, __wchar);
 }
@@ -2858,11 +2835,13 @@ __attribute__ ((__nothrow__ , __leaf__)) wctomb (char *__s, wchar_t __wchar)
 
 extern size_t __mbstowcs_chk (wchar_t *__restrict __dst,
          const char *__restrict __src,
-         size_t __len, size_t __dstlen) __attribute__ ((__nothrow__ , __leaf__));
+         size_t __len, size_t __dstlen) __attribute__ ((__nothrow__ , __leaf__))
+    __attribute__ ((__access__ (__write_only__, 1, 3))) __attribute__ ((__access__ (__read_only__, 2)));
 extern size_t __mbstowcs_alias (wchar_t *__restrict __dst, const char *__restrict __src, size_t __len) __asm__ ("" "mbstowcs") __attribute__ ((__nothrow__ , __leaf__))
 
 
-                                  ;
+
+    __attribute__ ((__access__ (__write_only__, 1, 3))) __attribute__ ((__access__ (__read_only__, 2)));
 extern size_t __mbstowcs_chk_warn (wchar_t *__restrict __dst, const char *__restrict __src, size_t __len, size_t __dstlen) __asm__ ("" "__mbstowcs_chk") __attribute__ ((__nothrow__ , __leaf__))
 
 
@@ -2874,27 +2853,21 @@ extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline
 __attribute__ ((__nothrow__ , __leaf__)) mbstowcs (wchar_t *__restrict __dst, const char *__restrict __src, size_t __len)
 
 {
-  if (__builtin_object_size (__dst, 2 > 1) != (size_t) -1)
-    {
-      if (!__builtin_constant_p (__len))
- return __mbstowcs_chk (__dst, __src, __len,
-          __builtin_object_size (__dst, 2 > 1) / sizeof (wchar_t));
+  return ((((__typeof (__len)) 0 < (__typeof (__len)) -1 || (__builtin_constant_p (__len) && (__len) > 0)) && __builtin_constant_p ((((long unsigned int) (__len)) <= (__builtin_object_size (__dst, 2 > 1)) / (sizeof (wchar_t)))) && (((long unsigned int) (__len)) <= (__builtin_object_size (__dst, 2 > 1)) / (sizeof (wchar_t)))) ? __mbstowcs_alias (__dst, __src, __len) : ((((__typeof (__len)) 0 < (__typeof (__len)) -1 || (__builtin_constant_p (__len) && (__len) > 0)) && __builtin_constant_p ((((long unsigned int) (__len)) <= (__builtin_object_size (__dst, 2 > 1)) / (sizeof (wchar_t)))) && !(((long unsigned int) (__len)) <= (__builtin_object_size (__dst, 2 > 1)) / (sizeof (wchar_t)))) ? __mbstowcs_chk_warn (__dst, __src, __len, (__builtin_object_size (__dst, 2 > 1)) / (sizeof (wchar_t))) : __mbstowcs_chk (__dst, __src, __len, (__builtin_object_size (__dst, 2 > 1)) / (sizeof (wchar_t)))))
 
-      if (__len > __builtin_object_size (__dst, 2 > 1) / sizeof (wchar_t))
- return __mbstowcs_chk_warn (__dst, __src, __len,
-         __builtin_object_size (__dst, 2 > 1) / sizeof (wchar_t));
-    }
-  return __mbstowcs_alias (__dst, __src, __len);
+                           ;
 }
 
 
 extern size_t __wcstombs_chk (char *__restrict __dst,
          const wchar_t *__restrict __src,
-         size_t __len, size_t __dstlen) __attribute__ ((__nothrow__ , __leaf__));
+         size_t __len, size_t __dstlen) __attribute__ ((__nothrow__ , __leaf__))
+  __attribute__ ((__access__ (__write_only__, 1, 3))) __attribute__ ((__access__ (__read_only__, 2)));
 extern size_t __wcstombs_alias (char *__restrict __dst, const wchar_t *__restrict __src, size_t __len) __asm__ ("" "wcstombs") __attribute__ ((__nothrow__ , __leaf__))
 
 
-                                  ;
+
+  __attribute__ ((__access__ (__write_only__, 1, 3))) __attribute__ ((__access__ (__read_only__, 2)));
 extern size_t __wcstombs_chk_warn (char *__restrict __dst, const wchar_t *__restrict __src, size_t __len, size_t __dstlen) __asm__ ("" "__wcstombs_chk") __attribute__ ((__nothrow__ , __leaf__))
 
 
@@ -2905,38 +2878,36 @@ extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline
 __attribute__ ((__nothrow__ , __leaf__)) wcstombs (char *__restrict __dst, const wchar_t *__restrict __src, size_t __len)
 
 {
-  if (__builtin_object_size (__dst, 2 > 1) != (size_t) -1)
-    {
-      if (!__builtin_constant_p (__len))
- return __wcstombs_chk (__dst, __src, __len, __builtin_object_size (__dst, 2 > 1));
-      if (__len > __builtin_object_size (__dst, 2 > 1))
- return __wcstombs_chk_warn (__dst, __src, __len, __builtin_object_size (__dst, 2 > 1));
-    }
-  return __wcstombs_alias (__dst, __src, __len);
+  return ((((__typeof (__len)) 0 < (__typeof (__len)) -1 || (__builtin_constant_p (__len) && (__len) > 0)) && __builtin_constant_p ((((long unsigned int) (__len)) <= (__builtin_object_size (__dst, 2 > 1)) / (sizeof (char)))) && (((long unsigned int) (__len)) <= (__builtin_object_size (__dst, 2 > 1)) / (sizeof (char)))) ? __wcstombs_alias (__dst, __src, __len) : ((((__typeof (__len)) 0 < (__typeof (__len)) -1 || (__builtin_constant_p (__len) && (__len) > 0)) && __builtin_constant_p ((((long unsigned int) (__len)) <= (__builtin_object_size (__dst, 2 > 1)) / (sizeof (char)))) && !(((long unsigned int) (__len)) <= (__builtin_object_size (__dst, 2 > 1)) / (sizeof (char)))) ? __wcstombs_chk_warn (__dst, __src, __len, __builtin_object_size (__dst, 2 > 1)) : __wcstombs_chk (__dst, __src, __len, __builtin_object_size (__dst, 2 > 1))))
+
+                         ;
 }
-# 1021 "/usr/include/stdlib.h" 2 3 4
+# 1028 "/usr/include/stdlib.h" 2 3 4
 
 
 
 
 
 
-# 20 "/workspace/acl/lib_fiber/c/src/stdafx.h" 2
-# 1 "/usr/lib/gcc/x86_64-linux-gnu/7/include/stdarg.h" 1 3 4
-# 21 "/workspace/acl/lib_fiber/c/src/stdafx.h" 2
+
+
+# 20 "/acl/lib_fiber/c/src/stdafx.h" 2
+# 1 "/usr/lib/gcc/aarch64-linux-gnu/11/include/stdarg.h" 1 3 4
+# 21 "/acl/lib_fiber/c/src/stdafx.h" 2
 # 1 "/usr/include/time.h" 1 3 4
 # 29 "/usr/include/time.h" 3 4
-# 1 "/usr/lib/gcc/x86_64-linux-gnu/7/include/stddef.h" 1 3 4
+# 1 "/usr/lib/gcc/aarch64-linux-gnu/11/include/stddef.h" 1 3 4
 # 30 "/usr/include/time.h" 2 3 4
 
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/time.h" 1 3 4
-# 73 "/usr/include/x86_64-linux-gnu/bits/time.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/timex.h" 1 3 4
-# 26 "/usr/include/x86_64-linux-gnu/bits/timex.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/time.h" 1 3 4
+# 73 "/usr/include/aarch64-linux-gnu/bits/time.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/timex.h" 1 3 4
+# 26 "/usr/include/aarch64-linux-gnu/bits/timex.h" 3 4
 struct timex
 {
+# 58 "/usr/include/aarch64-linux-gnu/bits/timex.h" 3 4
   unsigned int modes;
   __syscall_slong_t offset;
   __syscall_slong_t freq;
@@ -2963,14 +2934,15 @@ struct timex
   int :32; int :32; int :32; int :32;
   int :32; int :32; int :32; int :32;
   int :32; int :32; int :32;
+
 };
-# 74 "/usr/include/x86_64-linux-gnu/bits/time.h" 2 3 4
+# 74 "/usr/include/aarch64-linux-gnu/bits/time.h" 2 3 4
 
 
 
 
 extern int clock_adjtime (__clockid_t __clock_id, struct timex *__utx) __attribute__ ((__nothrow__ , __leaf__));
-
+# 90 "/usr/include/aarch64-linux-gnu/bits/time.h" 3 4
 
 # 34 "/usr/include/time.h" 2 3 4
 
@@ -2978,7 +2950,7 @@ extern int clock_adjtime (__clockid_t __clock_id, struct timex *__utx) __attribu
 
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/types/struct_tm.h" 1 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/types/struct_tm.h" 1 3 4
 
 
 
@@ -3007,7 +2979,7 @@ struct tm
 };
 # 40 "/usr/include/time.h" 2 3 4
 # 48 "/usr/include/time.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/types/struct_itimerspec.h" 1 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/types/struct_itimerspec.h" 1 3 4
 
 
 
@@ -3030,6 +3002,7 @@ struct sigevent;
 extern clock_t clock (void) __attribute__ ((__nothrow__ , __leaf__));
 
 
+
 extern time_t time (time_t *__timer) __attribute__ ((__nothrow__ , __leaf__));
 
 
@@ -3038,11 +3011,7 @@ extern double difftime (time_t __time1, time_t __time0)
 
 
 extern time_t mktime (struct tm *__tp) __attribute__ ((__nothrow__ , __leaf__));
-
-
-
-
-
+# 100 "/usr/include/time.h" 3 4
 extern size_t strftime (char *__restrict __s, size_t __maxsize,
    const char *__restrict __format,
    const struct tm *__restrict __tp) __attribute__ ((__nothrow__ , __leaf__));
@@ -3074,15 +3043,13 @@ extern char *strptime_l (const char *__restrict __s,
 
 
 
+
 extern struct tm *gmtime (const time_t *__timer) __attribute__ ((__nothrow__ , __leaf__));
 
 
 
 extern struct tm *localtime (const time_t *__timer) __attribute__ ((__nothrow__ , __leaf__));
-
-
-
-
+# 154 "/usr/include/time.h" 3 4
 extern struct tm *gmtime_r (const time_t *__restrict __timer,
        struct tm *__restrict __tp) __attribute__ ((__nothrow__ , __leaf__));
 
@@ -3090,30 +3057,21 @@ extern struct tm *gmtime_r (const time_t *__restrict __timer,
 
 extern struct tm *localtime_r (const time_t *__restrict __timer,
           struct tm *__restrict __tp) __attribute__ ((__nothrow__ , __leaf__));
-
-
-
-
+# 179 "/usr/include/time.h" 3 4
 extern char *asctime (const struct tm *__tp) __attribute__ ((__nothrow__ , __leaf__));
 
 
+
 extern char *ctime (const time_t *__timer) __attribute__ ((__nothrow__ , __leaf__));
-
-
-
-
-
-
+# 197 "/usr/include/time.h" 3 4
 extern char *asctime_r (const struct tm *__restrict __tp,
    char *__restrict __buf) __attribute__ ((__nothrow__ , __leaf__));
 
 
+
 extern char *ctime_r (const time_t *__restrict __timer,
         char *__restrict __buf) __attribute__ ((__nothrow__ , __leaf__));
-
-
-
-
+# 217 "/usr/include/time.h" 3 4
 extern char *__tzname[2];
 extern int __daylight;
 extern long int __timezone;
@@ -3131,24 +3089,15 @@ extern void tzset (void) __attribute__ ((__nothrow__ , __leaf__));
 
 extern int daylight;
 extern long int timezone;
-
-
-
-
-
-extern int stime (const time_t *__when) __attribute__ ((__nothrow__ , __leaf__));
-# 196 "/usr/include/time.h" 3 4
+# 249 "/usr/include/time.h" 3 4
 extern time_t timegm (struct tm *__tp) __attribute__ ((__nothrow__ , __leaf__));
 
-
 extern time_t timelocal (struct tm *__tp) __attribute__ ((__nothrow__ , __leaf__));
-
-
+# 262 "/usr/include/time.h" 3 4
 extern int dysize (int __year) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__const__));
-# 211 "/usr/include/time.h" 3 4
+# 272 "/usr/include/time.h" 3 4
 extern int nanosleep (const struct timespec *__requested_time,
         struct timespec *__remaining);
-
 
 
 extern int clock_getres (clockid_t __clock_id, struct timespec *__res) __attribute__ ((__nothrow__ , __leaf__));
@@ -3159,17 +3108,11 @@ extern int clock_gettime (clockid_t __clock_id, struct timespec *__tp) __attribu
 
 extern int clock_settime (clockid_t __clock_id, const struct timespec *__tp)
      __attribute__ ((__nothrow__ , __leaf__));
-
-
-
-
-
-
+# 311 "/usr/include/time.h" 3 4
 extern int clock_nanosleep (clockid_t __clock_id, int __flags,
        const struct timespec *__req,
        struct timespec *__rem);
-
-
+# 326 "/usr/include/time.h" 3 4
 extern int clock_getcpuclockid (pid_t __pid, clockid_t *__clock_id) __attribute__ ((__nothrow__ , __leaf__));
 
 
@@ -3183,6 +3126,7 @@ extern int timer_create (clockid_t __clock_id,
 extern int timer_delete (timer_t __timerid) __attribute__ ((__nothrow__ , __leaf__));
 
 
+
 extern int timer_settime (timer_t __timerid, int __flags,
      const struct itimerspec *__restrict __value,
      struct itimerspec *__restrict __ovalue) __attribute__ ((__nothrow__ , __leaf__));
@@ -3190,9 +3134,9 @@ extern int timer_settime (timer_t __timerid, int __flags,
 
 extern int timer_gettime (timer_t __timerid, struct itimerspec *__value)
      __attribute__ ((__nothrow__ , __leaf__));
-
-
+# 364 "/usr/include/time.h" 3 4
 extern int timer_getoverrun (timer_t __timerid) __attribute__ ((__nothrow__ , __leaf__));
+
 
 
 
@@ -3200,17 +3144,20 @@ extern int timer_getoverrun (timer_t __timerid) __attribute__ ((__nothrow__ , __
 
 extern int timespec_get (struct timespec *__ts, int __base)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)));
-# 280 "/usr/include/time.h" 3 4
+# 387 "/usr/include/time.h" 3 4
+extern int timespec_getres (struct timespec *__ts, int __base)
+     __attribute__ ((__nothrow__ , __leaf__));
+# 413 "/usr/include/time.h" 3 4
 extern int getdate_err;
-# 289 "/usr/include/time.h" 3 4
+# 422 "/usr/include/time.h" 3 4
 extern struct tm *getdate (const char *__string);
-# 303 "/usr/include/time.h" 3 4
+# 436 "/usr/include/time.h" 3 4
 extern int getdate_r (const char *__restrict __string,
         struct tm *__restrict __resbufp);
 
 
 
-# 22 "/workspace/acl/lib_fiber/c/src/stdafx.h" 2
+# 22 "/acl/lib_fiber/c/src/stdafx.h" 2
 # 1 "/usr/include/ctype.h" 1 3 4
 # 28 "/usr/include/ctype.h" 3 4
 
@@ -3319,7 +3266,7 @@ extern int __toupper_l (int __c, locale_t __l) __attribute__ ((__nothrow__ , __l
 extern int toupper_l (int __c, locale_t __l) __attribute__ ((__nothrow__ , __leaf__));
 # 327 "/usr/include/ctype.h" 3 4
 
-# 23 "/workspace/acl/lib_fiber/c/src/stdafx.h" 2
+# 23 "/acl/lib_fiber/c/src/stdafx.h" 2
 # 1 "/usr/include/assert.h" 1 3 4
 # 66 "/usr/include/assert.h" 3 4
 
@@ -3342,10 +3289,10 @@ extern void __assert (const char *__assertion, const char *__file, int __line)
 
 
 
-# 24 "/workspace/acl/lib_fiber/c/src/stdafx.h" 2
+# 24 "/acl/lib_fiber/c/src/stdafx.h" 2
 # 1 "/usr/include/string.h" 1 3 4
 # 26 "/usr/include/string.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/libc-header-start.h" 1 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/libc-header-start.h" 1 3 4
 # 27 "/usr/include/string.h" 2 3 4
 
 
@@ -3353,9 +3300,9 @@ extern void __assert (const char *__assertion, const char *__file, int __line)
 
 
 
-# 1 "/usr/lib/gcc/x86_64-linux-gnu/7/include/stddef.h" 1 3 4
+# 1 "/usr/lib/gcc/aarch64-linux-gnu/11/include/stddef.h" 1 3 4
 # 34 "/usr/include/string.h" 2 3 4
-# 42 "/usr/include/string.h" 3 4
+# 43 "/usr/include/string.h" 3 4
 extern void *memcpy (void *__restrict __dest, const void *__restrict __src,
        size_t __n) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1, 2)));
 
@@ -3369,7 +3316,7 @@ extern void *memmove (void *__dest, const void *__src, size_t __n)
 
 extern void *memccpy (void *__restrict __dest, const void *__restrict __src,
         int __c, size_t __n)
-     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1, 2)));
+    __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1, 2))) __attribute__ ((__access__ (__write_only__, 1, 4)));
 
 
 
@@ -3379,15 +3326,19 @@ extern void *memset (void *__s, int __c, size_t __n) __attribute__ ((__nothrow__
 
 extern int memcmp (const void *__s1, const void *__s2, size_t __n)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__pure__)) __attribute__ ((__nonnull__ (1, 2)));
-# 90 "/usr/include/string.h" 3 4
+# 80 "/usr/include/string.h" 3 4
+extern int __memcmpeq (const void *__s1, const void *__s2, size_t __n)
+     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__pure__)) __attribute__ ((__nonnull__ (1, 2)));
+# 107 "/usr/include/string.h" 3 4
 extern void *memchr (const void *__s, int __c, size_t __n)
       __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__pure__)) __attribute__ ((__nonnull__ (1)));
-# 103 "/usr/include/string.h" 3 4
+# 120 "/usr/include/string.h" 3 4
 extern void *rawmemchr (const void *__s, int __c)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__pure__)) __attribute__ ((__nonnull__ (1)));
-# 114 "/usr/include/string.h" 3 4
+# 133 "/usr/include/string.h" 3 4
 extern void *memrchr (const void *__s, int __c, size_t __n)
-      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__pure__)) __attribute__ ((__nonnull__ (1)));
+      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__pure__)) __attribute__ ((__nonnull__ (1)))
+      __attribute__ ((__access__ (__read_only__, 1, 3)));
 
 
 
@@ -3420,7 +3371,7 @@ extern int strcoll (const char *__s1, const char *__s2)
 
 extern size_t strxfrm (char *__restrict __dest,
          const char *__restrict __src, size_t __n)
-     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (2)));
+    __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (2))) __attribute__ ((__access__ (__write_only__, 1, 3)));
 
 
 
@@ -3432,7 +3383,8 @@ extern int strcoll_l (const char *__s1, const char *__s2, locale_t __l)
 
 
 extern size_t strxfrm_l (char *__dest, const char *__src, size_t __n,
-    locale_t __l) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (2, 4)));
+    locale_t __l) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (2, 4)))
+     __attribute__ ((__access__ (__write_only__, 1, 3)));
 
 
 
@@ -3448,13 +3400,13 @@ extern char *strdup (const char *__s)
 
 extern char *strndup (const char *__string, size_t __n)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__malloc__)) __attribute__ ((__nonnull__ (1)));
-# 225 "/usr/include/string.h" 3 4
+# 246 "/usr/include/string.h" 3 4
 extern char *strchr (const char *__s, int __c)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__pure__)) __attribute__ ((__nonnull__ (1)));
-# 252 "/usr/include/string.h" 3 4
+# 273 "/usr/include/string.h" 3 4
 extern char *strrchr (const char *__s, int __c)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__pure__)) __attribute__ ((__nonnull__ (1)));
-# 265 "/usr/include/string.h" 3 4
+# 286 "/usr/include/string.h" 3 4
 extern char *strchrnul (const char *__s, int __c)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__pure__)) __attribute__ ((__nonnull__ (1)));
 
@@ -3468,10 +3420,10 @@ extern size_t strcspn (const char *__s, const char *__reject)
 
 extern size_t strspn (const char *__s, const char *__accept)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__pure__)) __attribute__ ((__nonnull__ (1, 2)));
-# 302 "/usr/include/string.h" 3 4
+# 323 "/usr/include/string.h" 3 4
 extern char *strpbrk (const char *__s, const char *__accept)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__pure__)) __attribute__ ((__nonnull__ (1, 2)));
-# 329 "/usr/include/string.h" 3 4
+# 350 "/usr/include/string.h" 3 4
 extern char *strstr (const char *__haystack, const char *__needle)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__pure__)) __attribute__ ((__nonnull__ (1, 2)));
 
@@ -3491,7 +3443,7 @@ extern char *__strtok_r (char *__restrict __s,
 extern char *strtok_r (char *__restrict __s, const char *__restrict __delim,
          char **__restrict __save_ptr)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (2, 3)));
-# 359 "/usr/include/string.h" 3 4
+# 380 "/usr/include/string.h" 3 4
 extern char *strcasestr (const char *__haystack, const char *__needle)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__pure__)) __attribute__ ((__nonnull__ (1, 2)));
 
@@ -3503,7 +3455,9 @@ extern char *strcasestr (const char *__haystack, const char *__needle)
 
 extern void *memmem (const void *__haystack, size_t __haystacklen,
        const void *__needle, size_t __needlelen)
-     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__pure__)) __attribute__ ((__nonnull__ (1, 3)));
+     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__pure__)) __attribute__ ((__nonnull__ (1, 3)))
+    __attribute__ ((__access__ (__read_only__, 1, 2)))
+    __attribute__ ((__access__ (__read_only__, 3, 4)));
 
 
 
@@ -3530,9 +3484,16 @@ extern size_t strnlen (const char *__string, size_t __maxlen)
 
 
 extern char *strerror (int __errnum) __attribute__ ((__nothrow__ , __leaf__));
-# 420 "/usr/include/string.h" 3 4
+# 444 "/usr/include/string.h" 3 4
 extern char *strerror_r (int __errnum, char *__buf, size_t __buflen)
-     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (2))) __attribute__ ((__warn_unused_result__));
+     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (2))) __attribute__ ((__warn_unused_result__)) __attribute__ ((__access__ (__write_only__, 2, 3)));
+
+
+
+
+extern const char *strerrordesc_np (int __err) __attribute__ ((__nothrow__ , __leaf__));
+
+extern const char *strerrorname_np (int __err) __attribute__ ((__nothrow__ , __leaf__));
 
 
 
@@ -3544,7 +3505,7 @@ extern char *strerror_l (int __errnum, locale_t __l) __attribute__ ((__nothrow__
 
 # 1 "/usr/include/strings.h" 1 3 4
 # 23 "/usr/include/strings.h" 3 4
-# 1 "/usr/lib/gcc/x86_64-linux-gnu/7/include/stddef.h" 1 3 4
+# 1 "/usr/lib/gcc/aarch64-linux-gnu/11/include/stddef.h" 1 3 4
 # 24 "/usr/include/strings.h" 2 3 4
 
 
@@ -3617,25 +3578,28 @@ extern int strncasecmp_l (const char *__s1, const char *__s2,
 
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/strings_fortified.h" 1 3 4
-# 22 "/usr/include/x86_64-linux-gnu/bits/strings_fortified.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/strings_fortified.h" 1 3 4
+# 22 "/usr/include/aarch64-linux-gnu/bits/strings_fortified.h" 3 4
 extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline__)) __attribute__ ((__artificial__)) void
 __attribute__ ((__nothrow__ , __leaf__)) bcopy (const void *__src, void *__dest, size_t __len)
 {
-  (void) __builtin___memmove_chk (__dest, __src, __len, __builtin_object_size (__dest, 0));
+  (void) __builtin___memmove_chk (__dest, __src, __len,
+      __builtin_object_size (__dest, 0));
 }
 
 extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline__)) __attribute__ ((__artificial__)) void
 __attribute__ ((__nothrow__ , __leaf__)) bzero (void *__dest, size_t __len)
 {
-  (void) __builtin___memset_chk (__dest, '\0', __len, __builtin_object_size (__dest, 0));
+  (void) __builtin___memset_chk (__dest, '\0', __len,
+     __builtin_object_size (__dest, 0));
 }
 # 145 "/usr/include/strings.h" 2 3 4
-# 432 "/usr/include/string.h" 2 3 4
+# 463 "/usr/include/string.h" 2 3 4
 
 
 
-extern void explicit_bzero (void *__s, size_t __n) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)));
+extern void explicit_bzero (void *__s, size_t __n) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)))
+    __attribute__ ((__access__ (__write_only__, 1, 2)));
 
 
 
@@ -3647,6 +3611,14 @@ extern char *strsep (char **__restrict __stringp,
 
 
 extern char *strsignal (int __sig) __attribute__ ((__nothrow__ , __leaf__));
+
+
+
+extern const char *sigabbrev_np (int __sig) __attribute__ ((__nothrow__ , __leaf__));
+
+
+extern const char *sigdescr_np (int __sig) __attribute__ ((__nothrow__ , __leaf__));
+
 
 
 extern char *__stpcpy (char *__restrict __dest, const char *__restrict __src)
@@ -3673,8 +3645,9 @@ extern int strverscmp (const char *__s1, const char *__s2)
 extern char *strfry (char *__string) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)));
 
 
-extern void *memfrob (void *__s, size_t __n) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)));
-# 486 "/usr/include/string.h" 3 4
+extern void *memfrob (void *__s, size_t __n) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)))
+    __attribute__ ((__access__ (__read_write__, 1, 2)));
+# 527 "/usr/include/string.h" 3 4
 extern char *basename (const char *__filename) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)));
 
 
@@ -3683,19 +3656,21 @@ extern char *basename (const char *__filename) __attribute__ ((__nothrow__ , __l
 
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/string_fortified.h" 1 3 4
-# 30 "/usr/include/x86_64-linux-gnu/bits/string_fortified.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/string_fortified.h" 1 3 4
+# 25 "/usr/include/aarch64-linux-gnu/bits/string_fortified.h" 3 4
 extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline__)) __attribute__ ((__artificial__)) void *
 __attribute__ ((__nothrow__ , __leaf__)) memcpy (void *__restrict __dest, const void *__restrict __src, size_t __len)
 
 {
-  return __builtin___memcpy_chk (__dest, __src, __len, __builtin_object_size (__dest, 0));
+  return __builtin___memcpy_chk (__dest, __src, __len,
+     __builtin_object_size (__dest, 0));
 }
 
 extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline__)) __attribute__ ((__artificial__)) void *
 __attribute__ ((__nothrow__ , __leaf__)) memmove (void *__dest, const void *__src, size_t __len)
 {
-  return __builtin___memmove_chk (__dest, __src, __len, __builtin_object_size (__dest, 0));
+  return __builtin___memmove_chk (__dest, __src, __len,
+      __builtin_object_size (__dest, 0));
 }
 
 
@@ -3703,21 +3678,22 @@ extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline
 __attribute__ ((__nothrow__ , __leaf__)) mempcpy (void *__restrict __dest, const void *__restrict __src, size_t __len)
 
 {
-  return __builtin___mempcpy_chk (__dest, __src, __len, __builtin_object_size (__dest, 0));
+  return __builtin___mempcpy_chk (__dest, __src, __len,
+      __builtin_object_size (__dest, 0));
 }
-# 58 "/usr/include/x86_64-linux-gnu/bits/string_fortified.h" 3 4
+# 56 "/usr/include/aarch64-linux-gnu/bits/string_fortified.h" 3 4
 extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline__)) __attribute__ ((__artificial__)) void *
 __attribute__ ((__nothrow__ , __leaf__)) memset (void *__dest, int __ch, size_t __len)
 {
-# 71 "/usr/include/x86_64-linux-gnu/bits/string_fortified.h" 3 4
-  return __builtin___memset_chk (__dest, __ch, __len, __builtin_object_size (__dest, 0));
+  return __builtin___memset_chk (__dest, __ch, __len,
+     __builtin_object_size (__dest, 0));
 }
 
 
 
 
 void __explicit_bzero_chk (void *__dest, size_t __len, size_t __destlen)
-  __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)));
+  __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1))) __attribute__ ((__access__ (__write_only__, 1, 2)));
 
 extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline__)) __attribute__ ((__artificial__)) void
 __attribute__ ((__nothrow__ , __leaf__)) explicit_bzero (void *__dest, size_t __len)
@@ -3745,25 +3721,19 @@ extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline
 __attribute__ ((__nothrow__ , __leaf__)) strncpy (char *__restrict __dest, const char *__restrict __src, size_t __len)
 
 {
-  return __builtin___strncpy_chk (__dest, __src, __len, __builtin_object_size (__dest, 2 > 1));
+  return __builtin___strncpy_chk (__dest, __src, __len,
+      __builtin_object_size (__dest, 2 > 1));
 }
 
 
-extern char *__stpncpy_chk (char *__dest, const char *__src, size_t __n,
-       size_t __destlen) __attribute__ ((__nothrow__ , __leaf__));
-extern char *__stpncpy_alias (char *__dest, const char *__src, size_t __n) __asm__ ("" "stpncpy") __attribute__ ((__nothrow__ , __leaf__))
-                                 ;
 
 extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline__)) __attribute__ ((__artificial__)) char *
 __attribute__ ((__nothrow__ , __leaf__)) stpncpy (char *__dest, const char *__src, size_t __n)
 {
-  if (__builtin_object_size (__dest, 2 > 1) != (size_t) -1
-      && (!__builtin_constant_p (__n) || __n > __builtin_object_size (__dest, 2 > 1)))
-    return __stpncpy_chk (__dest, __src, __n, __builtin_object_size (__dest, 2 > 1));
-  return __stpncpy_alias (__dest, __src, __n);
+  return __builtin___stpncpy_chk (__dest, __src, __n,
+      __builtin_object_size (__dest, 2 > 1));
 }
-
-
+# 127 "/usr/include/aarch64-linux-gnu/bits/string_fortified.h" 3 4
 extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline__)) __attribute__ ((__artificial__)) char *
 __attribute__ ((__nothrow__ , __leaf__)) strcat (char *__restrict __dest, const char *__restrict __src)
 {
@@ -3775,20 +3745,21 @@ extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline
 __attribute__ ((__nothrow__ , __leaf__)) strncat (char *__restrict __dest, const char *__restrict __src, size_t __len)
 
 {
-  return __builtin___strncat_chk (__dest, __src, __len, __builtin_object_size (__dest, 2 > 1));
+  return __builtin___strncat_chk (__dest, __src, __len,
+      __builtin_object_size (__dest, 2 > 1));
 }
-# 495 "/usr/include/string.h" 2 3 4
+# 536 "/usr/include/string.h" 2 3 4
 
 
 
 
-# 25 "/workspace/acl/lib_fiber/c/src/stdafx.h" 2
+# 25 "/acl/lib_fiber/c/src/stdafx.h" 2
 # 1 "/usr/include/errno.h" 1 3 4
 # 28 "/usr/include/errno.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/errno.h" 1 3 4
-# 26 "/usr/include/x86_64-linux-gnu/bits/errno.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/errno.h" 1 3 4
+# 26 "/usr/include/aarch64-linux-gnu/bits/errno.h" 3 4
 # 1 "/usr/include/linux/errno.h" 1 3 4
-# 1 "/usr/include/x86_64-linux-gnu/asm/errno.h" 1 3 4
+# 1 "/usr/include/aarch64-linux-gnu/asm/errno.h" 1 3 4
 # 1 "/usr/include/asm-generic/errno.h" 1 3 4
 
 
@@ -3796,9 +3767,9 @@ __attribute__ ((__nothrow__ , __leaf__)) strncat (char *__restrict __dest, const
 
 # 1 "/usr/include/asm-generic/errno-base.h" 1 3 4
 # 6 "/usr/include/asm-generic/errno.h" 2 3 4
-# 1 "/usr/include/x86_64-linux-gnu/asm/errno.h" 2 3 4
-# 1 "/usr/include/linux/errno.h" 2 3 4
-# 27 "/usr/include/x86_64-linux-gnu/bits/errno.h" 2 3 4
+# 2 "/usr/include/aarch64-linux-gnu/asm/errno.h" 2 3 4
+# 2 "/usr/include/linux/errno.h" 2 3 4
+# 27 "/usr/include/aarch64-linux-gnu/bits/errno.h" 2 3 4
 # 29 "/usr/include/errno.h" 2 3 4
 
 
@@ -3819,17 +3790,15 @@ extern int *__errno_location (void) __attribute__ ((__nothrow__ , __leaf__)) __a
 extern char *program_invocation_name;
 extern char *program_invocation_short_name;
 
-
-
-
-
+# 1 "/usr/include/aarch64-linux-gnu/bits/types/error_t.h" 1 3 4
+# 22 "/usr/include/aarch64-linux-gnu/bits/types/error_t.h" 3 4
 typedef int error_t;
+# 49 "/usr/include/errno.h" 2 3 4
 
 
 
 
-
-# 26 "/workspace/acl/lib_fiber/c/src/stdafx.h" 2
+# 26 "/acl/lib_fiber/c/src/stdafx.h" 2
 # 1 "/usr/include/fcntl.h" 1 3 4
 # 28 "/usr/include/fcntl.h" 3 4
 
@@ -3839,19 +3808,14 @@ typedef int error_t;
 
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/fcntl.h" 1 3 4
-# 35 "/usr/include/x86_64-linux-gnu/bits/fcntl.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/fcntl.h" 1 3 4
+# 40 "/usr/include/aarch64-linux-gnu/bits/fcntl.h" 3 4
 struct flock
   {
     short int l_type;
     short int l_whence;
-
     __off_t l_start;
     __off_t l_len;
-
-
-
-
     __pid_t l_pid;
   };
 
@@ -3867,12 +3831,12 @@ struct flock64
 
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/fcntl-linux.h" 1 3 4
-# 38 "/usr/include/x86_64-linux-gnu/bits/fcntl-linux.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/types/struct_iovec.h" 1 3 4
-# 23 "/usr/include/x86_64-linux-gnu/bits/types/struct_iovec.h" 3 4
-# 1 "/usr/lib/gcc/x86_64-linux-gnu/7/include/stddef.h" 1 3 4
-# 24 "/usr/include/x86_64-linux-gnu/bits/types/struct_iovec.h" 2 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/fcntl-linux.h" 1 3 4
+# 38 "/usr/include/aarch64-linux-gnu/bits/fcntl-linux.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/types/struct_iovec.h" 1 3 4
+# 23 "/usr/include/aarch64-linux-gnu/bits/types/struct_iovec.h" 3 4
+# 1 "/usr/lib/gcc/aarch64-linux-gnu/11/include/stddef.h" 1 3 4
+# 24 "/usr/include/aarch64-linux-gnu/bits/types/struct_iovec.h" 2 3 4
 
 
 struct iovec
@@ -3880,8 +3844,8 @@ struct iovec
     void *iov_base;
     size_t iov_len;
   };
-# 39 "/usr/include/x86_64-linux-gnu/bits/fcntl-linux.h" 2 3 4
-# 265 "/usr/include/x86_64-linux-gnu/bits/fcntl-linux.h" 3 4
+# 39 "/usr/include/aarch64-linux-gnu/bits/fcntl-linux.h" 2 3 4
+# 265 "/usr/include/aarch64-linux-gnu/bits/fcntl-linux.h" 3 4
 enum __pid_type
   {
     F_OWNER_TID = 0,
@@ -3896,9 +3860,9 @@ struct f_owner_ex
     enum __pid_type type;
     __pid_t pid;
   };
-# 346 "/usr/include/x86_64-linux-gnu/bits/fcntl-linux.h" 3 4
+# 354 "/usr/include/aarch64-linux-gnu/bits/fcntl-linux.h" 3 4
 # 1 "/usr/include/linux/falloc.h" 1 3 4
-# 347 "/usr/include/x86_64-linux-gnu/bits/fcntl-linux.h" 2 3 4
+# 355 "/usr/include/aarch64-linux-gnu/bits/fcntl-linux.h" 2 3 4
 
 
 
@@ -3909,7 +3873,7 @@ struct file_handle
 
   unsigned char f_handle[0];
 };
-# 380 "/usr/include/x86_64-linux-gnu/bits/fcntl-linux.h" 3 4
+# 393 "/usr/include/aarch64-linux-gnu/bits/fcntl-linux.h" 3 4
 
 
 
@@ -3955,7 +3919,7 @@ extern __ssize_t tee (int __fdin, int __fdout, size_t __len,
 
 
 extern int fallocate (int __fd, int __mode, __off_t __offset, __off_t __len);
-# 435 "/usr/include/x86_64-linux-gnu/bits/fcntl-linux.h" 3 4
+# 448 "/usr/include/aarch64-linux-gnu/bits/fcntl-linux.h" 3 4
 extern int fallocate64 (int __fd, int __mode, __off64_t __offset,
    __off64_t __len);
 
@@ -3976,82 +3940,60 @@ extern int open_by_handle_at (int __mountdirfd, struct file_handle *__handle,
 
 
 
-# 61 "/usr/include/x86_64-linux-gnu/bits/fcntl.h" 2 3 4
+# 62 "/usr/include/aarch64-linux-gnu/bits/fcntl.h" 2 3 4
 # 36 "/usr/include/fcntl.h" 2 3 4
 # 78 "/usr/include/fcntl.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/stat.h" 1 3 4
-# 46 "/usr/include/x86_64-linux-gnu/bits/stat.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/stat.h" 1 3 4
+# 25 "/usr/include/aarch64-linux-gnu/bits/stat.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/struct_stat.h" 1 3 4
+# 27 "/usr/include/aarch64-linux-gnu/bits/struct_stat.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/wordsize.h" 1 3 4
+# 28 "/usr/include/aarch64-linux-gnu/bits/struct_stat.h" 2 3 4
+# 44 "/usr/include/aarch64-linux-gnu/bits/struct_stat.h" 3 4
 struct stat
   {
     __dev_t st_dev;
-
-
-
-
     __ino_t st_ino;
-
-
-
-
-
-
-
-    __nlink_t st_nlink;
     __mode_t st_mode;
-
+    __nlink_t st_nlink;
     __uid_t st_uid;
     __gid_t st_gid;
-
-    int __pad0;
-
     __dev_t st_rdev;
-
-
-
-
+    __dev_t __pad1;
     __off_t st_size;
-
-
-
     __blksize_t st_blksize;
-
+    int __pad2;
     __blkcnt_t st_blocks;
-# 91 "/usr/include/x86_64-linux-gnu/bits/stat.h" 3 4
+
+
+
+
+
+
+
     struct timespec st_atim;
     struct timespec st_mtim;
     struct timespec st_ctim;
-# 106 "/usr/include/x86_64-linux-gnu/bits/stat.h" 3 4
-    __syscall_slong_t __glibc_reserved[3];
-# 115 "/usr/include/x86_64-linux-gnu/bits/stat.h" 3 4
+# 79 "/usr/include/aarch64-linux-gnu/bits/struct_stat.h" 3 4
+    int __glibc_reserved[2];
   };
+
 
 
 
 struct stat64
   {
     __dev_t st_dev;
-
     __ino64_t st_ino;
-    __nlink_t st_nlink;
     __mode_t st_mode;
-
-
-
-
-
-
+    __nlink_t st_nlink;
     __uid_t st_uid;
     __gid_t st_gid;
-
-    int __pad0;
     __dev_t st_rdev;
-    __off_t st_size;
-
-
-
-
-
+    __dev_t __pad1;
+    __off64_t st_size;
     __blksize_t st_blksize;
+    int __pad2;
     __blkcnt64_t st_blocks;
 
 
@@ -4063,32 +4005,32 @@ struct stat64
     struct timespec st_atim;
     struct timespec st_mtim;
     struct timespec st_ctim;
-# 164 "/usr/include/x86_64-linux-gnu/bits/stat.h" 3 4
-    __syscall_slong_t __glibc_reserved[3];
-
-
-
+# 117 "/usr/include/aarch64-linux-gnu/bits/struct_stat.h" 3 4
+    int __glibc_reserved[2];
   };
+# 26 "/usr/include/aarch64-linux-gnu/bits/stat.h" 2 3 4
 # 79 "/usr/include/fcntl.h" 2 3 4
-# 147 "/usr/include/fcntl.h" 3 4
+# 149 "/usr/include/fcntl.h" 3 4
 extern int fcntl (int __fd, int __cmd, ...);
-# 157 "/usr/include/fcntl.h" 3 4
-extern int open (const char *__file, int __oflag, ...) __attribute__ ((__nonnull__ (1)));
-# 167 "/usr/include/fcntl.h" 3 4
-extern int open64 (const char *__file, int __oflag, ...) __attribute__ ((__nonnull__ (1)));
+# 158 "/usr/include/fcntl.h" 3 4
+extern int fcntl64 (int __fd, int __cmd, ...);
 # 181 "/usr/include/fcntl.h" 3 4
+extern int open (const char *__file, int __oflag, ...) __attribute__ ((__nonnull__ (1)));
+# 191 "/usr/include/fcntl.h" 3 4
+extern int open64 (const char *__file, int __oflag, ...) __attribute__ ((__nonnull__ (1)));
+# 205 "/usr/include/fcntl.h" 3 4
 extern int openat (int __fd, const char *__file, int __oflag, ...)
      __attribute__ ((__nonnull__ (2)));
-# 192 "/usr/include/fcntl.h" 3 4
+# 216 "/usr/include/fcntl.h" 3 4
 extern int openat64 (int __fd, const char *__file, int __oflag, ...)
      __attribute__ ((__nonnull__ (2)));
-# 203 "/usr/include/fcntl.h" 3 4
+# 227 "/usr/include/fcntl.h" 3 4
 extern int creat (const char *__file, mode_t __mode) __attribute__ ((__nonnull__ (1)));
-# 213 "/usr/include/fcntl.h" 3 4
+# 237 "/usr/include/fcntl.h" 3 4
 extern int creat64 (const char *__file, mode_t __mode) __attribute__ ((__nonnull__ (1)));
-# 232 "/usr/include/fcntl.h" 3 4
+# 256 "/usr/include/fcntl.h" 3 4
 extern int lockf (int __fd, int __cmd, off_t __len);
-# 241 "/usr/include/fcntl.h" 3 4
+# 265 "/usr/include/fcntl.h" 3 4
 extern int lockf64 (int __fd, int __cmd, off64_t __len);
 
 
@@ -4099,12 +4041,12 @@ extern int lockf64 (int __fd, int __cmd, off64_t __len);
 
 extern int posix_fadvise (int __fd, off_t __offset, off_t __len,
      int __advise) __attribute__ ((__nothrow__ , __leaf__));
-# 261 "/usr/include/fcntl.h" 3 4
+# 285 "/usr/include/fcntl.h" 3 4
 extern int posix_fadvise64 (int __fd, off64_t __offset, off64_t __len,
        int __advise) __attribute__ ((__nothrow__ , __leaf__));
-# 271 "/usr/include/fcntl.h" 3 4
+# 295 "/usr/include/fcntl.h" 3 4
 extern int posix_fallocate (int __fd, off_t __offset, off_t __len);
-# 282 "/usr/include/fcntl.h" 3 4
+# 306 "/usr/include/fcntl.h" 3 4
 extern int posix_fallocate64 (int __fd, off64_t __offset, off64_t __len);
 
 
@@ -4113,8 +4055,8 @@ extern int posix_fallocate64 (int __fd, off64_t __offset, off64_t __len);
 
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/fcntl2.h" 1 3 4
-# 26 "/usr/include/x86_64-linux-gnu/bits/fcntl2.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/fcntl2.h" 1 3 4
+# 26 "/usr/include/aarch64-linux-gnu/bits/fcntl2.h" 3 4
 extern int __open_2 (const char *__path, int __oflag) __attribute__ ((__nonnull__ (1)));
 extern int __open_alias (const char *__path, int __oflag, ...) __asm__ ("" "open")
                __attribute__ ((__nonnull__ (1)));
@@ -4137,7 +4079,7 @@ open (const char *__path, int __oflag, ...)
 
   if (__builtin_constant_p (__oflag))
     {
-      if ((((__oflag) & 0100) != 0 || ((__oflag) & (020000000 | 0200000)) == (020000000 | 0200000)) && __builtin_va_arg_pack_len () < 1)
+      if ((((__oflag) & 0100) != 0 || ((__oflag) & (020000000 | 040000)) == (020000000 | 040000)) && __builtin_va_arg_pack_len () < 1)
  {
    __open_missing_mode ();
    return __open_2 (__path, __oflag);
@@ -4169,7 +4111,7 @@ open64 (const char *__path, int __oflag, ...)
 
   if (__builtin_constant_p (__oflag))
     {
-      if ((((__oflag) & 0100) != 0 || ((__oflag) & (020000000 | 0200000)) == (020000000 | 0200000)) && __builtin_va_arg_pack_len () < 1)
+      if ((((__oflag) & 0100) != 0 || ((__oflag) & (020000000 | 040000)) == (020000000 | 040000)) && __builtin_va_arg_pack_len () < 1)
  {
    __open64_missing_mode ();
    return __open64_2 (__path, __oflag);
@@ -4192,7 +4134,7 @@ extern int __openat_2 (int __fd, const char *__path, int __oflag)
 extern int __openat_alias (int __fd, const char *__path, int __oflag, ...) __asm__ ("" "openat")
 
      __attribute__ ((__nonnull__ (2)));
-# 111 "/usr/include/x86_64-linux-gnu/bits/fcntl2.h" 3 4
+# 111 "/usr/include/aarch64-linux-gnu/bits/fcntl2.h" 3 4
 extern void __openat_too_many_args (void) __attribute__((__error__ ("openat can be called either with 3 or 4 arguments, not more")))
                                                                     ;
 extern void __openat_missing_mode (void) __attribute__((__error__ ("openat with O_CREAT or O_TMPFILE in third argument needs 4 arguments")))
@@ -4206,7 +4148,7 @@ openat (int __fd, const char *__path, int __oflag, ...)
 
   if (__builtin_constant_p (__oflag))
     {
-      if ((((__oflag) & 0100) != 0 || ((__oflag) & (020000000 | 0200000)) == (020000000 | 0200000)) && __builtin_va_arg_pack_len () < 1)
+      if ((((__oflag) & 0100) != 0 || ((__oflag) & (020000000 | 040000)) == (020000000 | 040000)) && __builtin_va_arg_pack_len () < 1)
  {
    __openat_missing_mode ();
    return __openat_2 (__fd, __path, __oflag);
@@ -4240,7 +4182,7 @@ openat64 (int __fd, const char *__path, int __oflag, ...)
 
   if (__builtin_constant_p (__oflag))
     {
-      if ((((__oflag) & 0100) != 0 || ((__oflag) & (020000000 | 0200000)) == (020000000 | 0200000)) && __builtin_va_arg_pack_len () < 1)
+      if ((((__oflag) & 0100) != 0 || ((__oflag) & (020000000 | 040000)) == (020000000 | 040000)) && __builtin_va_arg_pack_len () < 1)
  {
    __openat64_missing_mode ();
    return __openat64_2 (__fd, __path, __oflag);
@@ -4253,60 +4195,44 @@ openat64 (int __fd, const char *__path, int __oflag, ...)
 
   return __openat64_alias (__fd, __path, __oflag, __builtin_va_arg_pack ());
 }
-# 291 "/usr/include/fcntl.h" 2 3 4
+# 315 "/usr/include/fcntl.h" 2 3 4
 
 
 
-# 27 "/workspace/acl/lib_fiber/c/src/stdafx.h" 2
-# 1 "/usr/include/x86_64-linux-gnu/sys/stat.h" 1 3 4
-# 99 "/usr/include/x86_64-linux-gnu/sys/stat.h" 3 4
+# 27 "/acl/lib_fiber/c/src/stdafx.h" 2
+# 1 "/usr/include/aarch64-linux-gnu/sys/stat.h" 1 3 4
+# 99 "/usr/include/aarch64-linux-gnu/sys/stat.h" 3 4
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/stat.h" 1 3 4
-# 102 "/usr/include/x86_64-linux-gnu/sys/stat.h" 2 3 4
-# 205 "/usr/include/x86_64-linux-gnu/sys/stat.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/stat.h" 1 3 4
+# 102 "/usr/include/aarch64-linux-gnu/sys/stat.h" 2 3 4
+# 205 "/usr/include/aarch64-linux-gnu/sys/stat.h" 3 4
 extern int stat (const char *__restrict __file,
    struct stat *__restrict __buf) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1, 2)));
 
 
 
 extern int fstat (int __fd, struct stat *__buf) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (2)));
-# 224 "/usr/include/x86_64-linux-gnu/sys/stat.h" 3 4
+# 240 "/usr/include/aarch64-linux-gnu/sys/stat.h" 3 4
 extern int stat64 (const char *__restrict __file,
      struct stat64 *__restrict __buf) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1, 2)));
 extern int fstat64 (int __fd, struct stat64 *__buf) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (2)));
-
-
-
-
-
-
-
+# 264 "/usr/include/aarch64-linux-gnu/sys/stat.h" 3 4
 extern int fstatat (int __fd, const char *__restrict __file,
       struct stat *__restrict __buf, int __flag)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (2, 3)));
-# 249 "/usr/include/x86_64-linux-gnu/sys/stat.h" 3 4
+# 291 "/usr/include/aarch64-linux-gnu/sys/stat.h" 3 4
 extern int fstatat64 (int __fd, const char *__restrict __file,
         struct stat64 *__restrict __buf, int __flag)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (2, 3)));
-
-
-
-
-
-
-
+# 313 "/usr/include/aarch64-linux-gnu/sys/stat.h" 3 4
 extern int lstat (const char *__restrict __file,
     struct stat *__restrict __buf) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1, 2)));
-# 272 "/usr/include/x86_64-linux-gnu/sys/stat.h" 3 4
+# 338 "/usr/include/aarch64-linux-gnu/sys/stat.h" 3 4
 extern int lstat64 (const char *__restrict __file,
       struct stat64 *__restrict __buf)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1, 2)));
-
-
-
-
-
+# 352 "/usr/include/aarch64-linux-gnu/sys/stat.h" 3 4
 extern int chmod (const char *__file, __mode_t __mode)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)));
 
@@ -4387,122 +4313,41 @@ extern int mkfifoat (int __fd, const char *__path, __mode_t __mode)
 
 
 
+
 extern int utimensat (int __fd, const char *__path,
         const struct timespec __times[2],
         int __flags)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (2)));
-
-
-
-
+# 452 "/usr/include/aarch64-linux-gnu/sys/stat.h" 3 4
 extern int futimens (int __fd, const struct timespec __times[2]) __attribute__ ((__nothrow__ , __leaf__));
-# 395 "/usr/include/x86_64-linux-gnu/sys/stat.h" 3 4
-extern int __fxstat (int __ver, int __fildes, struct stat *__stat_buf)
-     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (3)));
-extern int __xstat (int __ver, const char *__filename,
-      struct stat *__stat_buf) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (2, 3)));
-extern int __lxstat (int __ver, const char *__filename,
-       struct stat *__stat_buf) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (2, 3)));
-extern int __fxstatat (int __ver, int __fildes, const char *__filename,
-         struct stat *__stat_buf, int __flag)
-     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (3, 4)));
-# 428 "/usr/include/x86_64-linux-gnu/sys/stat.h" 3 4
-extern int __fxstat64 (int __ver, int __fildes, struct stat64 *__stat_buf)
-     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (3)));
-extern int __xstat64 (int __ver, const char *__filename,
-        struct stat64 *__stat_buf) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (2, 3)));
-extern int __lxstat64 (int __ver, const char *__filename,
-         struct stat64 *__stat_buf) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (2, 3)));
-extern int __fxstatat64 (int __ver, int __fildes, const char *__filename,
-    struct stat64 *__stat_buf, int __flag)
-     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (3, 4)));
-
-extern int __xmknod (int __ver, const char *__path, __mode_t __mode,
-       __dev_t *__dev) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (2, 4)));
-
-extern int __xmknodat (int __ver, int __fd, const char *__path,
-         __mode_t __mode, __dev_t *__dev)
-     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (3, 5)));
+# 465 "/usr/include/aarch64-linux-gnu/sys/stat.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/statx.h" 1 3 4
+# 31 "/usr/include/aarch64-linux-gnu/bits/statx.h" 3 4
+# 1 "/usr/include/linux/stat.h" 1 3 4
 
 
 
 
-extern __inline __attribute__ ((__gnu_inline__)) int
-__attribute__ ((__nothrow__ , __leaf__)) stat (const char *__path, struct stat *__statbuf)
-{
-  return __xstat (1, __path, __statbuf);
-}
-
-
-extern __inline __attribute__ ((__gnu_inline__)) int
-__attribute__ ((__nothrow__ , __leaf__)) lstat (const char *__path, struct stat *__statbuf)
-{
-  return __lxstat (1, __path, __statbuf);
-}
-
-
-extern __inline __attribute__ ((__gnu_inline__)) int
-__attribute__ ((__nothrow__ , __leaf__)) fstat (int __fd, struct stat *__statbuf)
-{
-  return __fxstat (1, __fd, __statbuf);
-}
-
-
-extern __inline __attribute__ ((__gnu_inline__)) int
-__attribute__ ((__nothrow__ , __leaf__)) fstatat (int __fd, const char *__filename, struct stat *__statbuf, int __flag)
-
-{
-  return __fxstatat (1, __fd, __filename, __statbuf, __flag);
-}
+# 1 "/usr/include/linux/types.h" 1 3 4
 
 
 
-extern __inline __attribute__ ((__gnu_inline__)) int
-__attribute__ ((__nothrow__ , __leaf__)) mknod (const char *__path, __mode_t __mode, __dev_t __dev)
-{
-  return __xmknod (0, __path, __mode, &__dev);
-}
 
-
-
-extern __inline __attribute__ ((__gnu_inline__)) int
-__attribute__ ((__nothrow__ , __leaf__)) mknodat (int __fd, const char *__path, __mode_t __mode, __dev_t __dev)
-
-{
-  return __xmknodat (0, __fd, __path, __mode, &__dev);
-}
+# 1 "/usr/include/aarch64-linux-gnu/asm/types.h" 1 3 4
+# 1 "/usr/include/asm-generic/types.h" 1 3 4
 
 
 
 
 
-extern __inline __attribute__ ((__gnu_inline__)) int
-__attribute__ ((__nothrow__ , __leaf__)) stat64 (const char *__path, struct stat64 *__statbuf)
-{
-  return __xstat64 (1, __path, __statbuf);
-}
 
-
-extern __inline __attribute__ ((__gnu_inline__)) int
-__attribute__ ((__nothrow__ , __leaf__)) lstat64 (const char *__path, struct stat64 *__statbuf)
-{
-  return __lxstat64 (1, __path, __statbuf);
-}
-
-
-extern __inline __attribute__ ((__gnu_inline__)) int
-__attribute__ ((__nothrow__ , __leaf__)) fstat64 (int __fd, struct stat64 *__statbuf)
-{
-  return __fxstat64 (1, __fd, __statbuf);
-}
-
-
-extern __inline __attribute__ ((__gnu_inline__)) int
-__attribute__ ((__nothrow__ , __leaf__)) fstatat64 (int __fd, const char *__filename, struct stat64 *__statbuf, int __flag)
-
-{
-  return __fxstatat64 (1, __fd, __filename, __statbuf, __flag);
-}
+# 1 "/usr/include/asm-generic/int-ll64.h" 1 3 4
+# 12 "/usr/include/asm-generic/int-ll64.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/asm/bitsperlong.h" 1 3 4
+# 22 "/usr/include/aarch64-linux-gnu/asm/bitsperlong.h" 3 4
+# 1 "/usr/include/asm-generic/bitsperlong.h" 1 3 4
+# 23 "/usr/include/aarch64-linux-gnu/asm/bitsperlong.h" 2 3 4
+# 13 "/usr/include/asm-generic/int-ll64.h" 2 3 4
 
 
 
@@ -4510,25 +4355,215 @@ __attribute__ ((__nothrow__ , __leaf__)) fstatat64 (int __fd, const char *__file
 
 
 
-# 28 "/workspace/acl/lib_fiber/c/src/stdafx.h" 2
+typedef __signed__ char __s8;
+typedef unsigned char __u8;
+
+typedef __signed__ short __s16;
+typedef unsigned short __u16;
+
+typedef __signed__ int __s32;
+typedef unsigned int __u32;
+
+
+__extension__ typedef __signed__ long long __s64;
+__extension__ typedef unsigned long long __u64;
+# 8 "/usr/include/asm-generic/types.h" 2 3 4
+# 2 "/usr/include/aarch64-linux-gnu/asm/types.h" 2 3 4
+# 6 "/usr/include/linux/types.h" 2 3 4
+
+
+
+# 1 "/usr/include/linux/posix_types.h" 1 3 4
+
+
+
+
+# 1 "/usr/include/linux/stddef.h" 1 3 4
+# 6 "/usr/include/linux/posix_types.h" 2 3 4
+# 25 "/usr/include/linux/posix_types.h" 3 4
+typedef struct {
+ unsigned long fds_bits[1024 / (8 * sizeof(long))];
+} __kernel_fd_set;
+
+
+typedef void (*__kernel_sighandler_t)(int);
+
+
+typedef int __kernel_key_t;
+typedef int __kernel_mqd_t;
+
+# 1 "/usr/include/aarch64-linux-gnu/asm/posix_types.h" 1 3 4
+
+
+
+
+typedef unsigned short __kernel_old_uid_t;
+typedef unsigned short __kernel_old_gid_t;
+
+
+# 1 "/usr/include/asm-generic/posix_types.h" 1 3 4
+# 15 "/usr/include/asm-generic/posix_types.h" 3 4
+typedef long __kernel_long_t;
+typedef unsigned long __kernel_ulong_t;
+
+
+
+typedef __kernel_ulong_t __kernel_ino_t;
+
+
+
+typedef unsigned int __kernel_mode_t;
+
+
+
+typedef int __kernel_pid_t;
+
+
+
+typedef int __kernel_ipc_pid_t;
+
+
+
+typedef unsigned int __kernel_uid_t;
+typedef unsigned int __kernel_gid_t;
+
+
+
+typedef __kernel_long_t __kernel_suseconds_t;
+
+
+
+typedef int __kernel_daddr_t;
+
+
+
+typedef unsigned int __kernel_uid32_t;
+typedef unsigned int __kernel_gid32_t;
+# 59 "/usr/include/asm-generic/posix_types.h" 3 4
+typedef unsigned int __kernel_old_dev_t;
+# 72 "/usr/include/asm-generic/posix_types.h" 3 4
+typedef __kernel_ulong_t __kernel_size_t;
+typedef __kernel_long_t __kernel_ssize_t;
+typedef __kernel_long_t __kernel_ptrdiff_t;
+
+
+
+
+typedef struct {
+ int val[2];
+} __kernel_fsid_t;
+
+
+
+
+
+typedef __kernel_long_t __kernel_off_t;
+typedef long long __kernel_loff_t;
+typedef __kernel_long_t __kernel_old_time_t;
+typedef __kernel_long_t __kernel_time_t;
+typedef long long __kernel_time64_t;
+typedef __kernel_long_t __kernel_clock_t;
+typedef int __kernel_timer_t;
+typedef int __kernel_clockid_t;
+typedef char * __kernel_caddr_t;
+typedef unsigned short __kernel_uid16_t;
+typedef unsigned short __kernel_gid16_t;
+# 10 "/usr/include/aarch64-linux-gnu/asm/posix_types.h" 2 3 4
+# 37 "/usr/include/linux/posix_types.h" 2 3 4
+# 10 "/usr/include/linux/types.h" 2 3 4
+# 24 "/usr/include/linux/types.h" 3 4
+typedef __u16 __le16;
+typedef __u16 __be16;
+typedef __u32 __le32;
+typedef __u32 __be32;
+typedef __u64 __le64;
+typedef __u64 __be64;
+
+typedef __u16 __sum16;
+typedef __u32 __wsum;
+# 47 "/usr/include/linux/types.h" 3 4
+typedef unsigned __poll_t;
+# 6 "/usr/include/linux/stat.h" 2 3 4
+# 56 "/usr/include/linux/stat.h" 3 4
+struct statx_timestamp {
+ __s64 tv_sec;
+ __u32 tv_nsec;
+ __s32 __reserved;
+};
+# 99 "/usr/include/linux/stat.h" 3 4
+struct statx {
+
+ __u32 stx_mask;
+ __u32 stx_blksize;
+ __u64 stx_attributes;
+
+ __u32 stx_nlink;
+ __u32 stx_uid;
+ __u32 stx_gid;
+ __u16 stx_mode;
+ __u16 __spare0[1];
+
+ __u64 stx_ino;
+ __u64 stx_size;
+ __u64 stx_blocks;
+ __u64 stx_attributes_mask;
+
+ struct statx_timestamp stx_atime;
+ struct statx_timestamp stx_btime;
+ struct statx_timestamp stx_ctime;
+ struct statx_timestamp stx_mtime;
+
+ __u32 stx_rdev_major;
+ __u32 stx_rdev_minor;
+ __u32 stx_dev_major;
+ __u32 stx_dev_minor;
+
+ __u64 stx_mnt_id;
+ __u64 __spare2;
+
+ __u64 __spare3[12];
+
+};
+# 32 "/usr/include/aarch64-linux-gnu/bits/statx.h" 2 3 4
+
+
+
+
+
+
+
+# 1 "/usr/include/aarch64-linux-gnu/bits/statx-generic.h" 1 3 4
+# 25 "/usr/include/aarch64-linux-gnu/bits/statx-generic.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/types/struct_statx_timestamp.h" 1 3 4
+# 26 "/usr/include/aarch64-linux-gnu/bits/statx-generic.h" 2 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/types/struct_statx.h" 1 3 4
+# 27 "/usr/include/aarch64-linux-gnu/bits/statx-generic.h" 2 3 4
+# 57 "/usr/include/aarch64-linux-gnu/bits/statx-generic.h" 3 4
+
+
+
+int statx (int __dirfd, const char *__restrict __path, int __flags,
+           unsigned int __mask, struct statx *__restrict __buf)
+  __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (2, 5)));
+
+
+# 40 "/usr/include/aarch64-linux-gnu/bits/statx.h" 2 3 4
+# 466 "/usr/include/aarch64-linux-gnu/sys/stat.h" 2 3 4
+
+
+
+# 28 "/acl/lib_fiber/c/src/stdafx.h" 2
 
 # 1 "/usr/include/setjmp.h" 1 3 4
 # 27 "/usr/include/setjmp.h" 3 4
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/setjmp.h" 1 3 4
-# 26 "/usr/include/x86_64-linux-gnu/bits/setjmp.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/wordsize.h" 1 3 4
-# 27 "/usr/include/x86_64-linux-gnu/bits/setjmp.h" 2 3 4
-
-
-
-
-typedef long int __jmp_buf[8];
+# 1 "/usr/include/aarch64-linux-gnu/bits/setjmp.h" 1 3 4
+# 30 "/usr/include/aarch64-linux-gnu/bits/setjmp.h" 3 4
+__extension__ typedef unsigned long long __jmp_buf [22];
 # 30 "/usr/include/setjmp.h" 2 3 4
-
-
-
+# 1 "/usr/include/aarch64-linux-gnu/bits/types/struct___jmp_buf_tag.h" 1 3 4
+# 26 "/usr/include/aarch64-linux-gnu/bits/types/struct___jmp_buf_tag.h" 3 4
 struct __jmp_buf_tag
   {
 
@@ -4539,7 +4574,7 @@ struct __jmp_buf_tag
     int __mask_was_saved;
     __sigset_t __saved_mask;
   };
-
+# 31 "/usr/include/setjmp.h" 2 3 4
 
 typedef struct __jmp_buf_tag jmp_buf[1];
 
@@ -4555,7 +4590,7 @@ extern int __sigsetjmp (struct __jmp_buf_tag __env[1], int __savemask) __attribu
 
 
 extern int _setjmp (struct __jmp_buf_tag __env[1]) __attribute__ ((__nothrow__));
-# 67 "/usr/include/setjmp.h" 3 4
+# 54 "/usr/include/setjmp.h" 3 4
 extern void longjmp (struct __jmp_buf_tag __env[1], int __val)
      __attribute__ ((__nothrow__)) __attribute__ ((__noreturn__));
 
@@ -4573,7 +4608,7 @@ extern void _longjmp (struct __jmp_buf_tag __env[1], int __val)
 
 
 typedef struct __jmp_buf_tag sigjmp_buf[1];
-# 93 "/usr/include/setjmp.h" 3 4
+# 80 "/usr/include/setjmp.h" 3 4
 extern void siglongjmp (sigjmp_buf __env, int __val)
      __attribute__ ((__nothrow__)) __attribute__ ((__noreturn__));
 
@@ -4581,8 +4616,8 @@ extern void siglongjmp (sigjmp_buf __env, int __val)
 
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/setjmp2.h" 1 3 4
-# 25 "/usr/include/x86_64-linux-gnu/bits/setjmp2.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/setjmp2.h" 1 3 4
+# 25 "/usr/include/aarch64-linux-gnu/bits/setjmp2.h" 3 4
 extern void longjmp (struct __jmp_buf_tag __env[1], int __val) __asm__ ("" "__longjmp_chk") __attribute__ ((__nothrow__))
 
                         __attribute__ ((__noreturn__));
@@ -4592,23 +4627,23 @@ extern void _longjmp (struct __jmp_buf_tag __env[1], int __val) __asm__ ("" "__l
 extern void siglongjmp (struct __jmp_buf_tag __env[1], int __val) __asm__ ("" "__longjmp_chk") __attribute__ ((__nothrow__))
 
                         __attribute__ ((__noreturn__));
-# 101 "/usr/include/setjmp.h" 2 3 4
+# 88 "/usr/include/setjmp.h" 2 3 4
 
 
 
-# 30 "/workspace/acl/lib_fiber/c/src/stdafx.h" 2
+# 30 "/acl/lib_fiber/c/src/stdafx.h" 2
 # 1 "/usr/include/signal.h" 1 3 4
 # 27 "/usr/include/signal.h" 3 4
 
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/signum.h" 1 3 4
-# 26 "/usr/include/x86_64-linux-gnu/bits/signum.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/signum-generic.h" 1 3 4
-# 27 "/usr/include/x86_64-linux-gnu/bits/signum.h" 2 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/signum-generic.h" 1 3 4
+# 76 "/usr/include/aarch64-linux-gnu/bits/signum-generic.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/signum-arch.h" 1 3 4
+# 77 "/usr/include/aarch64-linux-gnu/bits/signum-generic.h" 2 3 4
 # 31 "/usr/include/signal.h" 2 3 4
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/types/sig_atomic_t.h" 1 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/types/sig_atomic_t.h" 1 3 4
 
 
 
@@ -4619,15 +4654,15 @@ extern void siglongjmp (struct __jmp_buf_tag __env[1], int __val) __asm__ ("" "_
 typedef __sig_atomic_t sig_atomic_t;
 # 33 "/usr/include/signal.h" 2 3 4
 # 57 "/usr/include/signal.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/types/siginfo_t.h" 1 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/types/siginfo_t.h" 1 3 4
 
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/wordsize.h" 1 3 4
-# 5 "/usr/include/x86_64-linux-gnu/bits/types/siginfo_t.h" 2 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/wordsize.h" 1 3 4
+# 5 "/usr/include/aarch64-linux-gnu/bits/types/siginfo_t.h" 2 3 4
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/types/__sigval_t.h" 1 3 4
-# 24 "/usr/include/x86_64-linux-gnu/bits/types/__sigval_t.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/types/__sigval_t.h" 1 3 4
+# 24 "/usr/include/aarch64-linux-gnu/bits/types/__sigval_t.h" 3 4
 union sigval
 {
   int sival_int;
@@ -4635,11 +4670,11 @@ union sigval
 };
 
 typedef union sigval __sigval_t;
-# 7 "/usr/include/x86_64-linux-gnu/bits/types/siginfo_t.h" 2 3 4
-# 16 "/usr/include/x86_64-linux-gnu/bits/types/siginfo_t.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/siginfo-arch.h" 1 3 4
-# 17 "/usr/include/x86_64-linux-gnu/bits/types/siginfo_t.h" 2 3 4
-# 36 "/usr/include/x86_64-linux-gnu/bits/types/siginfo_t.h" 3 4
+# 7 "/usr/include/aarch64-linux-gnu/bits/types/siginfo_t.h" 2 3 4
+# 16 "/usr/include/aarch64-linux-gnu/bits/types/siginfo_t.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/siginfo-arch.h" 1 3 4
+# 17 "/usr/include/aarch64-linux-gnu/bits/types/siginfo_t.h" 2 3 4
+# 36 "/usr/include/aarch64-linux-gnu/bits/types/siginfo_t.h" 3 4
 typedef struct
   {
     int si_signo;
@@ -4730,12 +4765,14 @@ typedef struct
       } _sifields;
   } siginfo_t ;
 # 58 "/usr/include/signal.h" 2 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/siginfo-consts.h" 1 3 4
-# 35 "/usr/include/x86_64-linux-gnu/bits/siginfo-consts.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/siginfo-consts.h" 1 3 4
+# 35 "/usr/include/aarch64-linux-gnu/bits/siginfo-consts.h" 3 4
 enum
 {
   SI_ASYNCNL = -60,
-  SI_TKILL = -6,
+  SI_DETHREAD = -7,
+
+  SI_TKILL,
   SI_SIGIO,
 
   SI_ASYNCIO,
@@ -4749,7 +4786,7 @@ enum
   SI_QUEUE,
   SI_USER,
   SI_KERNEL = 0x80
-# 63 "/usr/include/x86_64-linux-gnu/bits/siginfo-consts.h" 3 4
+# 66 "/usr/include/aarch64-linux-gnu/bits/siginfo-consts.h" 3 4
 };
 
 
@@ -4771,7 +4808,9 @@ enum
 
   ILL_COPROC,
 
-  ILL_BADSTK
+  ILL_BADSTK,
+
+  ILL_BADIADDR
 
 };
 
@@ -4792,7 +4831,11 @@ enum
 
   FPE_FLTINV,
 
-  FPE_FLTSUB
+  FPE_FLTSUB,
+
+  FPE_FLTUNK = 14,
+
+  FPE_CONDTRAP
 
 };
 
@@ -4805,7 +4848,17 @@ enum
 
   SEGV_BNDERR,
 
-  SEGV_PKUERR
+  SEGV_PKUERR,
+
+  SEGV_ACCADI,
+
+  SEGV_ADIDERR,
+
+  SEGV_ADIPERR,
+
+  SEGV_MTEAERR,
+
+  SEGV_MTESERR
 
 };
 
@@ -4831,7 +4884,13 @@ enum
 {
   TRAP_BRKPT = 1,
 
-  TRAP_TRACE
+  TRAP_TRACE,
+
+  TRAP_BRANCH,
+
+  TRAP_HWBKPT,
+
+  TRAP_UNK
 
 };
 
@@ -4875,26 +4934,26 @@ enum
 
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/siginfo-consts-arch.h" 1 3 4
-# 189 "/usr/include/x86_64-linux-gnu/bits/siginfo-consts.h" 2 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/siginfo-consts-arch.h" 1 3 4
+# 214 "/usr/include/aarch64-linux-gnu/bits/siginfo-consts.h" 2 3 4
 # 59 "/usr/include/signal.h" 2 3 4
 
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/types/sigval_t.h" 1 3 4
-# 16 "/usr/include/x86_64-linux-gnu/bits/types/sigval_t.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/types/sigval_t.h" 1 3 4
+# 16 "/usr/include/aarch64-linux-gnu/bits/types/sigval_t.h" 3 4
 typedef __sigval_t sigval_t;
 # 63 "/usr/include/signal.h" 2 3 4
 
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/types/sigevent_t.h" 1 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/types/sigevent_t.h" 1 3 4
 
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/wordsize.h" 1 3 4
-# 5 "/usr/include/x86_64-linux-gnu/bits/types/sigevent_t.h" 2 3 4
-# 22 "/usr/include/x86_64-linux-gnu/bits/types/sigevent_t.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/wordsize.h" 1 3 4
+# 5 "/usr/include/aarch64-linux-gnu/bits/types/sigevent_t.h" 2 3 4
+# 22 "/usr/include/aarch64-linux-gnu/bits/types/sigevent_t.h" 3 4
 typedef struct sigevent
   {
     __sigval_t sigev_value;
@@ -4917,8 +4976,8 @@ typedef struct sigevent
       } _sigev_un;
   } sigevent_t;
 # 67 "/usr/include/signal.h" 2 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/sigevent-consts.h" 1 3 4
-# 27 "/usr/include/x86_64-linux-gnu/bits/sigevent-consts.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/sigevent-consts.h" 1 3 4
+# 27 "/usr/include/aarch64-linux-gnu/bits/sigevent-consts.h" 3 4
 enum
 {
   SIGEV_SIGNAL = 0,
@@ -4983,8 +5042,9 @@ extern void psignal (int __sig, const char *__s);
 
 extern void psiginfo (const siginfo_t *__pinfo, const char *__s);
 # 151 "/usr/include/signal.h" 3 4
-extern int sigpause (int __sig) __asm__ ("__xpg_sigpause");
-# 170 "/usr/include/signal.h" 3 4
+extern int sigpause (int __sig) __asm__ ("__xpg_sigpause")
+  __attribute__ ((__deprecated__ ("Use the sigsuspend function instead")));
+# 173 "/usr/include/signal.h" 3 4
 extern int sigblock (int __mask) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__deprecated__));
 
 
@@ -4992,7 +5052,7 @@ extern int sigsetmask (int __mask) __attribute__ ((__nothrow__ , __leaf__)) __at
 
 
 extern int siggetmask (void) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__deprecated__));
-# 185 "/usr/include/signal.h" 3 4
+# 188 "/usr/include/signal.h" 3 4
 typedef __sighandler_t sighandler_t;
 
 
@@ -5034,8 +5094,8 @@ extern int sigorset (sigset_t *__set, const sigset_t *__left,
 
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/sigaction.h" 1 3 4
-# 24 "/usr/include/x86_64-linux-gnu/bits/sigaction.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/sigaction.h" 1 3 4
+# 27 "/usr/include/aarch64-linux-gnu/bits/sigaction.h" 3 4
 struct sigaction
   {
 
@@ -5063,7 +5123,7 @@ struct sigaction
 
     void (*sa_restorer) (void);
   };
-# 227 "/usr/include/signal.h" 2 3 4
+# 230 "/usr/include/signal.h" 2 3 4
 
 
 extern int sigprocmask (int __how, const sigset_t *__restrict __set,
@@ -5106,123 +5166,81 @@ extern int sigwaitinfo (const sigset_t *__restrict __set,
 
 
 
+
 extern int sigtimedwait (const sigset_t *__restrict __set,
     siginfo_t *__restrict __info,
     const struct timespec *__restrict __timeout)
      __attribute__ ((__nonnull__ (1)));
-
-
-
+# 292 "/usr/include/signal.h" 3 4
 extern int sigqueue (__pid_t __pid, int __sig, const union sigval __val)
      __attribute__ ((__nothrow__ , __leaf__));
-# 286 "/usr/include/signal.h" 3 4
-extern const char *const _sys_siglist[(64 + 1)];
-extern const char *const sys_siglist[(64 + 1)];
 
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/sigcontext.h" 1 3 4
-# 31 "/usr/include/x86_64-linux-gnu/bits/sigcontext.h" 3 4
-struct _fpx_sw_bytes
-{
-  __uint32_t magic1;
-  __uint32_t extended_size;
-  __uint64_t xstate_bv;
-  __uint32_t xstate_size;
-  __uint32_t __glibc_reserved1[7];
+
+
+
+
+# 1 "/usr/include/aarch64-linux-gnu/bits/sigcontext.h" 1 3 4
+# 30 "/usr/include/aarch64-linux-gnu/bits/sigcontext.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/asm/sigcontext.h" 1 3 4
+# 28 "/usr/include/aarch64-linux-gnu/asm/sigcontext.h" 3 4
+struct sigcontext {
+ __u64 fault_address;
+
+ __u64 regs[31];
+ __u64 sp;
+ __u64 pc;
+ __u64 pstate;
+
+ __u8 __reserved[4096] __attribute__((__aligned__(16)));
 };
-
-struct _fpreg
-{
-  unsigned short significand[4];
-  unsigned short exponent;
-};
-
-struct _fpxreg
-{
-  unsigned short significand[4];
-  unsigned short exponent;
-  unsigned short __glibc_reserved1[3];
-};
-
-struct _xmmreg
-{
-  __uint32_t element[4];
-};
-# 123 "/usr/include/x86_64-linux-gnu/bits/sigcontext.h" 3 4
-struct _fpstate
-{
-
-  __uint16_t cwd;
-  __uint16_t swd;
-  __uint16_t ftw;
-  __uint16_t fop;
-  __uint64_t rip;
-  __uint64_t rdp;
-  __uint32_t mxcsr;
-  __uint32_t mxcr_mask;
-  struct _fpxreg _st[8];
-  struct _xmmreg _xmm[16];
-  __uint32_t __glibc_reserved1[24];
-};
-
-struct sigcontext
-{
-  __uint64_t r8;
-  __uint64_t r9;
-  __uint64_t r10;
-  __uint64_t r11;
-  __uint64_t r12;
-  __uint64_t r13;
-  __uint64_t r14;
-  __uint64_t r15;
-  __uint64_t rdi;
-  __uint64_t rsi;
-  __uint64_t rbp;
-  __uint64_t rbx;
-  __uint64_t rdx;
-  __uint64_t rax;
-  __uint64_t rcx;
-  __uint64_t rsp;
-  __uint64_t rip;
-  __uint64_t eflags;
-  unsigned short cs;
-  unsigned short gs;
-  unsigned short fs;
-  unsigned short __pad0;
-  __uint64_t err;
-  __uint64_t trapno;
-  __uint64_t oldmask;
-  __uint64_t cr2;
-  __extension__ union
-    {
-      struct _fpstate * fpstate;
-      __uint64_t __fpstate_word;
-    };
-  __uint64_t __reserved1 [8];
+# 66 "/usr/include/aarch64-linux-gnu/asm/sigcontext.h" 3 4
+struct _aarch64_ctx {
+ __u32 magic;
+ __u32 size;
 };
 
 
 
-struct _xsave_hdr
-{
-  __uint64_t xstate_bv;
-  __uint64_t __glibc_reserved1[2];
-  __uint64_t __glibc_reserved2[5];
+struct fpsimd_context {
+ struct _aarch64_ctx head;
+ __u32 fpsr;
+ __u32 fpcr;
+ __uint128_t vregs[32];
+};
+# 92 "/usr/include/aarch64-linux-gnu/asm/sigcontext.h" 3 4
+struct esr_context {
+ struct _aarch64_ctx head;
+ __u64 esr;
+};
+# 125 "/usr/include/aarch64-linux-gnu/asm/sigcontext.h" 3 4
+struct extra_context {
+ struct _aarch64_ctx head;
+ __u64 datap;
+ __u32 size;
+ __u32 __reserved[3];
 };
 
-struct _ymmh_state
-{
-  __uint32_t ymmh_space[64];
+
+
+struct sve_context {
+ struct _aarch64_ctx head;
+ __u16 vl;
+ __u16 __reserved[3];
 };
 
-struct _xstate
-{
-  struct _fpstate fpstate;
-  struct _xsave_hdr xstate_hdr;
-  struct _ymmh_state ymmh;
-};
-# 292 "/usr/include/signal.h" 2 3 4
+
+
+# 1 "/usr/include/aarch64-linux-gnu/asm/sve_context.h" 1 3 4
+# 143 "/usr/include/aarch64-linux-gnu/asm/sigcontext.h" 2 3 4
+# 31 "/usr/include/aarch64-linux-gnu/bits/sigcontext.h" 2 3 4
+
+
+
+# 1 "/usr/lib/gcc/aarch64-linux-gnu/11/include/stddef.h" 1 3 4
+# 35 "/usr/include/aarch64-linux-gnu/bits/sigcontext.h" 2 3 4
+# 302 "/usr/include/signal.h" 2 3 4
 
 
 extern int sigreturn (struct sigcontext *__scp) __attribute__ ((__nothrow__ , __leaf__));
@@ -5232,13 +5250,13 @@ extern int sigreturn (struct sigcontext *__scp) __attribute__ ((__nothrow__ , __
 
 
 
-# 1 "/usr/lib/gcc/x86_64-linux-gnu/7/include/stddef.h" 1 3 4
-# 302 "/usr/include/signal.h" 2 3 4
+# 1 "/usr/lib/gcc/aarch64-linux-gnu/11/include/stddef.h" 1 3 4
+# 312 "/usr/include/signal.h" 2 3 4
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/types/stack_t.h" 1 3 4
-# 23 "/usr/include/x86_64-linux-gnu/bits/types/stack_t.h" 3 4
-# 1 "/usr/lib/gcc/x86_64-linux-gnu/7/include/stddef.h" 1 3 4
-# 24 "/usr/include/x86_64-linux-gnu/bits/types/stack_t.h" 2 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/types/stack_t.h" 1 3 4
+# 23 "/usr/include/aarch64-linux-gnu/bits/types/stack_t.h" 3 4
+# 1 "/usr/lib/gcc/aarch64-linux-gnu/11/include/stddef.h" 1 3 4
+# 24 "/usr/include/aarch64-linux-gnu/bits/types/stack_t.h" 2 3 4
 
 
 typedef struct
@@ -5247,871 +5265,302 @@ typedef struct
     int ss_flags;
     size_t ss_size;
   } stack_t;
-# 304 "/usr/include/signal.h" 2 3 4
+# 314 "/usr/include/signal.h" 2 3 4
 
 
-# 1 "/usr/include/x86_64-linux-gnu/sys/ucontext.h" 1 3 4
-# 37 "/usr/include/x86_64-linux-gnu/sys/ucontext.h" 3 4
-__extension__ typedef long long int greg_t;
-# 46 "/usr/include/x86_64-linux-gnu/sys/ucontext.h" 3 4
-typedef greg_t gregset_t[23];
+# 1 "/usr/include/aarch64-linux-gnu/sys/ucontext.h" 1 3 4
+# 36 "/usr/include/aarch64-linux-gnu/sys/ucontext.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/sys/procfs.h" 1 3 4
+# 33 "/usr/include/aarch64-linux-gnu/sys/procfs.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/sys/time.h" 1 3 4
+# 34 "/usr/include/aarch64-linux-gnu/sys/time.h" 3 4
+
+# 52 "/usr/include/aarch64-linux-gnu/sys/time.h" 3 4
+struct timezone
+  {
+    int tz_minuteswest;
+    int tz_dsttime;
+  };
+# 67 "/usr/include/aarch64-linux-gnu/sys/time.h" 3 4
+extern int gettimeofday (struct timeval *__restrict __tv,
+    void *__restrict __tz) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)));
+# 86 "/usr/include/aarch64-linux-gnu/sys/time.h" 3 4
+extern int settimeofday (const struct timeval *__tv,
+    const struct timezone *__tz)
+     __attribute__ ((__nothrow__ , __leaf__));
 
 
 
-enum
+
+
+extern int adjtime (const struct timeval *__delta,
+      struct timeval *__olddelta) __attribute__ ((__nothrow__ , __leaf__));
+# 114 "/usr/include/aarch64-linux-gnu/sys/time.h" 3 4
+enum __itimer_which
+  {
+
+    ITIMER_REAL = 0,
+
+
+    ITIMER_VIRTUAL = 1,
+
+
+
+    ITIMER_PROF = 2
+
+  };
+
+
+
+struct itimerval
+  {
+
+    struct timeval it_interval;
+
+    struct timeval it_value;
+  };
+
+
+
+
+typedef enum __itimer_which __itimer_which_t;
+
+
+
+
+
+
+
+extern int getitimer (__itimer_which_t __which,
+        struct itimerval *__value) __attribute__ ((__nothrow__ , __leaf__));
+
+
+
+
+extern int setitimer (__itimer_which_t __which,
+        const struct itimerval *__restrict __new,
+        struct itimerval *__restrict __old) __attribute__ ((__nothrow__ , __leaf__));
+
+
+
+
+extern int utimes (const char *__file, const struct timeval __tvp[2])
+     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)));
+# 189 "/usr/include/aarch64-linux-gnu/sys/time.h" 3 4
+extern int lutimes (const char *__file, const struct timeval __tvp[2])
+     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)));
+
+
+extern int futimes (int __fd, const struct timeval __tvp[2]) __attribute__ ((__nothrow__ , __leaf__));
+# 214 "/usr/include/aarch64-linux-gnu/sys/time.h" 3 4
+extern int futimesat (int __fd, const char *__file,
+        const struct timeval __tvp[2]) __attribute__ ((__nothrow__ , __leaf__));
+# 258 "/usr/include/aarch64-linux-gnu/sys/time.h" 3 4
+
+# 34 "/usr/include/aarch64-linux-gnu/sys/procfs.h" 2 3 4
+
+# 1 "/usr/include/aarch64-linux-gnu/sys/user.h" 1 3 4
+# 22 "/usr/include/aarch64-linux-gnu/sys/user.h" 3 4
+struct user_regs_struct
 {
-  REG_R8 = 0,
-
-  REG_R9,
-
-  REG_R10,
-
-  REG_R11,
-
-  REG_R12,
-
-  REG_R13,
-
-  REG_R14,
-
-  REG_R15,
-
-  REG_RDI,
-
-  REG_RSI,
-
-  REG_RBP,
-
-  REG_RBX,
-
-  REG_RDX,
-
-  REG_RAX,
-
-  REG_RCX,
-
-  REG_RSP,
-
-  REG_RIP,
-
-  REG_EFL,
-
-  REG_CSGSFS,
-
-  REG_ERR,
-
-  REG_TRAPNO,
-
-  REG_OLDMASK,
-
-  REG_CR2
-
+  unsigned long long regs[31];
+  unsigned long long sp;
+  unsigned long long pc;
+  unsigned long long pstate;
 };
 
-
-struct _libc_fpxreg
+struct user_fpsimd_struct
 {
-  unsigned short int significand[4];
-  unsigned short int exponent;
-  unsigned short int __glibc_reserved1[3];
+  __uint128_t vregs[32];
+  unsigned int fpsr;
+  unsigned int fpcr;
 };
-
-struct _libc_xmmreg
-{
-  __uint32_t element[4];
-};
-
-struct _libc_fpstate
-{
-
-  __uint16_t cwd;
-  __uint16_t swd;
-  __uint16_t ftw;
-  __uint16_t fop;
-  __uint64_t rip;
-  __uint64_t rdp;
-  __uint32_t mxcsr;
-  __uint32_t mxcr_mask;
-  struct _libc_fpxreg _st[8];
-  struct _libc_xmmreg _xmm[16];
-  __uint32_t __glibc_reserved1[24];
-};
+# 36 "/usr/include/aarch64-linux-gnu/sys/procfs.h" 2 3 4
 
 
-typedef struct _libc_fpstate *fpregset_t;
+
+
+# 1 "/usr/include/aarch64-linux-gnu/bits/procfs.h" 1 3 4
+# 25 "/usr/include/aarch64-linux-gnu/bits/procfs.h" 3 4
+typedef __uint64_t elf_greg_t;
+
+
+
+
+
+
+typedef elf_greg_t elf_gregset_t[(sizeof (struct user_regs_struct) / sizeof (elf_greg_t))];
+
+
+typedef struct user_fpsimd_struct elf_fpregset_t;
+# 41 "/usr/include/aarch64-linux-gnu/sys/procfs.h" 2 3 4
+
+
+
+# 1 "/usr/include/aarch64-linux-gnu/bits/procfs-id.h" 1 3 4
+# 24 "/usr/include/aarch64-linux-gnu/bits/procfs-id.h" 3 4
+typedef unsigned int __pr_uid_t;
+typedef unsigned int __pr_gid_t;
+# 45 "/usr/include/aarch64-linux-gnu/sys/procfs.h" 2 3 4
+
+
+
+
+struct elf_siginfo
+  {
+    int si_signo;
+    int si_code;
+    int si_errno;
+  };
+# 63 "/usr/include/aarch64-linux-gnu/sys/procfs.h" 3 4
+struct elf_prstatus
+  {
+    struct elf_siginfo pr_info;
+    short int pr_cursig;
+    unsigned long int pr_sigpend;
+    unsigned long int pr_sighold;
+    __pid_t pr_pid;
+    __pid_t pr_ppid;
+    __pid_t pr_pgrp;
+    __pid_t pr_sid;
+    struct timeval pr_utime;
+    struct timeval pr_stime;
+    struct timeval pr_cutime;
+    struct timeval pr_cstime;
+    elf_gregset_t pr_reg;
+    int pr_fpvalid;
+  };
+
+
+
+
+struct elf_prpsinfo
+  {
+    char pr_state;
+    char pr_sname;
+    char pr_zomb;
+    char pr_nice;
+    unsigned long int pr_flag;
+    __pr_uid_t pr_uid;
+    __pr_gid_t pr_gid;
+    int pr_pid, pr_ppid, pr_pgrp, pr_sid;
+
+    char pr_fname[16];
+    char pr_psargs[(80)];
+  };
+
+
+
+
+
+
+typedef void *psaddr_t;
+
+# 1 "/usr/include/aarch64-linux-gnu/bits/procfs-prregset.h" 1 3 4
+# 24 "/usr/include/aarch64-linux-gnu/bits/procfs-prregset.h" 3 4
+typedef elf_gregset_t __prgregset_t;
+typedef elf_fpregset_t __prfpregset_t;
+# 107 "/usr/include/aarch64-linux-gnu/sys/procfs.h" 2 3 4
+
+
+typedef __prgregset_t prgregset_t;
+typedef __prfpregset_t prfpregset_t;
+
+
+
+typedef __pid_t lwpid_t;
+
+
+typedef struct elf_prstatus prstatus_t;
+typedef struct elf_prpsinfo prpsinfo_t;
+
+
+
+
+
+# 1 "/usr/include/aarch64-linux-gnu/bits/procfs-extra.h" 1 3 4
+# 125 "/usr/include/aarch64-linux-gnu/sys/procfs.h" 2 3 4
+# 37 "/usr/include/aarch64-linux-gnu/sys/ucontext.h" 2 3 4
+
+
+typedef elf_greg_t greg_t;
+
+
+typedef elf_gregset_t gregset_t;
+
+
+typedef elf_fpregset_t fpregset_t;
+
+
+
+
 
 
 typedef struct
   {
-    gregset_t gregs;
+    unsigned long long int fault_address;
+    unsigned long long int regs[31];
+    unsigned long long int sp;
+    unsigned long long int pc;
+    unsigned long long int pstate;
 
-    fpregset_t fpregs;
-    __extension__ unsigned long long __reserved1 [8];
-} mcontext_t;
+
+
+
+    unsigned char __reserved[4096] __attribute__ ((__aligned__ (16)));
+  } mcontext_t;
 
 
 typedef struct ucontext_t
   {
-    unsigned long int uc_flags;
+    unsigned long uc_flags;
     struct ucontext_t *uc_link;
     stack_t uc_stack;
-    mcontext_t uc_mcontext;
     sigset_t uc_sigmask;
-    struct _libc_fpstate __fpregs_mem;
+    mcontext_t uc_mcontext;
   } ucontext_t;
-# 307 "/usr/include/signal.h" 2 3 4
-
-
-
-
-
-
-
-extern int siginterrupt (int __sig, int __interrupt) __attribute__ ((__nothrow__ , __leaf__));
-
-# 1 "/usr/include/x86_64-linux-gnu/bits/sigstack.h" 1 3 4
 # 317 "/usr/include/signal.h" 2 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/ss_flags.h" 1 3 4
-# 27 "/usr/include/x86_64-linux-gnu/bits/ss_flags.h" 3 4
-enum
-{
-  SS_ONSTACK = 1,
-
-  SS_DISABLE
-
-};
-# 318 "/usr/include/signal.h" 2 3 4
-
-
-
-extern int sigaltstack (const stack_t *__restrict __ss,
-   stack_t *__restrict __oss) __attribute__ ((__nothrow__ , __leaf__));
 
 
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/types/struct_sigstack.h" 1 3 4
-# 23 "/usr/include/x86_64-linux-gnu/bits/types/struct_sigstack.h" 3 4
-struct sigstack
-  {
-    void *ss_sp;
-    int ss_onstack;
-  };
+
+
+
+extern int siginterrupt (int __sig, int __interrupt) __attribute__ ((__nothrow__ , __leaf__))
+  __attribute__ ((__deprecated__ ("Use sigaction with SA_RESTART instead")));
+
+# 1 "/usr/include/aarch64-linux-gnu/bits/sigstack.h" 1 3 4
 # 328 "/usr/include/signal.h" 2 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/sigstksz.h" 1 3 4
+# 24 "/usr/include/aarch64-linux-gnu/bits/sigstksz.h" 3 4
+# 1 "/usr/include/unistd.h" 1 3 4
+# 27 "/usr/include/unistd.h" 3 4
+
+# 202 "/usr/include/unistd.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/posix_opt.h" 1 3 4
+# 203 "/usr/include/unistd.h" 2 3 4
 
 
 
+# 1 "/usr/include/aarch64-linux-gnu/bits/environments.h" 1 3 4
+# 22 "/usr/include/aarch64-linux-gnu/bits/environments.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/wordsize.h" 1 3 4
+# 23 "/usr/include/aarch64-linux-gnu/bits/environments.h" 2 3 4
+# 207 "/usr/include/unistd.h" 2 3 4
+# 226 "/usr/include/unistd.h" 3 4
+# 1 "/usr/lib/gcc/aarch64-linux-gnu/11/include/stddef.h" 1 3 4
+# 227 "/usr/include/unistd.h" 2 3 4
+# 267 "/usr/include/unistd.h" 3 4
+typedef __intptr_t intptr_t;
 
-
-
-
-extern int sigstack (struct sigstack *__ss, struct sigstack *__oss)
-     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__deprecated__));
-
-
-
-
-
-
-extern int sighold (int __sig) __attribute__ ((__nothrow__ , __leaf__));
-
-
-extern int sigrelse (int __sig) __attribute__ ((__nothrow__ , __leaf__));
-
-
-extern int sigignore (int __sig) __attribute__ ((__nothrow__ , __leaf__));
-
-
-extern __sighandler_t sigset (int __sig, __sighandler_t __disp) __attribute__ ((__nothrow__ , __leaf__));
-
-
-
-
-
-
-# 1 "/usr/include/x86_64-linux-gnu/bits/sigthread.h" 1 3 4
-# 31 "/usr/include/x86_64-linux-gnu/bits/sigthread.h" 3 4
-extern int pthread_sigmask (int __how,
-       const __sigset_t *__restrict __newmask,
-       __sigset_t *__restrict __oldmask)__attribute__ ((__nothrow__ , __leaf__));
-
-
-extern int pthread_kill (pthread_t __threadid, int __signo) __attribute__ ((__nothrow__ , __leaf__));
-
-
-
-extern int pthread_sigqueue (pthread_t __threadid, int __signo,
-        const union sigval __value) __attribute__ ((__nothrow__ , __leaf__));
-# 360 "/usr/include/signal.h" 2 3 4
-
-
-
-
-
-
-extern int __libc_current_sigrtmin (void) __attribute__ ((__nothrow__ , __leaf__));
-
-extern int __libc_current_sigrtmax (void) __attribute__ ((__nothrow__ , __leaf__));
-
-
-
-
-
-# 31 "/workspace/acl/lib_fiber/c/src/stdafx.h" 2
-
-
-# 1 "/usr/include/net/if.h" 1 3 4
-# 26 "/usr/include/net/if.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/sys/socket.h" 1 3 4
-# 24 "/usr/include/x86_64-linux-gnu/sys/socket.h" 3 4
-
-
-
-
-# 1 "/usr/lib/gcc/x86_64-linux-gnu/7/include/stddef.h" 1 3 4
-# 29 "/usr/include/x86_64-linux-gnu/sys/socket.h" 2 3 4
-
-
-
-
-# 1 "/usr/include/x86_64-linux-gnu/bits/socket.h" 1 3 4
-# 27 "/usr/include/x86_64-linux-gnu/bits/socket.h" 3 4
-# 1 "/usr/lib/gcc/x86_64-linux-gnu/7/include/stddef.h" 1 3 4
-# 28 "/usr/include/x86_64-linux-gnu/bits/socket.h" 2 3 4
 
 
 
 
 
 typedef __socklen_t socklen_t;
-
-
-
-
-# 1 "/usr/include/x86_64-linux-gnu/bits/socket_type.h" 1 3 4
-# 24 "/usr/include/x86_64-linux-gnu/bits/socket_type.h" 3 4
-enum __socket_type
-{
-  SOCK_STREAM = 1,
-
-
-  SOCK_DGRAM = 2,
-
-
-  SOCK_RAW = 3,
-
-  SOCK_RDM = 4,
-
-  SOCK_SEQPACKET = 5,
-
-
-  SOCK_DCCP = 6,
-
-  SOCK_PACKET = 10,
-
-
-
-
-
-
-
-  SOCK_CLOEXEC = 02000000,
-
-
-  SOCK_NONBLOCK = 00004000
-
-
-};
-# 39 "/usr/include/x86_64-linux-gnu/bits/socket.h" 2 3 4
-# 172 "/usr/include/x86_64-linux-gnu/bits/socket.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/sockaddr.h" 1 3 4
-# 28 "/usr/include/x86_64-linux-gnu/bits/sockaddr.h" 3 4
-typedef unsigned short int sa_family_t;
-# 173 "/usr/include/x86_64-linux-gnu/bits/socket.h" 2 3 4
-
-
-struct sockaddr
-  {
-    sa_family_t sa_family;
-    char sa_data[14];
-  };
-# 188 "/usr/include/x86_64-linux-gnu/bits/socket.h" 3 4
-struct sockaddr_storage
-  {
-    sa_family_t ss_family;
-    char __ss_padding[(128 - (sizeof (unsigned short int)) - sizeof (unsigned long int))];
-    unsigned long int __ss_align;
-  };
-
-
-
-enum
-  {
-    MSG_OOB = 0x01,
-
-    MSG_PEEK = 0x02,
-
-    MSG_DONTROUTE = 0x04,
-
-
-
-    MSG_TRYHARD = MSG_DONTROUTE,
-
-
-    MSG_CTRUNC = 0x08,
-
-    MSG_PROXY = 0x10,
-
-    MSG_TRUNC = 0x20,
-
-    MSG_DONTWAIT = 0x40,
-
-    MSG_EOR = 0x80,
-
-    MSG_WAITALL = 0x100,
-
-    MSG_FIN = 0x200,
-
-    MSG_SYN = 0x400,
-
-    MSG_CONFIRM = 0x800,
-
-    MSG_RST = 0x1000,
-
-    MSG_ERRQUEUE = 0x2000,
-
-    MSG_NOSIGNAL = 0x4000,
-
-    MSG_MORE = 0x8000,
-
-    MSG_WAITFORONE = 0x10000,
-
-    MSG_BATCH = 0x40000,
-
-    MSG_ZEROCOPY = 0x4000000,
-
-    MSG_FASTOPEN = 0x20000000,
-
-
-    MSG_CMSG_CLOEXEC = 0x40000000
-
-
-
-  };
-
-
-
-
-struct msghdr
-  {
-    void *msg_name;
-    socklen_t msg_namelen;
-
-    struct iovec *msg_iov;
-    size_t msg_iovlen;
-
-    void *msg_control;
-    size_t msg_controllen;
-
-
-
-
-    int msg_flags;
-  };
-
-
-struct cmsghdr
-  {
-    size_t cmsg_len;
-
-
-
-
-    int cmsg_level;
-    int cmsg_type;
-
-    __extension__ unsigned char __cmsg_data [];
-
-  };
-# 302 "/usr/include/x86_64-linux-gnu/bits/socket.h" 3 4
-extern struct cmsghdr *__cmsg_nxthdr (struct msghdr *__mhdr,
-          struct cmsghdr *__cmsg) __attribute__ ((__nothrow__ , __leaf__));
-
-
-
-
-extern __inline __attribute__ ((__gnu_inline__)) struct cmsghdr *
-__attribute__ ((__nothrow__ , __leaf__)) __cmsg_nxthdr (struct msghdr *__mhdr, struct cmsghdr *__cmsg)
-{
-  if ((size_t) __cmsg->cmsg_len < sizeof (struct cmsghdr))
-
-    return (struct cmsghdr *) 0;
-
-  __cmsg = (struct cmsghdr *) ((unsigned char *) __cmsg
-          + (((__cmsg->cmsg_len) + sizeof (size_t) - 1) & (size_t) ~(sizeof (size_t) - 1)));
-  if ((unsigned char *) (__cmsg + 1) > ((unsigned char *) __mhdr->msg_control
-     + __mhdr->msg_controllen)
-      || ((unsigned char *) __cmsg + (((__cmsg->cmsg_len) + sizeof (size_t) - 1) & (size_t) ~(sizeof (size_t) - 1))
-   > ((unsigned char *) __mhdr->msg_control + __mhdr->msg_controllen)))
-
-    return (struct cmsghdr *) 0;
-  return __cmsg;
-}
-
-
-
-
-enum
-  {
-    SCM_RIGHTS = 0x01
-
-
-    , SCM_CREDENTIALS = 0x02
-
-
-  };
-
-
-
-struct ucred
-{
-  pid_t pid;
-  uid_t uid;
-  gid_t gid;
-};
-# 390 "/usr/include/x86_64-linux-gnu/bits/socket.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/asm/socket.h" 1 3 4
-# 1 "/usr/include/asm-generic/socket.h" 1 3 4
-
-
-
-
-# 1 "/usr/include/x86_64-linux-gnu/asm/sockios.h" 1 3 4
-# 1 "/usr/include/asm-generic/sockios.h" 1 3 4
-# 1 "/usr/include/x86_64-linux-gnu/asm/sockios.h" 2 3 4
-# 6 "/usr/include/asm-generic/socket.h" 2 3 4
-# 1 "/usr/include/x86_64-linux-gnu/asm/socket.h" 2 3 4
-# 391 "/usr/include/x86_64-linux-gnu/bits/socket.h" 2 3 4
-# 444 "/usr/include/x86_64-linux-gnu/bits/socket.h" 3 4
-struct linger
-  {
-    int l_onoff;
-    int l_linger;
-  };
-# 34 "/usr/include/x86_64-linux-gnu/sys/socket.h" 2 3 4
-
-
-# 1 "/usr/include/x86_64-linux-gnu/bits/types/struct_osockaddr.h" 1 3 4
-
-
-
-
-
-struct osockaddr
-{
-  unsigned short int sa_family;
-  unsigned char sa_data[14];
-};
-# 37 "/usr/include/x86_64-linux-gnu/sys/socket.h" 2 3 4
-
-
-
-
-enum
-{
-  SHUT_RD = 0,
-
-  SHUT_WR,
-
-  SHUT_RDWR
-
-};
-# 79 "/usr/include/x86_64-linux-gnu/sys/socket.h" 3 4
-typedef union { struct sockaddr *__restrict __sockaddr__; struct sockaddr_at *__restrict __sockaddr_at__; struct sockaddr_ax25 *__restrict __sockaddr_ax25__; struct sockaddr_dl *__restrict __sockaddr_dl__; struct sockaddr_eon *__restrict __sockaddr_eon__; struct sockaddr_in *__restrict __sockaddr_in__; struct sockaddr_in6 *__restrict __sockaddr_in6__; struct sockaddr_inarp *__restrict __sockaddr_inarp__; struct sockaddr_ipx *__restrict __sockaddr_ipx__; struct sockaddr_iso *__restrict __sockaddr_iso__; struct sockaddr_ns *__restrict __sockaddr_ns__; struct sockaddr_un *__restrict __sockaddr_un__; struct sockaddr_x25 *__restrict __sockaddr_x25__;
-       } __SOCKADDR_ARG __attribute__ ((__transparent_union__));
-
-
-typedef union { const struct sockaddr *__restrict __sockaddr__; const struct sockaddr_at *__restrict __sockaddr_at__; const struct sockaddr_ax25 *__restrict __sockaddr_ax25__; const struct sockaddr_dl *__restrict __sockaddr_dl__; const struct sockaddr_eon *__restrict __sockaddr_eon__; const struct sockaddr_in *__restrict __sockaddr_in__; const struct sockaddr_in6 *__restrict __sockaddr_in6__; const struct sockaddr_inarp *__restrict __sockaddr_inarp__; const struct sockaddr_ipx *__restrict __sockaddr_ipx__; const struct sockaddr_iso *__restrict __sockaddr_iso__; const struct sockaddr_ns *__restrict __sockaddr_ns__; const struct sockaddr_un *__restrict __sockaddr_un__; const struct sockaddr_x25 *__restrict __sockaddr_x25__;
-       } __CONST_SOCKADDR_ARG __attribute__ ((__transparent_union__));
-
-
-
-
-
-struct mmsghdr
-  {
-    struct msghdr msg_hdr;
-    unsigned int msg_len;
-
-  };
-
-
-
-
-
-
-extern int socket (int __domain, int __type, int __protocol) __attribute__ ((__nothrow__ , __leaf__));
-
-
-
-
-
-extern int socketpair (int __domain, int __type, int __protocol,
-         int __fds[2]) __attribute__ ((__nothrow__ , __leaf__));
-
-
-extern int bind (int __fd, __CONST_SOCKADDR_ARG __addr, socklen_t __len)
-     __attribute__ ((__nothrow__ , __leaf__));
-
-
-extern int getsockname (int __fd, __SOCKADDR_ARG __addr,
-   socklen_t *__restrict __len) __attribute__ ((__nothrow__ , __leaf__));
-# 126 "/usr/include/x86_64-linux-gnu/sys/socket.h" 3 4
-extern int connect (int __fd, __CONST_SOCKADDR_ARG __addr, socklen_t __len);
-
-
-
-extern int getpeername (int __fd, __SOCKADDR_ARG __addr,
-   socklen_t *__restrict __len) __attribute__ ((__nothrow__ , __leaf__));
-
-
-
-
-
-
-extern ssize_t send (int __fd, const void *__buf, size_t __n, int __flags);
-
-
-
-
-
-
-extern ssize_t recv (int __fd, void *__buf, size_t __n, int __flags);
-
-
-
-
-
-
-extern ssize_t sendto (int __fd, const void *__buf, size_t __n,
-         int __flags, __CONST_SOCKADDR_ARG __addr,
-         socklen_t __addr_len);
-# 163 "/usr/include/x86_64-linux-gnu/sys/socket.h" 3 4
-extern ssize_t recvfrom (int __fd, void *__restrict __buf, size_t __n,
-    int __flags, __SOCKADDR_ARG __addr,
-    socklen_t *__restrict __addr_len);
-
-
-
-
-
-
-
-extern ssize_t sendmsg (int __fd, const struct msghdr *__message,
-   int __flags);
-
-
-
-
-
-
-
-extern int sendmmsg (int __fd, struct mmsghdr *__vmessages,
-       unsigned int __vlen, int __flags);
-
-
-
-
-
-
-
-extern ssize_t recvmsg (int __fd, struct msghdr *__message, int __flags);
-
-
-
-
-
-
-
-extern int recvmmsg (int __fd, struct mmsghdr *__vmessages,
-       unsigned int __vlen, int __flags,
-       struct timespec *__tmo);
-
-
-
-
-
-
-extern int getsockopt (int __fd, int __level, int __optname,
-         void *__restrict __optval,
-         socklen_t *__restrict __optlen) __attribute__ ((__nothrow__ , __leaf__));
-
-
-
-
-extern int setsockopt (int __fd, int __level, int __optname,
-         const void *__optval, socklen_t __optlen) __attribute__ ((__nothrow__ , __leaf__));
-
-
-
-
-
-extern int listen (int __fd, int __n) __attribute__ ((__nothrow__ , __leaf__));
-# 232 "/usr/include/x86_64-linux-gnu/sys/socket.h" 3 4
-extern int accept (int __fd, __SOCKADDR_ARG __addr,
-     socklen_t *__restrict __addr_len);
-
-
-
-
-
-
-extern int accept4 (int __fd, __SOCKADDR_ARG __addr,
-      socklen_t *__restrict __addr_len, int __flags);
-# 250 "/usr/include/x86_64-linux-gnu/sys/socket.h" 3 4
-extern int shutdown (int __fd, int __how) __attribute__ ((__nothrow__ , __leaf__));
-
-
-
-
-extern int sockatmark (int __fd) __attribute__ ((__nothrow__ , __leaf__));
-
-
-
-
-
-
-
-extern int isfdtype (int __fd, int __fdtype) __attribute__ ((__nothrow__ , __leaf__));
-
-
-
-
-
-# 1 "/usr/include/x86_64-linux-gnu/bits/socket2.h" 1 3 4
-# 23 "/usr/include/x86_64-linux-gnu/bits/socket2.h" 3 4
-extern ssize_t __recv_chk (int __fd, void *__buf, size_t __n, size_t __buflen,
-      int __flags);
-extern ssize_t __recv_alias (int __fd, void *__buf, size_t __n, int __flags) __asm__ ("" "recv")
-                          ;
-extern ssize_t __recv_chk_warn (int __fd, void *__buf, size_t __n, size_t __buflen, int __flags) __asm__ ("" "__recv_chk")
-
-
-     __attribute__((__warning__ ("recv called with bigger length than size of destination " "buffer")))
-            ;
-
-extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline__)) __attribute__ ((__artificial__)) ssize_t
-recv (int __fd, void *__buf, size_t __n, int __flags)
-{
-  if (__builtin_object_size (__buf, 0) != (size_t) -1)
-    {
-      if (!__builtin_constant_p (__n))
- return __recv_chk (__fd, __buf, __n, __builtin_object_size (__buf, 0), __flags);
-
-      if (__n > __builtin_object_size (__buf, 0))
- return __recv_chk_warn (__fd, __buf, __n, __builtin_object_size (__buf, 0), __flags);
-    }
-  return __recv_alias (__fd, __buf, __n, __flags);
-}
-
-extern ssize_t __recvfrom_chk (int __fd, void *__restrict __buf, size_t __n,
-          size_t __buflen, int __flags,
-          __SOCKADDR_ARG __addr,
-          socklen_t *__restrict __addr_len);
-extern ssize_t __recvfrom_alias (int __fd, void *__restrict __buf, size_t __n, int __flags, __SOCKADDR_ARG __addr, socklen_t *__restrict __addr_len) __asm__ ("" "recvfrom")
-
-
-                                                   ;
-extern ssize_t __recvfrom_chk_warn (int __fd, void *__restrict __buf, size_t __n, size_t __buflen, int __flags, __SOCKADDR_ARG __addr, socklen_t *__restrict __addr_len) __asm__ ("" "__recvfrom_chk")
-
-
-
-
-     __attribute__((__warning__ ("recvfrom called with bigger length than size of " "destination buffer")))
-                        ;
-
-extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline__)) __attribute__ ((__artificial__)) ssize_t
-recvfrom (int __fd, void *__restrict __buf, size_t __n, int __flags,
-   __SOCKADDR_ARG __addr, socklen_t *__restrict __addr_len)
-{
-  if (__builtin_object_size (__buf, 0) != (size_t) -1)
-    {
-      if (!__builtin_constant_p (__n))
- return __recvfrom_chk (__fd, __buf, __n, __builtin_object_size (__buf, 0), __flags,
-          __addr, __addr_len);
-      if (__n > __builtin_object_size (__buf, 0))
- return __recvfrom_chk_warn (__fd, __buf, __n, __builtin_object_size (__buf, 0), __flags,
-        __addr, __addr_len);
-    }
-  return __recvfrom_alias (__fd, __buf, __n, __flags, __addr, __addr_len);
-}
-# 270 "/usr/include/x86_64-linux-gnu/sys/socket.h" 2 3 4
-
-
-
-# 27 "/usr/include/net/if.h" 2 3 4
-
-
-
-
-
-
-struct if_nameindex
-  {
-    unsigned int if_index;
-    char *if_name;
-  };
-
-
-
-
-enum
-  {
-    IFF_UP = 0x1,
-
-    IFF_BROADCAST = 0x2,
-
-    IFF_DEBUG = 0x4,
-
-    IFF_LOOPBACK = 0x8,
-
-    IFF_POINTOPOINT = 0x10,
-
-    IFF_NOTRAILERS = 0x20,
-
-    IFF_RUNNING = 0x40,
-
-    IFF_NOARP = 0x80,
-
-    IFF_PROMISC = 0x100,
-
-
-
-    IFF_ALLMULTI = 0x200,
-
-
-    IFF_MASTER = 0x400,
-
-    IFF_SLAVE = 0x800,
-
-
-    IFF_MULTICAST = 0x1000,
-
-
-    IFF_PORTSEL = 0x2000,
-
-    IFF_AUTOMEDIA = 0x4000,
-
-    IFF_DYNAMIC = 0x8000
-
-  };
-
-
-
-
-
-
-struct ifaddr
-  {
-    struct sockaddr ifa_addr;
-    union
-      {
- struct sockaddr ifu_broadaddr;
- struct sockaddr ifu_dstaddr;
-      } ifa_ifu;
-    struct iface *ifa_ifp;
-    struct ifaddr *ifa_next;
-  };
-# 111 "/usr/include/net/if.h" 3 4
-struct ifmap
-  {
-    unsigned long int mem_start;
-    unsigned long int mem_end;
-    unsigned short int base_addr;
-    unsigned char irq;
-    unsigned char dma;
-    unsigned char port;
-
-  };
-
-
-
-
-
-struct ifreq
-  {
-
-
-    union
-      {
- char ifrn_name[16];
-      } ifr_ifrn;
-
-    union
-      {
- struct sockaddr ifru_addr;
- struct sockaddr ifru_dstaddr;
- struct sockaddr ifru_broadaddr;
- struct sockaddr ifru_netmask;
- struct sockaddr ifru_hwaddr;
- short int ifru_flags;
- int ifru_ivalue;
- int ifru_mtu;
- struct ifmap ifru_map;
- char ifru_slave[16];
- char ifru_newname[16];
- __caddr_t ifru_data;
-      } ifr_ifru;
-  };
-# 176 "/usr/include/net/if.h" 3 4
-struct ifconf
-  {
-    int ifc_len;
-    union
-      {
- __caddr_t ifcu_buf;
- struct ifreq *ifcu_req;
-      } ifc_ifcu;
-  };
-
-
-
-
-
-
-
-
-extern unsigned int if_nametoindex (const char *__ifname) __attribute__ ((__nothrow__ , __leaf__));
-extern char *if_indextoname (unsigned int __ifindex, char *__ifname) __attribute__ ((__nothrow__ , __leaf__));
-
-
-extern struct if_nameindex *if_nameindex (void) __attribute__ ((__nothrow__ , __leaf__));
-
-
-extern void if_freenameindex (struct if_nameindex *__ptr) __attribute__ ((__nothrow__ , __leaf__));
-
-
-# 34 "/workspace/acl/lib_fiber/c/src/stdafx.h" 2
-# 1 "/usr/include/unistd.h" 1 3 4
-# 27 "/usr/include/unistd.h" 3 4
-
-# 205 "/usr/include/unistd.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/posix_opt.h" 1 3 4
-# 206 "/usr/include/unistd.h" 2 3 4
-
-
-
-# 1 "/usr/include/x86_64-linux-gnu/bits/environments.h" 1 3 4
-# 22 "/usr/include/x86_64-linux-gnu/bits/environments.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/wordsize.h" 1 3 4
-# 23 "/usr/include/x86_64-linux-gnu/bits/environments.h" 2 3 4
-# 210 "/usr/include/unistd.h" 2 3 4
-# 229 "/usr/include/unistd.h" 3 4
-# 1 "/usr/lib/gcc/x86_64-linux-gnu/7/include/stddef.h" 1 3 4
-# 230 "/usr/include/unistd.h" 2 3 4
-# 270 "/usr/include/unistd.h" 3 4
-typedef __intptr_t intptr_t;
-# 290 "/usr/include/unistd.h" 3 4
+# 287 "/usr/include/unistd.h" 3 4
 extern int access (const char *__name, int __type) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)));
 
 
@@ -6125,15 +5574,20 @@ extern int eaccess (const char *__name, int __type)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)));
 
 
+extern int execveat (int __fd, const char *__path, char *const __argv[],
+                     char *const __envp[], int __flags)
+    __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (2, 3)));
+
+
 
 
 
 
 extern int faccessat (int __fd, const char *__file, int __type, int __flag)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (2))) __attribute__ ((__warn_unused_result__));
-# 337 "/usr/include/unistd.h" 3 4
+# 339 "/usr/include/unistd.h" 3 4
 extern __off_t lseek (int __fd, __off_t __offset, int __whence) __attribute__ ((__nothrow__ , __leaf__));
-# 348 "/usr/include/unistd.h" 3 4
+# 350 "/usr/include/unistd.h" 3 4
 extern __off64_t lseek64 (int __fd, __off64_t __offset, int __whence)
      __attribute__ ((__nothrow__ , __leaf__));
 
@@ -6147,18 +5601,27 @@ extern int close (int __fd);
 
 
 
-
-
-extern ssize_t read (int __fd, void *__buf, size_t __nbytes) __attribute__ ((__warn_unused_result__));
-
+extern void closefrom (int __lowfd) __attribute__ ((__nothrow__ , __leaf__));
 
 
 
 
-extern ssize_t write (int __fd, const void *__buf, size_t __n) __attribute__ ((__warn_unused_result__));
-# 379 "/usr/include/unistd.h" 3 4
+
+
+
+extern ssize_t read (int __fd, void *__buf, size_t __nbytes) __attribute__ ((__warn_unused_result__))
+    __attribute__ ((__access__ (__write_only__, 2, 3)));
+
+
+
+
+
+extern ssize_t write (int __fd, const void *__buf, size_t __n) __attribute__ ((__warn_unused_result__))
+    __attribute__ ((__access__ (__read_only__, 2, 3)));
+# 389 "/usr/include/unistd.h" 3 4
 extern ssize_t pread (int __fd, void *__buf, size_t __nbytes,
-        __off_t __offset) __attribute__ ((__warn_unused_result__));
+        __off_t __offset) __attribute__ ((__warn_unused_result__))
+    __attribute__ ((__access__ (__write_only__, 2, 3)));
 
 
 
@@ -6166,14 +5629,17 @@ extern ssize_t pread (int __fd, void *__buf, size_t __nbytes,
 
 
 extern ssize_t pwrite (int __fd, const void *__buf, size_t __n,
-         __off_t __offset) __attribute__ ((__warn_unused_result__));
-# 407 "/usr/include/unistd.h" 3 4
+         __off_t __offset) __attribute__ ((__warn_unused_result__))
+    __attribute__ ((__access__ (__read_only__, 2, 3)));
+# 422 "/usr/include/unistd.h" 3 4
 extern ssize_t pread64 (int __fd, void *__buf, size_t __nbytes,
-   __off64_t __offset) __attribute__ ((__warn_unused_result__));
+   __off64_t __offset) __attribute__ ((__warn_unused_result__))
+    __attribute__ ((__access__ (__write_only__, 2, 3)));
 
 
 extern ssize_t pwrite64 (int __fd, const void *__buf, size_t __n,
-    __off64_t __offset) __attribute__ ((__warn_unused_result__));
+    __off64_t __offset) __attribute__ ((__warn_unused_result__))
+    __attribute__ ((__access__ (__read_only__, 2, 3)));
 
 
 
@@ -6187,9 +5653,9 @@ extern int pipe (int __pipedes[2]) __attribute__ ((__nothrow__ , __leaf__)) __at
 
 
 extern int pipe2 (int __pipedes[2], int __flags) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__warn_unused_result__));
-# 435 "/usr/include/unistd.h" 3 4
+# 452 "/usr/include/unistd.h" 3 4
 extern unsigned int alarm (unsigned int __seconds) __attribute__ ((__nothrow__ , __leaf__));
-# 447 "/usr/include/unistd.h" 3 4
+# 464 "/usr/include/unistd.h" 3 4
 extern unsigned int sleep (unsigned int __seconds);
 
 
@@ -6207,7 +5673,7 @@ extern __useconds_t ualarm (__useconds_t __value, __useconds_t __interval)
 
 
 extern int usleep (__useconds_t __useconds);
-# 472 "/usr/include/unistd.h" 3 4
+# 489 "/usr/include/unistd.h" 3 4
 extern int pause (void);
 
 
@@ -6241,7 +5707,7 @@ extern int chdir (const char *__path) __attribute__ ((__nothrow__ , __leaf__)) _
 
 
 extern int fchdir (int __fd) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__warn_unused_result__));
-# 514 "/usr/include/unistd.h" 3 4
+# 531 "/usr/include/unistd.h" 3 4
 extern char *getcwd (char *__buf, size_t __size) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__warn_unused_result__));
 
 
@@ -6257,7 +5723,8 @@ extern char *get_current_dir_name (void) __attribute__ ((__nothrow__ , __leaf__)
 
 
 extern char *getwd (char *__buf)
-     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1))) __attribute__ ((__deprecated__)) __attribute__ ((__warn_unused_result__));
+     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1))) __attribute__ ((__deprecated__)) __attribute__ ((__warn_unused_result__))
+    __attribute__ ((__access__ (__write_only__, 1)));
 
 
 
@@ -6340,8 +5807,8 @@ extern void _exit (int __status) __attribute__ ((__noreturn__));
 
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/confname.h" 1 3 4
-# 24 "/usr/include/x86_64-linux-gnu/bits/confname.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/confname.h" 1 3 4
+# 24 "/usr/include/aarch64-linux-gnu/bits/confname.h" 3 4
 enum
   {
     _PC_LINK_MAX,
@@ -6846,7 +6313,13 @@ enum
 
     _SC_THREAD_ROBUST_PRIO_INHERIT,
 
-    _SC_THREAD_ROBUST_PRIO_PROTECT
+    _SC_THREAD_ROBUST_PRIO_PROTECT,
+
+
+    _SC_MINSIGSTKSZ,
+
+
+    _SC_SIGSTKSZ
 
   };
 
@@ -6994,7 +6467,7 @@ enum
     _CS_V7_ENV
 
   };
-# 613 "/usr/include/unistd.h" 2 3 4
+# 631 "/usr/include/unistd.h" 2 3 4
 
 
 extern long int pathconf (const char *__path, int __name)
@@ -7008,7 +6481,8 @@ extern long int sysconf (int __name) __attribute__ ((__nothrow__ , __leaf__));
 
 
 
-extern size_t confstr (int __name, char *__buf, size_t __len) __attribute__ ((__nothrow__ , __leaf__));
+extern size_t confstr (int __name, char *__buf, size_t __len) __attribute__ ((__nothrow__ , __leaf__))
+    __attribute__ ((__access__ (__write_only__, 2, 3)));
 
 
 
@@ -7032,7 +6506,7 @@ extern __pid_t getpgid (__pid_t __pid) __attribute__ ((__nothrow__ , __leaf__));
 
 
 extern int setpgid (__pid_t __pid, __pid_t __pgid) __attribute__ ((__nothrow__ , __leaf__));
-# 663 "/usr/include/unistd.h" 3 4
+# 682 "/usr/include/unistd.h" 3 4
 extern int setpgrp (void) __attribute__ ((__nothrow__ , __leaf__));
 
 
@@ -7062,8 +6536,8 @@ extern __gid_t getegid (void) __attribute__ ((__nothrow__ , __leaf__));
 
 
 
-extern int getgroups (int __size, __gid_t __list[]) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__warn_unused_result__));
-
+extern int getgroups (int __size, __gid_t __list[]) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__warn_unused_result__))
+    __attribute__ ((__access__ (__write_only__, 2, 1)));
 
 
 extern int group_member (__gid_t __gid) __attribute__ ((__nothrow__ , __leaf__));
@@ -7143,12 +6617,20 @@ extern __pid_t vfork (void) __attribute__ ((__nothrow__ , __leaf__));
 
 
 
+
+extern __pid_t _Fork (void) __attribute__ ((__nothrow__ , __leaf__));
+
+
+
+
+
 extern char *ttyname (int __fd) __attribute__ ((__nothrow__ , __leaf__));
 
 
 
 extern int ttyname_r (int __fd, char *__buf, size_t __buflen)
-     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (2))) __attribute__ ((__warn_unused_result__));
+     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (2))) __attribute__ ((__warn_unused_result__))
+     __attribute__ ((__access__ (__write_only__, 2, 3)));
 
 
 
@@ -7183,7 +6665,9 @@ extern int symlink (const char *__from, const char *__to)
 
 extern ssize_t readlink (const char *__restrict __path,
     char *__restrict __buf, size_t __len)
-     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1, 2))) __attribute__ ((__warn_unused_result__));
+     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1, 2))) __attribute__ ((__warn_unused_result__))
+     __attribute__ ((__access__ (__write_only__, 2, 3)));
+
 
 
 
@@ -7194,7 +6678,8 @@ extern int symlinkat (const char *__from, int __tofd,
 
 extern ssize_t readlinkat (int __fd, const char *__restrict __path,
       char *__restrict __buf, size_t __len)
-     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (2, 3))) __attribute__ ((__warn_unused_result__));
+     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (2, 3))) __attribute__ ((__warn_unused_result__))
+     __attribute__ ((__access__ (__write_only__, 3, 4)));
 
 
 
@@ -7229,7 +6714,8 @@ extern char *getlogin (void);
 
 
 
-extern int getlogin_r (char *__name, size_t __name_len) __attribute__ ((__nonnull__ (1)));
+extern int getlogin_r (char *__name, size_t __name_len) __attribute__ ((__nonnull__ (1)))
+    __attribute__ ((__access__ (__write_only__, 1, 2)));
 
 
 
@@ -7242,10 +6728,10 @@ extern int setlogin (const char *__name) __attribute__ ((__nothrow__ , __leaf__)
 
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/getopt_posix.h" 1 3 4
-# 27 "/usr/include/x86_64-linux-gnu/bits/getopt_posix.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/getopt_core.h" 1 3 4
-# 28 "/usr/include/x86_64-linux-gnu/bits/getopt_core.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/getopt_posix.h" 1 3 4
+# 27 "/usr/include/aarch64-linux-gnu/bits/getopt_posix.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/getopt_core.h" 1 3 4
+# 28 "/usr/include/aarch64-linux-gnu/bits/getopt_core.h" 3 4
 
 
 
@@ -7255,7 +6741,7 @@ extern int setlogin (const char *__name) __attribute__ ((__nothrow__ , __leaf__)
 
 
 extern char *optarg;
-# 50 "/usr/include/x86_64-linux-gnu/bits/getopt_core.h" 3 4
+# 50 "/usr/include/aarch64-linux-gnu/bits/getopt_core.h" 3 4
 extern int optind;
 
 
@@ -7266,25 +6752,26 @@ extern int opterr;
 
 
 extern int optopt;
-# 91 "/usr/include/x86_64-linux-gnu/bits/getopt_core.h" 3 4
+# 91 "/usr/include/aarch64-linux-gnu/bits/getopt_core.h" 3 4
 extern int getopt (int ___argc, char *const *___argv, const char *__shortopts)
        __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (2, 3)));
 
 
-# 28 "/usr/include/x86_64-linux-gnu/bits/getopt_posix.h" 2 3 4
+# 28 "/usr/include/aarch64-linux-gnu/bits/getopt_posix.h" 2 3 4
 
 
-# 49 "/usr/include/x86_64-linux-gnu/bits/getopt_posix.h" 3 4
+# 49 "/usr/include/aarch64-linux-gnu/bits/getopt_posix.h" 3 4
 
-# 873 "/usr/include/unistd.h" 2 3 4
-
-
-
+# 904 "/usr/include/unistd.h" 2 3 4
 
 
 
 
-extern int gethostname (char *__name, size_t __len) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)));
+
+
+
+extern int gethostname (char *__name, size_t __len) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)))
+    __attribute__ ((__access__ (__write_only__, 1, 2)));
 
 
 
@@ -7292,7 +6779,7 @@ extern int gethostname (char *__name, size_t __len) __attribute__ ((__nothrow__ 
 
 
 extern int sethostname (const char *__name, size_t __len)
-     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1))) __attribute__ ((__warn_unused_result__));
+     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1))) __attribute__ ((__warn_unused_result__)) __attribute__ ((__access__ (__read_only__, 1, 2)));
 
 
 
@@ -7303,10 +6790,10 @@ extern int sethostid (long int __id) __attribute__ ((__nothrow__ , __leaf__)) __
 
 
 extern int getdomainname (char *__name, size_t __len)
-     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1))) __attribute__ ((__warn_unused_result__));
+     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1))) __attribute__ ((__warn_unused_result__))
+     __attribute__ ((__access__ (__write_only__, 1, 2)));
 extern int setdomainname (const char *__name, size_t __len)
-     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1))) __attribute__ ((__warn_unused_result__));
-
+     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1))) __attribute__ ((__warn_unused_result__)) __attribute__ ((__access__ (__read_only__, 1, 2)));
 
 
 
@@ -7389,17 +6876,17 @@ extern int getpagesize (void) __attribute__ ((__nothrow__ , __leaf__)) __attribu
 
 
 extern int getdtablesize (void) __attribute__ ((__nothrow__ , __leaf__));
-# 994 "/usr/include/unistd.h" 3 4
+# 1026 "/usr/include/unistd.h" 3 4
 extern int truncate (const char *__file, __off_t __length)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1))) __attribute__ ((__warn_unused_result__));
-# 1006 "/usr/include/unistd.h" 3 4
+# 1038 "/usr/include/unistd.h" 3 4
 extern int truncate64 (const char *__file, __off64_t __length)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1))) __attribute__ ((__warn_unused_result__));
-# 1017 "/usr/include/unistd.h" 3 4
+# 1049 "/usr/include/unistd.h" 3 4
 extern int ftruncate (int __fd, __off_t __length) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__warn_unused_result__));
-# 1027 "/usr/include/unistd.h" 3 4
+# 1059 "/usr/include/unistd.h" 3 4
 extern int ftruncate64 (int __fd, __off64_t __length) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__warn_unused_result__));
-# 1038 "/usr/include/unistd.h" 3 4
+# 1070 "/usr/include/unistd.h" 3 4
 extern int brk (void *__addr) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__warn_unused_result__));
 
 
@@ -7407,9 +6894,9 @@ extern int brk (void *__addr) __attribute__ ((__nothrow__ , __leaf__)) __attribu
 
 
 extern void *sbrk (intptr_t __delta) __attribute__ ((__nothrow__ , __leaf__));
-# 1059 "/usr/include/unistd.h" 3 4
+# 1091 "/usr/include/unistd.h" 3 4
 extern long int syscall (long int __sysno, ...) __attribute__ ((__nothrow__ , __leaf__));
-# 1110 "/usr/include/unistd.h" 3 4
+# 1142 "/usr/include/unistd.h" 3 4
 ssize_t copy_file_range (int __infd, __off64_t *__pinoff,
     int __outfd, __off64_t *__poutoff,
     size_t __length, unsigned int __flags);
@@ -7419,20 +6906,10 @@ ssize_t copy_file_range (int __infd, __off64_t *__pinoff,
 
 
 extern int fdatasync (int __fildes);
-
-
-
-
-
-
-
+# 1159 "/usr/include/unistd.h" 3 4
 extern char *crypt (const char *__key, const char *__salt)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1, 2)));
 
-
-
-extern void encrypt (char *__glibc_block, int __edflag)
-     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)));
 
 
 
@@ -7440,19 +6917,27 @@ extern void encrypt (char *__glibc_block, int __edflag)
 
 
 extern void swab (const void *__restrict __from, void *__restrict __to,
-    ssize_t __n) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1, 2)));
-# 1167 "/usr/include/unistd.h" 3 4
-int getentropy (void *__buffer, size_t __length) __attribute__ ((__warn_unused_result__));
+    ssize_t __n) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1, 2)))
+    __attribute__ ((__access__ (__read_only__, 1, 3)))
+    __attribute__ ((__access__ (__write_only__, 2, 3)));
+# 1198 "/usr/include/unistd.h" 3 4
+int getentropy (void *__buffer, size_t __length) __attribute__ ((__warn_unused_result__))
+    __attribute__ ((__access__ (__write_only__, 1, 2)));
+# 1208 "/usr/include/unistd.h" 3 4
+extern int close_range (unsigned int __fd, unsigned int __max_fd,
+   int __flags) __attribute__ ((__nothrow__ , __leaf__));
 
 
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/unistd.h" 1 3 4
-# 23 "/usr/include/x86_64-linux-gnu/bits/unistd.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/unistd.h" 1 3 4
+# 23 "/usr/include/aarch64-linux-gnu/bits/unistd.h" 3 4
 extern ssize_t __read_chk (int __fd, void *__buf, size_t __nbytes,
-      size_t __buflen) __attribute__ ((__warn_unused_result__));
+      size_t __buflen)
+  __attribute__ ((__warn_unused_result__)) __attribute__ ((__access__ (__write_only__, 2, 3)));
 extern ssize_t __read_alias (int __fd, void *__buf, size_t __nbytes) __asm__ ("" "read")
-                               __attribute__ ((__warn_unused_result__));
+
+  __attribute__ ((__warn_unused_result__)) __attribute__ ((__access__ (__write_only__, 2, 3)));
 extern ssize_t __read_chk_warn (int __fd, void *__buf, size_t __nbytes, size_t __buflen) __asm__ ("" "__read_chk")
 
 
@@ -7462,28 +6947,26 @@ extern ssize_t __read_chk_warn (int __fd, void *__buf, size_t __nbytes, size_t _
 extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline__)) __attribute__ ((__artificial__)) __attribute__ ((__warn_unused_result__)) ssize_t
 read (int __fd, void *__buf, size_t __nbytes)
 {
-  if (__builtin_object_size (__buf, 0) != (size_t) -1)
-    {
-      if (!__builtin_constant_p (__nbytes))
- return __read_chk (__fd, __buf, __nbytes, __builtin_object_size (__buf, 0));
+  return ((((__typeof (__nbytes)) 0 < (__typeof (__nbytes)) -1 || (__builtin_constant_p (__nbytes) && (__nbytes) > 0)) && __builtin_constant_p ((((long unsigned int) (__nbytes)) <= (__builtin_object_size (__buf, 0)) / (sizeof (char)))) && (((long unsigned int) (__nbytes)) <= (__builtin_object_size (__buf, 0)) / (sizeof (char)))) ? __read_alias (__fd, __buf, __nbytes) : ((((__typeof (__nbytes)) 0 < (__typeof (__nbytes)) -1 || (__builtin_constant_p (__nbytes) && (__nbytes) > 0)) && __builtin_constant_p ((((long unsigned int) (__nbytes)) <= (__builtin_object_size (__buf, 0)) / (sizeof (char)))) && !(((long unsigned int) (__nbytes)) <= (__builtin_object_size (__buf, 0)) / (sizeof (char)))) ? __read_chk_warn (__fd, __buf, __nbytes, __builtin_object_size (__buf, 0)) : __read_chk (__fd, __buf, __nbytes, __builtin_object_size (__buf, 0))))
 
-      if (__nbytes > __builtin_object_size (__buf, 0))
- return __read_chk_warn (__fd, __buf, __nbytes, __builtin_object_size (__buf, 0));
-    }
-  return __read_alias (__fd, __buf, __nbytes);
+                           ;
 }
 
 
 extern ssize_t __pread_chk (int __fd, void *__buf, size_t __nbytes,
-       __off_t __offset, size_t __bufsize) __attribute__ ((__warn_unused_result__));
+       __off_t __offset, size_t __bufsize)
+  __attribute__ ((__warn_unused_result__)) __attribute__ ((__access__ (__write_only__, 2, 3)));
 extern ssize_t __pread64_chk (int __fd, void *__buf, size_t __nbytes,
-         __off64_t __offset, size_t __bufsize) __attribute__ ((__warn_unused_result__));
+         __off64_t __offset, size_t __bufsize)
+  __attribute__ ((__warn_unused_result__)) __attribute__ ((__access__ (__write_only__, 2, 3)));
 extern ssize_t __pread_alias (int __fd, void *__buf, size_t __nbytes, __off_t __offset) __asm__ ("" "pread")
 
-                                 __attribute__ ((__warn_unused_result__));
+
+  __attribute__ ((__warn_unused_result__)) __attribute__ ((__access__ (__write_only__, 2, 3)));
 extern ssize_t __pread64_alias (int __fd, void *__buf, size_t __nbytes, __off64_t __offset) __asm__ ("" "pread64")
 
-                                     __attribute__ ((__warn_unused_result__));
+
+  __attribute__ ((__warn_unused_result__)) __attribute__ ((__access__ (__write_only__, 2, 3)));
 extern ssize_t __pread_chk_warn (int __fd, void *__buf, size_t __nbytes, __off_t __offset, size_t __bufsize) __asm__ ("" "__pread_chk")
 
 
@@ -7500,32 +6983,17 @@ extern ssize_t __pread64_chk_warn (int __fd, void *__buf, size_t __nbytes, __off
 extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline__)) __attribute__ ((__artificial__)) __attribute__ ((__warn_unused_result__)) ssize_t
 pread (int __fd, void *__buf, size_t __nbytes, __off_t __offset)
 {
-  if (__builtin_object_size (__buf, 0) != (size_t) -1)
-    {
-      if (!__builtin_constant_p (__nbytes))
- return __pread_chk (__fd, __buf, __nbytes, __offset, __builtin_object_size (__buf, 0));
+  return ((((__typeof (__nbytes)) 0 < (__typeof (__nbytes)) -1 || (__builtin_constant_p (__nbytes) && (__nbytes) > 0)) && __builtin_constant_p ((((long unsigned int) (__nbytes)) <= (__builtin_object_size (__buf, 0)) / (sizeof (char)))) && (((long unsigned int) (__nbytes)) <= (__builtin_object_size (__buf, 0)) / (sizeof (char)))) ? __pread_alias (__fd, __buf, __nbytes, __offset) : ((((__typeof (__nbytes)) 0 < (__typeof (__nbytes)) -1 || (__builtin_constant_p (__nbytes) && (__nbytes) > 0)) && __builtin_constant_p ((((long unsigned int) (__nbytes)) <= (__builtin_object_size (__buf, 0)) / (sizeof (char)))) && !(((long unsigned int) (__nbytes)) <= (__builtin_object_size (__buf, 0)) / (sizeof (char)))) ? __pread_chk_warn (__fd, __buf, __nbytes, __offset, __builtin_object_size (__buf, 0)) : __pread_chk (__fd, __buf, __nbytes, __offset, __builtin_object_size (__buf, 0))))
 
-      if ( __nbytes > __builtin_object_size (__buf, 0))
- return __pread_chk_warn (__fd, __buf, __nbytes, __offset,
-     __builtin_object_size (__buf, 0));
-    }
-  return __pread_alias (__fd, __buf, __nbytes, __offset);
+                                     ;
 }
-# 104 "/usr/include/x86_64-linux-gnu/bits/unistd.h" 3 4
+# 89 "/usr/include/aarch64-linux-gnu/bits/unistd.h" 3 4
 extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline__)) __attribute__ ((__artificial__)) __attribute__ ((__warn_unused_result__)) ssize_t
 pread64 (int __fd, void *__buf, size_t __nbytes, __off64_t __offset)
 {
-  if (__builtin_object_size (__buf, 0) != (size_t) -1)
-    {
-      if (!__builtin_constant_p (__nbytes))
- return __pread64_chk (__fd, __buf, __nbytes, __offset, __builtin_object_size (__buf, 0));
+  return ((((__typeof (__nbytes)) 0 < (__typeof (__nbytes)) -1 || (__builtin_constant_p (__nbytes) && (__nbytes) > 0)) && __builtin_constant_p ((((long unsigned int) (__nbytes)) <= (__builtin_object_size (__buf, 0)) / (sizeof (char)))) && (((long unsigned int) (__nbytes)) <= (__builtin_object_size (__buf, 0)) / (sizeof (char)))) ? __pread64_alias (__fd, __buf, __nbytes, __offset) : ((((__typeof (__nbytes)) 0 < (__typeof (__nbytes)) -1 || (__builtin_constant_p (__nbytes) && (__nbytes) > 0)) && __builtin_constant_p ((((long unsigned int) (__nbytes)) <= (__builtin_object_size (__buf, 0)) / (sizeof (char)))) && !(((long unsigned int) (__nbytes)) <= (__builtin_object_size (__buf, 0)) / (sizeof (char)))) ? __pread64_chk_warn (__fd, __buf, __nbytes, __offset, __builtin_object_size (__buf, 0)) : __pread64_chk (__fd, __buf, __nbytes, __offset, __builtin_object_size (__buf, 0))))
 
-      if ( __nbytes > __builtin_object_size (__buf, 0))
- return __pread64_chk_warn (__fd, __buf, __nbytes, __offset,
-       __builtin_object_size (__buf, 0));
-    }
-
-  return __pread64_alias (__fd, __buf, __nbytes, __offset);
+                                     ;
 }
 
 
@@ -7534,11 +7002,11 @@ pread64 (int __fd, void *__buf, size_t __nbytes, __off64_t __offset)
 extern ssize_t __readlink_chk (const char *__restrict __path,
           char *__restrict __buf, size_t __len,
           size_t __buflen)
-     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1, 2))) __attribute__ ((__warn_unused_result__));
+     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1, 2))) __attribute__ ((__warn_unused_result__)) __attribute__ ((__access__ (__write_only__, 2, 3)));
 extern ssize_t __readlink_alias (const char *__restrict __path, char *__restrict __buf, size_t __len) __asm__ ("" "readlink") __attribute__ ((__nothrow__ , __leaf__))
 
 
-     __attribute__ ((__nonnull__ (1, 2))) __attribute__ ((__warn_unused_result__));
+     __attribute__ ((__nonnull__ (1, 2))) __attribute__ ((__warn_unused_result__)) __attribute__ ((__access__ (__write_only__, 2, 3)));
 extern ssize_t __readlink_chk_warn (const char *__restrict __path, char *__restrict __buf, size_t __len, size_t __buflen) __asm__ ("" "__readlink_chk") __attribute__ ((__nothrow__ , __leaf__))
 
 
@@ -7550,15 +7018,9 @@ extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline
 __attribute__ ((__nothrow__ , __leaf__)) readlink (const char *__restrict __path, char *__restrict __buf, size_t __len)
 
 {
-  if (__builtin_object_size (__buf, 2 > 1) != (size_t) -1)
-    {
-      if (!__builtin_constant_p (__len))
- return __readlink_chk (__path, __buf, __len, __builtin_object_size (__buf, 2 > 1));
+  return ((((__typeof (__len)) 0 < (__typeof (__len)) -1 || (__builtin_constant_p (__len) && (__len) > 0)) && __builtin_constant_p ((((long unsigned int) (__len)) <= (__builtin_object_size (__buf, 2 > 1)) / (sizeof (char)))) && (((long unsigned int) (__len)) <= (__builtin_object_size (__buf, 2 > 1)) / (sizeof (char)))) ? __readlink_alias (__path, __buf, __len) : ((((__typeof (__len)) 0 < (__typeof (__len)) -1 || (__builtin_constant_p (__len) && (__len) > 0)) && __builtin_constant_p ((((long unsigned int) (__len)) <= (__builtin_object_size (__buf, 2 > 1)) / (sizeof (char)))) && !(((long unsigned int) (__len)) <= (__builtin_object_size (__buf, 2 > 1)) / (sizeof (char)))) ? __readlink_chk_warn (__path, __buf, __len, __builtin_object_size (__buf, 2 > 1)) : __readlink_chk (__path, __buf, __len, __builtin_object_size (__buf, 2 > 1))))
 
-      if ( __len > __builtin_object_size (__buf, 2 > 1))
- return __readlink_chk_warn (__path, __buf, __len, __builtin_object_size (__buf, 2 > 1));
-    }
-  return __readlink_alias (__path, __buf, __len);
+                          ;
 }
 
 
@@ -7566,12 +7028,12 @@ __attribute__ ((__nothrow__ , __leaf__)) readlink (const char *__restrict __path
 extern ssize_t __readlinkat_chk (int __fd, const char *__restrict __path,
      char *__restrict __buf, size_t __len,
      size_t __buflen)
-     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (2, 3))) __attribute__ ((__warn_unused_result__));
+     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (2, 3))) __attribute__ ((__warn_unused_result__)) __attribute__ ((__access__ (__write_only__, 3, 4)));
 extern ssize_t __readlinkat_alias (int __fd, const char *__restrict __path, char *__restrict __buf, size_t __len) __asm__ ("" "readlinkat") __attribute__ ((__nothrow__ , __leaf__))
 
 
 
-     __attribute__ ((__nonnull__ (2, 3))) __attribute__ ((__warn_unused_result__));
+     __attribute__ ((__nonnull__ (2, 3))) __attribute__ ((__warn_unused_result__)) __attribute__ ((__access__ (__write_only__, 3, 4)));
 extern ssize_t __readlinkat_chk_warn (int __fd, const char *__restrict __path, char *__restrict __buf, size_t __len, size_t __buflen) __asm__ ("" "__readlinkat_chk") __attribute__ ((__nothrow__ , __leaf__))
 
 
@@ -7584,16 +7046,9 @@ extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline
 __attribute__ ((__nothrow__ , __leaf__)) readlinkat (int __fd, const char *__restrict __path, char *__restrict __buf, size_t __len)
 
 {
-  if (__builtin_object_size (__buf, 2 > 1) != (size_t) -1)
-    {
-      if (!__builtin_constant_p (__len))
- return __readlinkat_chk (__fd, __path, __buf, __len, __builtin_object_size (__buf, 2 > 1));
+  return ((((__typeof (__len)) 0 < (__typeof (__len)) -1 || (__builtin_constant_p (__len) && (__len) > 0)) && __builtin_constant_p ((((long unsigned int) (__len)) <= (__builtin_object_size (__buf, 2 > 1)) / (sizeof (char)))) && (((long unsigned int) (__len)) <= (__builtin_object_size (__buf, 2 > 1)) / (sizeof (char)))) ? __readlinkat_alias (__fd, __path, __buf, __len) : ((((__typeof (__len)) 0 < (__typeof (__len)) -1 || (__builtin_constant_p (__len) && (__len) > 0)) && __builtin_constant_p ((((long unsigned int) (__len)) <= (__builtin_object_size (__buf, 2 > 1)) / (sizeof (char)))) && !(((long unsigned int) (__len)) <= (__builtin_object_size (__buf, 2 > 1)) / (sizeof (char)))) ? __readlinkat_chk_warn (__fd, __path, __buf, __len, __builtin_object_size (__buf, 2 > 1)) : __readlinkat_chk (__fd, __path, __buf, __len, __builtin_object_size (__buf, 2 > 1))))
 
-      if (__len > __builtin_object_size (__buf, 2 > 1))
- return __readlinkat_chk_warn (__fd, __path, __buf, __len,
-          __builtin_object_size (__buf, 2 > 1));
-    }
-  return __readlinkat_alias (__fd, __path, __buf, __len);
+                                ;
 }
 
 
@@ -7610,20 +7065,14 @@ extern char *__getcwd_chk_warn (char *__buf, size_t __size, size_t __buflen) __a
 extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline__)) __attribute__ ((__artificial__)) __attribute__ ((__warn_unused_result__)) char *
 __attribute__ ((__nothrow__ , __leaf__)) getcwd (char *__buf, size_t __size)
 {
-  if (__builtin_object_size (__buf, 2 > 1) != (size_t) -1)
-    {
-      if (!__builtin_constant_p (__size))
- return __getcwd_chk (__buf, __size, __builtin_object_size (__buf, 2 > 1));
+  return ((((__typeof (__size)) 0 < (__typeof (__size)) -1 || (__builtin_constant_p (__size) && (__size) > 0)) && __builtin_constant_p ((((long unsigned int) (__size)) <= (__builtin_object_size (__buf, 2 > 1)) / (sizeof (char)))) && (((long unsigned int) (__size)) <= (__builtin_object_size (__buf, 2 > 1)) / (sizeof (char)))) ? __getcwd_alias (__buf, __size) : ((((__typeof (__size)) 0 < (__typeof (__size)) -1 || (__builtin_constant_p (__size) && (__size) > 0)) && __builtin_constant_p ((((long unsigned int) (__size)) <= (__builtin_object_size (__buf, 2 > 1)) / (sizeof (char)))) && !(((long unsigned int) (__size)) <= (__builtin_object_size (__buf, 2 > 1)) / (sizeof (char)))) ? __getcwd_chk_warn (__buf, __size, __builtin_object_size (__buf, 2 > 1)) : __getcwd_chk (__buf, __size, __builtin_object_size (__buf, 2 > 1))))
 
-      if (__size > __builtin_object_size (__buf, 2 > 1))
- return __getcwd_chk_warn (__buf, __size, __builtin_object_size (__buf, 2 > 1));
-    }
-  return __getcwd_alias (__buf, __size);
+                   ;
 }
 
 
 extern char *__getwd_chk (char *__buf, size_t buflen)
-     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1))) __attribute__ ((__warn_unused_result__));
+     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1))) __attribute__ ((__warn_unused_result__)) __attribute__ ((__access__ (__write_only__, 1, 2)));
 extern char *__getwd_warn (char *__buf) __asm__ ("" "getwd") __attribute__ ((__nothrow__ , __leaf__))
      __attribute__ ((__nonnull__ (1))) __attribute__ ((__warn_unused_result__)) __attribute__((__warning__ ("please use getcwd instead, as getwd " "doesn't specify buffer size")))
                                          ;
@@ -7638,9 +7087,11 @@ __attribute__ ((__nothrow__ , __leaf__)) getwd (char *__buf)
 
 
 extern size_t __confstr_chk (int __name, char *__buf, size_t __len,
-        size_t __buflen) __attribute__ ((__nothrow__ , __leaf__));
+        size_t __buflen) __attribute__ ((__nothrow__ , __leaf__))
+  __attribute__ ((__access__ (__write_only__, 2, 3)));
 extern size_t __confstr_alias (int __name, char *__buf, size_t __len) __asm__ ("" "confstr") __attribute__ ((__nothrow__ , __leaf__))
-                             ;
+
+   __attribute__ ((__access__ (__write_only__, 2, 3)));
 extern size_t __confstr_chk_warn (int __name, char *__buf, size_t __len, size_t __buflen) __asm__ ("" "__confstr_chk") __attribute__ ((__nothrow__ , __leaf__))
 
 
@@ -7650,22 +7101,16 @@ extern size_t __confstr_chk_warn (int __name, char *__buf, size_t __len, size_t 
 extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline__)) __attribute__ ((__artificial__)) size_t
 __attribute__ ((__nothrow__ , __leaf__)) confstr (int __name, char *__buf, size_t __len)
 {
-  if (__builtin_object_size (__buf, 2 > 1) != (size_t) -1)
-    {
-      if (!__builtin_constant_p (__len))
- return __confstr_chk (__name, __buf, __len, __builtin_object_size (__buf, 2 > 1));
+  return ((((__typeof (__len)) 0 < (__typeof (__len)) -1 || (__builtin_constant_p (__len) && (__len) > 0)) && __builtin_constant_p ((((long unsigned int) (__len)) <= (__builtin_object_size (__buf, 2 > 1)) / (sizeof (char)))) && (((long unsigned int) (__len)) <= (__builtin_object_size (__buf, 2 > 1)) / (sizeof (char)))) ? __confstr_alias (__name, __buf, __len) : ((((__typeof (__len)) 0 < (__typeof (__len)) -1 || (__builtin_constant_p (__len) && (__len) > 0)) && __builtin_constant_p ((((long unsigned int) (__len)) <= (__builtin_object_size (__buf, 2 > 1)) / (sizeof (char)))) && !(((long unsigned int) (__len)) <= (__builtin_object_size (__buf, 2 > 1)) / (sizeof (char)))) ? __confstr_chk_warn (__name, __buf, __len, __builtin_object_size (__buf, 2 > 1)) : __confstr_chk (__name, __buf, __len, __builtin_object_size (__buf, 2 > 1))))
 
-      if (__builtin_object_size (__buf, 2 > 1) < __len)
- return __confstr_chk_warn (__name, __buf, __len, __builtin_object_size (__buf, 2 > 1));
-    }
-  return __confstr_alias (__name, __buf, __len);
+                          ;
 }
 
 
 extern int __getgroups_chk (int __size, __gid_t __list[], size_t __listlen)
-     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__warn_unused_result__));
+  __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__warn_unused_result__)) __attribute__ ((__access__ (__write_only__, 2, 1)));
 extern int __getgroups_alias (int __size, __gid_t __list[]) __asm__ ("" "getgroups") __attribute__ ((__nothrow__ , __leaf__))
-                 __attribute__ ((__warn_unused_result__));
+                 __attribute__ ((__warn_unused_result__)) __attribute__ ((__access__ (__write_only__, 2, 1)));
 extern int __getgroups_chk_warn (int __size, __gid_t __list[], size_t __listlen) __asm__ ("" "__getgroups_chk") __attribute__ ((__nothrow__ , __leaf__))
 
 
@@ -7675,20 +7120,15 @@ extern int __getgroups_chk_warn (int __size, __gid_t __list[], size_t __listlen)
 extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline__)) __attribute__ ((__artificial__)) int
 __attribute__ ((__nothrow__ , __leaf__)) getgroups (int __size, __gid_t __list[])
 {
-  if (__builtin_object_size (__list, 2 > 1) != (size_t) -1)
-    {
-      if (!__builtin_constant_p (__size) || __size < 0)
- return __getgroups_chk (__size, __list, __builtin_object_size (__list, 2 > 1));
+  return ((((__typeof (__size)) 0 < (__typeof (__size)) -1 || (__builtin_constant_p (__size) && (__size) > 0)) && __builtin_constant_p ((((long unsigned int) (__size)) <= (__builtin_object_size (__list, 2 > 1)) / (sizeof (__gid_t)))) && (((long unsigned int) (__size)) <= (__builtin_object_size (__list, 2 > 1)) / (sizeof (__gid_t)))) ? __getgroups_alias (__size, __list) : ((((__typeof (__size)) 0 < (__typeof (__size)) -1 || (__builtin_constant_p (__size) && (__size) > 0)) && __builtin_constant_p ((((long unsigned int) (__size)) <= (__builtin_object_size (__list, 2 > 1)) / (sizeof (__gid_t)))) && !(((long unsigned int) (__size)) <= (__builtin_object_size (__list, 2 > 1)) / (sizeof (__gid_t)))) ? __getgroups_chk_warn (__size, __list, __builtin_object_size (__list, 2 > 1)) : __getgroups_chk (__size, __list, __builtin_object_size (__list, 2 > 1))))
 
-      if (__size * sizeof (__gid_t) > __builtin_object_size (__list, 2 > 1))
- return __getgroups_chk_warn (__size, __list, __builtin_object_size (__list, 2 > 1));
-    }
-  return __getgroups_alias (__size, __list);
+                    ;
 }
 
 
 extern int __ttyname_r_chk (int __fd, char *__buf, size_t __buflen,
-       size_t __nreal) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (2)));
+       size_t __nreal) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (2)))
+   __attribute__ ((__access__ (__write_only__, 2, 3)));
 extern int __ttyname_r_alias (int __fd, char *__buf, size_t __buflen) __asm__ ("" "ttyname_r") __attribute__ ((__nothrow__ , __leaf__))
 
      __attribute__ ((__nonnull__ (2)));
@@ -7701,21 +7141,15 @@ extern int __ttyname_r_chk_warn (int __fd, char *__buf, size_t __buflen, size_t 
 extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline__)) __attribute__ ((__artificial__)) int
 __attribute__ ((__nothrow__ , __leaf__)) ttyname_r (int __fd, char *__buf, size_t __buflen)
 {
-  if (__builtin_object_size (__buf, 2 > 1) != (size_t) -1)
-    {
-      if (!__builtin_constant_p (__buflen))
- return __ttyname_r_chk (__fd, __buf, __buflen, __builtin_object_size (__buf, 2 > 1));
+  return ((((__typeof (__buflen)) 0 < (__typeof (__buflen)) -1 || (__builtin_constant_p (__buflen) && (__buflen) > 0)) && __builtin_constant_p ((((long unsigned int) (__buflen)) <= (__builtin_object_size (__buf, 2 > 1)) / (sizeof (char)))) && (((long unsigned int) (__buflen)) <= (__builtin_object_size (__buf, 2 > 1)) / (sizeof (char)))) ? __ttyname_r_alias (__fd, __buf, __buflen) : ((((__typeof (__buflen)) 0 < (__typeof (__buflen)) -1 || (__builtin_constant_p (__buflen) && (__buflen) > 0)) && __builtin_constant_p ((((long unsigned int) (__buflen)) <= (__builtin_object_size (__buf, 2 > 1)) / (sizeof (char)))) && !(((long unsigned int) (__buflen)) <= (__builtin_object_size (__buf, 2 > 1)) / (sizeof (char)))) ? __ttyname_r_chk_warn (__fd, __buf, __buflen, __builtin_object_size (__buf, 2 > 1)) : __ttyname_r_chk (__fd, __buf, __buflen, __builtin_object_size (__buf, 2 > 1))))
 
-      if (__buflen > __builtin_object_size (__buf, 2 > 1))
- return __ttyname_r_chk_warn (__fd, __buf, __buflen, __builtin_object_size (__buf, 2 > 1));
-    }
-  return __ttyname_r_alias (__fd, __buf, __buflen);
+                           ;
 }
 
 
 
 extern int __getlogin_r_chk (char *__buf, size_t __buflen, size_t __nreal)
-     __attribute__ ((__nonnull__ (1)));
+     __attribute__ ((__nonnull__ (1))) __attribute__ ((__access__ (__write_only__, 1, 2)));
 extern int __getlogin_r_alias (char *__buf, size_t __buflen) __asm__ ("" "getlogin_r")
                      __attribute__ ((__nonnull__ (1)));
 extern int __getlogin_r_chk_warn (char *__buf, size_t __buflen, size_t __nreal) __asm__ ("" "__getlogin_r_chk")
@@ -7727,24 +7161,19 @@ extern int __getlogin_r_chk_warn (char *__buf, size_t __buflen, size_t __nreal) 
 extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline__)) __attribute__ ((__artificial__)) int
 getlogin_r (char *__buf, size_t __buflen)
 {
-  if (__builtin_object_size (__buf, 2 > 1) != (size_t) -1)
-    {
-      if (!__builtin_constant_p (__buflen))
- return __getlogin_r_chk (__buf, __buflen, __builtin_object_size (__buf, 2 > 1));
+  return ((((__typeof (__buflen)) 0 < (__typeof (__buflen)) -1 || (__builtin_constant_p (__buflen) && (__buflen) > 0)) && __builtin_constant_p ((((long unsigned int) (__buflen)) <= (__builtin_object_size (__buf, 2 > 1)) / (sizeof (char)))) && (((long unsigned int) (__buflen)) <= (__builtin_object_size (__buf, 2 > 1)) / (sizeof (char)))) ? __getlogin_r_alias (__buf, __buflen) : ((((__typeof (__buflen)) 0 < (__typeof (__buflen)) -1 || (__builtin_constant_p (__buflen) && (__buflen) > 0)) && __builtin_constant_p ((((long unsigned int) (__buflen)) <= (__builtin_object_size (__buf, 2 > 1)) / (sizeof (char)))) && !(((long unsigned int) (__buflen)) <= (__builtin_object_size (__buf, 2 > 1)) / (sizeof (char)))) ? __getlogin_r_chk_warn (__buf, __buflen, __builtin_object_size (__buf, 2 > 1)) : __getlogin_r_chk (__buf, __buflen, __builtin_object_size (__buf, 2 > 1))))
 
-      if (__buflen > __builtin_object_size (__buf, 2 > 1))
- return __getlogin_r_chk_warn (__buf, __buflen, __builtin_object_size (__buf, 2 > 1));
-    }
-  return __getlogin_r_alias (__buf, __buflen);
+                     ;
 }
 
 
 
 
 extern int __gethostname_chk (char *__buf, size_t __buflen, size_t __nreal)
-     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)));
+     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1))) __attribute__ ((__access__ (__write_only__, 1, 2)));
 extern int __gethostname_alias (char *__buf, size_t __buflen) __asm__ ("" "gethostname") __attribute__ ((__nothrow__ , __leaf__))
-                   __attribute__ ((__nonnull__ (1)));
+
+  __attribute__ ((__nonnull__ (1))) __attribute__ ((__access__ (__write_only__, 1, 2)));
 extern int __gethostname_chk_warn (char *__buf, size_t __buflen, size_t __nreal) __asm__ ("" "__gethostname_chk") __attribute__ ((__nothrow__ , __leaf__))
 
 
@@ -7754,25 +7183,20 @@ extern int __gethostname_chk_warn (char *__buf, size_t __buflen, size_t __nreal)
 extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline__)) __attribute__ ((__artificial__)) int
 __attribute__ ((__nothrow__ , __leaf__)) gethostname (char *__buf, size_t __buflen)
 {
-  if (__builtin_object_size (__buf, 2 > 1) != (size_t) -1)
-    {
-      if (!__builtin_constant_p (__buflen))
- return __gethostname_chk (__buf, __buflen, __builtin_object_size (__buf, 2 > 1));
+  return ((((__typeof (__buflen)) 0 < (__typeof (__buflen)) -1 || (__builtin_constant_p (__buflen) && (__buflen) > 0)) && __builtin_constant_p ((((long unsigned int) (__buflen)) <= (__builtin_object_size (__buf, 2 > 1)) / (sizeof (char)))) && (((long unsigned int) (__buflen)) <= (__builtin_object_size (__buf, 2 > 1)) / (sizeof (char)))) ? __gethostname_alias (__buf, __buflen) : ((((__typeof (__buflen)) 0 < (__typeof (__buflen)) -1 || (__builtin_constant_p (__buflen) && (__buflen) > 0)) && __builtin_constant_p ((((long unsigned int) (__buflen)) <= (__builtin_object_size (__buf, 2 > 1)) / (sizeof (char)))) && !(((long unsigned int) (__buflen)) <= (__builtin_object_size (__buf, 2 > 1)) / (sizeof (char)))) ? __gethostname_chk_warn (__buf, __buflen, __builtin_object_size (__buf, 2 > 1)) : __gethostname_chk (__buf, __buflen, __builtin_object_size (__buf, 2 > 1))))
 
-      if (__buflen > __builtin_object_size (__buf, 2 > 1))
- return __gethostname_chk_warn (__buf, __buflen, __builtin_object_size (__buf, 2 > 1));
-    }
-  return __gethostname_alias (__buf, __buflen);
+                     ;
 }
 
 
 
 
 extern int __getdomainname_chk (char *__buf, size_t __buflen, size_t __nreal)
-     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1))) __attribute__ ((__warn_unused_result__));
+     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1))) __attribute__ ((__warn_unused_result__)) __attribute__ ((__access__ (__write_only__, 1, 2)));
 extern int __getdomainname_alias (char *__buf, size_t __buflen) __asm__ ("" "getdomainname") __attribute__ ((__nothrow__ , __leaf__))
 
-                     __attribute__ ((__nonnull__ (1))) __attribute__ ((__warn_unused_result__));
+                     __attribute__ ((__nonnull__ (1)))
+  __attribute__ ((__warn_unused_result__)) __attribute__ ((__access__ (__write_only__, 1, 2)));
 extern int __getdomainname_chk_warn (char *__buf, size_t __buflen, size_t __nreal) __asm__ ("" "__getdomainname_chk") __attribute__ ((__nothrow__ , __leaf__))
 
 
@@ -7783,29 +7207,728 @@ extern int __getdomainname_chk_warn (char *__buf, size_t __buflen, size_t __nrea
 extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline__)) __attribute__ ((__artificial__)) int
 __attribute__ ((__nothrow__ , __leaf__)) getdomainname (char *__buf, size_t __buflen)
 {
-  if (__builtin_object_size (__buf, 2 > 1) != (size_t) -1)
-    {
-      if (!__builtin_constant_p (__buflen))
- return __getdomainname_chk (__buf, __buflen, __builtin_object_size (__buf, 2 > 1));
+  return ((((__typeof (__buflen)) 0 < (__typeof (__buflen)) -1 || (__builtin_constant_p (__buflen) && (__buflen) > 0)) && __builtin_constant_p ((((long unsigned int) (__buflen)) <= (__builtin_object_size (__buf, 2 > 1)) / (sizeof (char)))) && (((long unsigned int) (__buflen)) <= (__builtin_object_size (__buf, 2 > 1)) / (sizeof (char)))) ? __getdomainname_alias (__buf, __buflen) : ((((__typeof (__buflen)) 0 < (__typeof (__buflen)) -1 || (__builtin_constant_p (__buflen) && (__buflen) > 0)) && __builtin_constant_p ((((long unsigned int) (__buflen)) <= (__builtin_object_size (__buf, 2 > 1)) / (sizeof (char)))) && !(((long unsigned int) (__buflen)) <= (__builtin_object_size (__buf, 2 > 1)) / (sizeof (char)))) ? __getdomainname_chk_warn (__buf, __buflen, __builtin_object_size (__buf, 2 > 1)) : __getdomainname_chk (__buf, __buflen, __builtin_object_size (__buf, 2 > 1))))
 
-      if (__buflen > __builtin_object_size (__buf, 2 > 1))
- return __getdomainname_chk_warn (__buf, __buflen, __builtin_object_size (__buf, 2 > 1));
-    }
-  return __getdomainname_alias (__buf, __buflen);
+                     ;
 }
-# 1173 "/usr/include/unistd.h" 2 3 4
+# 1215 "/usr/include/unistd.h" 2 3 4
 
 
 
-# 35 "/workspace/acl/lib_fiber/c/src/stdafx.h" 2
+# 1 "/usr/include/aarch64-linux-gnu/bits/unistd_ext.h" 1 3 4
+# 34 "/usr/include/aarch64-linux-gnu/bits/unistd_ext.h" 3 4
+extern __pid_t gettid (void) __attribute__ ((__nothrow__ , __leaf__));
+
+
+
+# 1 "/usr/include/linux/close_range.h" 1 3 4
+# 39 "/usr/include/aarch64-linux-gnu/bits/unistd_ext.h" 2 3 4
+# 1219 "/usr/include/unistd.h" 2 3 4
+
+
+# 25 "/usr/include/aarch64-linux-gnu/bits/sigstksz.h" 2 3 4
+# 329 "/usr/include/signal.h" 2 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/ss_flags.h" 1 3 4
+# 27 "/usr/include/aarch64-linux-gnu/bits/ss_flags.h" 3 4
+enum
+{
+  SS_ONSTACK = 1,
+
+  SS_DISABLE
+
+};
+# 330 "/usr/include/signal.h" 2 3 4
+
+
+
+extern int sigaltstack (const stack_t *__restrict __ss,
+   stack_t *__restrict __oss) __attribute__ ((__nothrow__ , __leaf__));
+
+
+
+
+# 1 "/usr/include/aarch64-linux-gnu/bits/types/struct_sigstack.h" 1 3 4
+# 23 "/usr/include/aarch64-linux-gnu/bits/types/struct_sigstack.h" 3 4
+struct sigstack
+  {
+    void *ss_sp;
+    int ss_onstack;
+  };
+# 340 "/usr/include/signal.h" 2 3 4
+
+
+
+
+
+
+
+extern int sigstack (struct sigstack *__ss, struct sigstack *__oss)
+     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__deprecated__));
+
+
+
+
+
+
+extern int sighold (int __sig) __attribute__ ((__nothrow__ , __leaf__))
+  __attribute__ ((__deprecated__ ("Use the sigprocmask function instead")));
+
+
+extern int sigrelse (int __sig) __attribute__ ((__nothrow__ , __leaf__))
+  __attribute__ ((__deprecated__ ("Use the sigprocmask function instead")));
+
+
+extern int sigignore (int __sig) __attribute__ ((__nothrow__ , __leaf__))
+  __attribute__ ((__deprecated__ ("Use the signal function instead")));
+
+
+extern __sighandler_t sigset (int __sig, __sighandler_t __disp) __attribute__ ((__nothrow__ , __leaf__))
+  __attribute__ ((__deprecated__ ("Use the signal and sigprocmask functions instead")))
+                                                        ;
+
+
+
+
+
+
+# 1 "/usr/include/aarch64-linux-gnu/bits/sigthread.h" 1 3 4
+# 31 "/usr/include/aarch64-linux-gnu/bits/sigthread.h" 3 4
+extern int pthread_sigmask (int __how,
+       const __sigset_t *__restrict __newmask,
+       __sigset_t *__restrict __oldmask)__attribute__ ((__nothrow__ , __leaf__));
+
+
+extern int pthread_kill (pthread_t __threadid, int __signo) __attribute__ ((__nothrow__ , __leaf__));
+
+
+
+extern int pthread_sigqueue (pthread_t __threadid, int __signo,
+        const union sigval __value) __attribute__ ((__nothrow__ , __leaf__));
+# 377 "/usr/include/signal.h" 2 3 4
+
+
+
+
+
+
+extern int __libc_current_sigrtmin (void) __attribute__ ((__nothrow__ , __leaf__));
+
+extern int __libc_current_sigrtmax (void) __attribute__ ((__nothrow__ , __leaf__));
+
+
+
+
+
+# 1 "/usr/include/aarch64-linux-gnu/bits/signal_ext.h" 1 3 4
+# 29 "/usr/include/aarch64-linux-gnu/bits/signal_ext.h" 3 4
+extern int tgkill (__pid_t __tgid, __pid_t __tid, int __signal);
+# 392 "/usr/include/signal.h" 2 3 4
+
+
+# 31 "/acl/lib_fiber/c/src/stdafx.h" 2
+
+
+# 1 "/usr/include/net/if.h" 1 3 4
+# 26 "/usr/include/net/if.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/sys/socket.h" 1 3 4
+# 24 "/usr/include/aarch64-linux-gnu/sys/socket.h" 3 4
+
+
+
+
+# 1 "/usr/lib/gcc/aarch64-linux-gnu/11/include/stddef.h" 1 3 4
+# 29 "/usr/include/aarch64-linux-gnu/sys/socket.h" 2 3 4
+
+
+
+
+# 1 "/usr/include/aarch64-linux-gnu/bits/socket.h" 1 3 4
+# 27 "/usr/include/aarch64-linux-gnu/bits/socket.h" 3 4
+# 1 "/usr/lib/gcc/aarch64-linux-gnu/11/include/stddef.h" 1 3 4
+# 28 "/usr/include/aarch64-linux-gnu/bits/socket.h" 2 3 4
+# 38 "/usr/include/aarch64-linux-gnu/bits/socket.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/socket_type.h" 1 3 4
+# 24 "/usr/include/aarch64-linux-gnu/bits/socket_type.h" 3 4
+enum __socket_type
+{
+  SOCK_STREAM = 1,
+
+
+  SOCK_DGRAM = 2,
+
+
+  SOCK_RAW = 3,
+
+  SOCK_RDM = 4,
+
+  SOCK_SEQPACKET = 5,
+
+
+  SOCK_DCCP = 6,
+
+  SOCK_PACKET = 10,
+
+
+
+
+
+
+
+  SOCK_CLOEXEC = 02000000,
+
+
+  SOCK_NONBLOCK = 00004000
+
+
+};
+# 39 "/usr/include/aarch64-linux-gnu/bits/socket.h" 2 3 4
+# 177 "/usr/include/aarch64-linux-gnu/bits/socket.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/sockaddr.h" 1 3 4
+# 28 "/usr/include/aarch64-linux-gnu/bits/sockaddr.h" 3 4
+typedef unsigned short int sa_family_t;
+# 178 "/usr/include/aarch64-linux-gnu/bits/socket.h" 2 3 4
+
+
+struct sockaddr
+  {
+    sa_family_t sa_family;
+    char sa_data[14];
+  };
+# 193 "/usr/include/aarch64-linux-gnu/bits/socket.h" 3 4
+struct sockaddr_storage
+  {
+    sa_family_t ss_family;
+    char __ss_padding[(128 - (sizeof (unsigned short int)) - sizeof (unsigned long int))];
+    unsigned long int __ss_align;
+  };
+
+
+
+enum
+  {
+    MSG_OOB = 0x01,
+
+    MSG_PEEK = 0x02,
+
+    MSG_DONTROUTE = 0x04,
+
+
+
+    MSG_TRYHARD = MSG_DONTROUTE,
+
+
+    MSG_CTRUNC = 0x08,
+
+    MSG_PROXY = 0x10,
+
+    MSG_TRUNC = 0x20,
+
+    MSG_DONTWAIT = 0x40,
+
+    MSG_EOR = 0x80,
+
+    MSG_WAITALL = 0x100,
+
+    MSG_FIN = 0x200,
+
+    MSG_SYN = 0x400,
+
+    MSG_CONFIRM = 0x800,
+
+    MSG_RST = 0x1000,
+
+    MSG_ERRQUEUE = 0x2000,
+
+    MSG_NOSIGNAL = 0x4000,
+
+    MSG_MORE = 0x8000,
+
+    MSG_WAITFORONE = 0x10000,
+
+    MSG_BATCH = 0x40000,
+
+    MSG_ZEROCOPY = 0x4000000,
+
+    MSG_FASTOPEN = 0x20000000,
+
+
+    MSG_CMSG_CLOEXEC = 0x40000000
+
+
+
+  };
+
+
+
+
+struct msghdr
+  {
+    void *msg_name;
+    socklen_t msg_namelen;
+
+    struct iovec *msg_iov;
+    size_t msg_iovlen;
+
+    void *msg_control;
+    size_t msg_controllen;
+
+
+
+
+    int msg_flags;
+  };
+
+
+struct cmsghdr
+  {
+    size_t cmsg_len;
+
+
+
+
+    int cmsg_level;
+    int cmsg_type;
+
+    __extension__ unsigned char __cmsg_data [];
+
+  };
+# 307 "/usr/include/aarch64-linux-gnu/bits/socket.h" 3 4
+extern struct cmsghdr *__cmsg_nxthdr (struct msghdr *__mhdr,
+          struct cmsghdr *__cmsg) __attribute__ ((__nothrow__ , __leaf__));
+
+
+
+
+extern __inline __attribute__ ((__gnu_inline__)) struct cmsghdr *
+__attribute__ ((__nothrow__ , __leaf__)) __cmsg_nxthdr (struct msghdr *__mhdr, struct cmsghdr *__cmsg)
+{
+  if ((size_t) __cmsg->cmsg_len < sizeof (struct cmsghdr))
+
+    return (struct cmsghdr *) 0;
+
+  __cmsg = (struct cmsghdr *) ((unsigned char *) __cmsg
+          + (((__cmsg->cmsg_len) + sizeof (size_t) - 1) & (size_t) ~(sizeof (size_t) - 1)));
+  if ((unsigned char *) (__cmsg + 1) > ((unsigned char *) __mhdr->msg_control
+     + __mhdr->msg_controllen)
+      || ((unsigned char *) __cmsg + (((__cmsg->cmsg_len) + sizeof (size_t) - 1) & (size_t) ~(sizeof (size_t) - 1))
+   > ((unsigned char *) __mhdr->msg_control + __mhdr->msg_controllen)))
+
+    return (struct cmsghdr *) 0;
+  return __cmsg;
+}
+
+
+
+
+enum
+  {
+    SCM_RIGHTS = 0x01
+
+
+    , SCM_CREDENTIALS = 0x02
+
+
+  };
+
+
+
+struct ucred
+{
+  pid_t pid;
+  uid_t uid;
+  gid_t gid;
+};
+
+
+
+
+# 1 "/usr/include/aarch64-linux-gnu/asm/socket.h" 1 3 4
+# 1 "/usr/include/asm-generic/socket.h" 1 3 4
+
+
+
+
+
+# 1 "/usr/include/aarch64-linux-gnu/asm/sockios.h" 1 3 4
+# 1 "/usr/include/asm-generic/sockios.h" 1 3 4
+# 2 "/usr/include/aarch64-linux-gnu/asm/sockios.h" 2 3 4
+# 7 "/usr/include/asm-generic/socket.h" 2 3 4
+# 2 "/usr/include/aarch64-linux-gnu/asm/socket.h" 2 3 4
+# 357 "/usr/include/aarch64-linux-gnu/bits/socket.h" 2 3 4
+
+
+
+
+
+
+struct linger
+  {
+    int l_onoff;
+    int l_linger;
+  };
+# 34 "/usr/include/aarch64-linux-gnu/sys/socket.h" 2 3 4
+
+
+# 1 "/usr/include/aarch64-linux-gnu/bits/types/struct_osockaddr.h" 1 3 4
+
+
+
+
+
+struct osockaddr
+{
+  unsigned short int sa_family;
+  unsigned char sa_data[14];
+};
+# 37 "/usr/include/aarch64-linux-gnu/sys/socket.h" 2 3 4
+
+
+
+
+enum
+{
+  SHUT_RD = 0,
+
+  SHUT_WR,
+
+  SHUT_RDWR
+
+};
+# 79 "/usr/include/aarch64-linux-gnu/sys/socket.h" 3 4
+typedef union { struct sockaddr *__restrict __sockaddr__; struct sockaddr_at *__restrict __sockaddr_at__; struct sockaddr_ax25 *__restrict __sockaddr_ax25__; struct sockaddr_dl *__restrict __sockaddr_dl__; struct sockaddr_eon *__restrict __sockaddr_eon__; struct sockaddr_in *__restrict __sockaddr_in__; struct sockaddr_in6 *__restrict __sockaddr_in6__; struct sockaddr_inarp *__restrict __sockaddr_inarp__; struct sockaddr_ipx *__restrict __sockaddr_ipx__; struct sockaddr_iso *__restrict __sockaddr_iso__; struct sockaddr_ns *__restrict __sockaddr_ns__; struct sockaddr_un *__restrict __sockaddr_un__; struct sockaddr_x25 *__restrict __sockaddr_x25__;
+       } __SOCKADDR_ARG __attribute__ ((__transparent_union__));
+
+
+typedef union { const struct sockaddr *__restrict __sockaddr__; const struct sockaddr_at *__restrict __sockaddr_at__; const struct sockaddr_ax25 *__restrict __sockaddr_ax25__; const struct sockaddr_dl *__restrict __sockaddr_dl__; const struct sockaddr_eon *__restrict __sockaddr_eon__; const struct sockaddr_in *__restrict __sockaddr_in__; const struct sockaddr_in6 *__restrict __sockaddr_in6__; const struct sockaddr_inarp *__restrict __sockaddr_inarp__; const struct sockaddr_ipx *__restrict __sockaddr_ipx__; const struct sockaddr_iso *__restrict __sockaddr_iso__; const struct sockaddr_ns *__restrict __sockaddr_ns__; const struct sockaddr_un *__restrict __sockaddr_un__; const struct sockaddr_x25 *__restrict __sockaddr_x25__;
+       } __CONST_SOCKADDR_ARG __attribute__ ((__transparent_union__));
+
+
+
+
+
+struct mmsghdr
+  {
+    struct msghdr msg_hdr;
+    unsigned int msg_len;
+
+  };
+
+
+
+
+
+
+extern int socket (int __domain, int __type, int __protocol) __attribute__ ((__nothrow__ , __leaf__));
+
+
+
+
+
+extern int socketpair (int __domain, int __type, int __protocol,
+         int __fds[2]) __attribute__ ((__nothrow__ , __leaf__));
+
+
+extern int bind (int __fd, __CONST_SOCKADDR_ARG __addr, socklen_t __len)
+     __attribute__ ((__nothrow__ , __leaf__));
+
+
+extern int getsockname (int __fd, __SOCKADDR_ARG __addr,
+   socklen_t *__restrict __len) __attribute__ ((__nothrow__ , __leaf__));
+# 126 "/usr/include/aarch64-linux-gnu/sys/socket.h" 3 4
+extern int connect (int __fd, __CONST_SOCKADDR_ARG __addr, socklen_t __len);
+
+
+
+extern int getpeername (int __fd, __SOCKADDR_ARG __addr,
+   socklen_t *__restrict __len) __attribute__ ((__nothrow__ , __leaf__));
+
+
+
+
+
+
+extern ssize_t send (int __fd, const void *__buf, size_t __n, int __flags);
+
+
+
+
+
+
+extern ssize_t recv (int __fd, void *__buf, size_t __n, int __flags);
+
+
+
+
+
+
+extern ssize_t sendto (int __fd, const void *__buf, size_t __n,
+         int __flags, __CONST_SOCKADDR_ARG __addr,
+         socklen_t __addr_len);
+# 163 "/usr/include/aarch64-linux-gnu/sys/socket.h" 3 4
+extern ssize_t recvfrom (int __fd, void *__restrict __buf, size_t __n,
+    int __flags, __SOCKADDR_ARG __addr,
+    socklen_t *__restrict __addr_len);
+# 174 "/usr/include/aarch64-linux-gnu/sys/socket.h" 3 4
+extern ssize_t sendmsg (int __fd, const struct msghdr *__message,
+   int __flags);
+# 195 "/usr/include/aarch64-linux-gnu/sys/socket.h" 3 4
+extern int sendmmsg (int __fd, struct mmsghdr *__vmessages,
+       unsigned int __vlen, int __flags);
+# 216 "/usr/include/aarch64-linux-gnu/sys/socket.h" 3 4
+extern ssize_t recvmsg (int __fd, struct msghdr *__message, int __flags);
+# 235 "/usr/include/aarch64-linux-gnu/sys/socket.h" 3 4
+extern int recvmmsg (int __fd, struct mmsghdr *__vmessages,
+       unsigned int __vlen, int __flags,
+       struct timespec *__tmo);
+# 255 "/usr/include/aarch64-linux-gnu/sys/socket.h" 3 4
+extern int getsockopt (int __fd, int __level, int __optname,
+         void *__restrict __optval,
+         socklen_t *__restrict __optlen) __attribute__ ((__nothrow__ , __leaf__));
+# 277 "/usr/include/aarch64-linux-gnu/sys/socket.h" 3 4
+extern int setsockopt (int __fd, int __level, int __optname,
+         const void *__optval, socklen_t __optlen) __attribute__ ((__nothrow__ , __leaf__));
+# 296 "/usr/include/aarch64-linux-gnu/sys/socket.h" 3 4
+extern int listen (int __fd, int __n) __attribute__ ((__nothrow__ , __leaf__));
+# 306 "/usr/include/aarch64-linux-gnu/sys/socket.h" 3 4
+extern int accept (int __fd, __SOCKADDR_ARG __addr,
+     socklen_t *__restrict __addr_len);
+
+
+
+
+
+
+extern int accept4 (int __fd, __SOCKADDR_ARG __addr,
+      socklen_t *__restrict __addr_len, int __flags);
+# 324 "/usr/include/aarch64-linux-gnu/sys/socket.h" 3 4
+extern int shutdown (int __fd, int __how) __attribute__ ((__nothrow__ , __leaf__));
+
+
+
+
+extern int sockatmark (int __fd) __attribute__ ((__nothrow__ , __leaf__));
+
+
+
+
+
+
+
+extern int isfdtype (int __fd, int __fdtype) __attribute__ ((__nothrow__ , __leaf__));
+
+
+
+
+
+# 1 "/usr/include/aarch64-linux-gnu/bits/socket2.h" 1 3 4
+# 23 "/usr/include/aarch64-linux-gnu/bits/socket2.h" 3 4
+extern ssize_t __recv_chk (int __fd, void *__buf, size_t __n, size_t __buflen,
+      int __flags);
+extern ssize_t __recv_alias (int __fd, void *__buf, size_t __n, int __flags) __asm__ ("" "recv")
+                          ;
+extern ssize_t __recv_chk_warn (int __fd, void *__buf, size_t __n, size_t __buflen, int __flags) __asm__ ("" "__recv_chk")
+
+
+     __attribute__((__warning__ ("recv called with bigger length than size of destination " "buffer")))
+            ;
+
+extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline__)) __attribute__ ((__artificial__)) ssize_t
+recv (int __fd, void *__buf, size_t __n, int __flags)
+{
+  size_t sz = __builtin_object_size (__buf, 0);
+  if ((((__typeof (__n)) 0 < (__typeof (__n)) -1 || (__builtin_constant_p (__n) && (__n) > 0)) && __builtin_constant_p ((((long unsigned int) (__n)) <= (sz) / (sizeof (char)))) && (((long unsigned int) (__n)) <= (sz) / (sizeof (char)))))
+    return __recv_alias (__fd, __buf, __n, __flags);
+  if ((((__typeof (__n)) 0 < (__typeof (__n)) -1 || (__builtin_constant_p (__n) && (__n) > 0)) && __builtin_constant_p ((((long unsigned int) (__n)) <= (sz) / (sizeof (char)))) && !(((long unsigned int) (__n)) <= (sz) / (sizeof (char)))))
+    return __recv_chk_warn (__fd, __buf, __n, sz, __flags);
+  return __recv_chk (__fd, __buf, __n, sz, __flags);
+}
+
+extern ssize_t __recvfrom_chk (int __fd, void *__restrict __buf, size_t __n,
+          size_t __buflen, int __flags,
+          __SOCKADDR_ARG __addr,
+          socklen_t *__restrict __addr_len);
+extern ssize_t __recvfrom_alias (int __fd, void *__restrict __buf, size_t __n, int __flags, __SOCKADDR_ARG __addr, socklen_t *__restrict __addr_len) __asm__ ("" "recvfrom")
+
+
+                                                   ;
+extern ssize_t __recvfrom_chk_warn (int __fd, void *__restrict __buf, size_t __n, size_t __buflen, int __flags, __SOCKADDR_ARG __addr, socklen_t *__restrict __addr_len) __asm__ ("" "__recvfrom_chk")
+
+
+
+
+     __attribute__((__warning__ ("recvfrom called with bigger length than size of " "destination buffer")))
+                        ;
+
+extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline__)) __attribute__ ((__artificial__)) ssize_t
+recvfrom (int __fd, void *__restrict __buf, size_t __n, int __flags,
+   __SOCKADDR_ARG __addr, socklen_t *__restrict __addr_len)
+{
+  size_t sz = __builtin_object_size (__buf, 0);
+  if ((((__typeof (__n)) 0 < (__typeof (__n)) -1 || (__builtin_constant_p (__n) && (__n) > 0)) && __builtin_constant_p ((((long unsigned int) (__n)) <= (sz) / (sizeof (char)))) && (((long unsigned int) (__n)) <= (sz) / (sizeof (char)))))
+    return __recvfrom_alias (__fd, __buf, __n, __flags, __addr, __addr_len);
+  if ((((__typeof (__n)) 0 < (__typeof (__n)) -1 || (__builtin_constant_p (__n) && (__n) > 0)) && __builtin_constant_p ((((long unsigned int) (__n)) <= (sz) / (sizeof (char)))) && !(((long unsigned int) (__n)) <= (sz) / (sizeof (char)))))
+    return __recvfrom_chk_warn (__fd, __buf, __n, sz, __flags, __addr,
+    __addr_len);
+  return __recvfrom_chk (__fd, __buf, __n, sz, __flags, __addr, __addr_len);
+}
+# 344 "/usr/include/aarch64-linux-gnu/sys/socket.h" 2 3 4
+
+
+
+# 27 "/usr/include/net/if.h" 2 3 4
+
+
+
+
+
+
+struct if_nameindex
+  {
+    unsigned int if_index;
+    char *if_name;
+  };
+
+
+
+
+enum
+  {
+    IFF_UP = 0x1,
+
+    IFF_BROADCAST = 0x2,
+
+    IFF_DEBUG = 0x4,
+
+    IFF_LOOPBACK = 0x8,
+
+    IFF_POINTOPOINT = 0x10,
+
+    IFF_NOTRAILERS = 0x20,
+
+    IFF_RUNNING = 0x40,
+
+    IFF_NOARP = 0x80,
+
+    IFF_PROMISC = 0x100,
+
+
+
+    IFF_ALLMULTI = 0x200,
+
+
+    IFF_MASTER = 0x400,
+
+    IFF_SLAVE = 0x800,
+
+
+    IFF_MULTICAST = 0x1000,
+
+
+    IFF_PORTSEL = 0x2000,
+
+    IFF_AUTOMEDIA = 0x4000,
+
+    IFF_DYNAMIC = 0x8000
+
+  };
+
+
+
+
+
+
+struct ifaddr
+  {
+    struct sockaddr ifa_addr;
+    union
+      {
+ struct sockaddr ifu_broadaddr;
+ struct sockaddr ifu_dstaddr;
+      } ifa_ifu;
+    struct iface *ifa_ifp;
+    struct ifaddr *ifa_next;
+  };
+# 111 "/usr/include/net/if.h" 3 4
+struct ifmap
+  {
+    unsigned long int mem_start;
+    unsigned long int mem_end;
+    unsigned short int base_addr;
+    unsigned char irq;
+    unsigned char dma;
+    unsigned char port;
+
+  };
+
+
+
+
+
+struct ifreq
+  {
+
+
+    union
+      {
+ char ifrn_name[16];
+      } ifr_ifrn;
+
+    union
+      {
+ struct sockaddr ifru_addr;
+ struct sockaddr ifru_dstaddr;
+ struct sockaddr ifru_broadaddr;
+ struct sockaddr ifru_netmask;
+ struct sockaddr ifru_hwaddr;
+ short int ifru_flags;
+ int ifru_ivalue;
+ int ifru_mtu;
+ struct ifmap ifru_map;
+ char ifru_slave[16];
+ char ifru_newname[16];
+ __caddr_t ifru_data;
+      } ifr_ifru;
+  };
+# 176 "/usr/include/net/if.h" 3 4
+struct ifconf
+  {
+    int ifc_len;
+    union
+      {
+ __caddr_t ifcu_buf;
+ struct ifreq *ifcu_req;
+      } ifc_ifcu;
+  };
+
+
+
+
+
+
+
+
+extern unsigned int if_nametoindex (const char *__ifname) __attribute__ ((__nothrow__ , __leaf__));
+extern char *if_indextoname (unsigned int __ifindex,
+        char __ifname[16]) __attribute__ ((__nothrow__ , __leaf__))
+    __attribute__ ((__access__ (__write_only__, 2)));
+
+
+extern struct if_nameindex *if_nameindex (void) __attribute__ ((__nothrow__ , __leaf__));
+
+
+extern void if_freenameindex (struct if_nameindex *__ptr) __attribute__ ((__nothrow__ , __leaf__));
+
+
+# 34 "/acl/lib_fiber/c/src/stdafx.h" 2
+
 # 1 "/usr/include/dlfcn.h" 1 3 4
 # 24 "/usr/include/dlfcn.h" 3 4
-# 1 "/usr/lib/gcc/x86_64-linux-gnu/7/include/stddef.h" 1 3 4
+# 1 "/usr/lib/gcc/aarch64-linux-gnu/11/include/stddef.h" 1 3 4
 # 25 "/usr/include/dlfcn.h" 2 3 4
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/dlfcn.h" 1 3 4
-# 57 "/usr/include/x86_64-linux-gnu/bits/dlfcn.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/dlfcn.h" 1 3 4
+# 57 "/usr/include/aarch64-linux-gnu/bits/dlfcn.h" 3 4
 
 
 
@@ -7813,7 +7936,12 @@ extern void _dl_mcount_wrapper_check (void *__selfpc) __attribute__ ((__nothrow_
 
 
 # 28 "/usr/include/dlfcn.h" 2 3 4
-# 44 "/usr/include/dlfcn.h" 3 4
+
+
+
+# 1 "/usr/include/aarch64-linux-gnu/bits/dl_find_object.h" 1 3 4
+# 32 "/usr/include/dlfcn.h" 2 3 4
+# 46 "/usr/include/dlfcn.h" 3 4
 typedef long int Lmid_t;
 
 
@@ -7953,120 +8081,49 @@ typedef struct
 {
   size_t dls_size;
   unsigned int dls_cnt;
-  Dl_serpath dls_serpath[1];
+
+
+
+
+
+  __extension__ union
+  {
+    Dl_serpath dls_serpath[0];
+    Dl_serpath __dls_serpath_pad[1];
+  };
+
+
+
 } Dl_serinfo;
 
+struct dl_find_object
+{
+  __extension__ unsigned long long int dlfo_flags;
+  void *dlfo_map_start;
+  void *dlfo_map_end;
+  struct link_map *dlfo_link_map;
+  void *dlfo_eh_frame;
+# 217 "/usr/include/dlfcn.h" 3 4
+  __extension__ unsigned long long int __dflo_reserved[7];
+};
 
 
 
-# 36 "/workspace/acl/lib_fiber/c/src/stdafx.h" 2
-
-# 1 "/usr/include/x86_64-linux-gnu/sys/time.h" 1 3 4
-# 34 "/usr/include/x86_64-linux-gnu/sys/time.h" 3 4
-
-# 52 "/usr/include/x86_64-linux-gnu/sys/time.h" 3 4
-struct timezone
-  {
-    int tz_minuteswest;
-    int tz_dsttime;
-  };
-
-typedef struct timezone *__restrict __timezone_ptr_t;
-# 68 "/usr/include/x86_64-linux-gnu/sys/time.h" 3 4
-extern int gettimeofday (struct timeval *__restrict __tv,
-    __timezone_ptr_t __tz) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)));
-
-
-
-
-extern int settimeofday (const struct timeval *__tv,
-    const struct timezone *__tz)
-     __attribute__ ((__nothrow__ , __leaf__));
+int _dl_find_object (void *__address, struct dl_find_object *__result) __attribute__ ((__nothrow__ , __leaf__));
 
 
 
 
 
-extern int adjtime (const struct timeval *__delta,
-      struct timeval *__olddelta) __attribute__ ((__nothrow__ , __leaf__));
+# 36 "/acl/lib_fiber/c/src/stdafx.h" 2
 
 
-
-
-enum __itimer_which
-  {
-
-    ITIMER_REAL = 0,
-
-
-    ITIMER_VIRTUAL = 1,
-
-
-
-    ITIMER_PROF = 2
-
-  };
-
-
-
-struct itimerval
-  {
-
-    struct timeval it_interval;
-
-    struct timeval it_value;
-  };
-
-
-
-
-typedef enum __itimer_which __itimer_which_t;
-
-
-
-
-
-
-extern int getitimer (__itimer_which_t __which,
-        struct itimerval *__value) __attribute__ ((__nothrow__ , __leaf__));
-
-
-
-
-extern int setitimer (__itimer_which_t __which,
-        const struct itimerval *__restrict __new,
-        struct itimerval *__restrict __old) __attribute__ ((__nothrow__ , __leaf__));
-
-
-
-
-extern int utimes (const char *__file, const struct timeval __tvp[2])
-     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)));
-
-
-
-extern int lutimes (const char *__file, const struct timeval __tvp[2])
-     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)));
-
-
-extern int futimes (int __fd, const struct timeval __tvp[2]) __attribute__ ((__nothrow__ , __leaf__));
-
-
-
-
-
-
-extern int futimesat (int __fd, const char *__file,
-        const struct timeval __tvp[2]) __attribute__ ((__nothrow__ , __leaf__));
-# 186 "/usr/include/x86_64-linux-gnu/sys/time.h" 3 4
-
-# 38 "/workspace/acl/lib_fiber/c/src/stdafx.h" 2
 
 # 1 "/usr/include/poll.h" 1 3 4
-# 1 "/usr/include/x86_64-linux-gnu/sys/poll.h" 1 3 4
-# 25 "/usr/include/x86_64-linux-gnu/sys/poll.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/poll.h" 1 3 4
-# 26 "/usr/include/x86_64-linux-gnu/sys/poll.h" 2 3 4
+# 1 "/usr/include/aarch64-linux-gnu/sys/poll.h" 1 3 4
+# 25 "/usr/include/aarch64-linux-gnu/sys/poll.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/poll.h" 1 3 4
+# 26 "/usr/include/aarch64-linux-gnu/sys/poll.h" 2 3 4
 
 
 
@@ -8086,44 +8143,40 @@ struct pollfd
 
 
 
-# 54 "/usr/include/x86_64-linux-gnu/sys/poll.h" 3 4
-extern int poll (struct pollfd *__fds, nfds_t __nfds, int __timeout);
-# 63 "/usr/include/x86_64-linux-gnu/sys/poll.h" 3 4
+# 54 "/usr/include/aarch64-linux-gnu/sys/poll.h" 3 4
+extern int poll (struct pollfd *__fds, nfds_t __nfds, int __timeout)
+    __attribute__ ((__access__ (__write_only__, 1, 2)));
+# 64 "/usr/include/aarch64-linux-gnu/sys/poll.h" 3 4
 extern int ppoll (struct pollfd *__fds, nfds_t __nfds,
     const struct timespec *__timeout,
-    const __sigset_t *__ss);
+    const __sigset_t *__ss)
+    __attribute__ ((__access__ (__write_only__, 1, 2)));
+# 82 "/usr/include/aarch64-linux-gnu/sys/poll.h" 3 4
 
 
 
 
 
-
-
-# 1 "/usr/include/x86_64-linux-gnu/bits/poll2.h" 1 3 4
-# 24 "/usr/include/x86_64-linux-gnu/bits/poll2.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/poll2.h" 1 3 4
+# 24 "/usr/include/aarch64-linux-gnu/bits/poll2.h" 3 4
 
 
 extern int __poll_alias (struct pollfd *__fds, nfds_t __nfds, int __timeout) __asm__ ("" "poll")
                                ;
 extern int __poll_chk (struct pollfd *__fds, nfds_t __nfds, int __timeout,
-         long unsigned int __fdslen);
+         long unsigned int __fdslen)
+    __attribute__ ((__access__ (__write_only__, 1, 2)));
 extern int __poll_chk_warn (struct pollfd *__fds, nfds_t __nfds, int __timeout, long unsigned int __fdslen) __asm__ ("" "__poll_chk")
 
 
   __attribute__((__warning__ ("poll called with fds buffer too small file nfds entries")));
 
-extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline__)) __attribute__ ((__artificial__)) int
+extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline__)) __attribute__ ((__artificial__)) __attribute__ ((__access__ (__write_only__, 1, 2))) int
 poll (struct pollfd *__fds, nfds_t __nfds, int __timeout)
 {
-  if (__builtin_object_size (__fds, 2 > 1) != (long unsigned int) -1)
-    {
-      if (! __builtin_constant_p (__nfds))
- return __poll_chk (__fds, __nfds, __timeout, __builtin_object_size (__fds, 2 > 1));
-      else if (__builtin_object_size (__fds, 2 > 1) / sizeof (*__fds) < __nfds)
- return __poll_chk_warn (__fds, __nfds, __timeout, __builtin_object_size (__fds, 2 > 1));
-    }
+  return ((((__typeof (__nfds)) 0 < (__typeof (__nfds)) -1 || (__builtin_constant_p (__nfds) && (__nfds) > 0)) && __builtin_constant_p ((((long unsigned int) (__nfds)) <= (__builtin_object_size (__fds, 2 > 1)) / (sizeof (*__fds)))) && (((long unsigned int) (__nfds)) <= (__builtin_object_size (__fds, 2 > 1)) / (sizeof (*__fds)))) ? __poll_alias (__fds, __nfds, __timeout) : ((((__typeof (__nfds)) 0 < (__typeof (__nfds)) -1 || (__builtin_constant_p (__nfds) && (__nfds) > 0)) && __builtin_constant_p ((((long unsigned int) (__nfds)) <= (__builtin_object_size (__fds, 2 > 1)) / (sizeof (*__fds)))) && !(((long unsigned int) (__nfds)) <= (__builtin_object_size (__fds, 2 > 1)) / (sizeof (*__fds)))) ? __poll_chk_warn (__fds, __nfds, __timeout, __builtin_object_size (__fds, 2 > 1)) : __poll_chk (__fds, __nfds, __timeout, __builtin_object_size (__fds, 2 > 1))))
 
-  return __poll_alias (__fds, __nfds, __timeout);
+                              ;
 }
 
 
@@ -8133,7 +8186,8 @@ extern int __ppoll_alias (struct pollfd *__fds, nfds_t __nfds, const struct time
                                           ;
 extern int __ppoll_chk (struct pollfd *__fds, nfds_t __nfds,
    const struct timespec *__timeout,
-   const __sigset_t *__ss, long unsigned int __fdslen);
+   const __sigset_t *__ss, long unsigned int __fdslen)
+    __attribute__ ((__access__ (__write_only__, 1, 2)));
 extern int __ppoll_chk_warn (struct pollfd *__fds, nfds_t __nfds, const struct timespec *__timeout, const __sigset_t *__ss, long unsigned int __fdslen) __asm__ ("" "__ppoll_chk")
 
 
@@ -8141,33 +8195,26 @@ extern int __ppoll_chk_warn (struct pollfd *__fds, nfds_t __nfds, const struct t
 
   __attribute__((__warning__ ("ppoll called with fds buffer too small file nfds entries")));
 
-extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline__)) __attribute__ ((__artificial__)) int
+extern __inline __attribute__ ((__always_inline__)) __attribute__ ((__gnu_inline__)) __attribute__ ((__artificial__)) __attribute__ ((__access__ (__write_only__, 1, 2))) int
 ppoll (struct pollfd *__fds, nfds_t __nfds, const struct timespec *__timeout,
        const __sigset_t *__ss)
 {
-  if (__builtin_object_size (__fds, 2 > 1) != (long unsigned int) -1)
-    {
-      if (! __builtin_constant_p (__nfds))
- return __ppoll_chk (__fds, __nfds, __timeout, __ss, __builtin_object_size (__fds, 2 > 1));
-      else if (__builtin_object_size (__fds, 2 > 1) / sizeof (*__fds) < __nfds)
- return __ppoll_chk_warn (__fds, __nfds, __timeout, __ss,
-     __builtin_object_size (__fds, 2 > 1));
-    }
+  return ((((__typeof (__nfds)) 0 < (__typeof (__nfds)) -1 || (__builtin_constant_p (__nfds) && (__nfds) > 0)) && __builtin_constant_p ((((long unsigned int) (__nfds)) <= (__builtin_object_size (__fds, 2 > 1)) / (sizeof (*__fds)))) && (((long unsigned int) (__nfds)) <= (__builtin_object_size (__fds, 2 > 1)) / (sizeof (*__fds)))) ? __ppoll_alias (__fds, __nfds, __timeout, __ss) : ((((__typeof (__nfds)) 0 < (__typeof (__nfds)) -1 || (__builtin_constant_p (__nfds) && (__nfds) > 0)) && __builtin_constant_p ((((long unsigned int) (__nfds)) <= (__builtin_object_size (__fds, 2 > 1)) / (sizeof (*__fds)))) && !(((long unsigned int) (__nfds)) <= (__builtin_object_size (__fds, 2 > 1)) / (sizeof (*__fds)))) ? __ppoll_chk_warn (__fds, __nfds, __timeout, __ss, __builtin_object_size (__fds, 2 > 1)) : __ppoll_chk (__fds, __nfds, __timeout, __ss, __builtin_object_size (__fds, 2 > 1))))
 
-  return __ppoll_alias (__fds, __nfds, __timeout, __ss);
+                                    ;
 }
 
 
 
-# 74 "/usr/include/x86_64-linux-gnu/sys/poll.h" 2 3 4
-# 1 "/usr/include/poll.h" 2 3 4
-# 40 "/workspace/acl/lib_fiber/c/src/stdafx.h" 2
+# 88 "/usr/include/aarch64-linux-gnu/sys/poll.h" 2 3 4
+# 2 "/usr/include/poll.h" 2 3 4
+# 40 "/acl/lib_fiber/c/src/stdafx.h" 2
 # 1 "/usr/include/netdb.h" 1 3 4
 # 27 "/usr/include/netdb.h" 3 4
 # 1 "/usr/include/netinet/in.h" 1 3 4
 # 22 "/usr/include/netinet/in.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/stdint-uintn.h" 1 3 4
-# 24 "/usr/include/x86_64-linux-gnu/bits/stdint-uintn.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/stdint-uintn.h" 1 3 4
+# 24 "/usr/include/aarch64-linux-gnu/bits/stdint-uintn.h" 3 4
 typedef __uint8_t uint8_t;
 typedef __uint16_t uint16_t;
 typedef __uint32_t uint32_t;
@@ -8187,8 +8234,8 @@ struct in_addr
   };
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/in.h" 1 3 4
-# 142 "/usr/include/x86_64-linux-gnu/bits/in.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/in.h" 1 3 4
+# 143 "/usr/include/aarch64-linux-gnu/bits/in.h" 3 4
 struct ip_opts
   {
     struct in_addr ip_dst;
@@ -8263,7 +8310,11 @@ enum
 
     IPPROTO_MPLS = 137,
 
+    IPPROTO_ETHERNET = 143,
+
     IPPROTO_RAW = 255,
+
+    IPPROTO_MPTCP = 262,
 
     IPPROTO_MAX
   };
@@ -8333,7 +8384,7 @@ enum
 
     IPPORT_USERRESERVED = 5000
   };
-# 211 "/usr/include/netinet/in.h" 3 4
+# 219 "/usr/include/netinet/in.h" 3 4
 struct in6_addr
   {
     union
@@ -8352,7 +8403,7 @@ struct in6_addr
 
 extern const struct in6_addr in6addr_any;
 extern const struct in6_addr in6addr_loopback;
-# 237 "/usr/include/netinet/in.h" 3 4
+# 245 "/usr/include/netinet/in.h" 3 4
 struct sockaddr_in
   {
     sa_family_t sin_family;
@@ -8360,10 +8411,10 @@ struct sockaddr_in
     struct in_addr sin_addr;
 
 
-    unsigned char sin_zero[sizeof (struct sockaddr) -
-      (sizeof (unsigned short int)) -
-      sizeof (in_port_t) -
-      sizeof (struct in_addr)];
+    unsigned char sin_zero[sizeof (struct sockaddr)
+      - (sizeof (unsigned short int))
+      - sizeof (in_port_t)
+      - sizeof (struct in_addr)];
   };
 
 
@@ -8476,7 +8527,7 @@ struct group_filter
 
     struct sockaddr_storage gf_slist[1];
 };
-# 374 "/usr/include/netinet/in.h" 3 4
+# 382 "/usr/include/netinet/in.h" 3 4
 extern uint32_t ntohl (uint32_t __netlong) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__const__));
 extern uint16_t ntohs (uint16_t __netshort)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__const__));
@@ -8488,17 +8539,17 @@ extern uint16_t htons (uint16_t __hostshort)
 
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/byteswap.h" 1 3 4
-# 386 "/usr/include/netinet/in.h" 2 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/uintn-identity.h" 1 3 4
-# 387 "/usr/include/netinet/in.h" 2 3 4
-# 502 "/usr/include/netinet/in.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/byteswap.h" 1 3 4
+# 394 "/usr/include/netinet/in.h" 2 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/uintn-identity.h" 1 3 4
+# 395 "/usr/include/netinet/in.h" 2 3 4
+# 510 "/usr/include/netinet/in.h" 3 4
 extern int bindresvport (int __sockfd, struct sockaddr_in *__sock_in) __attribute__ ((__nothrow__ , __leaf__));
 
 
 extern int bindresvport6 (int __sockfd, struct sockaddr_in6 *__sock_in)
      __attribute__ ((__nothrow__ , __leaf__));
-# 532 "/usr/include/netinet/in.h" 3 4
+# 540 "/usr/include/netinet/in.h" 3 4
 struct cmsghdr;
 
 
@@ -8605,7 +8656,7 @@ extern int setsourcefilter (int __s, uint32_t __interface_addr,
 
 # 1 "/usr/include/rpc/netdb.h" 1 3 4
 # 42 "/usr/include/rpc/netdb.h" 3 4
-# 1 "/usr/lib/gcc/x86_64-linux-gnu/7/include/stddef.h" 1 3 4
+# 1 "/usr/lib/gcc/aarch64-linux-gnu/11/include/stddef.h" 1 3 4
 # 43 "/usr/include/rpc/netdb.h" 2 3 4
 
 
@@ -8645,8 +8696,8 @@ extern int getrpcent_r (struct rpcent *__result_buf, char *__buffer,
 
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/netdb.h" 1 3 4
-# 26 "/usr/include/x86_64-linux-gnu/bits/netdb.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/netdb.h" 1 3 4
+# 26 "/usr/include/aarch64-linux-gnu/bits/netdb.h" 3 4
 struct netent
 {
   char *n_name;
@@ -9030,8 +9081,7 @@ extern int getaddrinfo_a (int __mode, struct gaicb *__list[__restrict],
 # 701 "/usr/include/netdb.h" 3 4
 extern int gai_suspend (const struct gaicb *const __list[], int __ent,
    const struct timespec *__timeout);
-
-
+# 716 "/usr/include/netdb.h" 3 4
 extern int gai_error (struct gaicb *__req) __attribute__ ((__nothrow__ , __leaf__));
 
 
@@ -9039,57 +9089,55 @@ extern int gai_cancel (struct gaicb *__gaicbp) __attribute__ ((__nothrow__ , __l
 
 
 
-# 41 "/workspace/acl/lib_fiber/c/src/stdafx.h" 2
+# 41 "/acl/lib_fiber/c/src/stdafx.h" 2
 
 # 1 "/usr/include/netinet/tcp.h" 1 3 4
-# 80 "/usr/include/netinet/tcp.h" 3 4
-# 1 "/usr/lib/gcc/x86_64-linux-gnu/7/include/stdint.h" 1 3 4
-# 9 "/usr/lib/gcc/x86_64-linux-gnu/7/include/stdint.h" 3 4
+# 91 "/usr/include/netinet/tcp.h" 3 4
+# 1 "/usr/lib/gcc/aarch64-linux-gnu/11/include/stdint.h" 1 3 4
+# 9 "/usr/lib/gcc/aarch64-linux-gnu/11/include/stdint.h" 3 4
 # 1 "/usr/include/stdint.h" 1 3 4
 # 26 "/usr/include/stdint.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/libc-header-start.h" 1 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/libc-header-start.h" 1 3 4
 # 27 "/usr/include/stdint.h" 2 3 4
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/wchar.h" 1 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/wchar.h" 1 3 4
 # 29 "/usr/include/stdint.h" 2 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/wordsize.h" 1 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/wordsize.h" 1 3 4
 # 30 "/usr/include/stdint.h" 2 3 4
 # 43 "/usr/include/stdint.h" 3 4
-typedef signed char int_least8_t;
-typedef short int int_least16_t;
-typedef int int_least32_t;
-
-typedef long int int_least64_t;
-
+typedef __int_least8_t int_least8_t;
+typedef __int_least16_t int_least16_t;
+typedef __int_least32_t int_least32_t;
+typedef __int_least64_t int_least64_t;
 
 
+typedef __uint_least8_t uint_least8_t;
+typedef __uint_least16_t uint_least16_t;
+typedef __uint_least32_t uint_least32_t;
+typedef __uint_least64_t uint_least64_t;
 
 
 
-typedef unsigned char uint_least8_t;
-typedef unsigned short int uint_least16_t;
-typedef unsigned int uint_least32_t;
 
-typedef unsigned long int uint_least64_t;
-# 68 "/usr/include/stdint.h" 3 4
+
 typedef signed char int_fast8_t;
 
 typedef long int int_fast16_t;
 typedef long int int_fast32_t;
 typedef long int int_fast64_t;
-# 81 "/usr/include/stdint.h" 3 4
+# 71 "/usr/include/stdint.h" 3 4
 typedef unsigned char uint_fast8_t;
 
 typedef unsigned long int uint_fast16_t;
 typedef unsigned long int uint_fast32_t;
 typedef unsigned long int uint_fast64_t;
-# 100 "/usr/include/stdint.h" 3 4
+# 90 "/usr/include/stdint.h" 3 4
 typedef unsigned long int uintptr_t;
-# 111 "/usr/include/stdint.h" 3 4
+# 101 "/usr/include/stdint.h" 3 4
 typedef __intmax_t intmax_t;
 typedef __uintmax_t uintmax_t;
-# 10 "/usr/lib/gcc/x86_64-linux-gnu/7/include/stdint.h" 2 3 4
-# 81 "/usr/include/netinet/tcp.h" 2 3 4
+# 10 "/usr/lib/gcc/aarch64-linux-gnu/11/include/stdint.h" 2 3 4
+# 92 "/usr/include/netinet/tcp.h" 2 3 4
 
 typedef uint32_t tcp_seq;
 
@@ -9141,7 +9189,7 @@ struct tcphdr
  uint16_t ack:1;
  uint16_t urg:1;
  uint16_t res2:2;
-# 145 "/usr/include/netinet/tcp.h" 3 4
+# 156 "/usr/include/netinet/tcp.h" 3 4
  uint16_t window;
  uint16_t check;
  uint16_t urg_ptr;
@@ -9163,7 +9211,7 @@ enum
   TCP_LISTEN,
   TCP_CLOSING
 };
-# 206 "/usr/include/netinet/tcp.h" 3 4
+# 217 "/usr/include/netinet/tcp.h" 3 4
 enum tcp_ca_state
 {
   TCP_CA_Open = 0,
@@ -9215,7 +9263,7 @@ struct tcp_info
 
   uint32_t tcpi_total_retrans;
 };
-# 265 "/usr/include/netinet/tcp.h" 3 4
+# 276 "/usr/include/netinet/tcp.h" 3 4
 struct tcp_md5sig
 {
   struct sockaddr_storage tcpm_addr;
@@ -9241,7 +9289,7 @@ enum
   TCP_SEND_QUEUE,
   TCP_QUEUES_NR,
 };
-# 308 "/usr/include/netinet/tcp.h" 3 4
+# 319 "/usr/include/netinet/tcp.h" 3 4
 struct tcp_cookie_transactions
 {
   uint16_t tcpct_flags;
@@ -9261,7 +9309,15 @@ struct tcp_repair_window
   uint32_t rcv_wnd;
   uint32_t rcv_wup;
 };
-# 43 "/workspace/acl/lib_fiber/c/src/stdafx.h" 2
+
+
+struct tcp_zerocopy_receive
+{
+  uint64_t address;
+  uint32_t length;
+  uint32_t recv_skip_hint;
+};
+# 43 "/acl/lib_fiber/c/src/stdafx.h" 2
 # 1 "/usr/include/arpa/inet.h" 1 3 4
 # 30 "/usr/include/arpa/inet.h" 3 4
 
@@ -9311,7 +9367,8 @@ extern int inet_aton (const char *__cp, struct in_addr *__inp) __attribute__ ((_
 
 
 
-extern char *inet_neta (in_addr_t __net, char *__buf, size_t __len) __attribute__ ((__nothrow__ , __leaf__));
+extern char *inet_neta (in_addr_t __net, char *__buf, size_t __len) __attribute__ ((__nothrow__ , __leaf__))
+  __attribute__ ((__deprecated__ ("Use inet_ntop instead")));
 
 
 
@@ -9338,61 +9395,74 @@ extern char *inet_nsap_ntoa (int __len, const unsigned char *__cp,
 
 
 
-# 44 "/workspace/acl/lib_fiber/c/src/stdafx.h" 2
-# 1 "/usr/lib/gcc/x86_64-linux-gnu/7/include-fixed/limits.h" 1 3 4
-# 34 "/usr/lib/gcc/x86_64-linux-gnu/7/include-fixed/limits.h" 3 4
-# 1 "/usr/lib/gcc/x86_64-linux-gnu/7/include-fixed/syslimits.h" 1 3 4
+# 44 "/acl/lib_fiber/c/src/stdafx.h" 2
+# 1 "/usr/lib/gcc/aarch64-linux-gnu/11/include/limits.h" 1 3 4
+# 34 "/usr/lib/gcc/aarch64-linux-gnu/11/include/limits.h" 3 4
+# 1 "/usr/lib/gcc/aarch64-linux-gnu/11/include/syslimits.h" 1 3 4
 
 
 
 
 
 
-# 1 "/usr/lib/gcc/x86_64-linux-gnu/7/include-fixed/limits.h" 1 3 4
-# 194 "/usr/lib/gcc/x86_64-linux-gnu/7/include-fixed/limits.h" 3 4
+# 1 "/usr/lib/gcc/aarch64-linux-gnu/11/include/limits.h" 1 3 4
+# 203 "/usr/lib/gcc/aarch64-linux-gnu/11/include/limits.h" 3 4
 # 1 "/usr/include/limits.h" 1 3 4
 # 26 "/usr/include/limits.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/libc-header-start.h" 1 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/libc-header-start.h" 1 3 4
 # 27 "/usr/include/limits.h" 2 3 4
-# 183 "/usr/include/limits.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/posix1_lim.h" 1 3 4
-# 160 "/usr/include/x86_64-linux-gnu/bits/posix1_lim.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/local_lim.h" 1 3 4
-# 38 "/usr/include/x86_64-linux-gnu/bits/local_lim.h" 3 4
+# 195 "/usr/include/limits.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/posix1_lim.h" 1 3 4
+# 27 "/usr/include/aarch64-linux-gnu/bits/posix1_lim.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/wordsize.h" 1 3 4
+# 28 "/usr/include/aarch64-linux-gnu/bits/posix1_lim.h" 2 3 4
+# 161 "/usr/include/aarch64-linux-gnu/bits/posix1_lim.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/local_lim.h" 1 3 4
+# 38 "/usr/include/aarch64-linux-gnu/bits/local_lim.h" 3 4
 # 1 "/usr/include/linux/limits.h" 1 3 4
-# 39 "/usr/include/x86_64-linux-gnu/bits/local_lim.h" 2 3 4
-# 161 "/usr/include/x86_64-linux-gnu/bits/posix1_lim.h" 2 3 4
-# 184 "/usr/include/limits.h" 2 3 4
+# 39 "/usr/include/aarch64-linux-gnu/bits/local_lim.h" 2 3 4
+# 81 "/usr/include/aarch64-linux-gnu/bits/local_lim.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/pthread_stack_min-dynamic.h" 1 3 4
+# 23 "/usr/include/aarch64-linux-gnu/bits/pthread_stack_min-dynamic.h" 3 4
+
+extern long int __sysconf (int __name) __attribute__ ((__nothrow__ , __leaf__));
+
+# 82 "/usr/include/aarch64-linux-gnu/bits/local_lim.h" 2 3 4
+# 162 "/usr/include/aarch64-linux-gnu/bits/posix1_lim.h" 2 3 4
+# 196 "/usr/include/limits.h" 2 3 4
 
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/posix2_lim.h" 1 3 4
-# 188 "/usr/include/limits.h" 2 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/posix2_lim.h" 1 3 4
+# 200 "/usr/include/limits.h" 2 3 4
 
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/xopen_lim.h" 1 3 4
-# 64 "/usr/include/x86_64-linux-gnu/bits/xopen_lim.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/uio_lim.h" 1 3 4
-# 65 "/usr/include/x86_64-linux-gnu/bits/xopen_lim.h" 2 3 4
-# 192 "/usr/include/limits.h" 2 3 4
-# 195 "/usr/lib/gcc/x86_64-linux-gnu/7/include-fixed/limits.h" 2 3 4
-# 8 "/usr/lib/gcc/x86_64-linux-gnu/7/include-fixed/syslimits.h" 2 3 4
-# 35 "/usr/lib/gcc/x86_64-linux-gnu/7/include-fixed/limits.h" 2 3 4
-# 45 "/workspace/acl/lib_fiber/c/src/stdafx.h" 2
+# 1 "/usr/include/aarch64-linux-gnu/bits/xopen_lim.h" 1 3 4
+# 64 "/usr/include/aarch64-linux-gnu/bits/xopen_lim.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/uio_lim.h" 1 3 4
+# 65 "/usr/include/aarch64-linux-gnu/bits/xopen_lim.h" 2 3 4
+# 204 "/usr/include/limits.h" 2 3 4
+# 204 "/usr/lib/gcc/aarch64-linux-gnu/11/include/limits.h" 2 3 4
+# 8 "/usr/lib/gcc/aarch64-linux-gnu/11/include/syslimits.h" 2 3 4
+# 35 "/usr/lib/gcc/aarch64-linux-gnu/11/include/limits.h" 2 3 4
+# 45 "/acl/lib_fiber/c/src/stdafx.h" 2
 # 1 "/usr/include/pthread.h" 1 3 4
-# 23 "/usr/include/pthread.h" 3 4
+# 22 "/usr/include/pthread.h" 3 4
 # 1 "/usr/include/sched.h" 1 3 4
 # 29 "/usr/include/sched.h" 3 4
-# 1 "/usr/lib/gcc/x86_64-linux-gnu/7/include/stddef.h" 1 3 4
+# 1 "/usr/lib/gcc/aarch64-linux-gnu/11/include/stddef.h" 1 3 4
 # 30 "/usr/include/sched.h" 2 3 4
 # 43 "/usr/include/sched.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/sched.h" 1 3 4
-# 75 "/usr/include/x86_64-linux-gnu/bits/sched.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/sched.h" 1 3 4
+# 76 "/usr/include/aarch64-linux-gnu/bits/sched.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/types/struct_sched_param.h" 1 3 4
+# 23 "/usr/include/aarch64-linux-gnu/bits/types/struct_sched_param.h" 3 4
 struct sched_param
 {
   int sched_priority;
 };
+# 77 "/usr/include/aarch64-linux-gnu/bits/sched.h" 2 3 4
 
 
 
@@ -9408,13 +9478,16 @@ extern int unshare (int __flags) __attribute__ ((__nothrow__ , __leaf__));
 extern int sched_getcpu (void) __attribute__ ((__nothrow__ , __leaf__));
 
 
+extern int getcpu (unsigned int *, unsigned int *) __attribute__ ((__nothrow__ , __leaf__));
+
+
 extern int setns (int __fd, int __nstype) __attribute__ ((__nothrow__ , __leaf__));
 
 
 
 # 44 "/usr/include/sched.h" 2 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/cpu-set.h" 1 3 4
-# 32 "/usr/include/x86_64-linux-gnu/bits/cpu-set.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/cpu-set.h" 1 3 4
+# 32 "/usr/include/aarch64-linux-gnu/bits/cpu-set.h" 3 4
 typedef unsigned long int __cpu_mask;
 
 
@@ -9426,7 +9499,7 @@ typedef struct
 {
   __cpu_mask __bits[1024 / (8 * sizeof (__cpu_mask))];
 } cpu_set_t;
-# 115 "/usr/include/x86_64-linux-gnu/bits/cpu-set.h" 3 4
+# 115 "/usr/include/aarch64-linux-gnu/bits/cpu-set.h" 3 4
 
 
 extern int __sched_cpucount (size_t __setsize, const cpu_set_t *__setp)
@@ -9468,8 +9541,9 @@ extern int sched_get_priority_max (int __algorithm) __attribute__ ((__nothrow__ 
 extern int sched_get_priority_min (int __algorithm) __attribute__ ((__nothrow__ , __leaf__));
 
 
+
 extern int sched_rr_get_interval (__pid_t __pid, struct timespec *__t) __attribute__ ((__nothrow__ , __leaf__));
-# 121 "/usr/include/sched.h" 3 4
+# 130 "/usr/include/sched.h" 3 4
 extern int sched_setaffinity (__pid_t __pid, size_t __cpusetsize,
          const cpu_set_t *__cpuset) __attribute__ ((__nothrow__ , __leaf__));
 
@@ -9479,17 +9553,15 @@ extern int sched_getaffinity (__pid_t __pid, size_t __cpusetsize,
 
 
 
-# 24 "/usr/include/pthread.h" 2 3 4
+# 23 "/usr/include/pthread.h" 2 3 4
 
 
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/wordsize.h" 1 3 4
+
+# 1 "/usr/include/aarch64-linux-gnu/bits/wordsize.h" 1 3 4
 # 29 "/usr/include/pthread.h" 2 3 4
-
-
-
-
+# 37 "/usr/include/pthread.h" 3 4
 enum
 {
   PTHREAD_CREATE_JOINABLE,
@@ -9540,7 +9612,7 @@ enum
   PTHREAD_PRIO_INHERIT,
   PTHREAD_PRIO_PROTECT
 };
-# 115 "/usr/include/pthread.h" 3 4
+# 104 "/usr/include/pthread.h" 3 4
 enum
 {
   PTHREAD_RWLOCK_PREFER_READER_NP,
@@ -9548,7 +9620,7 @@ enum
   PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP,
   PTHREAD_RWLOCK_DEFAULT_NP = PTHREAD_RWLOCK_PREFER_READER_NP
 };
-# 156 "/usr/include/pthread.h" 3 4
+# 124 "/usr/include/pthread.h" 3 4
 enum
 {
   PTHREAD_INHERIT_SCHED,
@@ -9576,7 +9648,7 @@ enum
   PTHREAD_PROCESS_SHARED
 
 };
-# 191 "/usr/include/pthread.h" 3 4
+# 159 "/usr/include/pthread.h" 3 4
 struct _pthread_cleanup_buffer
 {
   void (*__routine) (void *);
@@ -9600,7 +9672,7 @@ enum
   PTHREAD_CANCEL_ASYNCHRONOUS
 
 };
-# 229 "/usr/include/pthread.h" 3 4
+# 197 "/usr/include/pthread.h" 3 4
 
 
 
@@ -9629,21 +9701,14 @@ extern int pthread_join (pthread_t __th, void **__thread_return);
 
 
 extern int pthread_tryjoin_np (pthread_t __th, void **__thread_return) __attribute__ ((__nothrow__ , __leaf__));
-
-
-
-
-
-
-
+# 233 "/usr/include/pthread.h" 3 4
 extern int pthread_timedjoin_np (pthread_t __th, void **__thread_return,
      const struct timespec *__abstime);
-
-
-
-
-
-
+# 243 "/usr/include/pthread.h" 3 4
+extern int pthread_clockjoin_np (pthread_t __th, void **__thread_return,
+                                 clockid_t __clockid,
+     const struct timespec *__abstime);
+# 269 "/usr/include/pthread.h" 3 4
 extern int pthread_detach (pthread_t __th) __attribute__ ((__nothrow__ , __leaf__));
 
 
@@ -9786,6 +9851,20 @@ extern int pthread_getattr_default_np (pthread_attr_t *__attr)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)));
 
 
+extern int pthread_attr_setsigmask_np (pthread_attr_t *__attr,
+           const __sigset_t *sigmask);
+
+
+
+
+extern int pthread_attr_getsigmask_np (const pthread_attr_t *__attr,
+           __sigset_t *sigmask);
+
+
+
+
+
+
 
 extern int pthread_setattr_default_np (const pthread_attr_t *__attr)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)));
@@ -9838,11 +9917,14 @@ extern int pthread_setconcurrency (int __level) __attribute__ ((__nothrow__ , __
 
 
 
-
-
-
-
 extern int pthread_yield (void) __attribute__ ((__nothrow__ , __leaf__));
+
+extern int pthread_yield (void) __asm__ ("" "sched_yield") __attribute__ ((__nothrow__ , __leaf__))
+  __attribute__ ((__deprecated__ ("pthread_yield is deprecated, use sched_yield instead")))
+                                                      ;
+
+
+
 
 
 
@@ -9855,10 +9937,10 @@ extern int pthread_setaffinity_np (pthread_t __th, size_t __cpusetsize,
 extern int pthread_getaffinity_np (pthread_t __th, size_t __cpusetsize,
        cpu_set_t *__cpuset)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (3)));
-# 495 "/usr/include/pthread.h" 3 4
+# 509 "/usr/include/pthread.h" 3 4
 extern int pthread_once (pthread_once_t *__once_control,
     void (*__init_routine) (void)) __attribute__ ((__nonnull__ (1, 2)));
-# 507 "/usr/include/pthread.h" 3 4
+# 521 "/usr/include/pthread.h" 3 4
 extern int pthread_setcancelstate (int __state, int *__oldstate);
 
 
@@ -9876,16 +9958,18 @@ extern void pthread_testcancel (void);
 
 
 
+struct __cancel_jmp_buf_tag
+{
+  __jmp_buf __cancel_jmp_buf;
+  int __mask_was_saved;
+};
+
 typedef struct
 {
-  struct
-  {
-    __jmp_buf __cancel_jmp_buf;
-    int __mask_was_saved;
-  } __cancel_jmp_buf[1];
+  struct __cancel_jmp_buf_tag __cancel_jmp_buf[1];
   void *__pad[4];
 } __pthread_unwind_buf_t __attribute__ ((__aligned__));
-# 541 "/usr/include/pthread.h" 3 4
+# 557 "/usr/include/pthread.h" 3 4
 struct __pthread_cleanup_frame
 {
   void (*__cancel_routine) (void *);
@@ -9893,16 +9977,16 @@ struct __pthread_cleanup_frame
   int __do_it;
   int __cancel_type;
 };
-# 681 "/usr/include/pthread.h" 3 4
+# 697 "/usr/include/pthread.h" 3 4
 extern void __pthread_register_cancel (__pthread_unwind_buf_t *__buf)
      ;
-# 693 "/usr/include/pthread.h" 3 4
+# 709 "/usr/include/pthread.h" 3 4
 extern void __pthread_unregister_cancel (__pthread_unwind_buf_t *__buf)
   ;
-# 716 "/usr/include/pthread.h" 3 4
+# 732 "/usr/include/pthread.h" 3 4
 extern void __pthread_register_cancel_defer (__pthread_unwind_buf_t *__buf)
      ;
-# 729 "/usr/include/pthread.h" 3 4
+# 745 "/usr/include/pthread.h" 3 4
 extern void __pthread_unregister_cancel_restore (__pthread_unwind_buf_t *__buf)
   ;
 
@@ -9914,16 +9998,12 @@ extern void __pthread_unwind_next (__pthread_unwind_buf_t *__buf)
      __attribute__ ((__weak__))
 
      ;
+# 766 "/usr/include/pthread.h" 3 4
+extern int __sigsetjmp_cancel (struct __cancel_jmp_buf_tag __env[1], int __savemask) __asm__ ("" "__sigsetjmp") __attribute__ ((__nothrow__))
 
 
-
-struct __jmp_buf_tag;
-extern int __sigsetjmp (struct __jmp_buf_tag *__env, int __savemask) __attribute__ ((__nothrow__));
-
-
-
-
-
+                     __attribute__ ((__returns_twice__));
+# 781 "/usr/include/pthread.h" 3 4
 extern int pthread_mutex_init (pthread_mutex_t *__mutex,
           const pthread_mutexattr_t *__mutexattr)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)));
@@ -9942,12 +10022,16 @@ extern int pthread_mutex_lock (pthread_mutex_t *__mutex)
 
 
 
+
 extern int pthread_mutex_timedlock (pthread_mutex_t *__restrict __mutex,
         const struct timespec *__restrict
         __abstime) __attribute__ ((__nothrow__)) __attribute__ ((__nonnull__ (1, 2)));
-
-
-
+# 817 "/usr/include/pthread.h" 3 4
+extern int pthread_mutex_clocklock (pthread_mutex_t *__restrict __mutex,
+        clockid_t __clockid,
+        const struct timespec *__restrict
+        __abstime) __attribute__ ((__nothrow__)) __attribute__ ((__nonnull__ (1, 3)));
+# 835 "/usr/include/pthread.h" 3 4
 extern int pthread_mutex_unlock (pthread_mutex_t *__mutex)
      __attribute__ ((__nothrow__)) __attribute__ ((__nonnull__ (1)));
 
@@ -9971,9 +10055,12 @@ extern int pthread_mutex_setprioceiling (pthread_mutex_t *__restrict __mutex,
 extern int pthread_mutex_consistent (pthread_mutex_t *__mutex)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)));
 
-extern int pthread_mutex_consistent_np (pthread_mutex_t *__mutex)
-     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)));
-# 807 "/usr/include/pthread.h" 3 4
+
+extern int pthread_mutex_consistent_np (pthread_mutex_t *) __asm__ ("" "pthread_mutex_consistent") __attribute__ ((__nothrow__ , __leaf__))
+                                __attribute__ ((__nonnull__ (1)))
+  __attribute__ ((__deprecated__ ("pthread_mutex_consistent_np is deprecated, use pthread_mutex_consistent")))
+                                                                         ;
+# 874 "/usr/include/pthread.h" 3 4
 extern int pthread_mutexattr_init (pthread_mutexattr_t *__attr)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)));
 
@@ -10034,9 +10121,15 @@ extern int pthread_mutexattr_getrobust (const pthread_mutexattr_t *__attr,
      int *__robustness)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1, 2)));
 
-extern int pthread_mutexattr_getrobust_np (const pthread_mutexattr_t *__attr,
-        int *__robustness)
-     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1, 2)));
+
+extern int pthread_mutexattr_getrobust_np (pthread_mutexattr_t *, int *) __asm__ ("" "pthread_mutexattr_getrobust") __attribute__ ((__nothrow__ , __leaf__))
+
+                                   __attribute__ ((__nonnull__ (1)))
+  __attribute__ ((__deprecated__ ("pthread_mutexattr_getrobust_np is deprecated, use pthread_mutexattr_getrobust")))
+                                                                               ;
+
+
+
 
 
 
@@ -10044,10 +10137,13 @@ extern int pthread_mutexattr_setrobust (pthread_mutexattr_t *__attr,
      int __robustness)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)));
 
-extern int pthread_mutexattr_setrobust_np (pthread_mutexattr_t *__attr,
-        int __robustness)
-     __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)));
-# 889 "/usr/include/pthread.h" 3 4
+
+extern int pthread_mutexattr_setrobust_np (pthread_mutexattr_t *, int) __asm__ ("" "pthread_mutexattr_setrobust") __attribute__ ((__nothrow__ , __leaf__))
+
+                                   __attribute__ ((__nonnull__ (1)))
+  __attribute__ ((__deprecated__ ("pthread_mutexattr_setrobust_np is deprecated, use pthread_mutexattr_setrobust")))
+                                                                               ;
+# 967 "/usr/include/pthread.h" 3 4
 extern int pthread_rwlock_init (pthread_rwlock_t *__restrict __rwlock,
     const pthread_rwlockattr_t *__restrict
     __attr) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)));
@@ -10066,12 +10162,16 @@ extern int pthread_rwlock_tryrdlock (pthread_rwlock_t *__rwlock)
 
 
 
+
 extern int pthread_rwlock_timedrdlock (pthread_rwlock_t *__restrict __rwlock,
            const struct timespec *__restrict
            __abstime) __attribute__ ((__nothrow__)) __attribute__ ((__nonnull__ (1, 2)));
-
-
-
+# 1004 "/usr/include/pthread.h" 3 4
+extern int pthread_rwlock_clockrdlock (pthread_rwlock_t *__restrict __rwlock,
+           clockid_t __clockid,
+           const struct timespec *__restrict
+           __abstime) __attribute__ ((__nothrow__)) __attribute__ ((__nonnull__ (1, 3)));
+# 1023 "/usr/include/pthread.h" 3 4
 extern int pthread_rwlock_wrlock (pthread_rwlock_t *__rwlock)
      __attribute__ ((__nothrow__)) __attribute__ ((__nonnull__ (1)));
 
@@ -10081,12 +10181,16 @@ extern int pthread_rwlock_trywrlock (pthread_rwlock_t *__rwlock)
 
 
 
+
 extern int pthread_rwlock_timedwrlock (pthread_rwlock_t *__restrict __rwlock,
            const struct timespec *__restrict
            __abstime) __attribute__ ((__nothrow__)) __attribute__ ((__nonnull__ (1, 2)));
-
-
-
+# 1051 "/usr/include/pthread.h" 3 4
+extern int pthread_rwlock_clockwrlock (pthread_rwlock_t *__restrict __rwlock,
+           clockid_t __clockid,
+           const struct timespec *__restrict
+           __abstime) __attribute__ ((__nothrow__)) __attribute__ ((__nonnull__ (1, 3)));
+# 1071 "/usr/include/pthread.h" 3 4
 extern int pthread_rwlock_unlock (pthread_rwlock_t *__rwlock)
      __attribute__ ((__nothrow__)) __attribute__ ((__nonnull__ (1)));
 
@@ -10152,15 +10256,18 @@ extern int pthread_cond_broadcast (pthread_cond_t *__cond)
 extern int pthread_cond_wait (pthread_cond_t *__restrict __cond,
          pthread_mutex_t *__restrict __mutex)
      __attribute__ ((__nonnull__ (1, 2)));
-# 1001 "/usr/include/pthread.h" 3 4
+# 1145 "/usr/include/pthread.h" 3 4
 extern int pthread_cond_timedwait (pthread_cond_t *__restrict __cond,
        pthread_mutex_t *__restrict __mutex,
        const struct timespec *__restrict __abstime)
      __attribute__ ((__nonnull__ (1, 2, 3)));
-
-
-
-
+# 1171 "/usr/include/pthread.h" 3 4
+extern int pthread_cond_clockwait (pthread_cond_t *__restrict __cond,
+       pthread_mutex_t *__restrict __mutex,
+       __clockid_t __clock_id,
+       const struct timespec *__restrict __abstime)
+     __attribute__ ((__nonnull__ (1, 2, 4)));
+# 1194 "/usr/include/pthread.h" 3 4
 extern int pthread_condattr_init (pthread_condattr_t *__attr)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)));
 
@@ -10189,7 +10296,7 @@ extern int pthread_condattr_getclock (const pthread_condattr_t *
 extern int pthread_condattr_setclock (pthread_condattr_t *__attr,
           __clockid_t __clock_id)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)));
-# 1045 "/usr/include/pthread.h" 3 4
+# 1230 "/usr/include/pthread.h" 3 4
 extern int pthread_spin_init (pthread_spinlock_t *__lock, int __pshared)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)));
 
@@ -10246,7 +10353,7 @@ extern int pthread_barrierattr_getpshared (const pthread_barrierattr_t *
 extern int pthread_barrierattr_setpshared (pthread_barrierattr_t *__attr,
         int __pshared)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)));
-# 1112 "/usr/include/pthread.h" 3 4
+# 1297 "/usr/include/pthread.h" 3 4
 extern int pthread_key_create (pthread_key_t *__key,
           void (*__destr_function) (void *))
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (1)));
@@ -10259,7 +10366,8 @@ extern void *pthread_getspecific (pthread_key_t __key) __attribute__ ((__nothrow
 
 
 extern int pthread_setspecific (pthread_key_t __key,
-    const void *__pointer) __attribute__ ((__nothrow__ , __leaf__)) ;
+    const void *__pointer)
+  __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__access__ (__none__, 2)));
 
 
 
@@ -10267,7 +10375,7 @@ extern int pthread_setspecific (pthread_key_t __key,
 extern int pthread_getcpuclockid (pthread_t __thread_id,
       __clockid_t *__clock_id)
      __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (2)));
-# 1146 "/usr/include/pthread.h" 3 4
+# 1332 "/usr/include/pthread.h" 3 4
 extern int pthread_atfork (void (*__prepare) (void),
       void (*__parent) (void),
       void (*__child) (void)) __attribute__ ((__nothrow__ , __leaf__));
@@ -10283,11 +10391,11 @@ __attribute__ ((__nothrow__ , __leaf__)) pthread_equal (pthread_t __thread1, pth
 
 
 
-# 46 "/workspace/acl/lib_fiber/c/src/stdafx.h" 2
-# 1 "/usr/include/x86_64-linux-gnu/sys/resource.h" 1 3 4
-# 24 "/usr/include/x86_64-linux-gnu/sys/resource.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/resource.h" 1 3 4
-# 31 "/usr/include/x86_64-linux-gnu/bits/resource.h" 3 4
+# 46 "/acl/lib_fiber/c/src/stdafx.h" 2
+# 1 "/usr/include/aarch64-linux-gnu/sys/resource.h" 1 3 4
+# 24 "/usr/include/aarch64-linux-gnu/sys/resource.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/resource.h" 1 3 4
+# 31 "/usr/include/aarch64-linux-gnu/bits/resource.h" 3 4
 enum __rlimit_resource
 {
 
@@ -10369,7 +10477,7 @@ enum __rlimit_resource
 
 
 };
-# 131 "/usr/include/x86_64-linux-gnu/bits/resource.h" 3 4
+# 131 "/usr/include/aarch64-linux-gnu/bits/resource.h" 3 4
 typedef __rlim_t rlim_t;
 
 
@@ -10418,8 +10526,8 @@ enum __rusage_who
 };
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/types/struct_rusage.h" 1 3 4
-# 31 "/usr/include/x86_64-linux-gnu/bits/types/struct_rusage.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/types/struct_rusage.h" 1 3 4
+# 33 "/usr/include/aarch64-linux-gnu/bits/types/struct_rusage.h" 3 4
 struct rusage
   {
 
@@ -10432,7 +10540,6 @@ struct rusage
  long int ru_maxrss;
  __syscall_slong_t __ru_maxrss_word;
       };
-
 
 
     __extension__ union
@@ -10518,7 +10625,7 @@ struct rusage
  __syscall_slong_t __ru_nivcsw_word;
       };
   };
-# 180 "/usr/include/x86_64-linux-gnu/bits/resource.h" 2 3 4
+# 180 "/usr/include/aarch64-linux-gnu/bits/resource.h" 2 3 4
 
 
 
@@ -10545,7 +10652,7 @@ enum __priority_which
 extern int prlimit (__pid_t __pid, enum __rlimit_resource __resource,
       const struct rlimit *__new_limit,
       struct rlimit *__old_limit) __attribute__ ((__nothrow__ , __leaf__));
-# 217 "/usr/include/x86_64-linux-gnu/bits/resource.h" 3 4
+# 217 "/usr/include/aarch64-linux-gnu/bits/resource.h" 3 4
 extern int prlimit64 (__pid_t __pid, enum __rlimit_resource __resource,
         const struct rlimit64 *__new_limit,
         struct rlimit64 *__old_limit) __attribute__ ((__nothrow__ , __leaf__));
@@ -10553,7 +10660,7 @@ extern int prlimit64 (__pid_t __pid, enum __rlimit_resource __resource,
 
 
 
-# 25 "/usr/include/x86_64-linux-gnu/sys/resource.h" 2 3 4
+# 25 "/usr/include/aarch64-linux-gnu/sys/resource.h" 2 3 4
 
 
 
@@ -10570,12 +10677,12 @@ extern int prlimit64 (__pid_t __pid, enum __rlimit_resource __resource,
 typedef enum __rlimit_resource __rlimit_resource_t;
 typedef enum __rusage_who __rusage_who_t;
 typedef enum __priority_which __priority_which_t;
-# 50 "/usr/include/x86_64-linux-gnu/sys/resource.h" 3 4
+# 50 "/usr/include/aarch64-linux-gnu/sys/resource.h" 3 4
 extern int getrlimit (__rlimit_resource_t __resource,
-        struct rlimit *__rlimits) __attribute__ ((__nothrow__ , __leaf__));
-# 61 "/usr/include/x86_64-linux-gnu/sys/resource.h" 3 4
+        struct rlimit *__rlimits) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (2)));
+# 62 "/usr/include/aarch64-linux-gnu/sys/resource.h" 3 4
 extern int getrlimit64 (__rlimit_resource_t __resource,
-   struct rlimit64 *__rlimits) __attribute__ ((__nothrow__ , __leaf__));
+   struct rlimit64 *__rlimits) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (2)));
 
 
 
@@ -10583,20 +10690,17 @@ extern int getrlimit64 (__rlimit_resource_t __resource,
 
 
 extern int setrlimit (__rlimit_resource_t __resource,
-        const struct rlimit *__rlimits) __attribute__ ((__nothrow__ , __leaf__));
-# 81 "/usr/include/x86_64-linux-gnu/sys/resource.h" 3 4
+        const struct rlimit *__rlimits) __attribute__ ((__nothrow__ , __leaf__)) __attribute__ ((__nonnull__ (2)));
+# 82 "/usr/include/aarch64-linux-gnu/sys/resource.h" 3 4
 extern int setrlimit64 (__rlimit_resource_t __resource,
-   const struct rlimit64 *__rlimits) __attribute__ ((__nothrow__ , __leaf__));
+   const struct rlimit64 *__rlimits) __attribute__ ((__nothrow__ , __leaf__))
+   __attribute__ ((__nonnull__ (2)));
 
 
 
 
 extern int getrusage (__rusage_who_t __who, struct rusage *__usage) __attribute__ ((__nothrow__ , __leaf__));
-
-
-
-
-
+# 105 "/usr/include/aarch64-linux-gnu/sys/resource.h" 3 4
 extern int getpriority (__priority_which_t __which, id_t __who) __attribute__ ((__nothrow__ , __leaf__));
 
 
@@ -10605,9 +10709,15 @@ extern int setpriority (__priority_which_t __which, id_t __who, int __prio)
      __attribute__ ((__nothrow__ , __leaf__));
 
 
-# 47 "/workspace/acl/lib_fiber/c/src/stdafx.h" 2
+# 47 "/acl/lib_fiber/c/src/stdafx.h" 2
 # 1 "/usr/include/ucontext.h" 1 3 4
-# 28 "/usr/include/ucontext.h" 3 4
+# 26 "/usr/include/ucontext.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/indirect-return.h" 1 3 4
+# 27 "/usr/include/ucontext.h" 2 3 4
+
+
+
+
 
 
 
@@ -10619,7 +10729,8 @@ extern int setcontext (const ucontext_t *__ucp) __attribute__ ((__nothrow__));
 
 
 extern int swapcontext (ucontext_t *__restrict __oucp,
-   const ucontext_t *__restrict __ucp) __attribute__ ((__nothrow__));
+   const ucontext_t *__restrict __ucp)
+  __attribute__ ((__nothrow__)) ;
 
 
 
@@ -10631,31 +10742,35 @@ extern void makecontext (ucontext_t *__ucp, void (*__func) (void),
     int __argc, ...) __attribute__ ((__nothrow__ , __leaf__));
 
 
-# 48 "/workspace/acl/lib_fiber/c/src/stdafx.h" 2
+# 48 "/acl/lib_fiber/c/src/stdafx.h" 2
 
 
 
-# 1 "/usr/include/x86_64-linux-gnu/sys/uio.h" 1 3 4
-# 31 "/usr/include/x86_64-linux-gnu/sys/uio.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/sys/uio.h" 1 3 4
+# 31 "/usr/include/aarch64-linux-gnu/sys/uio.h" 3 4
 
-# 41 "/usr/include/x86_64-linux-gnu/sys/uio.h" 3 4
+# 41 "/usr/include/aarch64-linux-gnu/sys/uio.h" 3 4
 extern ssize_t readv (int __fd, const struct iovec *__iovec, int __count)
-  __attribute__ ((__warn_unused_result__));
-# 52 "/usr/include/x86_64-linux-gnu/sys/uio.h" 3 4
+  __attribute__ ((__warn_unused_result__)) __attribute__ ((__access__ (__read_only__, 2, 3)));
+# 52 "/usr/include/aarch64-linux-gnu/sys/uio.h" 3 4
 extern ssize_t writev (int __fd, const struct iovec *__iovec, int __count)
-  __attribute__ ((__warn_unused_result__));
-# 67 "/usr/include/x86_64-linux-gnu/sys/uio.h" 3 4
+  __attribute__ ((__warn_unused_result__)) __attribute__ ((__access__ (__read_only__, 2, 3)));
+# 67 "/usr/include/aarch64-linux-gnu/sys/uio.h" 3 4
 extern ssize_t preadv (int __fd, const struct iovec *__iovec, int __count,
-         __off_t __offset) __attribute__ ((__warn_unused_result__));
-# 79 "/usr/include/x86_64-linux-gnu/sys/uio.h" 3 4
+         __off_t __offset)
+  __attribute__ ((__warn_unused_result__)) __attribute__ ((__access__ (__read_only__, 2, 3)));
+# 80 "/usr/include/aarch64-linux-gnu/sys/uio.h" 3 4
 extern ssize_t pwritev (int __fd, const struct iovec *__iovec, int __count,
-   __off_t __offset) __attribute__ ((__warn_unused_result__));
-# 106 "/usr/include/x86_64-linux-gnu/sys/uio.h" 3 4
+   __off_t __offset)
+  __attribute__ ((__warn_unused_result__)) __attribute__ ((__access__ (__read_only__, 2, 3)));
+# 110 "/usr/include/aarch64-linux-gnu/sys/uio.h" 3 4
 extern ssize_t preadv64 (int __fd, const struct iovec *__iovec, int __count,
-    __off64_t __offset) __attribute__ ((__warn_unused_result__));
-# 118 "/usr/include/x86_64-linux-gnu/sys/uio.h" 3 4
+    __off64_t __offset)
+  __attribute__ ((__warn_unused_result__)) __attribute__ ((__access__ (__read_only__, 2, 3)));
+# 123 "/usr/include/aarch64-linux-gnu/sys/uio.h" 3 4
 extern ssize_t pwritev64 (int __fd, const struct iovec *__iovec, int __count,
-     __off64_t __offset) __attribute__ ((__warn_unused_result__));
+     __off64_t __offset)
+  __attribute__ ((__warn_unused_result__)) __attribute__ ((__access__ (__read_only__, 2, 3)));
 
 
 
@@ -10664,20 +10779,23 @@ extern ssize_t pwritev64 (int __fd, const struct iovec *__iovec, int __count,
 
 
 extern ssize_t preadv2 (int __fp, const struct iovec *__iovec, int __count,
-   __off_t __offset, int ___flags) __attribute__ ((__warn_unused_result__));
+   __off_t __offset, int ___flags)
+  __attribute__ ((__warn_unused_result__)) __attribute__ ((__access__ (__read_only__, 2, 3)));
 
 
 extern ssize_t pwritev2 (int __fd, const struct iovec *__iodev, int __count,
     __off_t __offset, int __flags) __attribute__ ((__warn_unused_result__));
-# 152 "/usr/include/x86_64-linux-gnu/sys/uio.h" 3 4
+# 161 "/usr/include/aarch64-linux-gnu/sys/uio.h" 3 4
 extern ssize_t preadv64v2 (int __fp, const struct iovec *__iovec,
       int __count, __off64_t __offset,
-      int ___flags) __attribute__ ((__warn_unused_result__));
+      int ___flags)
+  __attribute__ ((__warn_unused_result__)) __attribute__ ((__access__ (__read_only__, 2, 3)));
 
 
 extern ssize_t pwritev64v2 (int __fd, const struct iovec *__iodev,
        int __count, __off64_t __offset,
-       int __flags) __attribute__ ((__warn_unused_result__));
+       int __flags)
+  __attribute__ ((__warn_unused_result__)) __attribute__ ((__access__ (__read_only__, 2, 3)));
 
 
 
@@ -10686,8 +10804,8 @@ extern ssize_t pwritev64v2 (int __fd, const struct iovec *__iodev,
 
 
 
-# 1 "/usr/include/x86_64-linux-gnu/bits/uio-ext.h" 1 3 4
-# 26 "/usr/include/x86_64-linux-gnu/bits/uio-ext.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/uio-ext.h" 1 3 4
+# 26 "/usr/include/aarch64-linux-gnu/bits/uio-ext.h" 3 4
 
 
 
@@ -10705,13 +10823,13 @@ extern ssize_t process_vm_writev (pid_t __pid, const struct iovec *__lvec,
       unsigned long int __riovcnt,
       unsigned long int __flags)
   __attribute__ ((__nothrow__ , __leaf__));
-# 51 "/usr/include/x86_64-linux-gnu/bits/uio-ext.h" 3 4
+# 51 "/usr/include/aarch64-linux-gnu/bits/uio-ext.h" 3 4
 
-# 169 "/usr/include/x86_64-linux-gnu/sys/uio.h" 2 3 4
-# 52 "/workspace/acl/lib_fiber/c/src/stdafx.h" 2
-# 64 "/workspace/acl/lib_fiber/c/src/stdafx.h"
-# 1 "/usr/include/x86_64-linux-gnu/sys/sendfile.h" 1 3 4
-# 25 "/usr/include/x86_64-linux-gnu/sys/sendfile.h" 3 4
+# 180 "/usr/include/aarch64-linux-gnu/sys/uio.h" 2 3 4
+# 52 "/acl/lib_fiber/c/src/stdafx.h" 2
+# 64 "/acl/lib_fiber/c/src/stdafx.h"
+# 1 "/usr/include/aarch64-linux-gnu/sys/sendfile.h" 1 3 4
+# 25 "/usr/include/aarch64-linux-gnu/sys/sendfile.h" 3 4
 
 
 
@@ -10722,23 +10840,23 @@ extern ssize_t process_vm_writev (pid_t __pid, const struct iovec *__lvec,
 
 extern ssize_t sendfile (int __out_fd, int __in_fd, off_t *__offset,
     size_t __count) __attribute__ ((__nothrow__ , __leaf__));
-# 45 "/usr/include/x86_64-linux-gnu/sys/sendfile.h" 3 4
+# 45 "/usr/include/aarch64-linux-gnu/sys/sendfile.h" 3 4
 extern ssize_t sendfile64 (int __out_fd, int __in_fd, __off64_t *__offset,
       size_t __count) __attribute__ ((__nothrow__ , __leaf__));
 
 
 
-# 65 "/workspace/acl/lib_fiber/c/src/stdafx.h" 2
-# 1 "/usr/include/x86_64-linux-gnu/sys/epoll.h" 1 3 4
-# 27 "/usr/include/x86_64-linux-gnu/sys/epoll.h" 3 4
-# 1 "/usr/include/x86_64-linux-gnu/bits/epoll.h" 1 3 4
-# 23 "/usr/include/x86_64-linux-gnu/bits/epoll.h" 3 4
+# 65 "/acl/lib_fiber/c/src/stdafx.h" 2
+# 1 "/usr/include/aarch64-linux-gnu/sys/epoll.h" 1 3 4
+# 28 "/usr/include/aarch64-linux-gnu/sys/epoll.h" 3 4
+# 1 "/usr/include/aarch64-linux-gnu/bits/epoll.h" 1 3 4
+# 23 "/usr/include/aarch64-linux-gnu/bits/epoll.h" 3 4
 enum
   {
     EPOLL_CLOEXEC = 02000000
 
   };
-# 28 "/usr/include/x86_64-linux-gnu/sys/epoll.h" 2 3 4
+# 29 "/usr/include/aarch64-linux-gnu/sys/epoll.h" 2 3 4
 
 
 
@@ -10778,7 +10896,7 @@ enum EPOLL_EVENTS
     EPOLLET = 1u << 31
 
   };
-# 75 "/usr/include/x86_64-linux-gnu/sys/epoll.h" 3 4
+# 76 "/usr/include/aarch64-linux-gnu/sys/epoll.h" 3 4
 typedef union epoll_data
 {
   void *ptr;
@@ -10791,7 +10909,7 @@ struct epoll_event
 {
   uint32_t events;
   epoll_data_t data;
-} __attribute__ ((__packed__));
+} ;
 
 
 
@@ -10805,10 +10923,10 @@ extern int epoll_create (int __size) __attribute__ ((__nothrow__ , __leaf__));
 
 
 extern int epoll_create1 (int __flags) __attribute__ ((__nothrow__ , __leaf__));
-# 109 "/usr/include/x86_64-linux-gnu/sys/epoll.h" 3 4
+# 110 "/usr/include/aarch64-linux-gnu/sys/epoll.h" 3 4
 extern int epoll_ctl (int __epfd, int __op, int __fd,
         struct epoll_event *__event) __attribute__ ((__nothrow__ , __leaf__));
-# 123 "/usr/include/x86_64-linux-gnu/sys/epoll.h" 3 4
+# 124 "/usr/include/aarch64-linux-gnu/sys/epoll.h" 3 4
 extern int epoll_wait (int __epfd, struct epoll_event *__events,
          int __maxevents, int __timeout);
 
@@ -10823,10 +10941,19 @@ extern int epoll_pwait (int __epfd, struct epoll_event *__events,
    const __sigset_t *__ss);
 
 
-# 66 "/workspace/acl/lib_fiber/c/src/stdafx.h" 2
-# 78 "/workspace/acl/lib_fiber/c/src/stdafx.h"
 
-# 78 "/workspace/acl/lib_fiber/c/src/stdafx.h"
+
+
+
+extern int epoll_pwait2 (int __epfd, struct epoll_event *__events,
+    int __maxevents, const struct timespec *__timeout,
+    const __sigset_t *__ss);
+# 157 "/usr/include/aarch64-linux-gnu/sys/epoll.h" 3 4
+
+# 66 "/acl/lib_fiber/c/src/stdafx.h" 2
+# 78 "/acl/lib_fiber/c/src/stdafx.h"
+
+# 78 "/acl/lib_fiber/c/src/stdafx.h"
 typedef union {
  struct sockaddr_storage ss;
 
@@ -10838,31 +10965,31 @@ typedef union {
 
  struct sockaddr sa;
 } SOCK_ADDR;
-# 92 "/workspace/acl/lib_fiber/c/src/common/avl.c" 2
+# 92 "/acl/lib_fiber/c/src/common/avl.c" 2
 
 
-# 1 "/workspace/acl/lib_fiber/c/src/common/avl.h" 1
-# 39 "/workspace/acl/lib_fiber/c/src/common/avl.h"
-# 1 "/workspace/acl/lib_fiber/c/src/common/avl_impl.h" 1
-# 37 "/workspace/acl/lib_fiber/c/src/common/avl_impl.h"
-# 1 "/usr/lib/gcc/x86_64-linux-gnu/7/include/stddef.h" 1 3 4
-# 149 "/usr/lib/gcc/x86_64-linux-gnu/7/include/stddef.h" 3 4
+# 1 "/acl/lib_fiber/c/src/common/avl.h" 1
+# 39 "/acl/lib_fiber/c/src/common/avl.h"
+# 1 "/acl/lib_fiber/c/src/common/avl_impl.h" 1
+# 37 "/acl/lib_fiber/c/src/common/avl_impl.h"
+# 1 "/usr/lib/gcc/aarch64-linux-gnu/11/include/stddef.h" 1 3 4
+# 143 "/usr/lib/gcc/aarch64-linux-gnu/11/include/stddef.h" 3 4
 
-# 149 "/usr/lib/gcc/x86_64-linux-gnu/7/include/stddef.h" 3 4
+# 143 "/usr/lib/gcc/aarch64-linux-gnu/11/include/stddef.h" 3 4
 typedef long int ptrdiff_t;
-# 38 "/workspace/acl/lib_fiber/c/src/common/avl_impl.h" 2
-# 59 "/workspace/acl/lib_fiber/c/src/common/avl_impl.h"
+# 38 "/acl/lib_fiber/c/src/common/avl_impl.h" 2
+# 59 "/acl/lib_fiber/c/src/common/avl_impl.h"
 
-# 59 "/workspace/acl/lib_fiber/c/src/common/avl_impl.h"
+# 59 "/acl/lib_fiber/c/src/common/avl_impl.h"
 typedef unsigned int ulong_t;
 
 typedef char boolean_t;
-# 117 "/workspace/acl/lib_fiber/c/src/common/avl_impl.h"
+# 117 "/acl/lib_fiber/c/src/common/avl_impl.h"
 struct avl_node {
  struct avl_node *avl_child[2];
  uintptr_t avl_pcb;
 };
-# 171 "/workspace/acl/lib_fiber/c/src/common/avl_impl.h"
+# 171 "/acl/lib_fiber/c/src/common/avl_impl.h"
 struct avl_tree {
  struct avl_node *avl_root;
  int (*avl_compar)(const void *, const void *);
@@ -10876,20 +11003,20 @@ struct avl_tree {
 
 
 void *avl_walk(struct avl_tree *, void *, int);
-# 40 "/workspace/acl/lib_fiber/c/src/common/avl.h" 2
-# 107 "/workspace/acl/lib_fiber/c/src/common/avl.h"
+# 40 "/acl/lib_fiber/c/src/common/avl.h" 2
+# 107 "/acl/lib_fiber/c/src/common/avl.h"
 typedef struct avl_tree avl_tree_t;
 
 
 
 
 typedef struct avl_node avl_node_t;
-# 125 "/workspace/acl/lib_fiber/c/src/common/avl.h"
+# 125 "/acl/lib_fiber/c/src/common/avl.h"
 typedef uintptr_t avl_index_t;
-# 158 "/workspace/acl/lib_fiber/c/src/common/avl.h"
+# 158 "/acl/lib_fiber/c/src/common/avl.h"
 void avl_create(avl_tree_t *tree,
  int (*compar) (const void *, const void *), size_t size, size_t offset);
-# 170 "/workspace/acl/lib_fiber/c/src/common/avl.h"
+# 170 "/acl/lib_fiber/c/src/common/avl.h"
 void *avl_find(avl_tree_t *tree, void *node, avl_index_t *where);
 
 
@@ -10899,7 +11026,7 @@ void *avl_find(avl_tree_t *tree, void *node, avl_index_t *where);
 
 
 void avl_insert(avl_tree_t *tree, void *node, avl_index_t where);
-# 191 "/workspace/acl/lib_fiber/c/src/common/avl.h"
+# 191 "/acl/lib_fiber/c/src/common/avl.h"
 void avl_insert_here(avl_tree_t *tree, void *new_data, void *here,
     int direction);
 
@@ -10911,9 +11038,9 @@ void avl_insert_here(avl_tree_t *tree, void *new_data, void *here,
 
 void *avl_first(avl_tree_t *tree);
 void *avl_last(avl_tree_t *tree);
-# 237 "/workspace/acl/lib_fiber/c/src/common/avl.h"
+# 237 "/acl/lib_fiber/c/src/common/avl.h"
 void *avl_nearest(avl_tree_t *tree, avl_index_t where, int direction);
-# 247 "/workspace/acl/lib_fiber/c/src/common/avl.h"
+# 247 "/acl/lib_fiber/c/src/common/avl.h"
 void avl_add(avl_tree_t *tree, void *node);
 
 
@@ -10923,7 +11050,7 @@ void avl_add(avl_tree_t *tree, void *node);
 
 
 void avl_remove(avl_tree_t *tree, void *node);
-# 264 "/workspace/acl/lib_fiber/c/src/common/avl.h"
+# 264 "/acl/lib_fiber/c/src/common/avl.h"
 boolean_t avl_update(avl_tree_t *, void *);
 boolean_t avl_update_lt(avl_tree_t *, void *);
 boolean_t avl_update_gt(avl_tree_t *, void *);
@@ -10937,7 +11064,7 @@ ulong_t avl_numnodes(avl_tree_t *tree);
 
 
 boolean_t avl_is_empty(avl_tree_t *tree);
-# 299 "/workspace/acl/lib_fiber/c/src/common/avl.h"
+# 299 "/acl/lib_fiber/c/src/common/avl.h"
 void *avl_destroy_nodes(avl_tree_t *tree, void **cookie);
 
 
@@ -10947,11 +11074,11 @@ void *avl_destroy_nodes(avl_tree_t *tree, void **cookie);
 
 
 void avl_destroy(avl_tree_t *tree);
-# 95 "/workspace/acl/lib_fiber/c/src/common/avl.c" 2
-# 109 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 95 "/acl/lib_fiber/c/src/common/avl.c" 2
+# 109 "/acl/lib_fiber/c/src/common/avl.c"
 static const int avl_child2balance[2] = {-1, 1};
 static const int avl_balance2child[] = {0, 0, 1};
-# 125 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 125 "/acl/lib_fiber/c/src/common/avl.c"
 void *
 avl_walk(avl_tree_t *tree, void *oldnode, int left)
 {
@@ -10965,14 +11092,14 @@ avl_walk(avl_tree_t *tree, void *oldnode, int left)
 
 
  if (node == 
-# 137 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 137 "/acl/lib_fiber/c/src/common/avl.c" 3 4
             ((void *)0)
-# 137 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 137 "/acl/lib_fiber/c/src/common/avl.c"
                 )
   return (
-# 138 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 138 "/acl/lib_fiber/c/src/common/avl.c" 3 4
          ((void *)0)
-# 138 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 138 "/acl/lib_fiber/c/src/common/avl.c"
              );
 
 
@@ -10982,15 +11109,15 @@ avl_walk(avl_tree_t *tree, void *oldnode, int left)
 
 
  if (node->avl_child[left] != 
-# 146 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 146 "/acl/lib_fiber/c/src/common/avl.c" 3 4
                              ((void *)0)
-# 146 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 146 "/acl/lib_fiber/c/src/common/avl.c"
                                  ) {
   for (node = node->avl_child[left];
       node->avl_child[right] != 
-# 148 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 148 "/acl/lib_fiber/c/src/common/avl.c" 3 4
                                ((void *)0)
-# 148 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 148 "/acl/lib_fiber/c/src/common/avl.c"
                                    ;
       node = node->avl_child[right])
    ;
@@ -11002,14 +11129,14 @@ avl_walk(avl_tree_t *tree, void *oldnode, int left)
    was_child = (((node)->avl_pcb >> 2) & 1);
    node = ((struct avl_node *)((node)->avl_pcb & ~7));
    if (node == 
-# 158 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 158 "/acl/lib_fiber/c/src/common/avl.c" 3 4
               ((void *)0)
-# 158 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 158 "/acl/lib_fiber/c/src/common/avl.c"
                   )
     return (
-# 159 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 159 "/acl/lib_fiber/c/src/common/avl.c" 3 4
            ((void *)0)
-# 159 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 159 "/acl/lib_fiber/c/src/common/avl.c"
                );
    if (was_child == right)
     break;
@@ -11028,29 +11155,29 @@ avl_first(avl_tree_t *tree)
 {
  avl_node_t *node;
  avl_node_t *prev = 
-# 176 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 176 "/acl/lib_fiber/c/src/common/avl.c" 3 4
                    ((void *)0)
-# 176 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 176 "/acl/lib_fiber/c/src/common/avl.c"
                        ;
  size_t off = tree->avl_offset;
 
  for (node = tree->avl_root; node != 
-# 179 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 179 "/acl/lib_fiber/c/src/common/avl.c" 3 4
                                     ((void *)0)
-# 179 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 179 "/acl/lib_fiber/c/src/common/avl.c"
                                         ; node = node->avl_child[0])
   prev = node;
 
  if (prev != 
-# 182 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 182 "/acl/lib_fiber/c/src/common/avl.c" 3 4
             ((void *)0)
-# 182 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 182 "/acl/lib_fiber/c/src/common/avl.c"
                 )
   return (((void *)((uintptr_t)(prev) - (off))));
  return (
-# 184 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 184 "/acl/lib_fiber/c/src/common/avl.c" 3 4
         ((void *)0)
-# 184 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 184 "/acl/lib_fiber/c/src/common/avl.c"
             );
 }
 
@@ -11063,32 +11190,32 @@ avl_last(avl_tree_t *tree)
 {
  avl_node_t *node;
  avl_node_t *prev = 
-# 195 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 195 "/acl/lib_fiber/c/src/common/avl.c" 3 4
                    ((void *)0)
-# 195 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 195 "/acl/lib_fiber/c/src/common/avl.c"
                        ;
  size_t off = tree->avl_offset;
 
  for (node = tree->avl_root; node != 
-# 198 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 198 "/acl/lib_fiber/c/src/common/avl.c" 3 4
                                     ((void *)0)
-# 198 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 198 "/acl/lib_fiber/c/src/common/avl.c"
                                         ; node = node->avl_child[1])
   prev = node;
 
  if (prev != 
-# 201 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 201 "/acl/lib_fiber/c/src/common/avl.c" 3 4
             ((void *)0)
-# 201 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 201 "/acl/lib_fiber/c/src/common/avl.c"
                 )
   return (((void *)((uintptr_t)(prev) - (off))));
  return (
-# 203 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 203 "/acl/lib_fiber/c/src/common/avl.c" 3 4
         ((void *)0)
-# 203 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 203 "/acl/lib_fiber/c/src/common/avl.c"
             );
 }
-# 215 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 215 "/acl/lib_fiber/c/src/common/avl.c"
 void *
 avl_nearest(avl_tree_t *tree, avl_index_t where, int direction)
 {
@@ -11098,31 +11225,31 @@ avl_nearest(avl_tree_t *tree, avl_index_t where, int direction)
  size_t off = tree->avl_offset;
 
  if (node == 
-# 223 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 223 "/acl/lib_fiber/c/src/common/avl.c" 3 4
             ((void *)0)
-# 223 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 223 "/acl/lib_fiber/c/src/common/avl.c"
                 ) {
   
-# 224 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 224 "/acl/lib_fiber/c/src/common/avl.c" 3 4
  ((void) sizeof ((
-# 224 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 224 "/acl/lib_fiber/c/src/common/avl.c"
  tree->avl_root == 
-# 224 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 224 "/acl/lib_fiber/c/src/common/avl.c" 3 4
  ((void *)0)) ? 1 : 0), __extension__ ({ if (
-# 224 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 224 "/acl/lib_fiber/c/src/common/avl.c"
  tree->avl_root == 
-# 224 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 224 "/acl/lib_fiber/c/src/common/avl.c" 3 4
  ((void *)0)) ; else __assert_fail (
-# 224 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 224 "/acl/lib_fiber/c/src/common/avl.c"
  "tree->avl_root == NULL"
-# 224 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
- , "/workspace/acl/lib_fiber/c/src/common/avl.c", 224, __extension__ __PRETTY_FUNCTION__); }))
-# 224 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 224 "/acl/lib_fiber/c/src/common/avl.c" 3 4
+ , "/acl/lib_fiber/c/src/common/avl.c", 224, __extension__ __PRETTY_FUNCTION__); }))
+# 224 "/acl/lib_fiber/c/src/common/avl.c"
                                ;
   return (
-# 225 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 225 "/acl/lib_fiber/c/src/common/avl.c" 3 4
          ((void *)0)
-# 225 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 225 "/acl/lib_fiber/c/src/common/avl.c"
              );
  }
  data = ((void *)((uintptr_t)(node) - (off)));
@@ -11131,24 +11258,24 @@ avl_nearest(avl_tree_t *tree, avl_index_t where, int direction)
 
  return (avl_walk(tree, data, direction));
 }
-# 244 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 244 "/acl/lib_fiber/c/src/common/avl.c"
 void *
 avl_find(avl_tree_t *tree, void *value, avl_index_t *where)
 {
  avl_node_t *node;
  avl_node_t *prev = 
-# 248 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 248 "/acl/lib_fiber/c/src/common/avl.c" 3 4
                    ((void *)0)
-# 248 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 248 "/acl/lib_fiber/c/src/common/avl.c"
                        ;
  int child = 0;
  int diff;
  size_t off = tree->avl_offset;
 
  for (node = tree->avl_root; node != 
-# 253 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 253 "/acl/lib_fiber/c/src/common/avl.c" 3 4
                                     ((void *)0)
-# 253 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 253 "/acl/lib_fiber/c/src/common/avl.c"
                                         ;
      node = node->avl_child[child]) {
 
@@ -11156,21 +11283,21 @@ avl_find(avl_tree_t *tree, void *value, avl_index_t *where)
 
   diff = tree->avl_compar(value, ((void *)((uintptr_t)(node) - (off))));
   
-# 259 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 259 "/acl/lib_fiber/c/src/common/avl.c" 3 4
  ((void) sizeof ((
-# 259 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 259 "/acl/lib_fiber/c/src/common/avl.c"
  -1 <= diff && diff <= 1
-# 259 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 259 "/acl/lib_fiber/c/src/common/avl.c" 3 4
  ) ? 1 : 0), __extension__ ({ if (
-# 259 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 259 "/acl/lib_fiber/c/src/common/avl.c"
  -1 <= diff && diff <= 1
-# 259 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 259 "/acl/lib_fiber/c/src/common/avl.c" 3 4
  ) ; else __assert_fail (
-# 259 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 259 "/acl/lib_fiber/c/src/common/avl.c"
  "-1 <= diff && diff <= 1"
-# 259 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
- , "/workspace/acl/lib_fiber/c/src/common/avl.c", 259, __extension__ __PRETTY_FUNCTION__); }))
-# 259 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 259 "/acl/lib_fiber/c/src/common/avl.c" 3 4
+ , "/acl/lib_fiber/c/src/common/avl.c", 259, __extension__ __PRETTY_FUNCTION__); }))
+# 259 "/acl/lib_fiber/c/src/common/avl.c"
                                 ;
   if (diff == 0) {
 
@@ -11184,19 +11311,19 @@ avl_find(avl_tree_t *tree, void *value, avl_index_t *where)
  }
 
  if (where != 
-# 271 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 271 "/acl/lib_fiber/c/src/common/avl.c" 3 4
              ((void *)0)
-# 271 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 271 "/acl/lib_fiber/c/src/common/avl.c"
                  )
   *where = ((avl_index_t)(prev) | (child));
 
  return (
-# 274 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 274 "/acl/lib_fiber/c/src/common/avl.c" 3 4
         ((void *)0)
-# 274 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 274 "/acl/lib_fiber/c/src/common/avl.c"
             );
 }
-# 292 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 292 "/acl/lib_fiber/c/src/common/avl.c"
 static int
 avl_rotation(avl_tree_t *tree, avl_node_t *node, int balance)
 {
@@ -11212,7 +11339,7 @@ avl_rotation(avl_tree_t *tree, avl_node_t *node, int balance)
  avl_node_t *gleft;
  int which_child = (((node)->avl_pcb >> 2) & 1);
  int child_bal = ((int)(((child)->avl_pcb & 3) - 1));
-# 335 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 335 "/acl/lib_fiber/c/src/common/avl.c"
  if (child_bal != right_heavy) {
 
 
@@ -11229,9 +11356,9 @@ avl_rotation(avl_tree_t *tree, avl_node_t *node, int balance)
   cright = child->avl_child[right];
   node->avl_child[left] = cright;
   if (cright != 
-# 350 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 350 "/acl/lib_fiber/c/src/common/avl.c" 3 4
                ((void *)0)
-# 350 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 350 "/acl/lib_fiber/c/src/common/avl.c"
                    ) {
    ((cright)->avl_pcb = (((cright)->avl_pcb & 7) | (uintptr_t)(node)));
    ((cright)->avl_pcb = (uintptr_t)(((cright)->avl_pcb & ~4) | ((left) << 2)));
@@ -11252,9 +11379,9 @@ avl_rotation(avl_tree_t *tree, avl_node_t *node, int balance)
   ((child)->avl_pcb = (uintptr_t)(((child)->avl_pcb & ~4) | ((which_child) << 2)));
   ((child)->avl_pcb = (((child)->avl_pcb & 7) | (uintptr_t)(parent)));
   if (parent != 
-# 369 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 369 "/acl/lib_fiber/c/src/common/avl.c" 3 4
                ((void *)0)
-# 369 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 369 "/acl/lib_fiber/c/src/common/avl.c"
                    )
    parent->avl_child[which_child] = child;
   else
@@ -11262,7 +11389,7 @@ avl_rotation(avl_tree_t *tree, avl_node_t *node, int balance)
 
   return (child_bal == 0);
  }
-# 410 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 410 "/acl/lib_fiber/c/src/common/avl.c"
  gchild = child->avl_child[right];
  gleft = gchild->avl_child[left];
  gright = gchild->avl_child[right];
@@ -11274,9 +11401,9 @@ avl_rotation(avl_tree_t *tree, avl_node_t *node, int balance)
 
  node->avl_child[left] = gright;
  if (gright != 
-# 420 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 420 "/acl/lib_fiber/c/src/common/avl.c" 3 4
               ((void *)0)
-# 420 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 420 "/acl/lib_fiber/c/src/common/avl.c"
                   ) {
   ((gright)->avl_pcb = (((gright)->avl_pcb & 7) | (uintptr_t)(node)));
   ((gright)->avl_pcb = (uintptr_t)(((gright)->avl_pcb & ~4) | ((left) << 2)));
@@ -11284,14 +11411,14 @@ avl_rotation(avl_tree_t *tree, avl_node_t *node, int balance)
 
  child->avl_child[right] = gleft;
  if (gleft != 
-# 426 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 426 "/acl/lib_fiber/c/src/common/avl.c" 3 4
              ((void *)0)
-# 426 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 426 "/acl/lib_fiber/c/src/common/avl.c"
                  ) {
   ((gleft)->avl_pcb = (((gleft)->avl_pcb & 7) | (uintptr_t)(child)));
   ((gleft)->avl_pcb = (uintptr_t)(((gleft)->avl_pcb & ~4) | ((right) << 2)));
  }
-# 438 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 438 "/acl/lib_fiber/c/src/common/avl.c"
  balance = ((int)(((gchild)->avl_pcb & 3) - 1));
  gchild->avl_child[left] = child;
  ((child)->avl_pcb = (uintptr_t)((((child)->avl_pcb & ~3) | (((balance == right_heavy ? left_heavy : 0)) + 1))));
@@ -11307,9 +11434,9 @@ avl_rotation(avl_tree_t *tree, avl_node_t *node, int balance)
  ((gchild)->avl_pcb = (((gchild)->avl_pcb & 7) | (uintptr_t)(parent)));
  ((gchild)->avl_pcb = (uintptr_t)(((gchild)->avl_pcb & ~4) | ((which_child) << 2)));
  if (parent != 
-# 452 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 452 "/acl/lib_fiber/c/src/common/avl.c" 3 4
               ((void *)0)
-# 452 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 452 "/acl/lib_fiber/c/src/common/avl.c"
                   )
   parent->avl_child[which_child] = gchild;
  else
@@ -11317,7 +11444,7 @@ avl_rotation(avl_tree_t *tree, avl_node_t *node, int balance)
 
  return (1);
 }
-# 471 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 471 "/acl/lib_fiber/c/src/common/avl.c"
 void
 avl_insert(avl_tree_t *tree, void *new_data, avl_index_t where)
 {
@@ -11329,39 +11456,39 @@ avl_insert(avl_tree_t *tree, void *new_data, avl_index_t where)
  size_t off = tree->avl_offset;
 
  
-# 481 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 481 "/acl/lib_fiber/c/src/common/avl.c" 3 4
 ((void) sizeof ((
-# 481 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 481 "/acl/lib_fiber/c/src/common/avl.c"
 tree
-# 481 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 481 "/acl/lib_fiber/c/src/common/avl.c" 3 4
 ) ? 1 : 0), __extension__ ({ if (
-# 481 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 481 "/acl/lib_fiber/c/src/common/avl.c"
 tree
-# 481 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 481 "/acl/lib_fiber/c/src/common/avl.c" 3 4
 ) ; else __assert_fail (
-# 481 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 481 "/acl/lib_fiber/c/src/common/avl.c"
 "tree"
-# 481 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
-, "/workspace/acl/lib_fiber/c/src/common/avl.c", 481, __extension__ __PRETTY_FUNCTION__); }))
-# 481 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 481 "/acl/lib_fiber/c/src/common/avl.c" 3 4
+, "/acl/lib_fiber/c/src/common/avl.c", 481, __extension__ __PRETTY_FUNCTION__); }))
+# 481 "/acl/lib_fiber/c/src/common/avl.c"
             ;
 
  
-# 483 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 483 "/acl/lib_fiber/c/src/common/avl.c" 3 4
 ((void) sizeof ((
-# 483 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 483 "/acl/lib_fiber/c/src/common/avl.c"
 ((uintptr_t)new_data & 0x7) == 0
-# 483 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 483 "/acl/lib_fiber/c/src/common/avl.c" 3 4
 ) ? 1 : 0), __extension__ ({ if (
-# 483 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 483 "/acl/lib_fiber/c/src/common/avl.c"
 ((uintptr_t)new_data & 0x7) == 0
-# 483 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 483 "/acl/lib_fiber/c/src/common/avl.c" 3 4
 ) ; else __assert_fail (
-# 483 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 483 "/acl/lib_fiber/c/src/common/avl.c"
 "((uintptr_t)new_data & 0x7) == 0"
-# 483 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
-, "/workspace/acl/lib_fiber/c/src/common/avl.c", 483, __extension__ __PRETTY_FUNCTION__); }))
-# 483 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 483 "/acl/lib_fiber/c/src/common/avl.c" 3 4
+, "/acl/lib_fiber/c/src/common/avl.c", 483, __extension__ __PRETTY_FUNCTION__); }))
+# 483 "/acl/lib_fiber/c/src/common/avl.c"
                                         ;
 
 
@@ -11373,59 +11500,59 @@ tree
  ++tree->avl_numnodes;
 
  node->avl_child[0] = 
-# 493 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 493 "/acl/lib_fiber/c/src/common/avl.c" 3 4
                      ((void *)0)
-# 493 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 493 "/acl/lib_fiber/c/src/common/avl.c"
                          ;
  node->avl_child[1] = 
-# 494 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 494 "/acl/lib_fiber/c/src/common/avl.c" 3 4
                      ((void *)0)
-# 494 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 494 "/acl/lib_fiber/c/src/common/avl.c"
                          ;
 
  ((node)->avl_pcb = (uintptr_t)(((node)->avl_pcb & ~4) | ((which_child) << 2)));
  ((node)->avl_pcb = (uintptr_t)((((node)->avl_pcb & ~3) | ((0) + 1))));
  ((node)->avl_pcb = (((node)->avl_pcb & 7) | (uintptr_t)(parent)));
  if (parent != 
-# 499 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 499 "/acl/lib_fiber/c/src/common/avl.c" 3 4
               ((void *)0)
-# 499 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 499 "/acl/lib_fiber/c/src/common/avl.c"
                   ) {
   
-# 500 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 500 "/acl/lib_fiber/c/src/common/avl.c" 3 4
  ((void) sizeof ((
-# 500 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 500 "/acl/lib_fiber/c/src/common/avl.c"
  parent->avl_child[which_child] == 
-# 500 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 500 "/acl/lib_fiber/c/src/common/avl.c" 3 4
  ((void *)0)) ? 1 : 0), __extension__ ({ if (
-# 500 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 500 "/acl/lib_fiber/c/src/common/avl.c"
  parent->avl_child[which_child] == 
-# 500 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 500 "/acl/lib_fiber/c/src/common/avl.c" 3 4
  ((void *)0)) ; else __assert_fail (
-# 500 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 500 "/acl/lib_fiber/c/src/common/avl.c"
  "parent->avl_child[which_child] == NULL"
-# 500 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
- , "/workspace/acl/lib_fiber/c/src/common/avl.c", 500, __extension__ __PRETTY_FUNCTION__); }))
-# 500 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 500 "/acl/lib_fiber/c/src/common/avl.c" 3 4
+ , "/acl/lib_fiber/c/src/common/avl.c", 500, __extension__ __PRETTY_FUNCTION__); }))
+# 500 "/acl/lib_fiber/c/src/common/avl.c"
                                                ;
   parent->avl_child[which_child] = node;
  } else {
   
-# 503 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 503 "/acl/lib_fiber/c/src/common/avl.c" 3 4
  ((void) sizeof ((
-# 503 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 503 "/acl/lib_fiber/c/src/common/avl.c"
  tree->avl_root == 
-# 503 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 503 "/acl/lib_fiber/c/src/common/avl.c" 3 4
  ((void *)0)) ? 1 : 0), __extension__ ({ if (
-# 503 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 503 "/acl/lib_fiber/c/src/common/avl.c"
  tree->avl_root == 
-# 503 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 503 "/acl/lib_fiber/c/src/common/avl.c" 3 4
  ((void *)0)) ; else __assert_fail (
-# 503 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 503 "/acl/lib_fiber/c/src/common/avl.c"
  "tree->avl_root == NULL"
-# 503 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
- , "/workspace/acl/lib_fiber/c/src/common/avl.c", 503, __extension__ __PRETTY_FUNCTION__); }))
-# 503 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 503 "/acl/lib_fiber/c/src/common/avl.c" 3 4
+ , "/acl/lib_fiber/c/src/common/avl.c", 503, __extension__ __PRETTY_FUNCTION__); }))
+# 503 "/acl/lib_fiber/c/src/common/avl.c"
                                ;
   tree->avl_root = node;
  }
@@ -11438,9 +11565,9 @@ tree
  for (;;) {
   node = parent;
   if (node == 
-# 514 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 514 "/acl/lib_fiber/c/src/common/avl.c" 3 4
              ((void *)0)
-# 514 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 514 "/acl/lib_fiber/c/src/common/avl.c"
                  )
    return;
 
@@ -11475,7 +11602,7 @@ tree
 
  (void) avl_rotation(tree, node, new_balance);
 }
-# 561 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 561 "/acl/lib_fiber/c/src/common/avl.c"
 void
 avl_insert_here(
  avl_tree_t *tree,
@@ -11490,72 +11617,72 @@ avl_insert_here(
 
 
  
-# 574 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 574 "/acl/lib_fiber/c/src/common/avl.c" 3 4
 ((void) sizeof ((
-# 574 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 574 "/acl/lib_fiber/c/src/common/avl.c"
 tree != 
-# 574 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 574 "/acl/lib_fiber/c/src/common/avl.c" 3 4
 ((void *)0)) ? 1 : 0), __extension__ ({ if (
-# 574 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 574 "/acl/lib_fiber/c/src/common/avl.c"
 tree != 
-# 574 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 574 "/acl/lib_fiber/c/src/common/avl.c" 3 4
 ((void *)0)) ; else __assert_fail (
-# 574 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 574 "/acl/lib_fiber/c/src/common/avl.c"
 "tree != NULL"
-# 574 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
-, "/workspace/acl/lib_fiber/c/src/common/avl.c", 574, __extension__ __PRETTY_FUNCTION__); }))
-# 574 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 574 "/acl/lib_fiber/c/src/common/avl.c" 3 4
+, "/acl/lib_fiber/c/src/common/avl.c", 574, __extension__ __PRETTY_FUNCTION__); }))
+# 574 "/acl/lib_fiber/c/src/common/avl.c"
                     ;
  
-# 575 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 575 "/acl/lib_fiber/c/src/common/avl.c" 3 4
 ((void) sizeof ((
-# 575 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 575 "/acl/lib_fiber/c/src/common/avl.c"
 new_data != 
-# 575 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 575 "/acl/lib_fiber/c/src/common/avl.c" 3 4
 ((void *)0)) ? 1 : 0), __extension__ ({ if (
-# 575 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 575 "/acl/lib_fiber/c/src/common/avl.c"
 new_data != 
-# 575 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 575 "/acl/lib_fiber/c/src/common/avl.c" 3 4
 ((void *)0)) ; else __assert_fail (
-# 575 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 575 "/acl/lib_fiber/c/src/common/avl.c"
 "new_data != NULL"
-# 575 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
-, "/workspace/acl/lib_fiber/c/src/common/avl.c", 575, __extension__ __PRETTY_FUNCTION__); }))
-# 575 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 575 "/acl/lib_fiber/c/src/common/avl.c" 3 4
+, "/acl/lib_fiber/c/src/common/avl.c", 575, __extension__ __PRETTY_FUNCTION__); }))
+# 575 "/acl/lib_fiber/c/src/common/avl.c"
                         ;
  
-# 576 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 576 "/acl/lib_fiber/c/src/common/avl.c" 3 4
 ((void) sizeof ((
-# 576 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 576 "/acl/lib_fiber/c/src/common/avl.c"
 here != 
-# 576 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 576 "/acl/lib_fiber/c/src/common/avl.c" 3 4
 ((void *)0)) ? 1 : 0), __extension__ ({ if (
-# 576 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 576 "/acl/lib_fiber/c/src/common/avl.c"
 here != 
-# 576 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 576 "/acl/lib_fiber/c/src/common/avl.c" 3 4
 ((void *)0)) ; else __assert_fail (
-# 576 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 576 "/acl/lib_fiber/c/src/common/avl.c"
 "here != NULL"
-# 576 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
-, "/workspace/acl/lib_fiber/c/src/common/avl.c", 576, __extension__ __PRETTY_FUNCTION__); }))
-# 576 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 576 "/acl/lib_fiber/c/src/common/avl.c" 3 4
+, "/acl/lib_fiber/c/src/common/avl.c", 576, __extension__ __PRETTY_FUNCTION__); }))
+# 576 "/acl/lib_fiber/c/src/common/avl.c"
                     ;
  
-# 577 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 577 "/acl/lib_fiber/c/src/common/avl.c" 3 4
 ((void) sizeof ((
-# 577 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 577 "/acl/lib_fiber/c/src/common/avl.c"
 direction == (0) || direction == (1)
-# 577 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 577 "/acl/lib_fiber/c/src/common/avl.c" 3 4
 ) ? 1 : 0), __extension__ ({ if (
-# 577 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 577 "/acl/lib_fiber/c/src/common/avl.c"
 direction == (0) || direction == (1)
-# 577 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 577 "/acl/lib_fiber/c/src/common/avl.c" 3 4
 ) ; else __assert_fail (
-# 577 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 577 "/acl/lib_fiber/c/src/common/avl.c"
 "direction == AVL_BEFORE || direction == AVL_AFTER"
-# 577 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
-, "/workspace/acl/lib_fiber/c/src/common/avl.c", 577, __extension__ __PRETTY_FUNCTION__); }))
-# 577 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 577 "/acl/lib_fiber/c/src/common/avl.c" 3 4
+, "/acl/lib_fiber/c/src/common/avl.c", 577, __extension__ __PRETTY_FUNCTION__); }))
+# 577 "/acl/lib_fiber/c/src/common/avl.c"
                                                          ;
 
 
@@ -11563,18 +11690,18 @@ direction == (0) || direction == (1)
 
 
  node = ((struct avl_node *)((uintptr_t)(here) + (tree->avl_offset)));
-# 592 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 592 "/acl/lib_fiber/c/src/common/avl.c"
  if (node->avl_child[child] != 
-# 592 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 592 "/acl/lib_fiber/c/src/common/avl.c" 3 4
                               ((void *)0)
-# 592 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 592 "/acl/lib_fiber/c/src/common/avl.c"
                                   ) {
   node = node->avl_child[child];
   child = 1 - child;
   while (node->avl_child[child] != 
-# 595 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 595 "/acl/lib_fiber/c/src/common/avl.c" 3 4
                                   ((void *)0)
-# 595 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 595 "/acl/lib_fiber/c/src/common/avl.c"
                                       ) {
 
 
@@ -11594,21 +11721,21 @@ direction == (0) || direction == (1)
 
  }
  
-# 613 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 613 "/acl/lib_fiber/c/src/common/avl.c" 3 4
 ((void) sizeof ((
-# 613 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 613 "/acl/lib_fiber/c/src/common/avl.c"
 node->avl_child[child] == 
-# 613 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 613 "/acl/lib_fiber/c/src/common/avl.c" 3 4
 ((void *)0)) ? 1 : 0), __extension__ ({ if (
-# 613 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 613 "/acl/lib_fiber/c/src/common/avl.c"
 node->avl_child[child] == 
-# 613 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 613 "/acl/lib_fiber/c/src/common/avl.c" 3 4
 ((void *)0)) ; else __assert_fail (
-# 613 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 613 "/acl/lib_fiber/c/src/common/avl.c"
 "node->avl_child[child] == NULL"
-# 613 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
-, "/workspace/acl/lib_fiber/c/src/common/avl.c", 613, __extension__ __PRETTY_FUNCTION__); }))
-# 613 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 613 "/acl/lib_fiber/c/src/common/avl.c" 3 4
+, "/acl/lib_fiber/c/src/common/avl.c", 613, __extension__ __PRETTY_FUNCTION__); }))
+# 613 "/acl/lib_fiber/c/src/common/avl.c"
                                       ;
 
  avl_insert(tree, new_data, ((avl_index_t)(node) | (child)));
@@ -11629,34 +11756,34 @@ avl_add(avl_tree_t *tree, void *new_node)
 
 
  if (avl_find(tree, new_node, &where) != 
-# 632 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 632 "/acl/lib_fiber/c/src/common/avl.c" 3 4
                                         ((void *)0)
-# 632 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 632 "/acl/lib_fiber/c/src/common/avl.c"
                                             )
 
 
 
   
-# 636 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 636 "/acl/lib_fiber/c/src/common/avl.c" 3 4
  ((void) sizeof ((
-# 636 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 636 "/acl/lib_fiber/c/src/common/avl.c"
  0
-# 636 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 636 "/acl/lib_fiber/c/src/common/avl.c" 3 4
  ) ? 1 : 0), __extension__ ({ if (
-# 636 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 636 "/acl/lib_fiber/c/src/common/avl.c"
  0
-# 636 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 636 "/acl/lib_fiber/c/src/common/avl.c" 3 4
  ) ; else __assert_fail (
-# 636 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 636 "/acl/lib_fiber/c/src/common/avl.c"
  "0"
-# 636 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
- , "/workspace/acl/lib_fiber/c/src/common/avl.c", 636, __extension__ __PRETTY_FUNCTION__); }))
-# 636 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 636 "/acl/lib_fiber/c/src/common/avl.c" 3 4
+ , "/acl/lib_fiber/c/src/common/avl.c", 636, __extension__ __PRETTY_FUNCTION__); }))
+# 636 "/acl/lib_fiber/c/src/common/avl.c"
           ;
 
  avl_insert(tree, new_node, where);
 }
-# 664 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 664 "/acl/lib_fiber/c/src/common/avl.c"
 void
 avl_remove(avl_tree_t *tree, void *data)
 {
@@ -11672,33 +11799,33 @@ avl_remove(avl_tree_t *tree, void *data)
  size_t off = tree->avl_offset;
 
  
-# 678 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 678 "/acl/lib_fiber/c/src/common/avl.c" 3 4
 ((void) sizeof ((
-# 678 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 678 "/acl/lib_fiber/c/src/common/avl.c"
 tree
-# 678 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 678 "/acl/lib_fiber/c/src/common/avl.c" 3 4
 ) ? 1 : 0), __extension__ ({ if (
-# 678 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 678 "/acl/lib_fiber/c/src/common/avl.c"
 tree
-# 678 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 678 "/acl/lib_fiber/c/src/common/avl.c" 3 4
 ) ; else __assert_fail (
-# 678 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 678 "/acl/lib_fiber/c/src/common/avl.c"
 "tree"
-# 678 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
-, "/workspace/acl/lib_fiber/c/src/common/avl.c", 678, __extension__ __PRETTY_FUNCTION__); }))
-# 678 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 678 "/acl/lib_fiber/c/src/common/avl.c" 3 4
+, "/acl/lib_fiber/c/src/common/avl.c", 678, __extension__ __PRETTY_FUNCTION__); }))
+# 678 "/acl/lib_fiber/c/src/common/avl.c"
             ;
 
  delete = ((struct avl_node *)((uintptr_t)(data) + (off)));
-# 692 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 692 "/acl/lib_fiber/c/src/common/avl.c"
  if (delete->avl_child[0] != 
-# 692 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 692 "/acl/lib_fiber/c/src/common/avl.c" 3 4
                             ((void *)0) 
-# 692 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 692 "/acl/lib_fiber/c/src/common/avl.c"
                                  && delete->avl_child[1] != 
-# 692 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 692 "/acl/lib_fiber/c/src/common/avl.c" 3 4
                                                             ((void *)0)
-# 692 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 692 "/acl/lib_fiber/c/src/common/avl.c"
                                                                 ) {
 
 
@@ -11714,9 +11841,9 @@ tree
 
   for (node = delete->avl_child[left];
       node->avl_child[right] != 
-# 706 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 706 "/acl/lib_fiber/c/src/common/avl.c" 3 4
                                ((void *)0)
-# 706 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 706 "/acl/lib_fiber/c/src/common/avl.c"
                                    ;
       node = node->avl_child[right])
    ;
@@ -11733,9 +11860,9 @@ tree
 
   parent = ((struct avl_node *)((node)->avl_pcb & ~7));
   if (parent != 
-# 721 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 721 "/acl/lib_fiber/c/src/common/avl.c" 3 4
                ((void *)0)
-# 721 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 721 "/acl/lib_fiber/c/src/common/avl.c"
                    )
    parent->avl_child[(((node)->avl_pcb >> 2) & 1)] = node;
   else
@@ -11752,9 +11879,9 @@ tree
   parent->avl_child[(((delete)->avl_pcb >> 2) & 1)] = delete;
   which_child = (delete->avl_child[1] != 0);
   if (delete->avl_child[which_child] != 
-# 736 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 736 "/acl/lib_fiber/c/src/common/avl.c" 3 4
                                        ((void *)0)
-# 736 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 736 "/acl/lib_fiber/c/src/common/avl.c"
                                            )
    ((delete->avl_child[which_child])->avl_pcb = (((delete->avl_child[which_child])->avl_pcb & 7) | (uintptr_t)(delete)));
  }
@@ -11765,29 +11892,29 @@ tree
 
 
  
-# 745 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 745 "/acl/lib_fiber/c/src/common/avl.c" 3 4
 ((void) sizeof ((
-# 745 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 745 "/acl/lib_fiber/c/src/common/avl.c"
 tree->avl_numnodes > 0
-# 745 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 745 "/acl/lib_fiber/c/src/common/avl.c" 3 4
 ) ? 1 : 0), __extension__ ({ if (
-# 745 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 745 "/acl/lib_fiber/c/src/common/avl.c"
 tree->avl_numnodes > 0
-# 745 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 745 "/acl/lib_fiber/c/src/common/avl.c" 3 4
 ) ; else __assert_fail (
-# 745 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 745 "/acl/lib_fiber/c/src/common/avl.c"
 "tree->avl_numnodes > 0"
-# 745 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
-, "/workspace/acl/lib_fiber/c/src/common/avl.c", 745, __extension__ __PRETTY_FUNCTION__); }))
-# 745 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 745 "/acl/lib_fiber/c/src/common/avl.c" 3 4
+, "/acl/lib_fiber/c/src/common/avl.c", 745, __extension__ __PRETTY_FUNCTION__); }))
+# 745 "/acl/lib_fiber/c/src/common/avl.c"
                               ;
  --tree->avl_numnodes;
  parent = ((struct avl_node *)((delete)->avl_pcb & ~7));
  which_child = (((delete)->avl_pcb >> 2) & 1);
  if (delete->avl_child[0] != 
-# 749 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 749 "/acl/lib_fiber/c/src/common/avl.c" 3 4
                             ((void *)0)
-# 749 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 749 "/acl/lib_fiber/c/src/common/avl.c"
                                 )
   node = delete->avl_child[0];
  else
@@ -11797,17 +11924,17 @@ tree->avl_numnodes > 0
 
 
  if (node != 
-# 757 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 757 "/acl/lib_fiber/c/src/common/avl.c" 3 4
             ((void *)0)
-# 757 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 757 "/acl/lib_fiber/c/src/common/avl.c"
                 ) {
   ((node)->avl_pcb = (((node)->avl_pcb & 7) | (uintptr_t)(parent)));
   ((node)->avl_pcb = (uintptr_t)(((node)->avl_pcb & ~4) | ((which_child) << 2)));
  }
  if (parent == 
-# 761 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 761 "/acl/lib_fiber/c/src/common/avl.c" 3 4
               ((void *)0)
-# 761 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 761 "/acl/lib_fiber/c/src/common/avl.c"
                   ) {
   tree->avl_root = node;
   return;
@@ -11842,15 +11969,15 @@ tree->avl_numnodes > 0
    ((node)->avl_pcb = (uintptr_t)((((node)->avl_pcb & ~3) | ((new_balance) + 1))));
    break;
   }
-# 803 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 803 "/acl/lib_fiber/c/src/common/avl.c"
   if (new_balance == 0)
    ((node)->avl_pcb = (uintptr_t)((((node)->avl_pcb & ~3) | ((new_balance) + 1))));
   else if (!avl_rotation(tree, node, new_balance))
    break;
  } while (parent != 
-# 807 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 807 "/acl/lib_fiber/c/src/common/avl.c" 3 4
                    ((void *)0)
-# 807 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 807 "/acl/lib_fiber/c/src/common/avl.c"
                        );
 }
 
@@ -11864,37 +11991,37 @@ avl_update_lt(avl_tree_t *t, void *obj)
  void *neighbor;
 
  
-# 819 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 819 "/acl/lib_fiber/c/src/common/avl.c" 3 4
 ((void) sizeof ((
-# 819 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 819 "/acl/lib_fiber/c/src/common/avl.c"
 ((neighbor = avl_walk(t, obj, (1))) == 
-# 819 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 819 "/acl/lib_fiber/c/src/common/avl.c" 3 4
 ((void *)0)
-# 819 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 819 "/acl/lib_fiber/c/src/common/avl.c"
 ) || (t->avl_compar(obj, neighbor) <= 0)
-# 819 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 819 "/acl/lib_fiber/c/src/common/avl.c" 3 4
 ) ? 1 : 0), __extension__ ({ if (
-# 819 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 819 "/acl/lib_fiber/c/src/common/avl.c"
 ((neighbor = avl_walk(t, obj, (1))) == 
-# 819 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 819 "/acl/lib_fiber/c/src/common/avl.c" 3 4
 ((void *)0)
-# 819 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 819 "/acl/lib_fiber/c/src/common/avl.c"
 ) || (t->avl_compar(obj, neighbor) <= 0)
-# 819 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 819 "/acl/lib_fiber/c/src/common/avl.c" 3 4
 ) ; else __assert_fail (
-# 819 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 819 "/acl/lib_fiber/c/src/common/avl.c"
 "((neighbor = AVL_NEXT(t, obj)) == NULL) || (t->avl_compar(obj, neighbor) <= 0)"
-# 819 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
-, "/workspace/acl/lib_fiber/c/src/common/avl.c", 819, __extension__ __PRETTY_FUNCTION__); }))
+# 819 "/acl/lib_fiber/c/src/common/avl.c" 3 4
+, "/acl/lib_fiber/c/src/common/avl.c", 819, __extension__ __PRETTY_FUNCTION__); }))
                                          
-# 820 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 820 "/acl/lib_fiber/c/src/common/avl.c"
                                         ;
 
  neighbor = avl_walk(t, obj, (0));
  if ((neighbor != 
-# 823 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 823 "/acl/lib_fiber/c/src/common/avl.c" 3 4
                  ((void *)0)
-# 823 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 823 "/acl/lib_fiber/c/src/common/avl.c"
                      ) && (t->avl_compar(obj, neighbor) < 0)) {
   avl_remove((t), (obj)); avl_add((t), (obj));
   return (1);
@@ -11909,37 +12036,37 @@ avl_update_gt(avl_tree_t *t, void *obj)
  void *neighbor;
 
  
-# 836 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 836 "/acl/lib_fiber/c/src/common/avl.c" 3 4
 ((void) sizeof ((
-# 836 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 836 "/acl/lib_fiber/c/src/common/avl.c"
 ((neighbor = avl_walk(t, obj, (0))) == 
-# 836 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 836 "/acl/lib_fiber/c/src/common/avl.c" 3 4
 ((void *)0)
-# 836 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 836 "/acl/lib_fiber/c/src/common/avl.c"
 ) || (t->avl_compar(obj, neighbor) >= 0)
-# 836 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 836 "/acl/lib_fiber/c/src/common/avl.c" 3 4
 ) ? 1 : 0), __extension__ ({ if (
-# 836 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 836 "/acl/lib_fiber/c/src/common/avl.c"
 ((neighbor = avl_walk(t, obj, (0))) == 
-# 836 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 836 "/acl/lib_fiber/c/src/common/avl.c" 3 4
 ((void *)0)
-# 836 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 836 "/acl/lib_fiber/c/src/common/avl.c"
 ) || (t->avl_compar(obj, neighbor) >= 0)
-# 836 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 836 "/acl/lib_fiber/c/src/common/avl.c" 3 4
 ) ; else __assert_fail (
-# 836 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 836 "/acl/lib_fiber/c/src/common/avl.c"
 "((neighbor = AVL_PREV(t, obj)) == NULL) || (t->avl_compar(obj, neighbor) >= 0)"
-# 836 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
-, "/workspace/acl/lib_fiber/c/src/common/avl.c", 836, __extension__ __PRETTY_FUNCTION__); }))
+# 836 "/acl/lib_fiber/c/src/common/avl.c" 3 4
+, "/acl/lib_fiber/c/src/common/avl.c", 836, __extension__ __PRETTY_FUNCTION__); }))
                                          
-# 837 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 837 "/acl/lib_fiber/c/src/common/avl.c"
                                         ;
 
  neighbor = avl_walk(t, obj, (1));
  if ((neighbor != 
-# 840 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 840 "/acl/lib_fiber/c/src/common/avl.c" 3 4
                  ((void *)0)
-# 840 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 840 "/acl/lib_fiber/c/src/common/avl.c"
                      ) && (t->avl_compar(obj, neighbor) > 0)) {
   avl_remove((t), (obj)); avl_add((t), (obj));
   return (1);
@@ -11955,9 +12082,9 @@ avl_update(avl_tree_t *t, void *obj)
 
  neighbor = avl_walk(t, obj, (0));
  if ((neighbor != 
-# 854 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 854 "/acl/lib_fiber/c/src/common/avl.c" 3 4
                  ((void *)0)
-# 854 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 854 "/acl/lib_fiber/c/src/common/avl.c"
                      ) && (t->avl_compar(obj, neighbor) < 0)) {
   avl_remove((t), (obj)); avl_add((t), (obj));
   return (1);
@@ -11965,9 +12092,9 @@ avl_update(avl_tree_t *t, void *obj)
 
  neighbor = avl_walk(t, obj, (1));
  if ((neighbor != 
-# 860 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 860 "/acl/lib_fiber/c/src/common/avl.c" 3 4
                  ((void *)0)
-# 860 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 860 "/acl/lib_fiber/c/src/common/avl.c"
                      ) && (t->avl_compar(obj, neighbor) > 0)) {
   avl_remove((t), (obj)); avl_add((t), (obj));
   return (1);
@@ -11984,98 +12111,98 @@ avl_create(avl_tree_t *tree, int (*compar) (const void *, const void *),
     size_t size, size_t offset)
 {
  
-# 875 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 875 "/acl/lib_fiber/c/src/common/avl.c" 3 4
 ((void) sizeof ((
-# 875 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 875 "/acl/lib_fiber/c/src/common/avl.c"
 tree
-# 875 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 875 "/acl/lib_fiber/c/src/common/avl.c" 3 4
 ) ? 1 : 0), __extension__ ({ if (
-# 875 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 875 "/acl/lib_fiber/c/src/common/avl.c"
 tree
-# 875 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 875 "/acl/lib_fiber/c/src/common/avl.c" 3 4
 ) ; else __assert_fail (
-# 875 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 875 "/acl/lib_fiber/c/src/common/avl.c"
 "tree"
-# 875 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
-, "/workspace/acl/lib_fiber/c/src/common/avl.c", 875, __extension__ __PRETTY_FUNCTION__); }))
-# 875 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 875 "/acl/lib_fiber/c/src/common/avl.c" 3 4
+, "/acl/lib_fiber/c/src/common/avl.c", 875, __extension__ __PRETTY_FUNCTION__); }))
+# 875 "/acl/lib_fiber/c/src/common/avl.c"
             ;
  
-# 876 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 876 "/acl/lib_fiber/c/src/common/avl.c" 3 4
 ((void) sizeof ((
-# 876 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 876 "/acl/lib_fiber/c/src/common/avl.c"
 compar
-# 876 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 876 "/acl/lib_fiber/c/src/common/avl.c" 3 4
 ) ? 1 : 0), __extension__ ({ if (
-# 876 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 876 "/acl/lib_fiber/c/src/common/avl.c"
 compar
-# 876 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 876 "/acl/lib_fiber/c/src/common/avl.c" 3 4
 ) ; else __assert_fail (
-# 876 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 876 "/acl/lib_fiber/c/src/common/avl.c"
 "compar"
-# 876 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
-, "/workspace/acl/lib_fiber/c/src/common/avl.c", 876, __extension__ __PRETTY_FUNCTION__); }))
-# 876 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 876 "/acl/lib_fiber/c/src/common/avl.c" 3 4
+, "/acl/lib_fiber/c/src/common/avl.c", 876, __extension__ __PRETTY_FUNCTION__); }))
+# 876 "/acl/lib_fiber/c/src/common/avl.c"
               ;
  
-# 877 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 877 "/acl/lib_fiber/c/src/common/avl.c" 3 4
 ((void) sizeof ((
-# 877 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 877 "/acl/lib_fiber/c/src/common/avl.c"
 size > 0
-# 877 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 877 "/acl/lib_fiber/c/src/common/avl.c" 3 4
 ) ? 1 : 0), __extension__ ({ if (
-# 877 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 877 "/acl/lib_fiber/c/src/common/avl.c"
 size > 0
-# 877 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 877 "/acl/lib_fiber/c/src/common/avl.c" 3 4
 ) ; else __assert_fail (
-# 877 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 877 "/acl/lib_fiber/c/src/common/avl.c"
 "size > 0"
-# 877 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
-, "/workspace/acl/lib_fiber/c/src/common/avl.c", 877, __extension__ __PRETTY_FUNCTION__); }))
-# 877 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 877 "/acl/lib_fiber/c/src/common/avl.c" 3 4
+, "/acl/lib_fiber/c/src/common/avl.c", 877, __extension__ __PRETTY_FUNCTION__); }))
+# 877 "/acl/lib_fiber/c/src/common/avl.c"
                 ;
  
-# 878 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 878 "/acl/lib_fiber/c/src/common/avl.c" 3 4
 ((void) sizeof ((
-# 878 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 878 "/acl/lib_fiber/c/src/common/avl.c"
 size >= offset + sizeof (avl_node_t)
-# 878 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 878 "/acl/lib_fiber/c/src/common/avl.c" 3 4
 ) ? 1 : 0), __extension__ ({ if (
-# 878 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 878 "/acl/lib_fiber/c/src/common/avl.c"
 size >= offset + sizeof (avl_node_t)
-# 878 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 878 "/acl/lib_fiber/c/src/common/avl.c" 3 4
 ) ; else __assert_fail (
-# 878 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 878 "/acl/lib_fiber/c/src/common/avl.c"
 "size >= offset + sizeof (avl_node_t)"
-# 878 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
-, "/workspace/acl/lib_fiber/c/src/common/avl.c", 878, __extension__ __PRETTY_FUNCTION__); }))
-# 878 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 878 "/acl/lib_fiber/c/src/common/avl.c" 3 4
+, "/acl/lib_fiber/c/src/common/avl.c", 878, __extension__ __PRETTY_FUNCTION__); }))
+# 878 "/acl/lib_fiber/c/src/common/avl.c"
                                             ;
 
  
-# 880 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 880 "/acl/lib_fiber/c/src/common/avl.c" 3 4
 ((void) sizeof ((
-# 880 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 880 "/acl/lib_fiber/c/src/common/avl.c"
 (offset & 0x7) == 0
-# 880 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 880 "/acl/lib_fiber/c/src/common/avl.c" 3 4
 ) ? 1 : 0), __extension__ ({ if (
-# 880 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 880 "/acl/lib_fiber/c/src/common/avl.c"
 (offset & 0x7) == 0
-# 880 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 880 "/acl/lib_fiber/c/src/common/avl.c" 3 4
 ) ; else __assert_fail (
-# 880 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 880 "/acl/lib_fiber/c/src/common/avl.c"
 "(offset & 0x7) == 0"
-# 880 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
-, "/workspace/acl/lib_fiber/c/src/common/avl.c", 880, __extension__ __PRETTY_FUNCTION__); }))
-# 880 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 880 "/acl/lib_fiber/c/src/common/avl.c" 3 4
+, "/acl/lib_fiber/c/src/common/avl.c", 880, __extension__ __PRETTY_FUNCTION__); }))
+# 880 "/acl/lib_fiber/c/src/common/avl.c"
                            ;
 
 
  tree->avl_compar = compar;
  tree->avl_root = 
-# 884 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 884 "/acl/lib_fiber/c/src/common/avl.c" 3 4
                  ((void *)0)
-# 884 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 884 "/acl/lib_fiber/c/src/common/avl.c"
                      ;
  tree->avl_numnodes = 0;
  tree->avl_size = size;
@@ -12090,55 +12217,55 @@ void
 avl_destroy(avl_tree_t *tree __attribute__ ((__unused__)))
 {
  
-# 897 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 897 "/acl/lib_fiber/c/src/common/avl.c" 3 4
 ((void) sizeof ((
-# 897 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 897 "/acl/lib_fiber/c/src/common/avl.c"
 tree
-# 897 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 897 "/acl/lib_fiber/c/src/common/avl.c" 3 4
 ) ? 1 : 0), __extension__ ({ if (
-# 897 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 897 "/acl/lib_fiber/c/src/common/avl.c"
 tree
-# 897 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 897 "/acl/lib_fiber/c/src/common/avl.c" 3 4
 ) ; else __assert_fail (
-# 897 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 897 "/acl/lib_fiber/c/src/common/avl.c"
 "tree"
-# 897 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
-, "/workspace/acl/lib_fiber/c/src/common/avl.c", 897, __extension__ __PRETTY_FUNCTION__); }))
-# 897 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 897 "/acl/lib_fiber/c/src/common/avl.c" 3 4
+, "/acl/lib_fiber/c/src/common/avl.c", 897, __extension__ __PRETTY_FUNCTION__); }))
+# 897 "/acl/lib_fiber/c/src/common/avl.c"
             ;
  
-# 898 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 898 "/acl/lib_fiber/c/src/common/avl.c" 3 4
 ((void) sizeof ((
-# 898 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 898 "/acl/lib_fiber/c/src/common/avl.c"
 tree->avl_numnodes == 0
-# 898 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 898 "/acl/lib_fiber/c/src/common/avl.c" 3 4
 ) ? 1 : 0), __extension__ ({ if (
-# 898 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 898 "/acl/lib_fiber/c/src/common/avl.c"
 tree->avl_numnodes == 0
-# 898 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 898 "/acl/lib_fiber/c/src/common/avl.c" 3 4
 ) ; else __assert_fail (
-# 898 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 898 "/acl/lib_fiber/c/src/common/avl.c"
 "tree->avl_numnodes == 0"
-# 898 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
-, "/workspace/acl/lib_fiber/c/src/common/avl.c", 898, __extension__ __PRETTY_FUNCTION__); }))
-# 898 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 898 "/acl/lib_fiber/c/src/common/avl.c" 3 4
+, "/acl/lib_fiber/c/src/common/avl.c", 898, __extension__ __PRETTY_FUNCTION__); }))
+# 898 "/acl/lib_fiber/c/src/common/avl.c"
                                ;
  
-# 899 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 899 "/acl/lib_fiber/c/src/common/avl.c" 3 4
 ((void) sizeof ((
-# 899 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 899 "/acl/lib_fiber/c/src/common/avl.c"
 tree->avl_root == 
-# 899 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 899 "/acl/lib_fiber/c/src/common/avl.c" 3 4
 ((void *)0)) ? 1 : 0), __extension__ ({ if (
-# 899 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 899 "/acl/lib_fiber/c/src/common/avl.c"
 tree->avl_root == 
-# 899 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 899 "/acl/lib_fiber/c/src/common/avl.c" 3 4
 ((void *)0)) ; else __assert_fail (
-# 899 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 899 "/acl/lib_fiber/c/src/common/avl.c"
 "tree->avl_root == NULL"
-# 899 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
-, "/workspace/acl/lib_fiber/c/src/common/avl.c", 899, __extension__ __PRETTY_FUNCTION__); }))
-# 899 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 899 "/acl/lib_fiber/c/src/common/avl.c" 3 4
+, "/acl/lib_fiber/c/src/common/avl.c", 899, __extension__ __PRETTY_FUNCTION__); }))
+# 899 "/acl/lib_fiber/c/src/common/avl.c"
                               ;
 }
 
@@ -12150,21 +12277,21 @@ ulong_t
 avl_numnodes(avl_tree_t *tree)
 {
  
-# 909 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 909 "/acl/lib_fiber/c/src/common/avl.c" 3 4
 ((void) sizeof ((
-# 909 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 909 "/acl/lib_fiber/c/src/common/avl.c"
 tree
-# 909 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 909 "/acl/lib_fiber/c/src/common/avl.c" 3 4
 ) ? 1 : 0), __extension__ ({ if (
-# 909 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 909 "/acl/lib_fiber/c/src/common/avl.c"
 tree
-# 909 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 909 "/acl/lib_fiber/c/src/common/avl.c" 3 4
 ) ; else __assert_fail (
-# 909 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 909 "/acl/lib_fiber/c/src/common/avl.c"
 "tree"
-# 909 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
-, "/workspace/acl/lib_fiber/c/src/common/avl.c", 909, __extension__ __PRETTY_FUNCTION__); }))
-# 909 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 909 "/acl/lib_fiber/c/src/common/avl.c" 3 4
+, "/acl/lib_fiber/c/src/common/avl.c", 909, __extension__ __PRETTY_FUNCTION__); }))
+# 909 "/acl/lib_fiber/c/src/common/avl.c"
             ;
  return (tree->avl_numnodes);
 }
@@ -12173,25 +12300,25 @@ boolean_t
 avl_is_empty(avl_tree_t *tree)
 {
  
-# 916 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 916 "/acl/lib_fiber/c/src/common/avl.c" 3 4
 ((void) sizeof ((
-# 916 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 916 "/acl/lib_fiber/c/src/common/avl.c"
 tree
-# 916 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 916 "/acl/lib_fiber/c/src/common/avl.c" 3 4
 ) ? 1 : 0), __extension__ ({ if (
-# 916 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 916 "/acl/lib_fiber/c/src/common/avl.c"
 tree
-# 916 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 916 "/acl/lib_fiber/c/src/common/avl.c" 3 4
 ) ; else __assert_fail (
-# 916 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 916 "/acl/lib_fiber/c/src/common/avl.c"
 "tree"
-# 916 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
-, "/workspace/acl/lib_fiber/c/src/common/avl.c", 916, __extension__ __PRETTY_FUNCTION__); }))
-# 916 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 916 "/acl/lib_fiber/c/src/common/avl.c" 3 4
+, "/acl/lib_fiber/c/src/common/avl.c", 916, __extension__ __PRETTY_FUNCTION__); }))
+# 916 "/acl/lib_fiber/c/src/common/avl.c"
             ;
  return (tree->avl_numnodes == 0);
 }
-# 941 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 941 "/acl/lib_fiber/c/src/common/avl.c"
 void *
 avl_destroy_nodes(avl_tree_t *tree, void **cookie)
 {
@@ -12205,9 +12332,9 @@ avl_destroy_nodes(avl_tree_t *tree, void **cookie)
 
 
  if (*cookie == 
-# 953 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 953 "/acl/lib_fiber/c/src/common/avl.c" 3 4
                ((void *)0)
-# 953 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 953 "/acl/lib_fiber/c/src/common/avl.c"
                    ) {
   first = avl_first(tree);
 
@@ -12215,15 +12342,15 @@ avl_destroy_nodes(avl_tree_t *tree, void **cookie)
 
 
   if (first == 
-# 959 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 959 "/acl/lib_fiber/c/src/common/avl.c" 3 4
               ((void *)0)
-# 959 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 959 "/acl/lib_fiber/c/src/common/avl.c"
                   ) {
    *cookie = (void *)(1L);
    return (
-# 961 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 961 "/acl/lib_fiber/c/src/common/avl.c" 3 4
           ((void *)0)
-# 961 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 961 "/acl/lib_fiber/c/src/common/avl.c"
               );
   }
 
@@ -12237,43 +12364,43 @@ avl_destroy_nodes(avl_tree_t *tree, void **cookie)
 
  parent = (avl_node_t *)((uintptr_t)(*cookie) & ~(1L));
  if (parent == 
-# 973 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 973 "/acl/lib_fiber/c/src/common/avl.c" 3 4
               ((void *)0)
-# 973 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 973 "/acl/lib_fiber/c/src/common/avl.c"
                   ) {
   if (tree->avl_root != 
-# 974 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 974 "/acl/lib_fiber/c/src/common/avl.c" 3 4
                        ((void *)0)
-# 974 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 974 "/acl/lib_fiber/c/src/common/avl.c"
                            ) {
    
-# 975 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 975 "/acl/lib_fiber/c/src/common/avl.c" 3 4
   ((void) sizeof ((
-# 975 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 975 "/acl/lib_fiber/c/src/common/avl.c"
   tree->avl_numnodes == 1
-# 975 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 975 "/acl/lib_fiber/c/src/common/avl.c" 3 4
   ) ? 1 : 0), __extension__ ({ if (
-# 975 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 975 "/acl/lib_fiber/c/src/common/avl.c"
   tree->avl_numnodes == 1
-# 975 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 975 "/acl/lib_fiber/c/src/common/avl.c" 3 4
   ) ; else __assert_fail (
-# 975 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 975 "/acl/lib_fiber/c/src/common/avl.c"
   "tree->avl_numnodes == 1"
-# 975 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
-  , "/workspace/acl/lib_fiber/c/src/common/avl.c", 975, __extension__ __PRETTY_FUNCTION__); }))
-# 975 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 975 "/acl/lib_fiber/c/src/common/avl.c" 3 4
+  , "/acl/lib_fiber/c/src/common/avl.c", 975, __extension__ __PRETTY_FUNCTION__); }))
+# 975 "/acl/lib_fiber/c/src/common/avl.c"
                                  ;
    tree->avl_root = 
-# 976 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 976 "/acl/lib_fiber/c/src/common/avl.c" 3 4
                    ((void *)0)
-# 976 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 976 "/acl/lib_fiber/c/src/common/avl.c"
                        ;
    tree->avl_numnodes = 0;
   }
   return (
-# 979 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 979 "/acl/lib_fiber/c/src/common/avl.c" 3 4
          ((void *)0)
-# 979 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 979 "/acl/lib_fiber/c/src/common/avl.c"
              );
  }
 
@@ -12282,26 +12409,26 @@ avl_destroy_nodes(avl_tree_t *tree, void **cookie)
 
  child = (uintptr_t)(*cookie) & (1L);
  parent->avl_child[child] = 
-# 986 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 986 "/acl/lib_fiber/c/src/common/avl.c" 3 4
                            ((void *)0)
-# 986 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 986 "/acl/lib_fiber/c/src/common/avl.c"
                                ;
  
-# 987 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 987 "/acl/lib_fiber/c/src/common/avl.c" 3 4
 ((void) sizeof ((
-# 987 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 987 "/acl/lib_fiber/c/src/common/avl.c"
 tree->avl_numnodes > 1
-# 987 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 987 "/acl/lib_fiber/c/src/common/avl.c" 3 4
 ) ? 1 : 0), __extension__ ({ if (
-# 987 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 987 "/acl/lib_fiber/c/src/common/avl.c"
 tree->avl_numnodes > 1
-# 987 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 987 "/acl/lib_fiber/c/src/common/avl.c" 3 4
 ) ; else __assert_fail (
-# 987 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 987 "/acl/lib_fiber/c/src/common/avl.c"
 "tree->avl_numnodes > 1"
-# 987 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
-, "/workspace/acl/lib_fiber/c/src/common/avl.c", 987, __extension__ __PRETTY_FUNCTION__); }))
-# 987 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 987 "/acl/lib_fiber/c/src/common/avl.c" 3 4
+, "/acl/lib_fiber/c/src/common/avl.c", 987, __extension__ __PRETTY_FUNCTION__); }))
+# 987 "/acl/lib_fiber/c/src/common/avl.c"
                               ;
  --tree->avl_numnodes;
 
@@ -12309,9 +12436,9 @@ tree->avl_numnodes > 1
 
 
  if (child == 1 || parent->avl_child[1] == 
-# 993 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 993 "/acl/lib_fiber/c/src/common/avl.c" 3 4
                                           ((void *)0)
-# 993 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 993 "/acl/lib_fiber/c/src/common/avl.c"
                                               ) {
   node = parent;
   parent = ((struct avl_node *)((parent)->avl_pcb & ~7));
@@ -12323,9 +12450,9 @@ tree->avl_numnodes > 1
 
  node = parent->avl_child[1];
  while (node->avl_child[0] != 
-# 1003 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 1003 "/acl/lib_fiber/c/src/common/avl.c" 3 4
                              ((void *)0)
-# 1003 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 1003 "/acl/lib_fiber/c/src/common/avl.c"
                                  ) {
   parent = node;
   node = node->avl_child[0];
@@ -12337,98 +12464,98 @@ tree->avl_numnodes > 1
 
 check_right_side:
  if (node->avl_child[1] != 
-# 1013 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 1013 "/acl/lib_fiber/c/src/common/avl.c" 3 4
                           ((void *)0)
-# 1013 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 1013 "/acl/lib_fiber/c/src/common/avl.c"
                               ) {
   
-# 1014 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 1014 "/acl/lib_fiber/c/src/common/avl.c" 3 4
  ((void) sizeof ((
-# 1014 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 1014 "/acl/lib_fiber/c/src/common/avl.c"
  ((int)(((node)->avl_pcb & 3) - 1)) == 1
-# 1014 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 1014 "/acl/lib_fiber/c/src/common/avl.c" 3 4
  ) ? 1 : 0), __extension__ ({ if (
-# 1014 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 1014 "/acl/lib_fiber/c/src/common/avl.c"
  ((int)(((node)->avl_pcb & 3) - 1)) == 1
-# 1014 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 1014 "/acl/lib_fiber/c/src/common/avl.c" 3 4
  ) ; else __assert_fail (
-# 1014 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 1014 "/acl/lib_fiber/c/src/common/avl.c"
  "AVL_XBALANCE(node) == 1"
-# 1014 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
- , "/workspace/acl/lib_fiber/c/src/common/avl.c", 1014, __extension__ __PRETTY_FUNCTION__); }))
-# 1014 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 1014 "/acl/lib_fiber/c/src/common/avl.c" 3 4
+ , "/acl/lib_fiber/c/src/common/avl.c", 1014, __extension__ __PRETTY_FUNCTION__); }))
+# 1014 "/acl/lib_fiber/c/src/common/avl.c"
                                 ;
   parent = node;
   node = node->avl_child[1];
   
-# 1017 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 1017 "/acl/lib_fiber/c/src/common/avl.c" 3 4
  ((void) sizeof ((
-# 1017 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 1017 "/acl/lib_fiber/c/src/common/avl.c"
  node->avl_child[0] == 
-# 1017 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 1017 "/acl/lib_fiber/c/src/common/avl.c" 3 4
  ((void *)0) 
-# 1017 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 1017 "/acl/lib_fiber/c/src/common/avl.c"
  && node->avl_child[1] == 
-# 1017 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 1017 "/acl/lib_fiber/c/src/common/avl.c" 3 4
  ((void *)0)) ? 1 : 0), __extension__ ({ if (
-# 1017 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 1017 "/acl/lib_fiber/c/src/common/avl.c"
  node->avl_child[0] == 
-# 1017 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 1017 "/acl/lib_fiber/c/src/common/avl.c" 3 4
  ((void *)0) 
-# 1017 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 1017 "/acl/lib_fiber/c/src/common/avl.c"
  && node->avl_child[1] == 
-# 1017 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 1017 "/acl/lib_fiber/c/src/common/avl.c" 3 4
  ((void *)0)) ; else __assert_fail (
-# 1017 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 1017 "/acl/lib_fiber/c/src/common/avl.c"
  "node->avl_child[0] == NULL && node->avl_child[1] == NULL"
-# 1017 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
- , "/workspace/acl/lib_fiber/c/src/common/avl.c", 1017, __extension__ __PRETTY_FUNCTION__); }))
+# 1017 "/acl/lib_fiber/c/src/common/avl.c" 3 4
+ , "/acl/lib_fiber/c/src/common/avl.c", 1017, __extension__ __PRETTY_FUNCTION__); }))
                                  
-# 1018 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 1018 "/acl/lib_fiber/c/src/common/avl.c"
                                 ;
  } else {
   
-# 1020 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 1020 "/acl/lib_fiber/c/src/common/avl.c" 3 4
  ((void) sizeof ((
-# 1020 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 1020 "/acl/lib_fiber/c/src/common/avl.c"
  ((int)(((node)->avl_pcb & 3) - 1)) <= 0
-# 1020 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 1020 "/acl/lib_fiber/c/src/common/avl.c" 3 4
  ) ? 1 : 0), __extension__ ({ if (
-# 1020 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 1020 "/acl/lib_fiber/c/src/common/avl.c"
  ((int)(((node)->avl_pcb & 3) - 1)) <= 0
-# 1020 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 1020 "/acl/lib_fiber/c/src/common/avl.c" 3 4
  ) ; else __assert_fail (
-# 1020 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 1020 "/acl/lib_fiber/c/src/common/avl.c"
  "AVL_XBALANCE(node) <= 0"
-# 1020 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
- , "/workspace/acl/lib_fiber/c/src/common/avl.c", 1020, __extension__ __PRETTY_FUNCTION__); }))
-# 1020 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 1020 "/acl/lib_fiber/c/src/common/avl.c" 3 4
+ , "/acl/lib_fiber/c/src/common/avl.c", 1020, __extension__ __PRETTY_FUNCTION__); }))
+# 1020 "/acl/lib_fiber/c/src/common/avl.c"
                                 ;
  }
 
 done:
  if (parent == 
-# 1024 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 1024 "/acl/lib_fiber/c/src/common/avl.c" 3 4
               ((void *)0)
-# 1024 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 1024 "/acl/lib_fiber/c/src/common/avl.c"
                   ) {
   *cookie = (void *)(1L);
   
-# 1026 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 1026 "/acl/lib_fiber/c/src/common/avl.c" 3 4
  ((void) sizeof ((
-# 1026 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 1026 "/acl/lib_fiber/c/src/common/avl.c"
  node == tree->avl_root
-# 1026 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 1026 "/acl/lib_fiber/c/src/common/avl.c" 3 4
  ) ? 1 : 0), __extension__ ({ if (
-# 1026 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 1026 "/acl/lib_fiber/c/src/common/avl.c"
  node == tree->avl_root
-# 1026 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
+# 1026 "/acl/lib_fiber/c/src/common/avl.c" 3 4
  ) ; else __assert_fail (
-# 1026 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 1026 "/acl/lib_fiber/c/src/common/avl.c"
  "node == tree->avl_root"
-# 1026 "/workspace/acl/lib_fiber/c/src/common/avl.c" 3 4
- , "/workspace/acl/lib_fiber/c/src/common/avl.c", 1026, __extension__ __PRETTY_FUNCTION__); }))
-# 1026 "/workspace/acl/lib_fiber/c/src/common/avl.c"
+# 1026 "/acl/lib_fiber/c/src/common/avl.c" 3 4
+ , "/acl/lib_fiber/c/src/common/avl.c", 1026, __extension__ __PRETTY_FUNCTION__); }))
+# 1026 "/acl/lib_fiber/c/src/common/avl.c"
                                ;
  } else {
   *cookie = (void *)((uintptr_t)parent | (((node)->avl_pcb >> 2) & 1));
