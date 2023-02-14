@@ -1,8 +1,8 @@
 from src.setting import session
-from src.model.project import Project
-from src.model.src_file import SrcFile
-from src.model.xml_file import XmlFile
-from src.model.macro_variable import MacroVariable
+from src.entity.project import Project
+from src.entity.src_file import SrcFile
+from src.entity.xml_file import XmlFile
+from src.entity.macro_variable import MacroVariable
 
 project = Project(
     name="sample_p", url="https://something.com", total_file_count=123)

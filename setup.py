@@ -1,16 +1,20 @@
 from setuptools import setup
 
 setup(
-    name="model",
+    name="entity",
     version="0.1.0",
     description="",
     author="",
-    packages=["model"],
+    packages=["entity", "repository"],
     package_dir={
-        "model": "src/model",
+        "entity": "src/entity",
+        "repository": "src/repository"
     },
     package_data={
-        "model": [
+        "entity": [
+            "*.py",
+        ],
+        "repository": [
             "*.py",
         ]
     },

@@ -5,8 +5,8 @@ from sqlalchemy.orm import mapped_column, relationship, Mapped
 
 
 from src.setting import Base
-from src.model.src_file import SrcFile
-from src.model.file_macro_variable import \
+from src.entity.src_file import SrcFile
+from src.entity.file_macro_variable import \
     file_available_macro_variable, \
     file_define_macro_variable, \
     file_used_macro_variable

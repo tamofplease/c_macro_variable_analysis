@@ -3,7 +3,7 @@ from sqlalchemy.dialects.mysql import INTEGER as Integer
 from sqlalchemy.orm import mapped_column, relationship
 
 from src.setting import Base
-from src.model.file_macro_variable import \
+from src.entity.file_macro_variable import \
     file_available_macro_variable, \
     file_define_macro_variable, \
     file_used_macro_variable
