@@ -23,6 +23,3 @@ class Project(Base):
         primaryjoin="and_(Project.id==SrcFile.project_id, " "SrcFile.extension=='h')",
         back_populates="project"
     )
-
-    def __init__(self, name: str, url: str, total_file_count: int):
-        pass

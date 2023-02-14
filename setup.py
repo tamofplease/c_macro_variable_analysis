@@ -5,16 +5,16 @@ setup(
     version="0.1.0",
     description="",
     author="",
-    packages=["entity", "repository"],
+    packages=["entity", "use_case"],
     package_dir={
         "entity": "src/entity",
-        "repository": "src/repository"
+        "use_case": "src/use_case"
     },
     package_data={
         "entity": [
             "*.py",
         ],
-        "repository": [
+        "use_case": [
             "*.py",
         ]
     },
