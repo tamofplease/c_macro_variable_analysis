@@ -10,7 +10,10 @@ class Project(Base):
     id = mapped_column(Integer, primary_key=True, autoincrement=True)
     name = Column('name', String(127), nullable=False)
     url = Column('url', String(255), nullable=False)
-    total_file_count = Column('total_file_count', Integer, nullable=False)
+    commit_hash = Column('commit_hash', String(63), nullable=False)
+    organizer = Column('organizer', String(127), nullable=False)
+
+    src_files = relationship("SrcFile", back_populates="project")
 
     c_files = relationship(
         "SrcFile",
