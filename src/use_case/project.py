@@ -12,20 +12,22 @@ OUTPUT_ROOT_PATH = join(PROJECT_ROOT_PATH, 'out')
 
 def clone_project(project_origin_url: str):
     project_name = project_origin_url.split('.git')[0].split('/')[-1]
+    organizer = project_origin_url.split('.git')[0].split('/')[-2]
     output_path = join(OUTPUT_ROOT_PATH, project_name)
 
     # clone済みのprojectが存在するなら事前に削除する。
     if exists(output_path):
         rmtree(output_path)
 
-    Repo.clone_from(project_origin_url, output_path,
-                    multi_options=["--recursive"])
+    repo = Repo.clone_from(project_origin_url, output_path,
+                           multi_options=["--recursive"])
 
-    # new_commit = repo.head.commit
-    src_file_paths = glob(join(output_path, "**/*"), recursive=True)
-
-    project = Project(name=project_name, url=project_origin_url,
-                      total_file_count=len(src_file_paths))
+    project = Project(
+        name=project_name,
+        url=project_origin_url,
+        commit_hash=repo.head.commit,
+        organizer=organizer
+    )
 
     session.add(project)
     session.commit()
