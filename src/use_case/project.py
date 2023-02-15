@@ -1,5 +1,4 @@
 from os.path import join, exists
-from glob import glob
 from shutil import rmtree
 from git import Repo
 

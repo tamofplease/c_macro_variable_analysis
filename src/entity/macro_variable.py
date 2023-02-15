@@ -1,7 +1,8 @@
 import enum
 from typing import List
-from sqlalchemy import Integer, Column, Text, Enum
+from sqlalchemy import Integer, Column, Enum, VARCHAR
 from sqlalchemy.orm import mapped_column, relationship, Mapped
+from sqlalchemy.schema import UniqueConstraint
 
 
 from src.setting import Base
@@ -21,11 +22,14 @@ class MacroVariableType(enum.Enum):
 class MacroVariable(Base):
     __tablename__ = "macro_variable"
 
+    __table_args__ = (UniqueConstraint(
+        'key', 'value', 'type', name='_macro_variable_uk'), )
+
     id = mapped_column(
         Integer, primary_key=True, autoincrement=True)
-    key = Column('key', Text, nullable=False)
-    value = Column('value', Text)
-    type = Column(Enum(MacroVariableType))
+    key = Column('key', VARCHAR(255), nullable=False)
+    value = Column('value', VARCHAR(512))
+    type = Column(Enum(MacroVariableType), nullable=False)
 
     available_files: Mapped[List[SrcFile]] = relationship(
         secondary=file_available_macro_variable, back_populates='available_macro_variables'

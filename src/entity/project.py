@@ -1,11 +1,14 @@
 from sqlalchemy import Column, Integer, String
 from sqlalchemy.orm import mapped_column, relationship
+from sqlalchemy.schema import UniqueConstraint
 
 from src.setting import Base
 
 
 class Project(Base):
     __tablename__ = "project"
+    __table_args__ = (UniqueConstraint(
+        'url', name='_project_uk'), )
 
     id = mapped_column(Integer, primary_key=True, autoincrement=True)
     name = Column('name', String(127), nullable=False)

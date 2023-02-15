@@ -1,6 +1,7 @@
 from sqlalchemy import Column, String, ForeignKey
 from sqlalchemy.dialects.mysql import INTEGER as Integer
 from sqlalchemy.orm import mapped_column, relationship
+from sqlalchemy.schema import UniqueConstraint
 
 from src.setting import Base
 from src.entity.file_macro_variable import \
@@ -10,7 +11,12 @@ from src.entity.file_macro_variable import \
 
 
 class SrcFile(Base):
+
     __tablename__ = "src_file"
+
+    __table_args__ = (UniqueConstraint(
+        'project_id', 'name', 'path', name='_src_file_uk'), )
+
     id = mapped_column(
         Integer, primary_key=True, autoincrement=True)
     name = Column('name', String(255), nullable=False)
