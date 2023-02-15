@@ -5,7 +5,7 @@ from src.entity.xml_file import XmlFile
 from src.entity.macro_variable import MacroVariable
 
 project = Project(
-    name="sample_p", url="https://something.com", total_file_count=123)
+    name="sample_p", url="https://something.com", commit_hash="something commit", organizer="sample.org")
 
 srcFile = SrcFile(name="something.c",
                   path="sample_p/some/thing/something.c", extension="c", loc=123)
