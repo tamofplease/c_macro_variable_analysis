@@ -13,3 +13,5 @@ mysql -uroot -ppassword -h 127.0.0.1 -P 53306
 ## create project table
 
 DATABASE c_macro_variable_analysis;
+
+use c_macro_variable_analysis;
