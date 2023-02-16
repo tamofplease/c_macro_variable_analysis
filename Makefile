@@ -20,3 +20,7 @@ run-container:
 .PHONY: stop-container
 stop-container:
 	docker stop macro-dev
+
+.PHONE: db_reset
+db_reset:
+	python src/entity/main.py
