@@ -18,7 +18,9 @@ def clone_project(project_origin_url: str):
     # clone済みのprojectが存在するなら事前に削除する。
     if exists(output_path):
         rmtree(output_path)
-        # xmlも同時に削除してしまう。
+
+    # xmlも同時に削除してしまう。
+    if exists(output_path.replace('out', 'xml')):
         rmtree(output_path.replace('out', 'xml'))
 
     repo = Repo.clone_from(project_origin_url, output_path,

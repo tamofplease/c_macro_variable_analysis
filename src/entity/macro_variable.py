@@ -37,9 +37,8 @@ class MacroVariable(Base):
         secondary=FileDefineMacroVariable, back_populates='define_macro_variables'
     )
 
-    used_files: Mapped[List[SrcFile]] = relationship(
-        secondary=FileUsedMacroVariable, back_populates='used_macro_variables'
-    )
+    used_files: Mapped[List[SrcFile]] = relationship("FileUsedMacroVariable",
+                                                     back_populates='macro_variable')
 
     # pylint: disable=redefined-builtin
     def __init__(self, key: str, value: str, type: MacroVariableType):

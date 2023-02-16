@@ -38,6 +38,5 @@ class SrcFile(Base):
                                           secondary=FileDefineMacroVariable, back_populates='define_files'
                                           )
 
-    used_macro_variables = relationship("MacroVariable",
-                                        secondary=FileUsedMacroVariable, back_populates='used_files'
-                                        )
+    used_macro_variables = relationship(
+        "FileUsedMacroVariable", back_populates='src_file')
