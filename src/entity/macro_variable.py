@@ -1,8 +1,8 @@
+from hashlib import sha512
 import enum
 from typing import List
-from sqlalchemy import Integer, Column, Enum, VARCHAR
+from sqlalchemy import Integer, Column, Enum, VARCHAR, TEXT
 from sqlalchemy.orm import mapped_column, relationship, Mapped
-from sqlalchemy.schema import UniqueConstraint
 
 
 from src.setting import Base
@@ -22,14 +22,12 @@ class MacroVariableType(enum.Enum):
 class MacroVariable(Base):
     __tablename__ = "macro_variable"
 
-    __table_args__ = (UniqueConstraint(
-        'key', 'value', 'type', name='_macro_variable_uk'), )
-
     id = mapped_column(
         Integer, primary_key=True, autoincrement=True)
-    key = Column('key', VARCHAR(255), nullable=False)
-    value = Column('value', VARCHAR(512))
+    key = Column('key', TEXT, nullable=False)
+    value = Column('value', TEXT)
     type = Column(Enum(MacroVariableType), nullable=False)
+    hash = Column('hash', VARCHAR(512), nullable=False, unique=True)
 
     available_files: Mapped[List[SrcFile]] = relationship(
         secondary=file_available_macro_variable, back_populates='available_macro_variables'
@@ -42,3 +40,11 @@ class MacroVariable(Base):
     used_files: Mapped[List[SrcFile]] = relationship(
         secondary=file_used_macro_variable, back_populates='used_macro_variables'
     )
+
+    # pylint: disable=redefined-builtin
+    def __init__(self, key: str, value: str, type: MacroVariableType):
+        self.key = key
+        self.value = value
+        self.type = type
+        self.hash = sha512((key + '-' + value).encode('utf-8')).hexdigest()
+    # pylint: enable=redefined-builtin
