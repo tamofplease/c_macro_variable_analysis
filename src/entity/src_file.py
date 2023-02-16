@@ -5,9 +5,9 @@ from sqlalchemy.schema import UniqueConstraint
 
 from src.setting import Base
 from src.entity.file_macro_variable import \
-    file_available_macro_variable, \
-    file_define_macro_variable, \
-    file_used_macro_variable
+    FileAvailableMacroVariable, \
+    FileDefineMacroVariable, \
+    FileUsedMacroVariable
 
 
 class SrcFile(Base):
@@ -31,13 +31,13 @@ class SrcFile(Base):
                             back_populates="src_file")
 
     available_macro_variables = relationship("MacroVariable",
-                                             secondary=file_available_macro_variable, back_populates='available_files'
+                                             secondary=FileAvailableMacroVariable, back_populates='available_files'
                                              )
 
     define_macro_variables = relationship("MacroVariable",
-                                          secondary=file_define_macro_variable, back_populates='define_files'
+                                          secondary=FileDefineMacroVariable, back_populates='define_files'
                                           )
 
     used_macro_variables = relationship("MacroVariable",
-                                        secondary=file_used_macro_variable, back_populates='used_files'
+                                        secondary=FileUsedMacroVariable, back_populates='used_files'
                                         )

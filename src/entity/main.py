@@ -7,9 +7,9 @@ from src.entity.src_file import SrcFile
 from src.entity.xml_file import XmlFile
 from src.entity.macro_variable import MacroVariable
 from src.entity.file_macro_variable import \
-    file_available_macro_variable, \
-    file_define_macro_variable, \
-    file_used_macro_variable
+    FileAvailableMacroVariable, \
+    FileDefineMacroVariable, \
+    FileUsedMacroVariable
 # pylint: enable=unused-import
 
 

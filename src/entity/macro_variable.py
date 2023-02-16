@@ -8,9 +8,9 @@ from sqlalchemy.orm import mapped_column, relationship, Mapped
 from src.setting import Base
 from src.entity.src_file import SrcFile
 from src.entity.file_macro_variable import \
-    file_available_macro_variable, \
-    file_define_macro_variable, \
-    file_used_macro_variable
+    FileAvailableMacroVariable, \
+    FileDefineMacroVariable, \
+    FileUsedMacroVariable
 
 
 class MacroVariableType(enum.Enum):
@@ -30,15 +30,15 @@ class MacroVariable(Base):
     hash = Column('hash', VARCHAR(512), nullable=False, unique=True)
 
     available_files: Mapped[List[SrcFile]] = relationship(
-        secondary=file_available_macro_variable, back_populates='available_macro_variables'
+        secondary=FileAvailableMacroVariable, back_populates='available_macro_variables'
     )
 
     define_files: Mapped[List[SrcFile]] = relationship(
-        secondary=file_define_macro_variable, back_populates='define_macro_variables'
+        secondary=FileDefineMacroVariable, back_populates='define_macro_variables'
     )
 
     used_files: Mapped[List[SrcFile]] = relationship(
-        secondary=file_used_macro_variable, back_populates='used_macro_variables'
+        secondary=FileUsedMacroVariable, back_populates='used_macro_variables'
     )
 
     # pylint: disable=redefined-builtin
@@ -46,5 +46,6 @@ class MacroVariable(Base):
         self.key = key
         self.value = value
         self.type = type
+
         self.hash = sha512((key + '-' + value).encode('utf-8')).hexdigest()
     # pylint: enable=redefined-builtin

@@ -1,24 +1,33 @@
-from sqlalchemy import Table, ForeignKey, Column
+import enum
+from sqlalchemy import Table, ForeignKey, Column, Enum
 from src.setting import Base
 
-file_available_macro_variable = Table(
+
+class DefinePositionType(enum.Enum):
+    IN_FILE = 1
+    IN_PROJECT = 2
+    EXTERNAL = 3
+
+
+FileAvailableMacroVariable = Table(
     "file_available_macro_variable",
     Base.metadata,
-    Column("src_file_id", ForeignKey("src_file.id"), primary_key=True),
-    Column('macro_variable', ForeignKey('macro_variable.id'), primary_key=True)
+    Column("src_file_id", ForeignKey("src_file.id")),
+    Column('macro_variable_id', ForeignKey('macro_variable.id'))
 )
 
-file_define_macro_variable = Table(
+
+FileDefineMacroVariable = Table(
     "file_define_macro_variable",
     Base.metadata,
-    Column("src_file_id", ForeignKey("src_file.id"), primary_key=True),
-    Column('macro_variable', ForeignKey(
-        'macro_variable.id'), primary_key=True),
+    Column("src_file_id", ForeignKey("src_file.id")),
+    Column('macro_variable_id', ForeignKey('macro_variable.id'))
 )
 
-file_used_macro_variable = Table(
+FileUsedMacroVariable = Table(
     "file_used_macro_variable",
     Base.metadata,
-    Column("src_file_id", ForeignKey("src_file.id"), primary_key=True),
-    Column('macro_variable', ForeignKey('macro_variable.id'), primary_key=True)
+    Column("src_file_id", ForeignKey("src_file.id")),
+    Column('macro_variable_id', ForeignKey('macro_variable.id')),
+    Column('define_position_type', Enum(DefinePositionType))
 )
