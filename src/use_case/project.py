@@ -1,5 +1,6 @@
 from os.path import join, exists
 from shutil import rmtree
+from sqlalchemy.exc import IntegrityError
 from git import Repo
 
 from src.config import PROJECT_ROOT_PATH
@@ -28,8 +29,14 @@ def clone_project(project_origin_url: str):
         organizer=organizer
     )
 
-    session.add(project)
-    session.commit()
+    try:
+        session.add(project)
+        session.commit()
+    except IntegrityError as err:
+        session.rollback()
+        print(err)
+    return session.query(Project).filter(
+        Project.url == project_origin_url).one()
 
 
 def main():

@@ -19,7 +19,7 @@ class XmlFileAlreadyExistException(Exception):
     pass
 
 
-def generate_xml_file(src_file_id: int):
+def generate_xml_file(src_file_id: int) -> XmlFile:
     src_file = session.query(SrcFile).get(src_file_id)
 
     if not src_file.extension in ('.c', '.h'):
@@ -33,20 +33,20 @@ def generate_xml_file(src_file_id: int):
                            src_file.path, src_file.name)
 
     # 出力先のfile情報
-    output_file_dir = join(XML_ROOT_PATH, src_file.path)
+    output_file_dir = join(XML_ROOT_PATH, project.name, src_file.path)
     output_file_name = src_file.name + '.xml'
     output_file_path = join(output_file_dir, output_file_name)
 
-    # すでに出力が存在する場合は何もしない
-    if exists(output_file_path):
-        raise XmlFileAlreadyExistException(
-            f'xml file already exists in: {output_file_path}')
-
-    # 出力先のdirが存在しない場合は作成する。
-    if not exists(output_file_dir):
-        makedirs(output_file_dir)
-
     try:
+        # すでに出力が存在する場合は何もしない
+        if exists(output_file_path):
+            raise XmlFileAlreadyExistException(
+                f'xml file already exists in: {output_file_path}')
+
+        # 出力先のdirが存在しない場合は作成する。
+        if not exists(output_file_dir):
+            makedirs(output_file_dir)
+
         proc = run(
             f'srcml {input_file_path}',
             shell=True,
@@ -68,6 +68,9 @@ def generate_xml_file(src_file_id: int):
     except CalledProcessError as err:
         print(f'{err} has occured while executing with file_id: {src_file_id}')
         print(proc.stderr)
+    except XmlFileAlreadyExistException:
+        pass
+    return session.query(XmlFile).filter(XmlFile.src_file_id == src_file_id).one()
 
 
 def main():

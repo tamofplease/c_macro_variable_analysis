@@ -1,6 +1,7 @@
 from os.path import join, isdir
 from pathlib import Path
 from glob import glob
+from sqlalchemy.exc import IntegrityError
 
 from src.setting import session
 from src.entity.src_file import SrcFile
@@ -11,20 +12,18 @@ from src.config import PROJECT_ROOT_PATH
 OUTPUT_ROOT_PATH = join(PROJECT_ROOT_PATH, 'out')
 
 
-def save_files_by_project_id(project_id: int):
+def save_files_by_project_id(project_id: int) -> list[SrcFile]:
     project = session.query(Project).get(project_id)
     project_root_path = join(OUTPUT_ROOT_PATH, project.name)
 
-    src_file_paths = glob(join(project_root_path, "**/*"), recursive=True)
-    src_files = []
+    src_file_paths = [f_path for f_path in glob(
+        join(project_root_path, "**/*"), recursive=True) if not isdir(f_path)]
     for src_file_path in src_file_paths:
-        if (isdir(src_file_path)):
-            continue
         try:
-            with open(src_file_path, encoding='utf-8') as f:
-                loc = sum(1 for _ in f)
+            with open(src_file_path, encoding='utf-8') as f_r:
+                loc = sum(1 for _ in f_r)
                 path = Path(src_file_path)
-            src_files.append(
+            session.add(
                 SrcFile(
                     name=path.name,
                     path=src_file_path.replace(
@@ -36,13 +35,9 @@ def save_files_by_project_id(project_id: int):
             )
         except UnicodeDecodeError:
             pass
-    session.add_all(src_files)
-    session.commit()
-
-
-def main():
-    save_files_by_project_id(1)
-
-
-if __name__ == "__main__":
-    main()
+    try:
+        session.commit()
+    except IntegrityError as err:
+        session.rollback()
+        print(err)
+    return session.query(SrcFile).filter(SrcFile.project_id == project_id).all()
