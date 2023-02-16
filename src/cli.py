@@ -5,6 +5,7 @@ from src.use_case.project import clone_project
 from src.use_case.src_file import save_files_by_project_id
 from src.use_case.xml_file import generate_xml_file, InvalidExtensionException
 from src.use_case.define_macro import extract_define_macro
+from src.use_case.used_macro import extract_used_macro
 
 
 class ProjectNotFoundException(Exception):
@@ -30,7 +31,10 @@ def collect_data(project_url: str):
                 # run srcML to create xml files
                 xml_file = generate_xml_file(src_file_id=src_file.id)
 
-                extract_define_macro(xml_file.id)
+                extract_define_macro(xml_file_id=xml_file.id)
+
+                extract_used_macro(xml_file_id=xml_file.id)
+
             except InvalidExtensionException as err:
                 print(err)
 

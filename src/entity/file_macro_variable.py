@@ -33,8 +33,8 @@ class FileUsedMacroVariable(Base):
     id = mapped_column(
         Integer, primary_key=True, autoincrement=True)
 
-    define_position_type = Column(
-        'define_position_type', Enum(DefinePositionType))
+    type = Column(
+        'type', Enum(DefinePositionType))
 
     src_file_id = mapped_column('src_file_id', ForeignKey("src_file.id"))
     src_file = relationship("SrcFile", back_populates='used_macro_variables')
