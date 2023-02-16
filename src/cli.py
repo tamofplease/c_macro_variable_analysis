@@ -15,7 +15,7 @@ def collect_data(project_url: str):
     try:
         project: Project = clone_project(project_origin_url=project_url)
 
-        if (project is None):
+        if project is None:
             raise ProjectNotFoundException()
 
         src_files: list[SrcFile] = save_files_by_project_id(
